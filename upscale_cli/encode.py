@@ -7,6 +7,7 @@ needs both an ffmpeg build with NVENC and an NVIDIA GPU present).
 
 from __future__ import annotations
 
+import os
 import sys
 from fractions import Fraction
 
@@ -14,7 +15,11 @@ import av
 
 EncoderCandidate = tuple[str, str, dict[str, str]]
 
-DEFAULT_LOSSLESS_HEVC_PROFILE = "nvenc-p4-low-delay"
+# The env override lets machines without an NVIDIA GPU (CI, CPU-only
+# hosts) select a software profile such as "x265-ultrafast".
+DEFAULT_LOSSLESS_HEVC_PROFILE = os.environ.get(
+    "RELAY_LOSSLESS_HEVC_PROFILE", "nvenc-p4-low-delay"
+)
 
 # Public session choices. QP remains an implementation detail: clients render
 # ``label`` and send the stable ``id``. The bandwidth figures are deliberately
