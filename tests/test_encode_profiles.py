@@ -1,3 +1,5 @@
+import os
+
 import pytest
 
 import upscale_cli.encode as encode
@@ -71,6 +73,15 @@ def test_public_lossy_options_map_to_requested_nvenc_qps():
         assert options["preset"] == "p7"
 
 
-def test_lossless_hevc_defaults_to_p4_low_delay():
+def test_lossless_hevc_tier_wires_through_the_effective_default():
+    assert (
+        encode.TIERS["lossless-hevc"]
+        is encode.LOSSLESS_HEVC_PROFILES[encode.DEFAULT_LOSSLESS_HEVC_PROFILE]
+    )
+
+
+def test_shipped_default_is_p4_low_delay():
+    if "RELAY_LOSSLESS_HEVC_PROFILE" in os.environ:
+        pytest.skip("default profile overridden by RELAY_LOSSLESS_HEVC_PROFILE")
     assert encode.DEFAULT_LOSSLESS_HEVC_PROFILE == "nvenc-p4-low-delay"
     assert encode.TIERS["lossless-hevc"][0][2]["preset"] == "p4"

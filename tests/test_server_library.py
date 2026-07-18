@@ -11,6 +11,7 @@ import pytest
 from relay_client_core import RelayClient, SessionConfig
 from relay_server.library import LibraryPathError, MediaLibrary
 from relay_server.server import RelayServer
+from upscale_cli.encode import DEFAULT_LOSSLESS_HEVC_PROFILE
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -123,7 +124,7 @@ def test_library_http_range_and_server_source_pts(library_file):
             assert caps["quality_options"][1]["label"] == "HEVC ~350 Mbps"
             assert caps["quality_options"][-1]["android_supported"] is False
             async with client._http.get(f"http://127.0.0.1:{server.port}/status") as response:
-                assert (await response.json())["lossless_hevc_profile"] == "nvenc-p4-low-delay"
+                assert (await response.json())["lossless_hevc_profile"] == DEFAULT_LOSSLESS_HEVC_PROFILE
             tree = await client.fetch_library()
             assert tree["children"][0]["children"][0]["path"] == "Shows/Sample.MKV"
 
