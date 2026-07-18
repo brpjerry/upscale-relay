@@ -1,0 +1,17 @@
+# Environments
+.venv/
+.venv-cuda/
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+
+# libmpv Windows DLL drop (120 MB, exceeds GitHub limits) — see CLIENT_LINUX.md
+mpv-dev/
+
+# .onnx model drops + TensorRT engine cache — see PLAN.md model registry notes
+models/
+
+# Test media and captures (regenerate via `upscale-cli sample ...`)
+*.mkv
+*.bin

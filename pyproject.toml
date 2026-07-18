@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "upscale-cli"
+version = "0.1.0"
+description = "Video upscale relay - offline pipeline CLI (phase 1)"
+requires-python = ">=3.11"
+dependencies = [
+    "av>=13",
+    "numpy>=1.26",
+    "aiohttp>=3.9",
+    "zeroconf>=0.132",
+]
+
+[project.optional-dependencies]
+gui = [
+    "PySide6>=6.6",
+    "qasync>=0.27",
+    "python-mpv>=1.0",
+]
+
+[project.scripts]
+upscale-cli = "upscale_cli.cli:main"
+relay-server = "relay_server.server:main"
+relay-client = "relay_client_core.cli:main"
+relay-desktop = "desktop_client.app:main"
+
+[tool.setuptools.packages.find]
+include = ["upscale_cli*", "relay_protocol*", "relay_media*", "relay_server*", "relay_client_core*", "desktop_client*"]

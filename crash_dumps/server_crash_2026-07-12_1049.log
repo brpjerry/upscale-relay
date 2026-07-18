@@ -1,0 +1,120 @@
+2026-07-11 23:40:28,338 relay.server INFO control/status on :8590, media on :8591
+model: 2x_AnimeJaNai_HD_V3Sharp1_Compact.onnx | provider: TensorrtExecutionProvider | io: uint8-wrapped
+encode: tier 'lossless-hevc' -> hevc_nvenc {'tune': 'lossless', 'preset': 'p7'}
+2026-07-11 23:40:50,108 relay.session INFO session 75542639e58e -> playing
+2026-07-11 23:42:42,972 relay.session INFO session 75542639e58e -> closed
+2026-07-11 23:42:43,516 aiohttp.access INFO 127.0.0.1 [11/Jul/2026:23:40:48 -0700] "GET /control HTTP/1.1" 101 0 "-" "Python/3.13 aiohttp/3.14.1"
+2026-07-11 23:42:43,516 relay.server INFO media conn ('127.0.0.1', 56083) closed: IncompleteReadError('0 bytes read on a total of 25 expected bytes')
+model: 2x_AnimeJaNai_HD_V3Sharp1_Compact.onnx | provider: TensorrtExecutionProvider | io: uint8-wrapped
+encode: tier 'lossless-hevc' -> hevc_nvenc {'tune': 'lossless', 'preset': 'p7'}
+2026-07-11 23:43:00,910 relay.session INFO session 424eb3031ba7 -> playing
+2026-07-11 23:44:53,470 relay.session INFO session 424eb3031ba7 -> closed
+2026-07-11 23:44:54,052 aiohttp.access INFO 127.0.0.1 [11/Jul/2026:23:42:59 -0700] "GET /control HTTP/1.1" 101 0 "-" "Python/3.13 aiohttp/3.14.1"
+2026-07-11 23:44:54,052 relay.server INFO media conn ('127.0.0.1', 56119) closed: IncompleteReadError('0 bytes read on a total of 25 expected bytes')
+2026-07-11 23:44:54,053 aiohttp.access INFO 127.0.0.1 [11/Jul/2026:23:44:54 -0700] "GET /status HTTP/1.1" 200 346 "-" "Mozilla/5.0 (Windows NT; Windows NT 10.0; en-US) WindowsPowerShell/5.1.26100.8655"
+model: 2x_AnimeJaNai_HD_V3Sharp1_Compact.onnx | provider: TensorrtExecutionProvider | io: uint8-wrapped
+encode: tier 'lossless-hevc' -> hevc_nvenc {'tune': 'lossless', 'preset': 'p7'}
+2026-07-11 23:44:56,036 relay.session INFO session 8564d9085845 -> playing
+2026-07-11 23:46:48,408 relay.session INFO session 8564d9085845 -> closed
+2026-07-11 23:46:48,991 aiohttp.access INFO 127.0.0.1 [11/Jul/2026:23:44:54 -0700] "GET /control HTTP/1.1" 101 0 "-" "Python/3.13 aiohttp/3.14.1"
+2026-07-11 23:46:48,991 relay.server INFO media conn ('127.0.0.1', 55719) closed: IncompleteReadError('0 bytes read on a total of 25 expected bytes')
+2026-07-11 23:46:48,991 aiohttp.access INFO 127.0.0.1 [11/Jul/2026:23:46:48 -0700] "GET /status HTTP/1.1" 200 346 "-" "Mozilla/5.0 (Windows NT; Windows NT 10.0; en-US) WindowsPowerShell/5.1.26100.8655"
+model: 2x_AnimeJaNai_HD_V3Sharp1_Compact.onnx | provider: TensorrtExecutionProvider | io: uint8-wrapped
+encode: tier 'lossless-hevc' -> hevc_nvenc {'tune': 'lossless', 'preset': 'p7'}
+2026-07-11 23:46:50,958 relay.session INFO session fcd79d00d48a -> playing
+2026-07-11 23:48:44,454 relay.session INFO session fcd79d00d48a -> closed
+2026-07-11 23:48:45,019 aiohttp.access INFO 127.0.0.1 [11/Jul/2026:23:46:49 -0700] "GET /control HTTP/1.1" 101 0 "-" "Python/3.13 aiohttp/3.14.1"
+2026-07-11 23:48:45,019 relay.server INFO media conn ('127.0.0.1', 55743) closed: IncompleteReadError('0 bytes read on a total of 25 expected bytes')
+2026-07-11 23:48:45,020 aiohttp.access INFO 127.0.0.1 [11/Jul/2026:23:48:45 -0700] "GET /status HTTP/1.1" 200 346 "-" "Mozilla/5.0 (Windows NT; Windows NT 10.0; en-US) WindowsPowerShell/5.1.26100.8655"
+model: 2x_AnimeJaNai_HD_V3Sharp1_Compact.onnx | provider: TensorrtExecutionProvider | io: uint8-wrapped
+encode: tier 'lossless-hevc' -> hevc_nvenc {'tune': 'lossless', 'preset': 'p7'}
+2026-07-11 23:49:19,728 relay.session INFO session d173a68c5742 -> playing
+2026-07-11 23:49:24,938 relay.session INFO session d173a68c5742 -> closed
+2026-07-11 23:49:25,396 aiohttp.access INFO 127.0.0.1 [11/Jul/2026:23:49:17 -0700] "GET /control HTTP/1.1" 101 0 "-" "Python/3.13 aiohttp/3.14.1"
+2026-07-11 23:49:25,396 relay.server INFO media conn ('127.0.0.1', 63122) closed: ConnectionResetError(22, 'The specified network name is no longer available', None, 64, None)
+2026-07-11 23:49:25,397 aiohttp.access INFO 127.0.0.1 [11/Jul/2026:23:49:25 -0700] "GET /status HTTP/1.1" 200 346 "-" "Mozilla/5.0 (Windows NT; Windows NT 10.0; en-US) WindowsPowerShell/5.1.26100.8655"
+model: 2x_AnimeJaNai_HD_V3Sharp1_Compact.onnx | provider: TensorrtExecutionProvider | io: uint8-wrapped
+encode: tier 'lossless-hevc' -> hevc_nvenc {'tune': 'lossless', 'preset': 'p7'}
+2026-07-11 23:49:27,714 relay.session INFO session 68f3bcb2c873 -> playing
+2026-07-11 23:49:32,868 relay.session INFO session 68f3bcb2c873 -> closed
+2026-07-11 23:49:33,343 aiohttp.access INFO 127.0.0.1 [11/Jul/2026:23:49:26 -0700] "GET /control HTTP/1.1" 101 0 "-" "Python/3.13 aiohttp/3.14.1"
+2026-07-11 23:49:33,344 aiohttp.access INFO 127.0.0.1 [11/Jul/2026:23:49:33 -0700] "GET /status HTTP/1.1" 200 346 "-" "Mozilla/5.0 (Windows NT; Windows NT 10.0; en-US) WindowsPowerShell/5.1.26100.8655"
+2026-07-11 23:49:33,344 relay.server INFO media conn ('127.0.0.1', 63130) closed: ConnectionResetError(22, 'The specified network name is no longer available', None, 64, None)
+model: 2x_AnimeJaNai_HD_V3Sharp1_Compact.onnx | provider: TensorrtExecutionProvider | io: uint8-wrapped
+encode: tier 'lossless-hevc' -> hevc_nvenc {'tune': 'lossless', 'preset': 'p7'}
+2026-07-11 23:50:08,433 relay.session INFO session 45292db59b9c -> playing
+2026-07-11 23:50:23,670 relay.session INFO session 45292db59b9c -> closed
+2026-07-11 23:50:24,153 aiohttp.access INFO 127.0.0.1 [11/Jul/2026:23:50:06 -0700] "GET /control HTTP/1.1" 101 0 "-" "Python/3.13 aiohttp/3.14.1"
+2026-07-11 23:50:24,153 relay.server INFO media conn ('127.0.0.1', 63146) closed: ConnectionResetError(22, 'The specified network name is no longer available', None, 64, None)
+2026-07-11 23:50:24,270 aiohttp.access INFO 127.0.0.1 [11/Jul/2026:23:50:24 -0700] "GET /control HTTP/1.1" 101 0 "-" "Python/3.13 aiohttp/3.14.1"
+2026-07-11 23:50:24,316 aiohttp.access INFO 127.0.0.1 [11/Jul/2026:23:50:24 -0700] "GET /status HTTP/1.1" 200 346 "-" "Mozilla/5.0 (Windows NT; Windows NT 10.0; en-US) WindowsPowerShell/5.1.26100.8655"
+model: 2x_AnimeJaNai_HD_V3Sharp1_Compact.onnx | provider: TensorrtExecutionProvider | io: uint8-wrapped
+encode: tier 'lossless-hevc' -> hevc_nvenc {'tune': 'lossless', 'preset': 'p7'}
+2026-07-11 23:50:26,615 relay.session INFO session 647fad0d7e93 -> playing
+2026-07-11 23:50:42,000 relay.session INFO session 647fad0d7e93 -> closed
+2026-07-11 23:50:42,482 aiohttp.access INFO 127.0.0.1 [11/Jul/2026:23:50:24 -0700] "GET /control HTTP/1.1" 101 0 "-" "Python/3.13 aiohttp/3.14.1"
+2026-07-11 23:50:42,482 relay.server INFO media conn ('127.0.0.1', 63157) closed: ConnectionResetError(22, 'The specified network name is no longer available', None, 64, None)
+2026-07-11 23:50:42,600 aiohttp.access INFO 127.0.0.1 [11/Jul/2026:23:50:42 -0700] "GET /control HTTP/1.1" 101 0 "-" "Python/3.13 aiohttp/3.14.1"
+2026-07-11 23:50:42,623 aiohttp.access INFO 127.0.0.1 [11/Jul/2026:23:50:42 -0700] "GET /status HTTP/1.1" 200 346 "-" "Mozilla/5.0 (Windows NT; Windows NT 10.0; en-US) WindowsPowerShell/5.1.26100.8655"
+model: 2x_AnimeJaNai_HD_V3Sharp1_Compact.onnx | provider: TensorrtExecutionProvider | io: uint8-wrapped
+encode: tier 'visually-lossless' -> hevc_nvenc {'rc': 'constqp', 'qp': '16', 'preset': 'p6'}
+2026-07-12 10:49:46,865 relay.session INFO session e7c954c07646 -> playing
+Windows fatal exception: access violation
+
+Thread 0x0000e5dc (most recent call first):
+  File "C:\Users\b580v\Documents\CC\video-upscale-relay\relay_server\pipeline.py", line 463 in _finish_work
+  File "C:\Users\b580v\Documents\CC\video-upscale-relay\relay_server\pipeline.py", line 320 in run
+  File "C:\Program Files\WindowsApps\PythonSoftwareFoundation.Python.3.13_3.13.3824.0_x64__qbz5n2kfra8p0\Lib\threading.py", line 995 in run
+  File "C:\Program Files\WindowsApps\PythonSoftwareFoundation.Python.3.13_3.13.3824.0_x64__qbz5n2kfra8p0\Lib\threading.py", line 1044 in _bootstrap_inner
+  File "C:\Program Files\WindowsApps\PythonSoftwareFoundation.Python.3.13_3.13.3824.0_x64__qbz5n2kfra8p0\Lib\threading.py", line 1015 in _bootstrap
+
+Thread 0x0000dadc (most recent call first):
+  File "C:\Program Files\WindowsApps\PythonSoftwareFoundation.Python.3.13_3.13.3824.0_x64__qbz5n2kfra8p0\Lib\threading.py", line 359 in wait
+  File "C:\Program Files\WindowsApps\PythonSoftwareFoundation.Python.3.13_3.13.3824.0_x64__qbz5n2kfra8p0\Lib\threading.py", line ??? in wait
+  <invalid frame>
+
+Thread 0x00004f70 (most recent call first):
+  File "C:\Program Files\WindowsApps\PythonSoftwareFoundation.Python.3.13_3.13.3824.0_x64__qbz5n2kfra8p0\Lib\threading.py", line 363 in wait
+  File "C:\Program Files\WindowsApps\PythonSoftwareFoundation.Python.3.13_3.13.3824.0_x64__qbz5n2kfra8p0\Lib\queue.py", line 170 in put
+  File "C:\Users\b580v\Documents\CC\video-upscale-relay\relay_server\pipeline.py", line 246 in _safe_put
+  File "C:\Users\b580v\Documents\CC\video-upscale-relay\relay_server\pipeline.py", line 403 in _put_decoded
+  File "C:\Users\b580v\Documents\CC\video-upscale-relay\relay_server\pipeline.py", line 388 in _decode_work
+  File "C:\Users\b580v\Documents\CC\video-upscale-relay\relay_server\pipeline.py", line 320 in run
+  File "C:\Program Files\WindowsApps\PythonSoftwareFoundation.Python.3.13_3.13.3824.0_x64__qbz5n2kfra8p0\Lib\threading.py", line 995 in run
+  File "C:\Program Files\WindowsApps\PythonSoftwareFoundation.Python.3.13_3.13.3824.0_x64__qbz5n2kfra8p0\Lib\threading.py", line 1044 in _bootstrap_inner
+  File "C:\Program Files\WindowsApps\PythonSoftwareFoundation.Python.3.13_3.13.3824.0_x64__qbz5n2kfra8p0\Lib\threading.py", line 1015 in _bootstrap
+
+Thread 0x0000d878 (most recent call first):
+  File "C:\Program Files\WindowsApps\PythonSoftwareFoundation.Python.3.13_3.13.3824.0_x64__qbz5n2kfra8p0\Lib\concurrent\futures\thread.py", line 90 in _worker
+  File "C:\Program Files\WindowsApps\PythonSoftwareFoundation.Python.3.13_3.13.3824.0_x64__qbz5n2kfra8p0\Lib\threading.py", line 995 in run
+  File "C:\Program Files\WindowsApps\PythonSoftwareFoundation.Python.3.13_3.13.3824.0_x64__qbz5n2kfra8p0\Lib\threading.py", line 1044 in _bootstrap_inner
+  File "C:\Program Files\WindowsApps\PythonSoftwareFoundation.Python.3.13_3.13.3824.0_x64__qbz5n2kfra8p0\Lib\threading.py", line 1015 in _bootstrap
+
+Thread 0x0000b2c4 (most recent call first):
+  File "C:\Program Files\WindowsApps\PythonSoftwareFoundation.Python.3.13_3.13.3824.0_x64__qbz5n2kfra8p0\Lib\threading.py", line 359 in wait
+  File "C:\Program Files\WindowsApps\PythonSoftwareFoundation.Python.3.13_3.13.3824.0_x64__qbz5n2kfra8p0\Lib\queue.py", line 159 in put
+  File "C:\Users\b580v\Documents\CC\video-upscale-relay\relay_server\pipeline.py", line 279 in feed
+  File "C:\Program Files\WindowsApps\PythonSoftwareFoundation.Python.3.13_3.13.3824.0_x64__qbz5n2kfra8p0\Lib\concurrent\futures\thread.py", line 59 in run
+  File "C:\Program Files\WindowsApps\PythonSoftwareFoundation.Python.3.13_3.13.3824.0_x64__qbz5n2kfra8p0\Lib\concurrent\futures\thread.py", line 93 in _worker
+  File "C:\Program Files\WindowsApps\PythonSoftwareFoundation.Python.3.13_3.13.3824.0_x64__qbz5n2kfra8p0\Lib\threading.py", line 995 in run
+  File "C:\Program Files\WindowsApps\PythonSoftwareFoundation.Python.3.13_3.13.3824.0_x64__qbz5n2kfra8p0\Lib\threading.py", line 1044 in _bootstrap_inner
+  File "C:\Program Files\WindowsApps\PythonSoftwareFoundation.Python.3.13_3.13.3824.0_x64__qbz5n2kfra8p0\Lib\threading.py", line 1015 in _bootstrap
+
+Thread 0x00008764 (most recent call first):
+  File "C:\Program Files\WindowsApps\PythonSoftwareFoundation.Python.3.13_3.13.3824.0_x64__qbz5n2kfra8p0\Lib\concurrent\futures\thread.py", line 90 in _worker
+  File "C:\Program Files\WindowsApps\PythonSoftwareFoundation.Python.3.13_3.13.3824.0_x64__qbz5n2kfra8p0\Lib\threading.py", line 995 in run
+  File "C:\Program Files\WindowsApps\PythonSoftwareFoundation.Python.3.13_3.13.3824.0_x64__qbz5n2kfra8p0\Lib\threading.py", line 1044 in _bootstrap_inner
+  File "C:\Program Files\WindowsApps\PythonSoftwareFoundation.Python.3.13_3.13.3824.0_x64__qbz5n2kfra8p0\Lib\threading.py", line 1015 in _bootstrap
+
+Thread 0x0000d0c4 (most recent call first):
+  File "C:\Program Files\WindowsApps\PythonSoftwareFoundation.Python.3.13_3.13.3824.0_x64__qbz5n2kfra8p0\Lib\asyncio\windows_events.py", line 778 in _poll
+  File "C:\Program Files\WindowsApps\PythonSoftwareFoundation.Python.3.13_3.13.3824.0_x64__qbz5n2kfra8p0\Lib\asyncio\windows_events.py", line 446 in select
+  File "C:\Program Files\WindowsApps\PythonSoftwareFoundation.Python.3.13_3.13.3824.0_x64__qbz5n2kfra8p0\Lib\asyncio\base_events.py", line 2022 in _run_once
+  File "C:\Program Files\WindowsApps\PythonSoftwareFoundation.Python.3.13_3.13.3824.0_x64__qbz5n2kfra8p0\Lib\asyncio\base_events.py", line 683 in run_forever
+  File "C:\Program Files\WindowsApps\PythonSoftwareFoundation.Python.3.13_3.13.3824.0_x64__qbz5n2kfra8p0\Lib\asyncio\base_events.py", line 712 in run_until_complete
+  File "C:\Program Files\WindowsApps\PythonSoftwareFoundation.Python.3.13_3.13.3824.0_x64__qbz5n2kfra8p0\Lib\asyncio\runners.py", line 119 in run
+  File "C:\Program Files\WindowsApps\PythonSoftwareFoundation.Python.3.13_3.13.3824.0_x64__qbz5n2kfra8p0\Lib\asyncio\runners.py", line 196 in run
+  File "C:\Users\b580v\Documents\CC\video-upscale-relay\relay_server\server.py", line 241 in main
+  File "C:\Users\b580v\Documents\CC\video-upscale-relay\.venv-cuda\Scripts\relay-server.exe\__main__.py", line 5 in <module>
+  File "<frozen runpy>", line 88 in _run_code
+  File "<frozen runpy>", line 203 in _run_module_as_main
