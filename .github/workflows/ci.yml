@@ -37,7 +37,7 @@ jobs:
           packaging/server_entry.py
       - name: Smoke test
         run: dist/upscale-relay-server/upscale-relay-server.exe --help
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: upscale-relay-server-windows
           path: dist/upscale-relay-server/
