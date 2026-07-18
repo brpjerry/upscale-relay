@@ -15,7 +15,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import sys
+from pathlib import Path
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QAction, QColor, QFont, QIcon, QPainter, QPixmap
@@ -43,6 +45,26 @@ from .server import RelayServer
 log = logging.getLogger("relay.tray")
 
 _APP_NAME = "Upscale Relay Server"
+
+# Kept alive for the process lifetime: faulthandler holds this file's fd, so it
+# must not be garbage-collected/closed while the app runs.
+_diagnostics_log = None
+
+
+def _open_diagnostics_log():
+    """A writable log file for the windowed (frozen) build, which has no console.
+
+    Returns an open text file under %LOCALAPPDATA%\\upscale-relay (or ``None`` if
+    it cannot be created). ``sys.stderr`` is ``None`` in a --windowed PyInstaller
+    binary, so faulthandler and logging need a real file to write to.
+    """
+    base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
+    log_dir = Path(base) / "upscale-relay"
+    try:
+        log_dir.mkdir(parents=True, exist_ok=True)
+        return open(log_dir / "server-gui.log", "a", buffering=1, encoding="utf-8")
+    except OSError:
+        return None
 
 
 def make_icon() -> QIcon:
@@ -258,12 +280,28 @@ class TrayApp:
         log.info("%s", message)
 
 
-def main() -> None:
-    # Native faults (libav/ORT/TRT) kill the process silently otherwise —
-    # print the Python-level stack of the faulting thread instead.
+def setup_diagnostics() -> None:
+    """Enable faulthandler + logging without assuming a console exists.
+
+    Native faults (libav/ORT/TRT) kill the process silently otherwise — the
+    faulting thread's Python stack is printed instead. In a --windowed frozen
+    build there is no console: ``sys.stderr`` is ``None`` and both
+    ``faulthandler.enable()`` and ``logging`` default to it, so a bare
+    ``faulthandler.enable()`` raises "sys.stderr is None" and the app never
+    starts. Fall back to a log file, which also makes such failures diagnosable.
+    """
     import faulthandler
 
-    faulthandler.enable()
+    global _diagnostics_log
+    diag_stream = sys.stderr
+    if diag_stream is None:
+        _diagnostics_log = diag_stream = _open_diagnostics_log()
+
+    if diag_stream is not None:
+        try:
+            faulthandler.enable(file=diag_stream)
+        except (RuntimeError, ValueError):
+            pass
     try:
         from .crashinfo import install as _install_crashinfo
 
@@ -273,8 +311,20 @@ def main() -> None:
 
     logging.basicConfig(
         level=logging.INFO,
+        stream=diag_stream,
         format="%(asctime)s %(name)s %(levelname)s %(message)s",
     )
+
+
+def main() -> None:
+    # Frozen-build smoke hook: reaching here means the entry script imported
+    # relay_server.tray (and its deps) successfully, so exit 0 without any UI.
+    # A --windowed exe has no stdout, so signal via the exit code only — do not
+    # print. This is what CI runs to prove the binary isn't missing modules.
+    if "--check" in sys.argv[1:]:
+        return
+
+    setup_diagnostics()
 
     from qasync import QEventLoop
 

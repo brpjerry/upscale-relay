@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import sys
 
 import pytest
 
@@ -162,3 +163,32 @@ def test_tray_app_start_failure_opens_config(app, settings, tmp_path, monkeypatc
     asyncio.run(scenario())
     assert opened == [True]
     tray.tray.hide()
+
+
+def test_setup_diagnostics_survives_no_stderr(tmp_path, monkeypatch):
+    # A --windowed frozen build has sys.stderr is None; a bare
+    # faulthandler.enable() would raise "sys.stderr is None" and the exe would
+    # never start. setup_diagnostics() must fall back to a log file instead.
+    import faulthandler
+
+    from relay_server import tray
+
+    real_stderr = sys.stderr  # captured before we blank it, for cleanup
+    was_enabled = faulthandler.is_enabled()
+    monkeypatch.setattr(sys, "stderr", None)
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    tray._diagnostics_log = None
+    try:
+        tray.setup_diagnostics()  # must not raise
+        log_file = tmp_path / "upscale-relay" / "server-gui.log"
+        assert log_file.exists()
+        assert tray._diagnostics_log is not None
+    finally:
+        if tray._diagnostics_log is not None:
+            tray._diagnostics_log.close()
+            tray._diagnostics_log = None
+        # Restore faulthandler against the real stderr (still blanked here —
+        # monkeypatch only undoes at teardown, after this finally runs).
+        faulthandler.disable()
+        if was_enabled and real_stderr is not None:
+            faulthandler.enable(file=real_stderr)
