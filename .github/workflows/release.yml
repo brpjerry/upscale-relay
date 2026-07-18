@@ -22,22 +22,32 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
-      - name: Install with DirectML runtime
-        run: python -m pip install . onnxruntime-directml pyinstaller
-      - name: Build server binary
+      - name: Install with DirectML runtime and the tray GUI extra
+        run: python -m pip install ".[server-gui]" onnxruntime-directml pyinstaller
+      - name: Build console server binary
         run: >
           pyinstaller --noconfirm --onedir --console
           --name upscale-relay-server
           --collect-all onnxruntime
           --collect-submodules zeroconf
           packaging/server_entry.py
-      - name: Smoke test
+      - name: Build tray-GUI server binary
+        run: >
+          pyinstaller --noconfirm --onedir --windowed
+          --name upscale-relay-server-gui
+          --collect-all onnxruntime
+          --collect-submodules zeroconf
+          --collect-all PySide6
+          packaging/server_gui_entry.py
+      - name: Smoke test (console)
         run: dist/upscale-relay-server/upscale-relay-server.exe --help
-      - name: Package binary
+      - name: Package binaries
         shell: pwsh
         run: |
           Compress-Archive -Path dist/upscale-relay-server/* `
             -DestinationPath "dist/upscale-relay-server-$env:TAG-windows-x64.zip"
+          Compress-Archive -Path dist/upscale-relay-server-gui/* `
+            -DestinationPath "dist/upscale-relay-server-gui-$env:TAG-windows-x64.zip"
       - name: Publish GitHub Release
         shell: pwsh
         env:
@@ -46,5 +56,5 @@ jobs:
           gh release create "$env:TAG" `
             --title "Upscale Relay Server $env:TAG" `
             --generate-notes `
-            --notes "Windows server binary (DirectML/CPU runtime). The TensorRT path needs a CUDA source install." `
+            --notes "Windows server binaries (DirectML/CPU runtime): -gui is the double-click tray app with a configuration pane; the plain build is the headless console server. The TensorRT path needs a CUDA source install." `
             (Get-Item dist/*.zip).FullName

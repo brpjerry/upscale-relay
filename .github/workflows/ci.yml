@@ -29,18 +29,30 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
-      - name: Install with DirectML runtime
-        run: python -m pip install . onnxruntime-directml pyinstaller
-      - name: Build server binary
+      - name: Install with DirectML runtime and the tray GUI extra
+        run: python -m pip install ".[server-gui]" onnxruntime-directml pyinstaller
+      - name: Build console server binary
         run: >
           pyinstaller --noconfirm --onedir --console
           --name upscale-relay-server
           --collect-all onnxruntime
           --collect-submodules zeroconf
           packaging/server_entry.py
-      - name: Smoke test
+      - name: Build tray-GUI server binary
+        run: >
+          pyinstaller --noconfirm --onedir --windowed
+          --name upscale-relay-server-gui
+          --collect-all onnxruntime
+          --collect-submodules zeroconf
+          --collect-all PySide6
+          packaging/server_gui_entry.py
+      - name: Smoke test (console)
         run: dist/upscale-relay-server/upscale-relay-server.exe --help
       - uses: actions/upload-artifact@v7
         with:
           name: upscale-relay-server-windows
           path: dist/upscale-relay-server/
+      - uses: actions/upload-artifact@v7
+        with:
+          name: upscale-relay-server-gui-windows
+          path: dist/upscale-relay-server-gui/
