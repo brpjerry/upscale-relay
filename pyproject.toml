@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "upscale-cli"
-version = "0.1.0"
+version = "0.6.0"
 description = "Video upscale relay - offline pipeline CLI (phase 1)"
 requires-python = ">=3.11"
 dependencies = [
@@ -20,10 +20,16 @@ gui = [
     "qasync>=0.27",
     "python-mpv>=1.0",
 ]
+# Server tray GUI (Windows): Qt without the client's python-mpv dependency.
+server-gui = [
+    "PySide6>=6.6",
+    "qasync>=0.27",
+]
 
 [project.scripts]
 upscale-cli = "upscale_cli.cli:main"
 relay-server = "relay_server.server:main"
+relay-server-gui = "relay_server.tray:main"
 relay-client = "relay_client_core.cli:main"
 relay-desktop = "desktop_client.app:main"
 
