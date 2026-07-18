@@ -1,3 +1,7 @@
+import pytest
+
+pytest.importorskip("PySide6")  # desktop client is an optional extra
+
 """Desktop command-line option parsing."""
 
 from desktop_client.app import parse_args

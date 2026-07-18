@@ -1,3 +1,7 @@
+import pytest
+
+pytest.importorskip("PySide6")  # desktop client is an optional extra
+
 """Native-display propagation for libmpv hardware-decoder interop."""
 
 from ctypes import c_void_p

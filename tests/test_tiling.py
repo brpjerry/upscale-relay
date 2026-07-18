@@ -1,3 +1,7 @@
+import pytest
+
+pytest.importorskip("onnxruntime")  # inference runtime is an optional extra
+
 import sys
 from pathlib import Path
 
