@@ -7,7 +7,7 @@ import time
 from pathlib import Path
 
 from PySide6.QtCore import QDir, QEvent, Qt, QTimer
-from PySide6.QtGui import QCursor, QIcon, QStandardItem, QStandardItemModel
+from PySide6.QtGui import QCursor, QIcon, QPainter, QStandardItem, QStandardItemModel
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QMainWindow,
     QMessageBox,
+    QProgressBar,
     QPushButton,
     QSlider,
     QSplitter,
@@ -34,6 +35,13 @@ from qasync import asyncSlot
 
 from relay_client_core import RelayClient, SessionConfig
 
+from .chapters import (
+    Chapter,
+    chapter_index,
+    normalize_chapters,
+    slider_fractions,
+    step_target,
+)
 from .settings import AppSettings
 from .options import DesktopOptions
 
@@ -47,13 +55,28 @@ except (ImportError, OSError):
 VIDEO_EXTENSIONS = ["*.mkv", "*.mp4", "*.m4v", "*.avi", "*.mov", "*.ts", "*.webm"]
 
 
+def _format_time(seconds: float) -> str:
+    return f"{int(seconds // 60):02d}:{int(seconds % 60):02d}"
+
+
 class SeekSlider(QSlider):
     """QSlider whose groove clicks jump straight to the clicked position.
 
     Stock QSlider treats a groove click as one page-step. Moving the handle
     under the cursor before the default press handling means the click both
     jumps to the timestamp and starts a drag from there.
+
+    Chapter starts (as 0..1 fractions) are painted as tick marks over the
+    groove so chapter boundaries are visible while scrubbing.
     """
+
+    def __init__(self, *args) -> None:
+        super().__init__(*args)
+        self._chapter_fractions: list[float] = []
+
+    def set_chapter_marks(self, fractions: list[float]) -> None:
+        self._chapter_fractions = fractions
+        self.update()
 
     def mousePressEvent(self, event) -> None:
         if event.button() == Qt.LeftButton:
@@ -63,6 +86,25 @@ class SeekSlider(QSlider):
             )
             self.setSliderPosition(value)
         super().mousePressEvent(event)
+
+    def paintEvent(self, event) -> None:
+        super().paintEvent(event)
+        if not self._chapter_fractions:
+            return
+        painter = QPainter(self)
+        color = self.palette().windowText().color()
+        color.setAlpha(150)
+        span = self.maximum() - self.minimum()
+        mid_y = self.height() // 2
+        for fraction in self._chapter_fractions:
+            # Mirror mousePressEvent's mapping so ticks line up with where a
+            # click on that timestamp would land the handle.
+            x = QStyle.sliderPositionFromValue(
+                self.minimum(), self.maximum(),
+                round(self.minimum() + fraction * span), self.width(),
+            )
+            painter.fillRect(x - 1, mid_y - 4, 2, 8, color)
+        painter.end()
 
 
 class MainWindow(QMainWindow):
@@ -190,6 +232,20 @@ class MainWindow(QMainWindow):
         self.stop_btn.setIcon(self._icon("media-playback-stop", QStyle.SP_MediaStop))
         self.stop_btn.setToolTip("Stop")
         self.stop_btn.setEnabled(False)
+        self.chapter_prev_btn = QToolButton()
+        self.chapter_prev_btn.setIcon(
+            self._icon("media-skip-backward", QStyle.SP_MediaSkipBackward))
+        self.chapter_prev_btn.setToolTip("Previous chapter (PgDn)")
+        self.chapter_next_btn = QToolButton()
+        self.chapter_next_btn.setIcon(
+            self._icon("media-skip-forward", QStyle.SP_MediaSkipForward))
+        self.chapter_next_btn.setToolTip("Next chapter (PgUp)")
+        self.chapter_combo = QComboBox()
+        self.chapter_combo.setSizeAdjustPolicy(QComboBox.AdjustToContents)
+        self.chapter_combo.setToolTip("Jump to a chapter")
+        # Hidden until a session with chapters starts (_set_chapters).
+        for w in (self.chapter_prev_btn, self.chapter_combo, self.chapter_next_btn):
+            w.setVisible(False)
         self.fullscreen_btn = QToolButton()
         self.fullscreen_btn.setIcon(self._icon("view-fullscreen", QStyle.SP_TitleBarMaxButton))
         self.fullscreen_btn.setToolTip("Fullscreen — F or double-click the video; Esc exits")
@@ -218,6 +274,9 @@ class MainWindow(QMainWindow):
         transport = QHBoxLayout()
         transport.addWidget(self.play_btn)
         transport.addWidget(self.stop_btn)
+        transport.addWidget(self.chapter_prev_btn)
+        transport.addWidget(self.chapter_combo)
+        transport.addWidget(self.chapter_next_btn)
         transport.addWidget(self.fullscreen_btn)
         transport.addWidget(self.fallback_btn)
         transport.addWidget(QLabel(" subs "))
@@ -255,6 +314,14 @@ class MainWindow(QMainWindow):
         self._browser_sizes = [300, 900]  # restored when the browser is re-shown
         self.setCentralWidget(self.split)
         self.setStatusBar(QStatusBar())
+        # Indeterminate busy bar for session open — visible while the server
+        # prepares the pipeline (a first-use TensorRT engine build can run for
+        # minutes; session_progress messages narrate it in the status bar).
+        self.open_progress = QProgressBar()
+        self.open_progress.setRange(0, 0)
+        self.open_progress.setFixedWidth(140)
+        self.open_progress.setVisible(False)
+        self.statusBar().addPermanentWidget(self.open_progress)
         self.statusBar().showMessage(f"player backend: {PLAYER_BACKEND}")
 
         # -- signals ---------------------------------------------------------------
@@ -278,6 +345,13 @@ class MainWindow(QMainWindow):
         self.stop_btn.clicked.connect(self.on_stop)
         self.fallback_btn.clicked.connect(self.on_fallback)
         self.seek_slider.sliderReleased.connect(self.on_seek)
+        self.chapter_prev_btn.clicked.connect(lambda: self.on_chapter_step(-1))
+        self.chapter_next_btn.clicked.connect(lambda: self.on_chapter_step(1))
+        # activated (not currentIndexChanged): fires only on user choice, so
+        # the position-driven combo updates below never trigger seeks.
+        self.chapter_combo.activated.connect(self.on_chapter_selected)
+        if hasattr(self.player, "chapter_step_requested"):
+            self.player.chapter_step_requested.connect(self.on_chapter_step)
         self.sub_combo.currentIndexChanged.connect(self.on_sub_selected)
         self.sub_delay.valueChanged.connect(lambda v: self.player.set_sub_delay(v))
         self.player.stats_changed.connect(self.player_status.setText)
@@ -293,6 +367,7 @@ class MainWindow(QMainWindow):
 
         self._paused = False
         self._was_maximized = False
+        self._chapters: list[Chapter] = []
         self._duration_s: float | None = None
         self._position_s = 0.0
         self._slider_down = False
@@ -444,6 +519,20 @@ class MainWindow(QMainWindow):
         host, _, port = text.partition(":")
         return host or "127.0.0.1", int(port or 8590)
 
+    def _set_opening(self, active: bool, text: str = "") -> None:
+        """Show/hide the indeterminate busy bar while a session opens."""
+        self.open_progress.setVisible(active)
+        if active and text:
+            self.statusBar().showMessage(text)
+
+    def _on_open_progress(self, msg: dict) -> None:
+        """session_progress from the server (e.g. TensorRT engine build)."""
+        message = msg.get("message") or "preparing session…"
+        elapsed = msg.get("elapsed_s")
+        if isinstance(elapsed, (int, float)):
+            message = f"{message} ({elapsed:.0f} s)"
+        self._set_opening(True, message)
+
     def _error(self, title: str, message: str) -> None:
         self.statusBar().showMessage(message, 10_000)
         # Non-modal on purpose: a modal dialog spins the Qt event loop inside
@@ -457,6 +546,7 @@ class MainWindow(QMainWindow):
     async def _adopt_connected_client(self, client: RelayClient, caps: dict) -> None:
         """Install a connected control client and reflect its capabilities."""
         self.client = client
+        client.on_progress = self._on_open_progress
         self.settings.server_host, self.settings.server_port = client.host, client.port
         current = self.model_combo.currentText()
         self.model_combo.clear()
@@ -658,6 +748,7 @@ class MainWindow(QMainWindow):
         )
         self.settings.model = cfg.model
         self.settings.quality_tier = cfg.quality_tier
+        self._set_opening(True, f"opening session for {Path(path).name}…")
         try:
             session = await self.client.open_session(cfg)
             await self.client.attach_media()
@@ -666,6 +757,8 @@ class MainWindow(QMainWindow):
         except Exception as err:
             self._error("Session failed", str(err))
             return
+        finally:
+            self._set_opening(False)
         track = self.client.track
         time_base = track.time_base if track is not None else session.time_base
         avg_rate = track.average_rate if track is not None else session.avg_rate
@@ -688,6 +781,12 @@ class MainWindow(QMainWindow):
         )
         self._apply_panscan()
         self._duration_s = duration_s
+        # session_opened.chapters is authoritative (server file or echo); an
+        # older server without the echo still yields chapters for local files.
+        raw_chapters = session.chapters
+        if not raw_chapters and track is not None:
+            raw_chapters = track.chapters()
+        self._set_chapters(normalize_chapters(raw_chapters))
         self._pending_seek_s = None
         self.seek_slider.setEnabled(self._duration_s is not None)
         self.play_btn.setEnabled(True)
@@ -711,9 +810,20 @@ class MainWindow(QMainWindow):
             target_s = min(target_s, max(0.0, self._duration_s - 1.0))
         if target_s <= 0:
             return
+        await self._seek_to_seconds(target_s, announce=False)
+
+    async def _seek_to_seconds(self, target_s: float, announce: bool = True) -> None:
+        """Shared relay-protocol seek: slider, arrow keys, chapters, resume."""
+        if self.client is None or self.client.session is None:
+            return
+        target_s = max(0.0, target_s)
+        if self._duration_s:
+            target_s = min(target_s, max(0.0, self._duration_s - 1.0))
         tb = self._session_time_base
         if tb is None:
             return
+        if announce:
+            self.statusBar().showMessage(f"seeking to {target_s:.1f}s", 3000)
         self._arm_pending_seek(target_s)
         if hasattr(self.player, "prepare_seek"):
             self.player.prepare_seek(target_s)
@@ -786,43 +896,27 @@ class MainWindow(QMainWindow):
     @asyncSlot()
     async def on_seek(self) -> None:
         self._slider_down = False
-        if self.client is None or self._duration_s is None:
+        if self._duration_s is None:
             return
-        target_s = self.seek_slider.value() / 1000 * self._duration_s
-        tb = self._session_time_base
-        if tb is None:
-            return
-        target_pts = int(target_s / float(tb))
-        self.statusBar().showMessage(f"seeking to {target_s:.1f}s", 3000)
-        self._arm_pending_seek(target_s)
-        if hasattr(self.player, "prepare_seek"):
-            self.player.prepare_seek(target_s)
-        try:
-            await self.client.seek(target_pts)
-        except Exception as err:
-            self._pending_seek_s = None
-            self._error("Seek failed", str(err))
+        await self._seek_to_seconds(self.seek_slider.value() / 1000 * self._duration_s)
 
     @asyncSlot(float)
     async def on_seek_relative(self, delta_s: float) -> None:
         """Arrow-key seek: relay-protocol seek relative to current position."""
-        if self.client is None or self.client.session is None:
-            return
-        target_s = max(0.0, self._position_s + delta_s)
-        if self._duration_s:
-            target_s = min(target_s, max(0.0, self._duration_s - 1.0))
-        tb = self._session_time_base
-        if tb is None:
-            return
-        self.statusBar().showMessage(f"seeking to {target_s:.1f}s", 3000)
-        self._arm_pending_seek(target_s)
-        if hasattr(self.player, "prepare_seek"):
-            self.player.prepare_seek(target_s)
-        try:
-            await self.client.seek(int(target_s / float(tb)))
-        except Exception as err:
-            self._pending_seek_s = None
-            self._error("Seek failed", str(err))
+        await self._seek_to_seconds(self._position_s + delta_s)
+
+    @asyncSlot(int)
+    async def on_chapter_selected(self, index: int) -> None:
+        target = self.chapter_combo.itemData(index)
+        if target is not None:
+            await self._seek_to_seconds(float(target))
+
+    @asyncSlot(int)
+    async def on_chapter_step(self, delta: int) -> None:
+        """Prev/next chapter (buttons and PgUp/PgDn); no-op without chapters."""
+        target = step_target(self._chapters, self._position_s, delta)
+        if target is not None:
+            await self._seek_to_seconds(target)
 
     @asyncSlot()
     async def on_fallback(self) -> None:
@@ -846,6 +940,31 @@ class MainWindow(QMainWindow):
 
     def on_sub_selected(self, index: int) -> None:
         self.player.select_subtitle(self.sub_combo.itemData(index))
+
+    def _set_chapters(self, chapters: list[Chapter]) -> None:
+        self._chapters = chapters
+        visible = bool(chapters)
+        for widget in (self.chapter_prev_btn, self.chapter_combo, self.chapter_next_btn):
+            widget.setVisible(visible)
+        self.chapter_combo.blockSignals(True)
+        self.chapter_combo.clear()
+        for index, chapter in enumerate(chapters):
+            self.chapter_combo.addItem(
+                f"{index + 1:02d}  {chapter.title}  ({_format_time(chapter.start_s)})",
+                chapter.start_s,
+            )
+        self.chapter_combo.blockSignals(False)
+        self.seek_slider.set_chapter_marks(slider_fractions(chapters, self._duration_s))
+
+    def _sync_chapter_combo(self, pos_s: float) -> None:
+        if not self._chapters:
+            return
+        index = chapter_index(self._chapters, pos_s)
+        combo_index = -1 if index is None else index
+        if self.chapter_combo.currentIndex() != combo_index:
+            self.chapter_combo.blockSignals(True)
+            self.chapter_combo.setCurrentIndex(combo_index)
+            self.chapter_combo.blockSignals(False)
 
     def _on_tracks(self, subs: list, selected_sid=None) -> None:
         # selected_sid: the track the player auto-selected (subs default on);
@@ -877,12 +996,9 @@ class MainWindow(QMainWindow):
             self.seek_slider.blockSignals(True)
             self.seek_slider.setValue(int(pos_s / self._duration_s * 1000))
             self.seek_slider.blockSignals(False)
-
-        def fmt(s: float) -> str:
-            return f"{int(s // 60):02d}:{int(s % 60):02d}"
-
-        total = fmt(self._duration_s) if self._duration_s else "--:--"
-        self.pos_label.setText(f"{fmt(pos_s)} / {total}")
+        total = _format_time(self._duration_s) if self._duration_s else "--:--"
+        self.pos_label.setText(f"{_format_time(pos_s)} / {total}")
+        self._sync_chapter_combo(pos_s)
 
     def _arm_pending_seek(self, target_s: float) -> None:
         """Snap the UI to the seek target and ignore stale positions."""
@@ -908,6 +1024,7 @@ class MainWindow(QMainWindow):
     async def _teardown_session(self) -> None:
         self.player.stop()
         self._pending_seek_s = None
+        self._set_chapters([])
         self.play_btn.setEnabled(False)
         self.stop_btn.setEnabled(False)
         self.fallback_btn.setEnabled(False)

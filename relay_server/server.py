@@ -183,7 +183,12 @@ class RelayServer:
                     self.sessions[session.uplink_token] = session
                     self.sessions[session.downlink_token] = session
                     self.sessions[session.id] = session
-                    await session.handle_open(msg)
+                    # Run the open in the background so this loop stays inside
+                    # receive(): aiohttp only answers WS pings there, and a
+                    # first-use TensorRT engine build blocks handle_open for
+                    # minutes — awaiting it here left client pings unanswered
+                    # (OkHttp drops the socket after 10 s without a pong).
+                    session.begin_open(msg)
                 elif session is None:
                     await ws.send_str(json.dumps({
                         "type": "error", "code": "bad_message",

@@ -253,6 +253,7 @@ class MpvPlayerView(QOpenGLWidget):
     track_list_changed = Signal(list, object)  # [(sid, title)] subs, selected sid
     rebuffering = Signal(bool)
     seek_requested = Signal(float)  # relative seconds (arrow keys)
+    chapter_step_requested = Signal(int)  # +1 next / -1 previous (PgUp/PgDn)
     finished = Signal()
     failed = Signal(str)
     fullscreen_toggled = Signal()  # F key / double-click; the window fullscreens
@@ -261,13 +262,16 @@ class MpvPlayerView(QOpenGLWidget):
 
     # Bare keys the app reserves: arrows are NOT forwarded (mpv can't seek
     # the live stream — they emit seek_requested for a relay-protocol seek),
-    # F is the Qt window's fullscreen (mpv has no window on the render-API
-    # path), Esc propagates up to exit fullscreen. Everything else is
-    # translated and forwarded so user input.conf bindings work.
+    # PgUp/PgDn are relay chapter steps for the same reason (mpv's builtin
+    # chapter seek would act on the chapter-less live stream), F is the Qt
+    # window's fullscreen (mpv has no window on the render-API path), Esc
+    # propagates up to exit fullscreen. Everything else is translated and
+    # forwarded so user input.conf bindings work.
     _SEEK_KEYS = {
         Qt.Key_Left: -5.0, Qt.Key_Right: 5.0,
         Qt.Key_Down: -60.0, Qt.Key_Up: 60.0,
     }
+    _CHAPTER_KEYS = {Qt.Key_PageUp: 1, Qt.Key_PageDown: -1}
     # mpv's builtin quit bindings would shut down the embedded core and take
     # the whole player view with it — never forwarded.
     _BLOCKED_KEYS = {"q", "Q", "POWER", "CLOSE_WIN"}
@@ -522,6 +526,9 @@ class MpvPlayerView(QOpenGLWidget):
                 return
             if key in self._SEEK_KEYS:
                 self.seek_requested.emit(self._SEEK_KEYS[key])
+                return
+            if key in self._CHAPTER_KEYS:
+                self.chapter_step_requested.emit(self._CHAPTER_KEYS[key])
                 return
         mpv_key = _mpv_key_name(event)
         if mpv_key is not None and mpv_key not in self._BLOCKED_KEYS:
