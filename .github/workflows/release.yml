@@ -96,5 +96,5 @@ jobs:
           gh release create "$env:TAG" `
             --title "Upscale Relay Server $env:TAG" `
             --generate-notes `
-            --notes "Adds Matroska chapter discovery and chapter-aware relay playback, plus session-progress keepalives and loading feedback for long first-use TensorRT engine builds. Small Windows server binaries keep the pinned TensorRT 10.13 / CUDA 12.9 runtime in the versioned first-launch cache rather than the release ZIP. The -gui ZIP is the tray app; the plain ZIP is the headless console server." `
+            --notes "Replaces recursive remote-library scans with shallow paginated directory listings and adds on-demand loading to the desktop client. This avoids blocking on full-share traversal; legacy full-tree clients are no longer supported. Small Windows server binaries keep the pinned TensorRT 10.13 / CUDA 12.9 runtime in the versioned first-launch cache rather than the release ZIP. The -gui ZIP is the tray app; the plain ZIP is the headless console server." `
             (Get-Item dist/*.zip).FullName

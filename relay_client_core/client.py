@@ -343,10 +343,22 @@ class RelayClient:
         )
         return self.session
 
-    async def fetch_library(self) -> dict:
-        async with self._http.get(f"http://{self.host}:{self.port}/library") as response:
+    async def fetch_library_page(
+        self, path: str = "", *, cursor: str | None = None, limit: int = 100,
+    ) -> dict:
+        """Fetch one page of a directory's immediate children."""
+        params = {"path": path, "limit": str(limit)}
+        if cursor is not None:
+            params["cursor"] = cursor
+        async with self._http.get(
+            f"http://{self.host}:{self.port}/library", params=params,
+        ) as response:
             response.raise_for_status()
-            return (await response.json())["tree"]
+            payload = await response.json()
+            return {
+                "tree": payload["tree"],
+                "next_cursor": payload.get("next_cursor"),
+            }
 
     def media_url(self, relative_path: str) -> str:
         path = quote(relative_path, safe="/")

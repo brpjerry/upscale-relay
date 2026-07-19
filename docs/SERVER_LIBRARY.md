@@ -26,9 +26,12 @@ desktop retains its local-only browser appearance.
 ### Server
 
 - `relay_server.library.MediaLibrary` resolves every request beneath the
-  configured root, rejects traversal and non-playable files, and returns the
-  complete folder/file tree.
-- `GET /library` returns that tree as JSON.
+  configured root and rejects traversal and non-playable files.
+- `GET /library?path=<relative-directory>&limit=100&cursor=<offset>` returns
+  one sorted page of that directory's immediate children. The response carries
+  an opaque `next_cursor` (or `null`); `path` is empty for the root. Omitted
+  query parameters use those root/100/initial-cursor defaults. Recursive
+  full-tree responses are not supported.
 - `GET /media/<relative-path>` serves the original file with HTTP Range
   support through aiohttp `FileResponse`.
 - The `capabilities` message includes `library: true` while the feature is
@@ -44,11 +47,15 @@ desktop retains its local-only browser appearance.
 
 ### Client core and desktop UI
 
-- `RelayClient.fetch_library()` loads the server tree and `media_url()` builds
-  the Range URL for original tracks.
+- `RelayClient.fetch_library_page()` loads immediate directory pages and
+  `media_url()` builds the Range URL for original tracks.
 - The sidebar becomes a tab widget only when a connected server advertises a
-  library. The existing Local tree is unchanged; the Server tab uses a
-  `QStandardItemModel`, supports refresh, and reports empty/error states.
+  library. The existing Local tree is unchanged; the Server tab fetches a
+  directory when it is expanded and adds a page only when requested, supports
+  refresh, and reports empty/error states.
+- The Android browser uses the same shallow directory pages, keeps each
+  directory's cursor while navigating, and appends another page from its
+  `Load more` footer without discarding already loaded entries.
 - Double-clicking a server file opens a `server_file` session without creating
   a client `VideoTrack` or uplink sender.
 - libmpv attaches `/media` as both `audio-file` and `sub-files`, so original
