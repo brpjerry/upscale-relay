@@ -67,18 +67,26 @@ class FakeLibraryClient:
     session = None
     track = None
 
-    async def fetch_library(self):
+    def __init__(self):
+        self.fetches = []
+
+    async def fetch_library_page(self, path="", *, cursor=None, limit=100):
+        self.fetches.append((path, cursor, limit))
+        children = (
+            [{"type": "directory", "name": "Shows", "path": "Shows", "children": []}]
+            if path == "" else
+            [{"type": "file", "name": "Episode.mkv", "path": "Shows/Episode.mkv"}]
+        )
         return {
-            "type": "directory", "name": "Library", "path": "", "children": [
-                {"type": "directory", "name": "Shows", "path": "Shows", "children": [
-                    {"type": "file", "name": "Episode.mkv", "path": "Shows/Episode.mkv"}
-                ]}
-            ],
+            "tree": {"type": "directory", "name": path or "Library", "path": path,
+                     "children": children},
+            "next_cursor": None,
         }
 
 
 class FakeSessionClient(FakeLibraryClient):
     def __init__(self):
+        super().__init__()
         self.session = None
         self.track = None
         self.opened_config = None
@@ -110,6 +118,18 @@ class FakeSessionClient(FakeLibraryClient):
         return f"http://media-server:8590/media/{path}"
 
 
+class FakePagedLibraryClient(FakeLibraryClient):
+    async def fetch_library_page(self, path="", *, cursor=None, limit=100):
+        self.fetches.append((path, cursor, limit))
+        name = "Episode 1.mkv" if cursor is None else "Episode 2.mkv"
+        return {
+            "tree": {"type": "directory", "name": "Library", "path": "", "children": [
+                {"type": "file", "name": name, "path": name}
+            ]},
+            "next_cursor": "1" if cursor is None else None,
+        }
+
+
 @pytest.fixture()
 def window(monkeypatch):
     app = QApplication.instance() or QApplication([])
@@ -133,14 +153,35 @@ def test_server_tab_appears_populates_and_disappears(window):
         assert not window.browser_panel.tabBar().isHidden()
         assert window.server_model.rowCount() == 1
         folder = window.server_model.item(0)
+        assert folder.child(0).data(Qt.UserRole + 1) == "placeholder"
+        await window.on_server_directory_expanded(folder.index())
         episode = folder.child(0)
         assert episode.text() == "Episode.mkv"
         assert episode.data(Qt.UserRole) == "Shows/Episode.mkv"
         assert episode.data(Qt.UserRole + 1) == "file"
+        assert client.fetches == [("", None, 100), ("Shows", None, 100)]
 
         window._remove_server_tab()
         assert window.browser_panel.count() == 1
         assert window.browser_panel.tabBar().isHidden()
+
+    asyncio.run(scenario())
+
+
+def test_server_load_more_appends_without_reloading(window):
+    async def scenario():
+        client = FakePagedLibraryClient()
+        await window._adopt_connected_client(client, {
+            "server_name": "test", "models": [{"name": "passthrough"}], "library": True,
+        })
+        assert [window.server_model.item(row).text() for row in range(2)] == [
+            "Episode 1.mkv", "Load more…",
+        ]
+        await window.on_server_file_activated(window.server_model.item(1).index())
+        assert [window.server_model.item(row).text() for row in range(2)] == [
+            "Episode 1.mkv", "Episode 2.mkv",
+        ]
+        assert client.fetches == [("", None, 100), ("", "1", 100)]
 
     asyncio.run(scenario())
 

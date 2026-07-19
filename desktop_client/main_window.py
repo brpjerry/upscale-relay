@@ -53,6 +53,10 @@ except (ImportError, OSError):
     PLAYER_BACKEND = "preview (video-only; libmpv not found)"
 
 VIDEO_EXTENSIONS = ["*.mkv", "*.mp4", "*.m4v", "*.avi", "*.mov", "*.ts", "*.webm"]
+_SERVER_TYPE_ROLE = Qt.UserRole + 1
+_SERVER_LOADED_ROLE = Qt.UserRole + 2
+_SERVER_CURSOR_ROLE = Qt.UserRole + 3
+_SERVER_PAGE_SIZE = 100
 
 
 def _format_time(seconds: float) -> str:
@@ -618,6 +622,7 @@ class MainWindow(QMainWindow):
         self.server_refresh_btn = refresh
         refresh.clicked.connect(self.on_refresh_server_library)
         tree.doubleClicked.connect(self.on_server_file_activated)
+        tree.expanded.connect(self.on_server_directory_expanded)
         self.browser_panel.addTab(panel, "Server")
         self.browser_panel.tabBar().setVisible(True)
 
@@ -644,11 +649,62 @@ class MainWindow(QMainWindow):
         item = QStandardItem(icon, node.get("name", ""))
         item.setEditable(False)
         item.setData(node.get("path", ""), Qt.UserRole)
-        item.setData(node.get("type"), Qt.UserRole + 1)
+        item.setData(node.get("type"), _SERVER_TYPE_ROLE)
         parent.appendRow(item)
         if is_dir:
-            for child in node.get("children", []):
-                self._append_server_node(item, child)
+            item.setData(False, _SERVER_LOADED_ROLE)
+            placeholder = QStandardItem("Loading…")
+            placeholder.setEditable(False)
+            placeholder.setData("placeholder", _SERVER_TYPE_ROLE)
+            item.appendRow(placeholder)
+
+    def _append_server_more(
+        self, parent: QStandardItem, path: str, cursor: str,
+    ) -> None:
+        item = QStandardItem("Load more…")
+        item.setEditable(False)
+        item.setData(path, Qt.UserRole)
+        item.setData("more", _SERVER_TYPE_ROLE)
+        item.setData(cursor, _SERVER_CURSOR_ROLE)
+        parent.appendRow(item)
+
+    async def _load_server_page(
+        self, parent: QStandardItem, path: str, *, cursor: str | None = None,
+        reset: bool = False,
+    ) -> None:
+        client = self.client
+        if client is None or self.server_model is None:
+            return
+        if reset:
+            parent.removeRows(0, parent.rowCount())
+        page = await client.fetch_library_page(
+            path, cursor=cursor, limit=_SERVER_PAGE_SIZE,
+        )
+        if client is not self.client or self.server_model is None:
+            return
+        root = page["tree"]
+        for node in root.get("children", []):
+            self._append_server_node(parent, node)
+        if page["next_cursor"] is not None:
+            self._append_server_more(parent, path, page["next_cursor"])
+        parent.setData(True, _SERVER_LOADED_ROLE)
+
+    @asyncSlot("QModelIndex")
+    async def on_server_directory_expanded(self, index) -> None:
+        if index.data(_SERVER_TYPE_ROLE) != "directory":
+            return
+        item = self.server_model.itemFromIndex(index) if self.server_model is not None else None
+        if item is None or item.data(_SERVER_LOADED_ROLE):
+            return
+        item.setData(True, _SERVER_LOADED_ROLE)
+        try:
+            await self._load_server_page(item, item.data(Qt.UserRole), reset=True)
+        except Exception as err:
+            item.removeRows(0, item.rowCount())
+            error = QStandardItem(f"Could not load folder: {err}")
+            error.setEditable(False)
+            error.setData("error", _SERVER_TYPE_ROLE)
+            item.appendRow(error)
 
     @asyncSlot()
     async def on_refresh_server_library(self) -> None:
@@ -662,7 +718,7 @@ class MainWindow(QMainWindow):
         self.server_placeholder.setVisible(True)
         self.server_tree.setVisible(False)
         try:
-            root = await client.fetch_library()
+            page = await client.fetch_library_page(limit=_SERVER_PAGE_SIZE)
         except Exception as err:
             if client is self.client and self.server_placeholder is not None:
                 self.server_placeholder.setText(f"Could not load server library:\n{err}")
@@ -671,15 +727,16 @@ class MainWindow(QMainWindow):
             return
         self.server_model.clear()
         invisible = self.server_model.invisibleRootItem()
+        root = page["tree"]
         for node in root.get("children", []):
             self._append_server_node(invisible, node)
+        if page["next_cursor"] is not None:
+            self._append_server_more(invisible, "", page["next_cursor"])
         if self.server_model.rowCount() == 0:
             self.server_placeholder.setText("Server library is empty.")
             return
         self.server_placeholder.setVisible(False)
         self.server_tree.setVisible(True)
-        for row in range(self.server_model.rowCount()):
-            self.server_tree.setExpanded(self.server_model.index(row, 0), True)
 
     # -- slots -----------------------------------------------------------------------
 
@@ -715,7 +772,24 @@ class MainWindow(QMainWindow):
 
     @asyncSlot("QModelIndex")
     async def on_server_file_activated(self, index) -> None:
-        if index.data(Qt.UserRole + 1) != "file":
+        node_type = index.data(_SERVER_TYPE_ROLE)
+        if node_type == "more":
+            if self.server_model is None:
+                return
+            item = self.server_model.itemFromIndex(index)
+            parent = item.parent() or self.server_model.invisibleRootItem()
+            path = item.data(Qt.UserRole)
+            cursor = item.data(_SERVER_CURSOR_ROLE)
+            parent.removeRow(item.row())
+            try:
+                await self._load_server_page(parent, path, cursor=cursor)
+            except Exception as err:
+                error = QStandardItem(f"Could not load more: {err}")
+                error.setEditable(False)
+                error.setData("error", _SERVER_TYPE_ROLE)
+                parent.appendRow(error)
+            return
+        if node_type != "file":
             return
         path = index.data(Qt.UserRole)
         if not path:

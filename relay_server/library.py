@@ -36,11 +36,42 @@ class MediaLibrary:
             raise LibraryPathError("not a playable library file")
         return candidate
 
-    def tree(self) -> dict:
-        return self._directory_node(self.root, "")
+    def resolve_directory(self, relative: str) -> Path:
+        """Resolve a share-relative directory, allowing ``""`` for the root."""
+        if "\\" in relative:
+            raise LibraryPathError("invalid library path")
+        if not relative:
+            return self.root
+        rel = PurePosixPath(relative)
+        if rel.is_absolute() or any(part in ("", ".", "..") for part in rel.parts):
+            raise LibraryPathError("invalid library path")
+        candidate = self.root.joinpath(*rel.parts).resolve()
+        try:
+            candidate.relative_to(self.root)
+        except ValueError as err:
+            raise LibraryPathError("library path escapes root") from err
+        if not candidate.is_dir():
+            raise LibraryPathError("library directory not found")
+        return candidate
 
-    def _directory_node(self, directory: Path, relative: str) -> dict:
-        children = []
+    def page(self, relative: str = "", *, offset: int = 0, limit: int = 100) -> tuple[dict, str | None]:
+        """Return one sorted page of a directory's immediate playable children."""
+        if offset < 0 or limit < 1:
+            raise ValueError("invalid library page")
+        directory = self.resolve_directory(relative)
+        children = self._directory_children(directory, relative)
+        page_children = children[offset:offset + limit]
+        next_offset = offset + len(page_children)
+        node = {
+            "type": "directory",
+            "name": directory.name,
+            "path": relative,
+            "children": page_children,
+        }
+        return node, str(next_offset) if next_offset < len(children) else None
+
+    def _directory_children(self, directory: Path, relative: str) -> list[dict]:
+        children: list[dict] = []
         try:
             entries = sorted(directory.iterdir(), key=lambda p: (not p.is_dir(), p.name.casefold()))
         except OSError:
@@ -51,14 +82,11 @@ class MediaLibrary:
                 if entry.is_symlink():
                     continue
                 if entry.is_dir():
-                    children.append(self._directory_node(entry, child_rel))
+                    children.append({
+                        "type": "directory", "name": entry.name, "path": child_rel, "children": [],
+                    })
                 elif entry.is_file() and entry.suffix.casefold() in PLAYABLE_SUFFIXES:
                     children.append({"type": "file", "name": entry.name, "path": child_rel})
             except OSError:
                 continue
-        return {
-            "type": "directory",
-            "name": directory.name,
-            "path": relative,
-            "children": children,
-        }
+        return children

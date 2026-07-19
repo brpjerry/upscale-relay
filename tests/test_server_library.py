@@ -88,12 +88,17 @@ async def collect_some(client: RelayClient, count: int):
     return packets
 
 
-def test_library_tree_and_path_sandbox(library_file, tmp_path):
+def test_library_pages_and_path_sandbox(library_file, tmp_path):
     root, target = library_file
     library = MediaLibrary(root)
-    tree = library.tree()
-    assert tree["children"][0]["name"] == "Shows"
-    assert tree["children"][0]["children"] == [
+    root_page, cursor = library.page()
+    assert cursor is None
+    assert root_page["children"] == [
+        {"type": "directory", "name": "Shows", "path": "Shows", "children": []}
+    ]
+    shows_page, cursor = library.page("Shows")
+    assert cursor is None
+    assert shows_page["children"] == [
         {"type": "file", "name": "Sample.MKV", "path": "Shows/Sample.MKV"}
     ]
     assert library.resolve_file("Shows/Sample.MKV") == target.resolve()
@@ -103,6 +108,33 @@ def test_library_tree_and_path_sandbox(library_file, tmp_path):
         library.resolve_file("Shows\\Sample.MKV")
     with pytest.raises(LibraryPathError):
         library.resolve_file("ignore.txt")
+
+
+def test_library_pages_are_shallow_sorted_and_sandboxed(tmp_path):
+    root = tmp_path / "library"
+    root.mkdir()
+    (root / "B Folder").mkdir()
+    (root / "A Folder").mkdir()
+    (root / "A Folder" / "nested.mkv").write_bytes(b"video")
+    (root / "b.mkv").write_bytes(b"video")
+    (root / "a.mp4").write_bytes(b"video")
+    (root / "ignore.txt").write_text("no")
+    library = MediaLibrary(root)
+
+    first, cursor = library.page(limit=2)
+    assert [child["name"] for child in first["children"]] == ["A Folder", "B Folder"]
+    assert first["children"][0]["children"] == []
+    assert cursor == "2"
+    second, cursor = library.page(offset=int(cursor), limit=2)
+    assert [child["name"] for child in second["children"]] == ["a.mp4", "b.mkv"]
+    assert cursor is None
+    nested, cursor = library.page("A Folder", limit=10)
+    assert nested["children"] == [
+        {"type": "file", "name": "nested.mkv", "path": "A Folder/nested.mkv"}
+    ]
+    assert cursor is None
+    with pytest.raises(LibraryPathError):
+        library.page("../outside")
 
 
 def test_library_http_range_and_server_source_pts(library_file):
@@ -125,8 +157,20 @@ def test_library_http_range_and_server_source_pts(library_file):
             assert caps["quality_options"][-1]["android_supported"] is False
             async with client._http.get(f"http://127.0.0.1:{server.port}/status") as response:
                 assert (await response.json())["lossless_hevc_profile"] == DEFAULT_LOSSLESS_HEVC_PROFILE
-            tree = await client.fetch_library()
-            assert tree["children"][0]["children"][0]["path"] == "Shows/Sample.MKV"
+            async with client._http.get(
+                f"http://127.0.0.1:{server.port}/library"
+            ) as response:
+                bare_page = await response.json()
+                assert response.status == 200
+            assert bare_page["tree"]["children"] == [
+                {"type": "directory", "name": "Shows", "path": "Shows", "children": []}
+            ]
+            assert bare_page["next_cursor"] is None
+            page = await client.fetch_library_page(limit=1)
+            assert page["tree"]["children"][0] == {
+                "type": "directory", "name": "Shows", "path": "Shows", "children": [],
+            }
+            assert page["next_cursor"] is None
 
             async with client._http.get(
                 client.media_url("Shows/Sample.MKV"), headers={"Range": "bytes=0-31"}

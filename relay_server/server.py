@@ -286,8 +286,18 @@ class RelayServer:
 
     async def handle_library(self, request: web.Request) -> web.Response:
         assert self.library is not None
-        tree = await asyncio.to_thread(self.library.tree)
-        return web.json_response({"tree": tree})
+        relative = request.query.get("path", "")
+        try:
+            offset = int(request.query.get("cursor", "0"))
+            limit = min(int(request.query.get("limit", "100")), 500)
+            tree, next_cursor = await asyncio.to_thread(
+                self.library.page, relative, offset=offset, limit=limit,
+            )
+        except LibraryPathError as err:
+            raise web.HTTPNotFound(text=str(err)) from err
+        except ValueError as err:
+            raise web.HTTPBadRequest(text=str(err)) from err
+        return web.json_response({"tree": tree, "next_cursor": next_cursor})
 
     async def handle_media_file(self, request: web.Request) -> web.StreamResponse:
         assert self.library is not None
