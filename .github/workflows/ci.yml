@@ -45,9 +45,21 @@ jobs:
           --collect-all onnxruntime
           --collect-submodules zeroconf
           --collect-all PySide6
+          --collect-submodules relay_server
           packaging/server_gui_entry.py
       - name: Smoke test (console)
         run: dist/upscale-relay-server/upscale-relay-server.exe --help
+      - name: Smoke test (GUI import check)
+        shell: pwsh
+        timeout-minutes: 3
+        run: |
+          # --windowed exe: reaching exit 0 proves relay_server.tray and its
+          # deps are bundled. A missing module instead pops a modal error dialog
+          # and hangs, which the step timeout turns into a failure.
+          $exe = "dist/upscale-relay-server-gui/upscale-relay-server-gui.exe"
+          $p = Start-Process -FilePath $exe -ArgumentList "--check" -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "GUI --check failed with exit $($p.ExitCode)" }
+          "GUI import check OK"
       - uses: actions/upload-artifact@v7
         with:
           name: upscale-relay-server-windows

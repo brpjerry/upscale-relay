@@ -6,6 +6,11 @@ __pycache__/
 *.egg-info/
 .pytest_cache/
 
+# Build artifacts (setuptools / PyInstaller)
+build/
+dist/
+*.spec
+
 # libmpv Windows DLL drop (120 MB, exceeds GitHub limits) — see CLIENT_LINUX.md
 mpv-dev/
 
