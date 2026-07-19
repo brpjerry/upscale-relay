@@ -19,6 +19,9 @@ instructions remain at the root.
 
 ## Setup and operations
 
+- [Windows client and development setup](CLIENT_WINDOWS.md) — Python
+  environment, the exact libmpv archive/DLL layout, verification, GUI tests,
+  and the server-only distinction.
 - [Linux client setup](CLIENT_LINUX.md) — dependencies, installation, flags,
   firewall setup, and bandwidth guidance.
 

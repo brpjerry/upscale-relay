@@ -33,6 +33,7 @@ from upscale_cli.encode import (
     QUALITY_OPTIONS,
 )
 from upscale_cli.fit import DEFAULT_RESIZE_ALGORITHM, RESIZE_ALGORITHMS
+from upscale_cli.manifest import ModelManifest
 
 from .mdns import MdnsAdvertiser
 from .session import Session, State
@@ -42,17 +43,14 @@ log = logging.getLogger("relay.server")
 
 
 def discover_models(models_dir: str) -> dict[str, dict]:
-    """name -> {path, scale_factor} for every .onnx with a readable manifest."""
+    """Return model metadata, generating a default manifest when absent."""
     out = {}
     for path in sorted(Path(models_dir).glob("*.onnx")):
-        scale = None
-        manifest = path.with_suffix(".json")
-        if manifest.exists():
-            try:
-                scale = json.loads(manifest.read_text(encoding="utf-8-sig")).get("scale_factor")
-            except (OSError, json.JSONDecodeError):
-                continue
-        out[path.stem] = {"path": str(path), "scale_factor": scale}
+        try:
+            manifest = ModelManifest.load(path)
+        except (OSError, ValueError):
+            continue
+        out[path.stem] = {"path": str(path), "scale_factor": manifest.scale_factor}
     return out
 
 

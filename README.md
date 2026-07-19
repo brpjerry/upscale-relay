@@ -11,6 +11,8 @@ also host the source through its optional media library.
   design decisions, and remaining work
 - **[Wire protocol](docs/PROTOCOL.md)** — control channel, media framing, and
   seek/epoch semantics
+- **[Windows setup](docs/CLIENT_WINDOWS.md)** — desktop/libmpv and development
+  environment
 - **[Linux setup](docs/CLIENT_LINUX.md)** — desktop client installation
 - **[Android client](https://github.com/brpjerry/upscale-relay-android)** — Kotlin/Compose client
   (separate repository)
@@ -50,7 +52,12 @@ HEVC defaults to the P4 low-delay profile. Server-wide experimental overrides
 remain available through `--lossless-hevc-profile`; see
 [quality tier notes](docs/TIER_NOTES.md#lossless-hevc-server-profiles).
 
-Models are user-supplied `.onnx` files dropped into `models/` with a small
-JSON manifest (`{"scale_factor": 2, "channel_order": "rgb", "value_range": [0.0, 1.0]}`).
-The `mpv-dev/` folder (Windows) holds the libmpv DLL; Linux uses the distro's
-libmpv. Both are gitignored — see [the documentation](docs/README.md).
+Models are user-supplied `.onnx` files dropped into `models/`. When a matching
+JSON manifest is absent, the server creates one with RGB `[0, 1]` defaults and
+a 2x scale. Filename markers such as `3x`/`x3` or `4x`/`x4` select that scale
+instead. An explicit manifest can override the defaults
+(`{"scale_factor": 2, "channel_order": "rgb", "value_range": [0.0, 1.0]}`).
+On Windows source installs, the desktop client and full GUI tests require
+`mpv-dev/libmpv-2.dll` from an `mpv-dev-x86_64` archive; the server release
+binaries do not. See the exact [Windows setup](docs/CLIENT_WINDOWS.md). Linux
+uses the distro's libmpv package.

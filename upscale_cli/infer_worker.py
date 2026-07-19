@@ -88,7 +88,7 @@ class SubprocessUpscaler:
 
     def __init__(self, model_path: str, ep: str = "tensorrt",
                  tile_size: int | str | None = None):
-        from upscale_cli.infer import ModelManifest
+        from upscale_cli.manifest import ModelManifest
 
         self.model_path = model_path
         self.ep = ep
