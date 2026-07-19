@@ -58,9 +58,8 @@ def _should_use_tensorrt(ep: str, available_providers: set[str]) -> bool:
     if ep == "tensorrt" and provider not in available_providers:
         raise RuntimeError(
             "TensorRT execution provider is not available in this build; "
-            f"installed providers: {sorted(available_providers)}. Windows release "
-            "binaries include DirectML/CPU; use --ep auto or --ep dml, or run "
-            "the server from a CUDA/TensorRT source environment."
+            f"installed providers: {sorted(available_providers)}. Re-run the "
+            "first-launch NVIDIA setup or install the .[nvidia] source extra."
         )
     return ep == "tensorrt" or (ep == "auto" and provider in available_providers)
 

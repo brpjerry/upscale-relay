@@ -18,8 +18,14 @@ import socket
 
 from PySide6.QtWidgets import QApplication
 
-from relay_server.gui_settings import ServerSettings
-from relay_server.tray import ConfigDialog, ServerController, TrayApp, make_icon
+from relay_server.gui_settings import EP_CHOICES, ServerSettings, available_ep_choices
+from relay_server.tray import (
+    ConfigDialog,
+    RuntimeSetupDialog,
+    ServerController,
+    TrayApp,
+    make_icon,
+)
 
 _next_port = [0]
 
@@ -66,7 +72,8 @@ def settings():
 
 
 def test_settings_roundtrip(settings):
-    settings.ep = "dml"
+    provider = next((choice for choice in EP_CHOICES if choice != "auto"), "auto")
+    settings.ep = provider
     settings.port = 9001
     settings.library_dir = "D:/media"
     settings.models_dir = "D:/models"
@@ -74,7 +81,7 @@ def test_settings_roundtrip(settings):
     settings.file_logging = False
 
     fresh = ServerSettings(scope="test-server-tray")
-    assert fresh.ep == "dml"
+    assert fresh.ep == provider
     assert fresh.port == 9001
     assert fresh.library_dir == "D:/media"
     assert fresh.models_dir == "D:/models"
@@ -91,21 +98,44 @@ def test_make_icon_is_non_null(app):
     assert not make_icon().isNull()
 
 
+def test_runtime_setup_close_cancels_installer(app):
+    class FakeProcess:
+        terminated = False
+
+        def poll(self):
+            return None
+
+        def terminate(self):
+            self.terminated = True
+
+    dialog = RuntimeSetupDialog()
+    process = FakeProcess()
+    dialog.set_process(process)
+    dialog.reject()
+    assert dialog.cancelled
+    assert process.terminated
+
+
 def test_config_dialog_load_and_apply_persists(app, settings):
-    settings.ep = "cuda"
+    provider = next((choice for choice in EP_CHOICES if choice != "auto"), "auto")
+    settings.ep = provider
     settings.port = 8600
     settings.library_dir = "C:/lib"
 
     dialog = ConfigDialog(settings)
     try:
-        assert dialog.ep_combo.currentText() == "cuda"
+        assert dialog.ep_combo.currentText() == provider
         assert dialog.port_spin.value() == 8600
         assert dialog.library_edit.text() == "C:/lib"
         assert dialog.logging_check.isChecked()
 
         applied = []
         dialog.applied.connect(lambda: applied.append(True))
-        dialog.ep_combo.setCurrentText("cpu")
+        applied_provider = next(
+            (choice for choice in available_ep_choices() if choice != provider),
+            provider,
+        )
+        dialog.ep_combo.setCurrentText(applied_provider)
         dialog.port_spin.setValue(8700)
         dialog.library_edit.setText("C:/other")
         dialog.models_edit.setText("C:/models")
@@ -114,7 +144,7 @@ def test_config_dialog_load_and_apply_persists(app, settings):
 
         assert applied == [True]
         fresh = ServerSettings(scope="test-server-tray")
-        assert fresh.ep == "cpu"
+        assert fresh.ep == applied_provider
         assert fresh.port == 8700
         assert fresh.library_dir == "C:/other"
         assert fresh.models_dir == "C:/models"

@@ -41,6 +41,11 @@ Server (runs on the Windows box, not the laptop):
 `relay-server --models-dir models --ep tensorrt` from `.venv-cuda`.
 `http://<server>:8590/status` returns per-session pipeline fps + per-stage ms —
 first stop for any performance question.
+Release binaries stay small and use `relay_server/runtime_bootstrap.py` to
+install the pinned NVIDIA wheels into a versioned `%LOCALAPPDATA%` runtime on
+first launch. CI must not install or package the multi-GB `.[nvidia]` extra; it
+only verifies that the frozen first-run installer is present. Runtime setup
+itself verifies TensorRT, CUDA, and CPU before publishing its ready marker.
 The tray GUI's optional file log is `Documents/upscale-relay-server.log` and is
 enabled by default through its persisted configuration checkbox.
 
