@@ -292,6 +292,7 @@ class ServerController:
             s.models_dir,
             s.port,
             ep=s.ep,
+            stats_interval=2.0 if s.file_logging else None,
             library_root=s.library_dir or None,
             mdns=s.mdns,
         )

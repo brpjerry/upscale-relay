@@ -40,14 +40,17 @@ On Windows the server also ships as a double-click tray app: `relay-server-gui`
 (the `upscale-relay-server-gui.exe` release binary, installable from source with
 the `.[server-gui,nvidia]` extras) starts the server from its last-saved
 configuration and drops an icon in the notification area. The downloadable ZIP
-stays small: on first launch the program downloads the pinned TensorRT
+includes the lightweight ONNX graph tooling required for the fast
+`uint8-wrapped` TensorRT path, while staying small: on first launch the program downloads the pinned TensorRT
 10.13/CUDA 12.9 stack into `%LOCALAPPDATA%\upscale-relay\runtimes`. It verifies
 TensorRT, CUDA, and CPU providers before marking that versioned runtime ready;
 an interrupted or failed installation is retried on the next launch. The GUI
 shows setup progress, while the console build prints it. Its configuration pane sets the
 execution provider, control port, media library folder, models folder, and
 file logging, then restarts the listeners in place. GUI logging defaults on and
-writes `upscale-relay-server.log` to the user's Documents folder. The headless
+writes `upscale-relay-server.log` to the user's Documents folder. While a
+session is active it records a performance snapshot every two seconds plus a
+final snapshot on close. The headless
 `relay-server` CLI continues to log to its console.
 
 The first-run NVIDIA download is several gigabytes and needs an NVIDIA driver,

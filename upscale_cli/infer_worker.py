@@ -43,6 +43,12 @@ def worker_main(argv: list[str] | None = None) -> int:
 
     if argv == ["--check"]:
         return 0
+    if argv == ["--onnx-check"]:
+        import onnx
+
+        if not getattr(onnx, "__version__", None):
+            return 2
+        return 0
     if argv == ["--provider-check"]:
         return provider_check()
 

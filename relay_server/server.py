@@ -87,34 +87,45 @@ class RelayServer:
 
     # -- periodic stats (--verbose) ----------------------------------------------
 
+    @staticmethod
+    def _log_session_stats(session: Session, *, final: bool = False) -> None:
+        """Persist the live /status performance fields in a readable line."""
+        p = session.pipeline
+        if p is None:
+            return
+        depths = p.queue_depths()
+        stage = p.stats.stage_report()
+        infer_ms = stage.get("infer")
+        infer_fps = f"{1000.0 / infer_ms:5.1f}" if infer_ms else "  n/a"
+        stage_str = " ".join(f"{k}={v}ms" for k, v in stage.items()) or "stages=n/a"
+        cached = depths["decoded"] + depths["upscaled"] + session.down_q.qsize()
+        stats_log = logging.getLogger("relay.stats")
+        stats_log.info(
+            "session %s %s%s epoch=%d source=%s | pipeline %5.1f fps | "
+            "onnx %s fps | %s | output=%dx%d codec=%s encoder=%s tier=%s | "
+            "cached frames: in-flight=%d (dec=%d up=%d down=%d) uplink-pkts=%d | "
+            "client buffer %5d ms (est %5d) | %s | frames %d in / %d out",
+            session.id[:6], session.state.value, " FINAL" if final else "",
+            session.epoch, session.source_kind,
+            p.stats.fps, infer_fps, stage_str,
+            p.out_w, p.out_h, p.downlink_codec, p.encoder_name, p.quality_tier,
+            cached, depths["decoded"], depths["upscaled"],
+            session.down_q.qsize(), depths["in"],
+            p.client_buffered_ms, p.buffered_ms_now(),
+            "PAUSED(watermark)" if p.stats.paused_for_backpressure else "flowing",
+            p.stats.frames_in, p.stats.frames_out,
+        )
+
     async def _stats_loop(self) -> None:
         """One line per active session every stats_interval seconds: queue/cache
         depths through the pipeline, ONNX inference rate, and pacing state."""
-        stats_log = logging.getLogger("relay.stats")
         while True:
             await asyncio.sleep(self.stats_interval)
             for session in {s.id: s for s in self.sessions.values()}.values():
                 p = session.pipeline
                 if p is None or session.state.value == "closed":
                     continue
-                depths = p.queue_depths()
-                stage = p.stats.stage_report()
-                infer_ms = stage.get("infer")
-                infer_fps = f"{1000.0 / infer_ms:5.1f}" if infer_ms else "  n/a"
-                stage_str = " ".join(f"{k}={v}ms" for k, v in stage.items())
-                cached = depths["decoded"] + depths["upscaled"] + session.down_q.qsize()
-                stats_log.info(
-                    "session %s %s | pipeline %5.1f fps | onnx %s fps | %s | "
-                    "cached frames: in-flight=%d (dec=%d up=%d down=%d) uplink-pkts=%d | "
-                    "client buffer %5d ms (est %5d) | %s | frames %d in / %d out",
-                    session.id[:6], session.state.value,
-                    p.stats.fps, infer_fps, stage_str,
-                    cached, depths["decoded"], depths["upscaled"],
-                    session.down_q.qsize(), depths["in"],
-                    p.client_buffered_ms, p.buffered_ms_now(),
-                    "PAUSED(watermark)" if p.stats.paused_for_backpressure else "flowing",
-                    p.stats.frames_in, p.stats.frames_out,
-                )
+                self._log_session_stats(session)
 
     # -- control channel -------------------------------------------------------
 
@@ -193,6 +204,7 @@ class RelayServer:
                     await session.send("error", code="bad_message", message=mtype, fatal=False)
         finally:
             if session is not None:
+                self._log_session_stats(session, final=True)
                 await session.close()
                 for key in (session.uplink_token, session.downlink_token, session.id):
                     self.sessions.pop(key, None)

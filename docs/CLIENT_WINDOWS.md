@@ -97,4 +97,8 @@ Python fault stacks, and native crash attribution to:
 ```
 
 The checkbox shows the resolved path, including a redirected Documents folder.
+When enabled, the log includes a `relay.stats` snapshot every two seconds for
+each active session and a `FINAL` snapshot at teardown: pipeline/inference FPS,
+per-stage milliseconds, output and encoder settings, queue depths, client
+buffer/backpressure state, and frame counts.
 The headless console server logs to its terminal instead.

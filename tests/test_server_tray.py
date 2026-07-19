@@ -208,11 +208,14 @@ def test_controller_start_stop_binds_and_releases_port(app, settings, tmp_path):
     async def scenario():
         await controller.start()
         assert controller.running
+        assert controller.server.stats_interval == 2.0
         # Applying a new port rebinds; the old listeners must be released so
         # the new instance can bind without EADDRINUSE.
         settings.port = free_port_pair()
+        settings.file_logging = False
         await controller.start()
         assert controller.running
+        assert controller.server.stats_interval is None
         await controller.stop()
         assert not controller.running
 
