@@ -19,7 +19,7 @@ import os
 import sys
 from pathlib import Path
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import QStandardPaths, Qt, Signal
 from PySide6.QtGui import QAction, QColor, QFont, QIcon, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
@@ -46,25 +46,87 @@ log = logging.getLogger("relay.tray")
 
 _APP_NAME = "Upscale Relay Server"
 
-# Kept alive for the process lifetime: faulthandler holds this file's fd, so it
-# must not be garbage-collected/closed while the app runs.
+# Kept alive while file logging is enabled: faulthandler holds this file's fd,
+# so reconfiguration redirects faulthandler before closing it.
 _diagnostics_log = None
+_diagnostics_handler = None
+_console_stderr = None
+
+
+def diagnostics_log_path() -> Path:
+    """Return the visible, user-owned log path used by the tray GUI."""
+    override = os.environ.get("RELAY_GUI_LOG_DIR")
+    documents = override or QStandardPaths.writableLocation(QStandardPaths.DocumentsLocation)
+    base = Path(documents) if documents else Path.home() / "Documents"
+    return base / "upscale-relay-server.log"
 
 
 def _open_diagnostics_log():
     """A writable log file for the windowed (frozen) build, which has no console.
 
-    Returns an open text file under %LOCALAPPDATA%\\upscale-relay (or ``None`` if
-    it cannot be created). ``sys.stderr`` is ``None`` in a --windowed PyInstaller
-    binary, so faulthandler and logging need a real file to write to.
+    Returns an open text file in the user's Documents directory (or ``None``
+    if it cannot be created). ``sys.stderr`` is ``None`` in a --windowed
+    PyInstaller binary, so faulthandler and logging need a real file when file
+    logging is enabled.
     """
-    base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
-    log_dir = Path(base) / "upscale-relay"
+    log_path = diagnostics_log_path()
     try:
-        log_dir.mkdir(parents=True, exist_ok=True)
-        return open(log_dir / "server-gui.log", "a", buffering=1, encoding="utf-8")
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        return open(log_path, "a", buffering=1, encoding="utf-8")
     except OSError:
         return None
+
+
+def configure_file_logging(enabled: bool) -> Path | None:
+    """Apply the GUI file-logging preference immediately."""
+    import faulthandler
+
+    global _diagnostics_log, _diagnostics_handler
+
+    root = logging.getLogger()
+    if _diagnostics_handler is not None:
+        root.removeHandler(_diagnostics_handler)
+        _diagnostics_handler.flush()
+        _diagnostics_handler.close()
+
+    if _diagnostics_log is not None:
+        faulthandler.disable()
+        if sys.stderr is _diagnostics_log:
+            sys.stderr = _console_stderr
+        _diagnostics_log.close()
+
+    _diagnostics_log = None
+    _diagnostics_handler = None
+
+    if not enabled:
+        if _console_stderr is not None:
+            try:
+                faulthandler.enable(file=_console_stderr)
+            except (RuntimeError, ValueError):
+                pass
+        return None
+
+    stream = _open_diagnostics_log()
+    if stream is None:
+        return None
+
+    _diagnostics_log = stream
+    handler = logging.StreamHandler(stream)
+    handler.setLevel(logging.INFO)
+    handler.setFormatter(logging.Formatter(
+        "%(asctime)s %(name)s %(levelname)s %(message)s"
+    ))
+    root.addHandler(handler)
+    root.setLevel(logging.INFO)
+    _diagnostics_handler = handler
+
+    if _console_stderr is None:
+        sys.stderr = stream
+    try:
+        faulthandler.enable(file=stream)
+    except (RuntimeError, ValueError):
+        pass
+    return diagnostics_log_path()
 
 
 def make_icon() -> QIcon:
@@ -169,6 +231,9 @@ class ConfigDialog(QDialog):
         self.library_edit.setPlaceholderText("(none — no media library exposed)")
         self.models_edit = QLineEdit()
         self.mdns_check = QCheckBox("Advertise on the LAN via mDNS/DNS-SD")
+        self.logging_check = QCheckBox(
+            f"Write server log to {diagnostics_log_path()}"
+        )
 
         form = QFormLayout(self)
         form.addRow("Execution provider:", self.ep_combo)
@@ -176,6 +241,7 @@ class ConfigDialog(QDialog):
         form.addRow("Media library folder:", _folder_row(self.library_edit, self))
         form.addRow("Models folder:", _folder_row(self.models_edit, self))
         form.addRow("", self.mdns_check)
+        form.addRow("", self.logging_check)
 
         buttons = QDialogButtonBox(
             QDialogButtonBox.Apply | QDialogButtonBox.Close
@@ -194,6 +260,7 @@ class ConfigDialog(QDialog):
         self.library_edit.setText(s.library_dir)
         self.models_edit.setText(s.models_dir)
         self.mdns_check.setChecked(s.mdns)
+        self.logging_check.setChecked(s.file_logging)
 
     def _on_apply(self) -> None:
         s = self._settings
@@ -202,6 +269,7 @@ class ConfigDialog(QDialog):
         s.library_dir = self.library_edit.text().strip()
         s.models_dir = self.models_edit.text().strip()
         s.mdns = self.mdns_check.isChecked()
+        s.file_logging = self.logging_check.isChecked()
         self.applied.emit()
 
 
@@ -263,11 +331,19 @@ class TrayApp:
     def open_config(self) -> None:
         if self.dialog is None:
             self.dialog = ConfigDialog(self.settings)
-            self.dialog.applied.connect(lambda: asyncio.ensure_future(self.restart()))
+            self.dialog.applied.connect(self._settings_applied)
         self.dialog.load()
         self.dialog.show()
         self.dialog.raise_()
         self.dialog.activateWindow()
+
+    def _settings_applied(self) -> None:
+        path = configure_file_logging(self.settings.file_logging)
+        if self.settings.file_logging and path is None:
+            self._notify("Could not open the selected Documents log file", error=True)
+        elif path is not None:
+            log.info("file logging enabled: %s", path)
+        asyncio.ensure_future(self.restart())
 
     def _on_activated(self, reason: QSystemTrayIcon.ActivationReason) -> None:
         if reason in (QSystemTrayIcon.Trigger, QSystemTrayIcon.DoubleClick):
@@ -280,7 +356,7 @@ class TrayApp:
         log.info("%s", message)
 
 
-def setup_diagnostics() -> None:
+def setup_diagnostics(file_logging: bool = True) -> None:
     """Enable faulthandler + logging without assuming a console exists.
 
     Native faults (libav/ORT/TRT) kill the process silently otherwise — the
@@ -292,29 +368,27 @@ def setup_diagnostics() -> None:
     """
     import faulthandler
 
-    global _diagnostics_log
-    diag_stream = sys.stderr
-    if diag_stream is None:
-        _diagnostics_log = diag_stream = _open_diagnostics_log()
+    global _console_stderr
+    _console_stderr = sys.stderr
 
-    if diag_stream is not None:
+    if _console_stderr is not None:
         try:
-            faulthandler.enable(file=diag_stream)
+            faulthandler.enable(file=_console_stderr)
         except (RuntimeError, ValueError):
             pass
+        logging.basicConfig(
+            level=logging.INFO,
+            stream=_console_stderr,
+            format="%(asctime)s %(name)s %(levelname)s %(message)s",
+        )
+
+    configure_file_logging(file_logging)
     try:
         from .crashinfo import install as _install_crashinfo
 
         _install_crashinfo()
     except Exception:
         pass
-
-    logging.basicConfig(
-        level=logging.INFO,
-        stream=diag_stream,
-        format="%(asctime)s %(name)s %(levelname)s %(message)s",
-    )
-
 
 def main() -> None:
     # Frozen-build smoke hook: reaching here means the entry script imported
@@ -324,7 +398,8 @@ def main() -> None:
     if "--check" in sys.argv[1:]:
         return
 
-    setup_diagnostics()
+    settings = ServerSettings()
+    setup_diagnostics(settings.file_logging)
 
     from qasync import QEventLoop
 
@@ -344,7 +419,7 @@ def main() -> None:
     loop = QEventLoop(app)
     asyncio.set_event_loop(loop)
 
-    tray = TrayApp(ServerSettings())
+    tray = TrayApp(settings)
     with loop:
         # start() never blocks (it awaits the listeners binding, then returns);
         # run the initial startup, then hand control to the tray event loop.

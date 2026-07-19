@@ -16,6 +16,7 @@ Worker protocol (over stdin/stdout pipes, payloads in SharedMemory):
 
 from __future__ import annotations
 
+import os
 import queue
 import struct
 import subprocess
@@ -26,6 +27,7 @@ from multiprocessing import shared_memory
 import numpy as np
 
 _HDR = struct.Struct("<II")
+FROZEN_WORKER_ARG = "--upscale-infer-worker"
 
 # Input cap = TRT profile max; output cap covers scale 4x.
 _MAX_IN = (1440, 2560)
@@ -33,8 +35,11 @@ _MAX_IN_BYTES = _MAX_IN[0] * _MAX_IN[1] * 3
 _MAX_OUT_BYTES = _MAX_IN_BYTES * 16  # 4x scale in both dims
 
 
-def worker_main() -> int:
+def worker_main(argv: list[str] | None = None) -> int:
     import argparse
+
+    if argv == ["--check"]:
+        return 0
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", required=True)
@@ -42,7 +47,7 @@ def worker_main() -> int:
     parser.add_argument("--tile", default="none")
     parser.add_argument("--shm-in", required=True)
     parser.add_argument("--shm-out", required=True)
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     from upscale_cli.infer import OnnxUpscaler
 
@@ -52,9 +57,13 @@ def worker_main() -> int:
 
     shm_in = shared_memory.SharedMemory(name=args.shm_in)
     shm_out = shared_memory.SharedMemory(name=args.shm_out)
-    stdin = sys.stdin.buffer
-    stdout = sys.stdout.buffer
-    print(f"READY {up.scale_factor or 0}", flush=True)
+    # PyInstaller's --windowed bootloader may leave the Python stream objects
+    # as None even though Popen attached OS pipe handles. Open the inherited
+    # descriptors directly in that case so the GUI binary can host a worker.
+    stdin = sys.stdin.buffer if sys.stdin is not None else os.fdopen(0, "rb", buffering=0)
+    stdout = sys.stdout.buffer if sys.stdout is not None else os.fdopen(1, "wb", buffering=0)
+    stdout.write(f"READY {up.scale_factor or 0}\n".encode("ascii"))
+    stdout.flush()
 
     try:
         while True:
@@ -107,9 +116,9 @@ class SubprocessUpscaler:
     def _start_worker(self) -> None:
         tile = "none" if self.tile_size is None else str(self.tile_size)
         self._proc = subprocess.Popen(
-            [sys.executable, "-m", "upscale_cli.infer_worker",
-             "--model", self.model_path, "--ep", self.ep, "--tile", tile,
-             "--shm-in", self._shm_in.name, "--shm-out", self._shm_out.name],
+            build_worker_command(
+                self.model_path, self.ep, tile, self._shm_in.name, self._shm_out.name,
+            ),
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=sys.stderr,
         )
         # ONE persistent reader thread per worker: a thread-per-frame read
@@ -213,6 +222,25 @@ class SubprocessUpscaler:
             self._shm_in.unlink()
             self._shm_out.close()
             self._shm_out.unlink()
+
+
+def build_worker_command(model: str, ep: str, tile: str,
+                         shm_in: str, shm_out: str) -> list[str]:
+    args = [
+        "--model", model, "--ep", ep, "--tile", tile,
+        "--shm-in", shm_in, "--shm-out", shm_out,
+    ]
+    if getattr(sys, "frozen", False):
+        return [sys.executable, FROZEN_WORKER_ARG, *args]
+    return [sys.executable, "-m", "upscale_cli.infer_worker", *args]
+
+
+def maybe_run_frozen_worker(argv: list[str] | None = None) -> int | None:
+    """Dispatch a worker embedded in a frozen server executable."""
+    args = sys.argv[1:] if argv is None else argv
+    if not args or args[0] != FROZEN_WORKER_ARG:
+        return None
+    return worker_main(args[1:])
 
 
 if __name__ == "__main__":

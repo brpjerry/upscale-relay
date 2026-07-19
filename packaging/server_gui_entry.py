@@ -8,8 +8,13 @@ providers; the TensorRT path still needs a CUDA source install.
 
 import multiprocessing
 
-from relay_server.tray import main
+from upscale_cli.infer_worker import maybe_run_frozen_worker
 
 if __name__ == "__main__":
     multiprocessing.freeze_support()
+    worker_result = maybe_run_frozen_worker()
+    if worker_result is not None:
+        raise SystemExit(worker_result)
+    from relay_server.tray import main
+
     main()
