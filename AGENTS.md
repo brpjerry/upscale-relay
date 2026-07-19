@@ -31,6 +31,12 @@ relay-client FILE --model NAME --tier TIER --display WxH [--decode]   # headless
 upscale-cli sample out.mkv --frames 240 --size 1920x1080 --fps 24     # make test media
 ```
 
+On Windows, a source-run desktop client or full GUI test environment also
+needs `mpv-dev/libmpv-2.dll` at the repository root. Get it from the
+`mpv-dev-x86_64-...7z` archive, not the similarly named player archive; the
+client adds that directory to its DLL search path automatically. See
+`docs/CLIENT_WINDOWS.md`. Server-only release binaries do not need libmpv.
+
 Server (runs on the Windows box, not the laptop):
 `relay-server --models-dir models --ep tensorrt` from `.venv-cuda`.
 `http://<server>:8590/status` returns per-session pipeline fps + per-stage ms —

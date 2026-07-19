@@ -11,7 +11,7 @@ build/
 dist/
 *.spec
 
-# libmpv Windows DLL drop (120 MB, exceeds GitHub limits) — see CLIENT_LINUX.md
+# libmpv Windows DLL drop (about 100 MB) — see docs/CLIENT_WINDOWS.md
 mpv-dev/
 
 # .onnx model drops + TensorRT engine cache — see PLAN.md model registry notes

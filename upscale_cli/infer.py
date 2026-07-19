@@ -1,6 +1,6 @@
 """ONNX super-resolution inference stage.
 
-A model is an .onnx file with an optional JSON manifest beside it
+A model is an .onnx file with a JSON manifest beside it
 (model.onnx -> model.json):
 
     {
@@ -11,19 +11,20 @@ A model is an .onnx file with an optional JSON manifest beside it
 
 Models are expected to take NCHW float input with dynamic spatial dims and
 produce NCHW float output scaled by scale_factor. If the manifest is missing,
-defaults are used and scale_factor is inferred from the first frame.
+one is generated with RGB [0, 1] defaults. Scale markers such as 3x or x4 are
+read from the filename; filenames without one default to 2x.
 """
 
 from __future__ import annotations
 
-import json
 import sys
-from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable
 
 import av
 import numpy as np
+
+from .manifest import ModelManifest
 
 
 def _add_nvidia_dll_dirs() -> None:
@@ -56,25 +57,6 @@ _EP_ORDER = [
     ("cpu", "CPUExecutionProvider"),
 ]
 _EP_BY_ALIAS = dict(_EP_ORDER)
-
-
-@dataclass
-class ModelManifest:
-    scale_factor: int | None = None
-    channel_order: str = "rgb"
-    value_range: tuple[float, float] = (0.0, 1.0)
-
-    @classmethod
-    def load(cls, model_path: str) -> "ModelManifest":
-        manifest_path = Path(model_path).with_suffix(".json")
-        if not manifest_path.exists():
-            return cls()
-        data = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
-        return cls(
-            scale_factor=data.get("scale_factor"),
-            channel_order=data.get("channel_order", "rgb"),
-            value_range=tuple(data.get("value_range", (0.0, 1.0))),
-        )
 
 
 def _trt_options() -> dict:
