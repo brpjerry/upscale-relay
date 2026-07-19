@@ -7,6 +7,15 @@ from pathlib import Path, PurePosixPath
 
 PLAYABLE_SUFFIXES = frozenset({".mkv", ".mp4", ".m4v", ".avi", ".mov", ".ts", ".webm"})
 
+SORT_KEYS = ("name", "mtime")
+
+
+def _mtime(path: Path) -> float:
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return 0.0
+
 
 class LibraryPathError(ValueError):
     pass
@@ -54,12 +63,15 @@ class MediaLibrary:
             raise LibraryPathError("library directory not found")
         return candidate
 
-    def page(self, relative: str = "", *, offset: int = 0, limit: int = 100) -> tuple[dict, str | None]:
+    def page(self, relative: str = "", *, offset: int = 0, limit: int = 100,
+             sort: str = "name") -> tuple[dict, str | None]:
         """Return one sorted page of a directory's immediate playable children."""
+        if sort not in SORT_KEYS:
+            raise ValueError("invalid library sort")
         if offset < 0 or limit < 1:
             raise ValueError("invalid library page")
         directory = self.resolve_directory(relative)
-        children = self._directory_children(directory, relative)
+        children = self._directory_children(directory, relative, sort=sort)
         page_children = children[offset:offset + limit]
         next_offset = offset + len(page_children)
         node = {
@@ -70,10 +82,14 @@ class MediaLibrary:
         }
         return node, str(next_offset) if next_offset < len(children) else None
 
-    def _directory_children(self, directory: Path, relative: str) -> list[dict]:
+    def _directory_children(self, directory: Path, relative: str, sort: str = "name") -> list[dict]:
+        if sort == "mtime":
+            key = lambda p: (not p.is_dir(), -_mtime(p), p.name.casefold())
+        else:
+            key = lambda p: (not p.is_dir(), p.name.casefold())
         children: list[dict] = []
         try:
-            entries = sorted(directory.iterdir(), key=lambda p: (not p.is_dir(), p.name.casefold()))
+            entries = sorted(directory.iterdir(), key=key)
         except OSError:
             entries = []
         for entry in entries:

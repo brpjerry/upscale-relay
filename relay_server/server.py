@@ -37,7 +37,7 @@ from upscale_cli.manifest import ModelManifest
 
 from .mdns import MdnsAdvertiser
 from .session import Session, State
-from .library import LibraryPathError, MediaLibrary
+from .library import SORT_KEYS as LIBRARY_SORT_KEYS, LibraryPathError, MediaLibrary
 
 log = logging.getLogger("relay.server")
 
@@ -166,6 +166,9 @@ class RelayServer:
                         "resize_algorithms": list(RESIZE_ALGORITHMS),
                         "default_resize_algorithm": self.resize_algorithm,
                         "library": self.library is not None,
+                        "library_sort": (
+                            list(LIBRARY_SORT_KEYS) if self.library is not None else []
+                        ),
                     }))
                 elif mtype == "open_session":
                     if session is not None:
@@ -287,11 +290,12 @@ class RelayServer:
     async def handle_library(self, request: web.Request) -> web.Response:
         assert self.library is not None
         relative = request.query.get("path", "")
+        sort = request.query.get("sort", "name")
         try:
             offset = int(request.query.get("cursor", "0"))
             limit = min(int(request.query.get("limit", "100")), 500)
             tree, next_cursor = await asyncio.to_thread(
-                self.library.page, relative, offset=offset, limit=limit,
+                self.library.page, relative, offset=offset, limit=limit, sort=sort,
             )
         except LibraryPathError as err:
             raise web.HTTPNotFound(text=str(err)) from err

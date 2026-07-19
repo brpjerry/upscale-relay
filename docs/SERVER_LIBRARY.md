@@ -27,15 +27,23 @@ desktop retains its local-only browser appearance.
 
 - `relay_server.library.MediaLibrary` resolves every request beneath the
   configured root and rejects traversal and non-playable files.
-- `GET /library?path=<relative-directory>&limit=100&cursor=<offset>` returns
-  one sorted page of that directory's immediate children. The response carries
-  an opaque `next_cursor` (or `null`); `path` is empty for the root. Omitted
-  query parameters use those root/100/initial-cursor defaults. Recursive
-  full-tree responses are not supported.
+- `GET /library?path=<relative-directory>&limit=100&cursor=<offset>&sort=<key>`
+  returns one sorted page of that directory's immediate children. The response
+  carries an opaque `next_cursor` (or `null`); `path` is empty for the root.
+  Omitted query parameters use root/100/initial-cursor/`name` defaults.
+  Recursive full-tree responses are not supported.
+- `sort=name` (the default) orders directories first, then case-folded
+  lexicographic names. `sort=mtime` orders directories first, then descending
+  modification time (newest first) with a case-folded name ascending tiebreak;
+  directories also order by descending mtime among themselves. Unknown keys
+  are an HTTP 400, not a silent fallback. Clients must not mix pages fetched
+  with different `sort` values; refetch from offset 0 when switching. See
+  [LIBRARY_SORT_PLAN.md](LIBRARY_SORT_PLAN.md) for rationale.
 - `GET /media/<relative-path>` serves the original file with HTTP Range
   support through aiohttp `FileResponse`.
-- The `capabilities` message includes `library: true` while the feature is
-  configured.
+- The `capabilities` message includes `library: true` and
+  `library_sort: ["name", "mtime"]` while the feature is configured
+  (`library_sort` is `[]` otherwise).
 - `open_session.source` accepts `{type: "server_file", path: "..."}`.
 - Server-file sessions create a shared `relay_media.VideoTrack` locally and do
   not allocate or wait for an uplink attachment.

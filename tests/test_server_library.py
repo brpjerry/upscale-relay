@@ -1,6 +1,7 @@
 """Server-hosted library discovery, media serving, and streaming tests."""
 
 import asyncio
+import os
 import shutil
 import socket
 from pathlib import Path
@@ -137,6 +138,67 @@ def test_library_pages_are_shallow_sorted_and_sandboxed(tmp_path):
         library.page("../outside")
 
 
+def test_library_sort_mtime_newest_first_with_name_tiebreak(tmp_path):
+    root = tmp_path / "library"
+    root.mkdir()
+    (root / "Old Folder").mkdir()
+    (root / "New Folder").mkdir()
+    (root / "b old.mkv").write_bytes(b"video")
+    (root / "newest.mkv").write_bytes(b"video")
+    (root / "B tie.mkv").write_bytes(b"video")
+    (root / "a tie.mkv").write_bytes(b"video")
+    os.utime(root / "Old Folder", (100, 100))
+    os.utime(root / "New Folder", (400, 400))
+    os.utime(root / "b old.mkv", (100, 100))
+    os.utime(root / "newest.mkv", (300, 300))
+    os.utime(root / "B tie.mkv", (200, 200))
+    os.utime(root / "a tie.mkv", (200, 200))
+    library = MediaLibrary(root)
+
+    assert library.page(sort="name") == library.page()
+
+    page, cursor = library.page(sort="mtime")
+    assert cursor is None
+    assert [child["name"] for child in page["children"]] == [
+        "New Folder", "Old Folder",
+        "newest.mkv", "a tie.mkv", "B tie.mkv", "b old.mkv",
+    ]
+
+    with pytest.raises(ValueError):
+        library.page(sort="bogus")
+
+
+def test_library_mtime_pagination_walks_full_order(tmp_path):
+    root = tmp_path / "library"
+    root.mkdir()
+    for name, stamp in [("a.mkv", 100), ("b.mkv", 300), ("c.mkv", 200)]:
+        (root / name).write_bytes(b"video")
+        os.utime(root / name, (stamp, stamp))
+    library = MediaLibrary(root)
+
+    names, cursor = [], "0"
+    while cursor is not None:
+        page, cursor = library.page(offset=int(cursor), limit=1, sort="mtime")
+        names += [child["name"] for child in page["children"]]
+    assert names == ["b.mkv", "c.mkv", "a.mkv"]
+
+
+def test_capabilities_without_library_advertise_no_sort_keys():
+    async def scenario():
+        server = RelayServer(str(ROOT / "models"), free_port_pair())
+        await server.start()
+        client = RelayClient("127.0.0.1", server.port)
+        try:
+            caps = await client.connect()
+            assert caps["library"] is False
+            assert caps.get("library_sort", []) == []
+        finally:
+            await client.teardown()
+            await server.stop()
+
+    asyncio.run(scenario())
+
+
 def test_library_http_range_and_server_source_pts(library_file):
     root, target = library_file
 
@@ -147,6 +209,7 @@ def test_library_http_range_and_server_source_pts(library_file):
         try:
             caps = await client.connect()
             assert caps["library"] is True
+            assert caps["library_sort"] == ["name", "mtime"]
             assert caps["default_resize_algorithm"] == "lanczos"
             assert "area" in caps["resize_algorithms"]
             assert "sinc" in caps["resize_algorithms"]
@@ -166,6 +229,19 @@ def test_library_http_range_and_server_source_pts(library_file):
                 {"type": "directory", "name": "Shows", "path": "Shows", "children": []}
             ]
             assert bare_page["next_cursor"] is None
+            async with client._http.get(
+                f"http://127.0.0.1:{server.port}/library", params={"sort": "name"}
+            ) as response:
+                assert response.status == 200
+                assert await response.json() == bare_page
+            async with client._http.get(
+                f"http://127.0.0.1:{server.port}/library", params={"sort": "mtime"}
+            ) as response:
+                assert response.status == 200
+            async with client._http.get(
+                f"http://127.0.0.1:{server.port}/library", params={"sort": "bogus"}
+            ) as response:
+                assert response.status == 400
             page = await client.fetch_library_page(limit=1)
             assert page["tree"]["children"][0] == {
                 "type": "directory", "name": "Shows", "path": "Shows", "children": [],
