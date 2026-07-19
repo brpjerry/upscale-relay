@@ -55,6 +55,11 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "console worker dispatch check failed" }
           & $exe --check-nvidia-runtime-installer
           if ($LASTEXITCODE -ne 0) { throw "console runtime installer check failed" }
+          $target = Join-Path $env:RUNNER_TEMP "console-pip-smoke"
+          & $exe --smoke-nvidia-runtime-installer $target
+          if ($LASTEXITCODE -ne 0 -or -not (Test-Path "$target/humanfriendly")) {
+            throw "console frozen pip smoke failed"
+          }
       - name: Smoke test (GUI import check)
         shell: pwsh
         timeout-minutes: 3
@@ -71,6 +76,12 @@ jobs:
           $p = Start-Process -FilePath $exe `
             -ArgumentList "--check-nvidia-runtime-installer" -Wait -PassThru
           if ($p.ExitCode -ne 0) { throw "GUI runtime installer check failed with exit $($p.ExitCode)" }
+          $target = Join-Path $env:RUNNER_TEMP "gui-pip-smoke"
+          $p = Start-Process -FilePath $exe `
+            -ArgumentList "--smoke-nvidia-runtime-installer", $target -Wait -PassThru
+          if ($p.ExitCode -ne 0 -or -not (Test-Path "$target/humanfriendly")) {
+            throw "GUI frozen pip smoke failed with exit $($p.ExitCode)"
+          }
           "GUI import check OK"
       - uses: actions/upload-artifact@v7
         with:

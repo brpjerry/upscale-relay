@@ -24,6 +24,7 @@ from relay_server.tray import (
     RuntimeSetupDialog,
     ServerController,
     TrayApp,
+    ensure_runtime_gui,
     make_icon,
 )
 
@@ -114,6 +115,52 @@ def test_runtime_setup_close_cancels_installer(app):
     dialog.reject()
     assert dialog.cancelled
     assert process.terminated
+
+
+def test_runtime_setup_failure_shows_detail_and_closes(app):
+    dialog = RuntimeSetupDialog()
+    closed = []
+    dialog.closed.connect(lambda: closed.append(True))
+    dialog.show_failure("Unable to locate finder for 'pip._vendor.distlib'")
+
+    assert dialog.failed
+    assert "pip._vendor.distlib" in dialog.label.text()
+    assert "upscale-relay-server.log" in dialog.label.text()
+    dialog.reject()
+    assert closed == [True]
+    assert not dialog.isVisible()
+
+
+def test_runtime_setup_failure_coroutine_returns_after_close(app, monkeypatch):
+    from relay_server import runtime_bootstrap
+
+    monkeypatch.setattr(runtime_bootstrap, "activate_runtime", lambda: False)
+
+    def fail_installer(on_line, _on_process):
+        on_line("Unable to locate finder for 'pip._vendor.distlib'")
+        return 1
+
+    monkeypatch.setattr(runtime_bootstrap, "run_installer_process", fail_installer)
+
+    async def scenario():
+        setup = asyncio.create_task(ensure_runtime_gui())
+        dialog = None
+        for _ in range(100):
+            await asyncio.sleep(0.01)
+            dialog = next((
+                widget for widget in QApplication.topLevelWidgets()
+                if isinstance(widget, RuntimeSetupDialog) and widget.failed
+            ), None)
+            if dialog is not None:
+                break
+        assert dialog is not None
+        assert "pip._vendor.distlib" in dialog.label.text()
+        dialog.close_after_failure()
+        ok, returned_dialog = await asyncio.wait_for(setup, timeout=1)
+        assert ok is False
+        assert returned_dialog is dialog
+
+    asyncio.run(scenario())
 
 
 def test_config_dialog_load_and_apply_persists(app, settings):

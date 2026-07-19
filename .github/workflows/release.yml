@@ -48,6 +48,11 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "console worker dispatch check failed" }
           & $exe --check-nvidia-runtime-installer
           if ($LASTEXITCODE -ne 0) { throw "console runtime installer check failed" }
+          $target = Join-Path $env:RUNNER_TEMP "console-pip-smoke"
+          & $exe --smoke-nvidia-runtime-installer $target
+          if ($LASTEXITCODE -ne 0 -or -not (Test-Path "$target/humanfriendly")) {
+            throw "console frozen pip smoke failed"
+          }
       - name: Smoke test (GUI import check)
         shell: pwsh
         timeout-minutes: 3
@@ -64,6 +69,12 @@ jobs:
           $p = Start-Process -FilePath $exe `
             -ArgumentList "--check-nvidia-runtime-installer" -Wait -PassThru
           if ($p.ExitCode -ne 0) { throw "GUI runtime installer check failed with exit $($p.ExitCode)" }
+          $target = Join-Path $env:RUNNER_TEMP "gui-pip-smoke"
+          $p = Start-Process -FilePath $exe `
+            -ArgumentList "--smoke-nvidia-runtime-installer", $target -Wait -PassThru
+          if ($p.ExitCode -ne 0 -or -not (Test-Path "$target/humanfriendly")) {
+            throw "GUI frozen pip smoke failed with exit $($p.ExitCode)"
+          }
           "GUI import check OK"
       - name: Package binaries
         shell: pwsh
@@ -80,5 +91,5 @@ jobs:
           gh release create "$env:TAG" `
             --title "Upscale Relay Server $env:TAG" `
             --generate-notes `
-            --notes "Small Windows server binaries that install the pinned TensorRT 10.13 / CUDA 12.9 runtime into a versioned per-user cache on first launch. CI and the release ZIP do not contain the multi-gigabyte NVIDIA stack. TensorRT, CUDA, and CPU providers are verified before the runtime is activated. The -gui ZIP is the tray app; the plain ZIP is the headless console server." `
+            --notes "Small Windows server binaries that install the pinned TensorRT 10.13 / CUDA 12.9 runtime into a versioned per-user cache on first launch. CI and the release ZIP do not contain the multi-gigabyte NVIDIA stack. Frozen pip is smoke-tested with a small wheel, TensorRT/CUDA/CPU are verified before activation, and setup failures show the actual error and close cleanly. The -gui ZIP is the tray app; the plain ZIP is the headless console server." `
             (Get-Item dist/*.zip).FullName
