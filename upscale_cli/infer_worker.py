@@ -28,6 +28,9 @@ import numpy as np
 
 _HDR = struct.Struct("<II")
 FROZEN_WORKER_ARG = "--upscale-infer-worker"
+_NVIDIA_PROVIDERS = {
+    "TensorrtExecutionProvider", "CUDAExecutionProvider", "CPUExecutionProvider",
+}
 
 # Input cap = TRT profile max; output cap covers scale 4x.
 _MAX_IN = (1440, 2560)
@@ -40,6 +43,8 @@ def worker_main(argv: list[str] | None = None) -> int:
 
     if argv == ["--check"]:
         return 0
+    if argv == ["--provider-check"]:
+        return provider_check()
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", required=True)
@@ -83,6 +88,23 @@ def worker_main(argv: list[str] | None = None) -> int:
     finally:
         shm_in.close()
         shm_out.close()
+
+
+def provider_check() -> int:
+    """Verify the frozen NVIDIA runtime imports and registers every fallback."""
+    from upscale_cli.infer import ort
+    from relay_server.runtime_bootstrap import verify_native_runtime
+
+    available = set(ort.get_available_providers())
+    missing = _NVIDIA_PROVIDERS - available
+    if missing:
+        print(
+            f"missing packaged providers: {sorted(missing)}; available: {sorted(available)}",
+            file=sys.stderr,
+        )
+        return 2
+    verify_native_runtime()
+    return 0
 
 
 class SubprocessUpscaler:

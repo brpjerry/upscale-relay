@@ -30,16 +30,19 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QFormLayout,
     QHBoxLayout,
+    QLabel,
     QLineEdit,
     QMenu,
     QMessageBox,
     QPushButton,
+    QProgressBar,
     QSpinBox,
     QSystemTrayIcon,
+    QVBoxLayout,
     QWidget,
 )
 
-from .gui_settings import EP_CHOICES, ServerSettings
+from .gui_settings import ServerSettings, available_ep_choices
 from .server import RelayServer
 
 log = logging.getLogger("relay.tray")
@@ -51,6 +54,95 @@ _APP_NAME = "Upscale Relay Server"
 _diagnostics_log = None
 _diagnostics_handler = None
 _console_stderr = None
+
+
+class RuntimeSetupDialog(QDialog):
+    """Non-modal first-run progress for the large NVIDIA runtime download."""
+
+    status = Signal(str)
+
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle(f"{_APP_NAME} — NVIDIA setup")
+        self.setMinimumWidth(520)
+        self._process = None
+        self.cancelled = False
+
+        self.label = QLabel(
+            "Installing the pinned TensorRT/CUDA runtime. This one-time "
+            "download is several gigabytes and may take a while."
+        )
+        self.label.setWordWrap(True)
+        self.progress = QProgressBar()
+        self.progress.setRange(0, 0)
+        self.cancel_button = QPushButton("Cancel")
+        self.cancel_button.clicked.connect(self.cancel)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(self.label)
+        layout.addWidget(self.progress)
+        layout.addWidget(self.cancel_button, alignment=Qt.AlignRight)
+        self.status.connect(self._set_status)
+
+    def _set_status(self, line: str) -> None:
+        if line:
+            self.label.setText(line[-500:])
+
+    def set_process(self, process) -> None:
+        self._process = process
+        if self.cancelled and process.poll() is None:
+            process.terminate()
+
+    def cancel(self) -> None:
+        self.cancelled = True
+        self.label.setText("Cancelling setup…")
+        self.cancel_button.setEnabled(False)
+        if self._process is not None and self._process.poll() is None:
+            self._process.terminate()
+
+    def reject(self) -> None:
+        # Treat the title-bar close gesture exactly like the visible Cancel
+        # button; never leave a several-GB installer running invisibly.
+        self.cancel()
+
+    def show_failure(self) -> None:
+        self.progress.hide()
+        self.label.setText(
+            "NVIDIA runtime setup failed. Check your network connection and "
+            "free disk space, then launch the server again."
+        )
+        self.cancel_button.setText("Close")
+        self.cancel_button.setEnabled(True)
+        self.cancel_button.clicked.disconnect()
+        self.cancel_button.clicked.connect(QApplication.quit)
+
+
+async def ensure_runtime_gui() -> tuple[bool, RuntimeSetupDialog | None]:
+    """Install the external runtime without blocking Qt's event loop."""
+    from .runtime_bootstrap import activate_runtime, run_installer_process
+
+    if activate_runtime():
+        return True, None
+
+    dialog = RuntimeSetupDialog()
+    dialog.show()
+
+    def report(line: str) -> None:
+        log.info("runtime setup: %s", line)
+        dialog.status.emit(line)
+
+    result = await asyncio.to_thread(
+        run_installer_process, report, dialog.set_process,
+    )
+    if result == 0 and activate_runtime():
+        dialog.hide()
+        dialog.deleteLater()
+        return True, None
+    if dialog.cancelled:
+        dialog.hide()
+    else:
+        dialog.show_failure()
+    return False, dialog
 
 
 def diagnostics_log_path() -> Path:
@@ -224,7 +316,7 @@ class ConfigDialog(QDialog):
         self.setWindowTitle(f"{_APP_NAME} — Configuration")
 
         self.ep_combo = QComboBox()
-        self.ep_combo.addItems(EP_CHOICES)
+        self.ep_combo.addItems(available_ep_choices())
         self.port_spin = QSpinBox()
         self.port_spin.setRange(1, 65535)
         self.library_edit = QLineEdit()
@@ -419,8 +511,15 @@ def main() -> None:
     loop = QEventLoop(app)
     asyncio.set_event_loop(loop)
 
-    tray = TrayApp(settings)
     with loop:
+        runtime_ok, setup_dialog = loop.run_until_complete(ensure_runtime_gui())
+        if not runtime_ok:
+            # Keep the failure dialog responsive until Close is selected.
+            if not setup_dialog or not setup_dialog.cancelled:
+                loop.run_forever()
+            return
+
+        tray = TrayApp(settings)
         # start() never blocks (it awaits the listeners binding, then returns);
         # run the initial startup, then hand control to the tray event loop.
         loop.run_until_complete(tray.start())

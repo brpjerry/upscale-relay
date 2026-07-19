@@ -22,22 +22,21 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
-      - name: Install with DirectML runtime and the tray GUI extra
-        run: python -m pip install ".[server-gui]" onnxruntime-directml pyinstaller
+      - name: Install lightweight server build dependencies
+        run: python -m pip install ".[server-gui]" pyinstaller
       - name: Build console server binary
         run: >
           pyinstaller --noconfirm --onedir --console
           --name upscale-relay-server
-          --collect-all onnxruntime
+          --collect-all pip
           --collect-submodules zeroconf
           packaging/server_entry.py
       - name: Build tray-GUI server binary
         run: >
           pyinstaller --noconfirm --onedir --windowed
           --name upscale-relay-server-gui
-          --collect-all onnxruntime
+          --collect-all pip
           --collect-submodules zeroconf
-          --collect-all PySide6
           --collect-submodules relay_server
           packaging/server_gui_entry.py
       - name: Smoke test (console)
@@ -47,6 +46,8 @@ jobs:
           & $exe --help
           & $exe --upscale-infer-worker --check
           if ($LASTEXITCODE -ne 0) { throw "console worker dispatch check failed" }
+          & $exe --check-nvidia-runtime-installer
+          if ($LASTEXITCODE -ne 0) { throw "console runtime installer check failed" }
       - name: Smoke test (GUI import check)
         shell: pwsh
         timeout-minutes: 3
@@ -60,6 +61,9 @@ jobs:
           $p = Start-Process -FilePath $exe `
             -ArgumentList "--upscale-infer-worker", "--check" -Wait -PassThru
           if ($p.ExitCode -ne 0) { throw "GUI worker dispatch check failed with exit $($p.ExitCode)" }
+          $p = Start-Process -FilePath $exe `
+            -ArgumentList "--check-nvidia-runtime-installer" -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "GUI runtime installer check failed with exit $($p.ExitCode)" }
           "GUI import check OK"
       - name: Package binaries
         shell: pwsh
@@ -76,5 +80,5 @@ jobs:
           gh release create "$env:TAG" `
             --title "Upscale Relay Server $env:TAG" `
             --generate-notes `
-            --notes "Windows server binaries (DirectML/CPU runtime): -gui is the double-click tray app with a configuration pane; the plain build is the headless console server. The TensorRT path needs a CUDA source install." `
+            --notes "Small Windows server binaries that install the pinned TensorRT 10.13 / CUDA 12.9 runtime into a versioned per-user cache on first launch. CI and the release ZIP do not contain the multi-gigabyte NVIDIA stack. TensorRT, CUDA, and CPU providers are verified before the runtime is activated. The -gui ZIP is the tray app; the plain ZIP is the headless console server." `
             (Get-Item dist/*.zip).FullName

@@ -13,8 +13,28 @@ from PySide6.QtCore import QSettings
 _ORG = "upscale-relay"
 _APP = "server"
 
-# Same set the ``relay-server --ep`` argument accepts (see server.main).
-EP_CHOICES: tuple[str, ...] = ("auto", "tensorrt", "cuda", "dml", "cpu")
+_PROVIDER_ALIASES = (
+    ("tensorrt", "TensorrtExecutionProvider"),
+    ("cuda", "CUDAExecutionProvider"),
+    ("dml", "DmlExecutionProvider"),
+    ("cpu", "CPUExecutionProvider"),
+)
+
+
+def available_ep_choices() -> tuple[str, ...]:
+    """Only offer providers registered in the installed ORT build."""
+    try:
+        import onnxruntime as ort
+
+        available = set(ort.get_available_providers())
+    except ImportError:
+        return ("auto",)
+    return ("auto", *(alias for alias, name in _PROVIDER_ALIASES if name in available))
+
+
+# Backward-compatible snapshot for callers that only need import-time choices.
+# The GUI itself calls available_ep_choices() after first-run setup completes.
+EP_CHOICES: tuple[str, ...] = available_ep_choices()
 
 
 class ServerSettings:
@@ -51,7 +71,7 @@ class ServerSettings:
     @property
     def ep(self) -> str:
         value = str(self._qs.value("server/ep", "auto"))
-        return value if value in EP_CHOICES else "auto"
+        return value if value in available_ep_choices() else "auto"
 
     @ep.setter
     def ep(self, v: str) -> None:

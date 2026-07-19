@@ -29,22 +29,21 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
-      - name: Install with DirectML runtime and the tray GUI extra
-        run: python -m pip install ".[server-gui]" onnxruntime-directml pyinstaller
+      - name: Install lightweight server build dependencies
+        run: python -m pip install ".[server-gui]" pyinstaller
       - name: Build console server binary
         run: >
           pyinstaller --noconfirm --onedir --console
           --name upscale-relay-server
-          --collect-all onnxruntime
+          --collect-all pip
           --collect-submodules zeroconf
           packaging/server_entry.py
       - name: Build tray-GUI server binary
         run: >
           pyinstaller --noconfirm --onedir --windowed
           --name upscale-relay-server-gui
-          --collect-all onnxruntime
+          --collect-all pip
           --collect-submodules zeroconf
-          --collect-all PySide6
           --collect-submodules relay_server
           packaging/server_gui_entry.py
       - name: Smoke test (console)
@@ -54,6 +53,8 @@ jobs:
           & $exe --help
           & $exe --upscale-infer-worker --check
           if ($LASTEXITCODE -ne 0) { throw "console worker dispatch check failed" }
+          & $exe --check-nvidia-runtime-installer
+          if ($LASTEXITCODE -ne 0) { throw "console runtime installer check failed" }
       - name: Smoke test (GUI import check)
         shell: pwsh
         timeout-minutes: 3
@@ -67,6 +68,9 @@ jobs:
           $p = Start-Process -FilePath $exe `
             -ArgumentList "--upscale-infer-worker", "--check" -Wait -PassThru
           if ($p.ExitCode -ne 0) { throw "GUI worker dispatch check failed with exit $($p.ExitCode)" }
+          $p = Start-Process -FilePath $exe `
+            -ArgumentList "--check-nvidia-runtime-installer" -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "GUI runtime installer check failed with exit $($p.ExitCode)" }
           "GUI import check OK"
       - uses: actions/upload-artifact@v7
         with:

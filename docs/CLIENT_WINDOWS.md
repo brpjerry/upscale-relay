@@ -73,9 +73,16 @@ collect those tests and therefore must also have `mpv-dev\libmpv-2.dll`.
 ## 4. Server-only Windows use
 
 The downloadable `upscale-relay-server` and `upscale-relay-server-gui`
-packages contain the server and DirectML/CPU inference runtime. They do not
-load `desktop_client.mpv_view` and do not require libmpv. TensorRT remains a
-source-install path with the NVIDIA runtime, as described in the root README.
+packages are intentionally small and do not contain the multi-gigabyte NVIDIA
+stack. On first launch they install the pinned TensorRT 10.13/CUDA 12.9 runtime
+under `%LOCALAPPDATA%\upscale-relay\runtimes`; the GUI shows a progress window
+and the console build prints progress. Setup verifies TensorRT, CUDA, and CPU
+providers before publishing the versioned runtime, so a partial download is
+never used and is retried on the next launch. An NVIDIA driver, network access,
+and several gigabytes of download and temporary disk space are required, but no
+separate CUDA Toolkit or TensorRT installation is needed. CI does not download
+or package the NVIDIA stack. The server packages do not load
+`desktop_client.mpv_view` and do not require libmpv.
 
 The tray GUI's configuration window includes a **Write server log** checkbox,
 enabled by default. It applies immediately and writes normal server messages,

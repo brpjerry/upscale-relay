@@ -1,4 +1,5 @@
 import sys
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
@@ -45,8 +46,23 @@ def test_frozen_worker_dispatch_strips_internal_argument(monkeypatch):
 
 
 def test_frozen_release_reports_unavailable_tensorrt_clearly():
-    with pytest.raises(RuntimeError, match="Windows release binaries include DirectML/CPU"):
+    with pytest.raises(RuntimeError, match="first-launch NVIDIA setup"):
         _should_use_tensorrt("tensorrt", {"DmlExecutionProvider", "CPUExecutionProvider"})
 
     assert _should_use_tensorrt("auto", {"DmlExecutionProvider"}) is False
     assert _should_use_tensorrt("auto", {"TensorrtExecutionProvider"}) is True
+
+
+def test_packaged_provider_check_requires_nvidia_and_cpu_fallbacks(monkeypatch):
+    fake_infer = ModuleType("upscale_cli.infer")
+    fake_infer.ort = SimpleNamespace(
+        get_available_providers=lambda: sorted(infer_worker._NVIDIA_PROVIDERS),
+    )
+    monkeypatch.setitem(sys.modules, "upscale_cli.infer", fake_infer)
+    monkeypatch.delenv("UPSCALE_RELAY_ACTIVE_RUNTIME", raising=False)
+    assert infer_worker.provider_check() == 0
+
+    fake_infer.ort = SimpleNamespace(
+        get_available_providers=lambda: ["CUDAExecutionProvider", "CPUExecutionProvider"],
+    )
+    assert infer_worker.provider_check() == 2
