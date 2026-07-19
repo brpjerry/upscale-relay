@@ -53,6 +53,18 @@ RESUME_WATERMARK_MS = 9_500
 _QUEUE_DEPTH = 4  # frames buffered between stages
 
 
+def _should_use_tensorrt(ep: str, available_providers: set[str]) -> bool:
+    provider = "TensorrtExecutionProvider"
+    if ep == "tensorrt" and provider not in available_providers:
+        raise RuntimeError(
+            "TensorRT execution provider is not available in this build; "
+            f"installed providers: {sorted(available_providers)}. Windows release "
+            "binaries include DirectML/CPU; use --ep auto or --ep dml, or run "
+            "the server from a CUDA/TensorRT source environment."
+        )
+    return ep == "tensorrt" or (ep == "auto" and provider in available_providers)
+
+
 @dataclass(slots=True)
 class _FlushCmd:
     epoch: int
@@ -165,9 +177,7 @@ class Pipeline:
             tile = None if (video.height <= 1440 and video.width <= 2560) else 1024
             import onnxruntime as _ort
 
-            use_trt = ep == "tensorrt" or (
-                ep == "auto" and "TensorrtExecutionProvider" in _ort.get_available_providers()
-            )
+            use_trt = _should_use_tensorrt(ep, set(_ort.get_available_providers()))
             if use_trt:
                 # The ORT TensorRT EP corrupts the process heap on this stack
                 # (see upscale_cli/infer_worker.py) — run it out-of-process.

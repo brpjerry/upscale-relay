@@ -40,8 +40,10 @@ On Windows the server also ships as a double-click tray app: `relay-server-gui`
 (the `upscale-relay-server-gui.exe` release binary, installable with the
 `.[server-gui]` extra) starts the server from its last-saved configuration and
 drops an icon in the notification area. Its configuration pane sets the
-execution provider, control port, media library folder, and models folder, then
-restarts the listeners in place. The headless `relay-server` CLI is unchanged.
+execution provider, control port, media library folder, models folder, and
+file logging, then restarts the listeners in place. GUI logging defaults on and
+writes `upscale-relay-server.log` to the user's Documents folder. The headless
+`relay-server` CLI continues to log to its console.
 
 Add `--library <folder-or-UNC-path>` to browse and play server-hosted media.
 The final post-ONNX scale defaults to Lanczos; set a different server default

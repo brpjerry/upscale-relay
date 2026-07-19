@@ -76,3 +76,14 @@ The downloadable `upscale-relay-server` and `upscale-relay-server-gui`
 packages contain the server and DirectML/CPU inference runtime. They do not
 load `desktop_client.mpv_view` and do not require libmpv. TensorRT remains a
 source-install path with the NVIDIA runtime, as described in the root README.
+
+The tray GUI's configuration window includes a **Write server log** checkbox,
+enabled by default. It applies immediately and writes normal server messages,
+Python fault stacks, and native crash attribution to:
+
+```text
+%USERPROFILE%\Documents\upscale-relay-server.log
+```
+
+The checkbox shows the resolved path, including a redirected Documents folder.
+The headless console server logs to its terminal instead.

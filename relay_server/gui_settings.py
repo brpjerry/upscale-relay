@@ -64,3 +64,11 @@ class ServerSettings:
     @mdns.setter
     def mdns(self, v: bool) -> None:
         self._qs.setValue("server/mdns", bool(v))
+
+    @property
+    def file_logging(self) -> bool:
+        return self._qs.value("server/file_logging", True, type=bool)
+
+    @file_logging.setter
+    def file_logging(self, v: bool) -> None:
+        self._qs.setValue("server/file_logging", bool(v))

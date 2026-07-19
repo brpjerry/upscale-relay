@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import sys
 
@@ -60,6 +61,7 @@ def settings():
     s.library_dir = ""
     s.models_dir = "models"
     s.mdns = True
+    s.file_logging = True
     return s
 
 
@@ -69,6 +71,7 @@ def test_settings_roundtrip(settings):
     settings.library_dir = "D:/media"
     settings.models_dir = "D:/models"
     settings.mdns = False
+    settings.file_logging = False
 
     fresh = ServerSettings(scope="test-server-tray")
     assert fresh.ep == "dml"
@@ -76,6 +79,7 @@ def test_settings_roundtrip(settings):
     assert fresh.library_dir == "D:/media"
     assert fresh.models_dir == "D:/models"
     assert fresh.mdns is False
+    assert fresh.file_logging is False
 
 
 def test_settings_reject_unknown_ep(settings):
@@ -97,6 +101,7 @@ def test_config_dialog_load_and_apply_persists(app, settings):
         assert dialog.ep_combo.currentText() == "cuda"
         assert dialog.port_spin.value() == 8600
         assert dialog.library_edit.text() == "C:/lib"
+        assert dialog.logging_check.isChecked()
 
         applied = []
         dialog.applied.connect(lambda: applied.append(True))
@@ -104,6 +109,7 @@ def test_config_dialog_load_and_apply_persists(app, settings):
         dialog.port_spin.setValue(8700)
         dialog.library_edit.setText("C:/other")
         dialog.models_edit.setText("C:/models")
+        dialog.logging_check.setChecked(False)
         dialog._on_apply()
 
         assert applied == [True]
@@ -112,6 +118,7 @@ def test_config_dialog_load_and_apply_persists(app, settings):
         assert fresh.port == 8700
         assert fresh.library_dir == "C:/other"
         assert fresh.models_dir == "C:/models"
+        assert fresh.file_logging is False
     finally:
         dialog.deleteLater()
 
@@ -165,7 +172,7 @@ def test_tray_app_start_failure_opens_config(app, settings, tmp_path, monkeypatc
     tray.tray.hide()
 
 
-def test_setup_diagnostics_survives_no_stderr(tmp_path, monkeypatch):
+def test_setup_diagnostics_writes_documents_log_without_stderr(tmp_path, monkeypatch):
     # A --windowed frozen build has sys.stderr is None; a bare
     # faulthandler.enable() would raise "sys.stderr is None" and the exe would
     # never start. setup_diagnostics() must fall back to a log file instead.
@@ -176,17 +183,19 @@ def test_setup_diagnostics_survives_no_stderr(tmp_path, monkeypatch):
     real_stderr = sys.stderr  # captured before we blank it, for cleanup
     was_enabled = faulthandler.is_enabled()
     monkeypatch.setattr(sys, "stderr", None)
-    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    monkeypatch.setenv("RELAY_GUI_LOG_DIR", str(tmp_path))
     tray._diagnostics_log = None
+    tray._diagnostics_handler = None
     try:
-        tray.setup_diagnostics()  # must not raise
-        log_file = tmp_path / "upscale-relay" / "server-gui.log"
+        tray.setup_diagnostics(True)  # must not raise
+        logging.getLogger("relay.test").info("documents log probe")
+        tray._diagnostics_handler.flush()
+        log_file = tmp_path / "upscale-relay-server.log"
         assert log_file.exists()
+        assert "documents log probe" in log_file.read_text(encoding="utf-8")
         assert tray._diagnostics_log is not None
     finally:
-        if tray._diagnostics_log is not None:
-            tray._diagnostics_log.close()
-            tray._diagnostics_log = None
+        tray.configure_file_logging(False)
         # Restore faulthandler against the real stderr (still blanked here —
         # monkeypatch only undoes at teardown, after this finally runs).
         faulthandler.disable()

@@ -41,6 +41,8 @@ Server (runs on the Windows box, not the laptop):
 `relay-server --models-dir models --ep tensorrt` from `.venv-cuda`.
 `http://<server>:8590/status` returns per-session pipeline fps + per-stage ms —
 first stop for any performance question.
+The tray GUI's optional file log is `Documents/upscale-relay-server.log` and is
+enabled by default through its persisted configuration checkbox.
 
 Client flags: `--debug` (faulthandler), `--trace` (consume-loop trace),
 `--mpv-osc` (mpv OSC overlay — known to destabilize seeks), `--no-hwdec`
