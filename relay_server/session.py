@@ -22,6 +22,37 @@ from .pipeline import Pipeline, VideoConfig
 
 log = logging.getLogger("relay.session")
 
+# open_session keepalive pacing: a quick open sends nothing (initial delay
+# never elapses); a slow one — a first-use TensorRT engine build runs for
+# minutes — ticks session_progress so clients can hold their timeout open and
+# show a loading indicator. Module-level so tests can shrink them.
+PROGRESS_INITIAL_DELAY_S = 2.0
+PROGRESS_INTERVAL_S = 2.0
+
+_MAX_CHAPTERS = 512
+
+
+def _sanitize_chapters(raw: Any) -> list[dict]:
+    """Validate client-supplied file.chapters before echoing them back."""
+    if not isinstance(raw, list):
+        return []
+    chapters = []
+    for item in raw[:_MAX_CHAPTERS]:
+        if not isinstance(item, dict):
+            continue
+        start_s = item.get("start_s")
+        if not isinstance(start_s, (int, float)) or start_s < 0:
+            continue
+        end_s = item.get("end_s")
+        title = item.get("title")
+        chapters.append({
+            "start_s": float(start_s),
+            "end_s": float(end_s) if isinstance(end_s, (int, float)) else None,
+            "title": str(title) if title is not None else None,
+        })
+    chapters.sort(key=lambda c: c["start_s"])
+    return chapters
+
 
 class State(str, Enum):
     OPEN = "open"
@@ -46,6 +77,7 @@ class Session:
         self.source_path: str | None = None
         self.source_track: VideoTrack | None = None
         self._source_task: asyncio.Task | None = None
+        self._open_task: asyncio.Task | None = None
         self.state = State.OPEN
         self.epoch = 0
         self.uplink_token = new_token()
@@ -63,7 +95,9 @@ class Session:
     async def send(self, type_: str, **fields: Any) -> None:
         try:
             await self.ws.send_str(json.dumps({"type": type_, **fields}))
-        except ConnectionResetError:
+        except (ConnectionResetError, RuntimeError):
+            # RuntimeError: aiohttp's "closing transport" — reachable now that
+            # a backgrounded open can outlive its WS.
             pass
 
     async def set_state(self, state: State) -> None:
@@ -100,6 +134,25 @@ class Session:
 
         self._loop.call_soon_threadsafe(_put)
 
+    async def _progress_keepalive(self, stage: str, message: str,
+                                  done: asyncio.Event) -> None:
+        """Tick session_progress until ``done`` while a slow open runs."""
+        started = time.monotonic()
+        try:
+            await asyncio.wait_for(done.wait(), PROGRESS_INITIAL_DELAY_S)
+            return  # quick open: stay silent
+        except asyncio.TimeoutError:
+            pass
+        while not done.is_set():
+            await self.send(
+                "session_progress", stage=stage, message=message,
+                elapsed_s=round(time.monotonic() - started, 1),
+            )
+            try:
+                await asyncio.wait_for(done.wait(), PROGRESS_INTERVAL_S)
+            except asyncio.TimeoutError:
+                continue
+
     def _pipeline_error(self, message: str) -> None:
         async def _report() -> None:
             await self.send("error", code="pipeline_error", message=message, fatal=True)
@@ -108,6 +161,23 @@ class Session:
         asyncio.run_coroutine_threadsafe(_report(), self._loop)
 
     # -- control message handlers ----------------------------------------------
+
+    def begin_open(self, msg: dict) -> None:
+        """Run handle_open as a task so the control WS keeps servicing pings
+        while a slow pipeline build (first-use TensorRT engine) runs."""
+        self._open_task = asyncio.create_task(self._open_and_reap(msg))
+
+    async def _open_and_reap(self, msg: dict) -> None:
+        try:
+            await self.handle_open(msg)
+        except Exception:
+            log.exception("session %s: open failed", self.id)
+        finally:
+            # The WS may have died while the engine was building; close() ran
+            # with pipeline still None, so dispose the late arrival here.
+            if self.state == State.CLOSED and self.pipeline is not None:
+                pipeline, self.pipeline = self.pipeline, None
+                await asyncio.to_thread(pipeline.close)
 
     async def handle_open(self, msg: dict) -> None:
         source = msg.get("source", "uplink")
@@ -161,6 +231,16 @@ class Session:
             time_base=Fraction(*video["time_base"]),
             avg_rate=Fraction(*video["avg_rate"]) if video.get("avg_rate") else None,
         )
+        # Pipeline construction can block for minutes when a model's TensorRT
+        # engine is built for the first time; keepalives stop the client's
+        # open_session timeout from firing meanwhile.
+        build_done = asyncio.Event()
+        keepalive = asyncio.create_task(self._progress_keepalive(
+            "pipeline_init",
+            f"Preparing {model_name} — the first use of a model builds a "
+            "TensorRT engine and can take several minutes",
+            build_done,
+        ))
         try:
             self.pipeline = await asyncio.to_thread(
                 Pipeline,
@@ -179,9 +259,17 @@ class Session:
             await self.send("error", code="pipeline_error", message=str(err), fatal=True)
             await self.close()
             return
+        finally:
+            build_done.set()
+            await keepalive
         duration_s = (self.source_track.duration_seconds() if self.source_track else
                       (msg.get("file") or {}).get("duration_s"))
         avg_rate = self.source_track.average_rate if self.source_track else cfg.avg_rate
+        # server_file: chapters come from the file itself. uplink: the client
+        # is the only party with the container, so echo its file.chapters —
+        # session_opened.chapters is the one place clients read them from.
+        chapters = (self.source_track.chapters() if self.source_track else
+                    _sanitize_chapters((msg.get("file") or {}).get("chapters")))
         await self.send(
             "session_opened",
             session_id=self.id,
@@ -200,6 +288,7 @@ class Session:
             time_base=[cfg.time_base.numerator, cfg.time_base.denominator],
             duration_s=duration_s,
             avg_rate=[avg_rate.numerator, avg_rate.denominator] if avg_rate else None,
+            chapters=chapters or None,
         )
 
     media_port: int = 0  # set by server at construction

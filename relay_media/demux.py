@@ -98,6 +98,31 @@ class VideoTrack:
             flags |= FLAG_DISCONTINUITY
         return MediaPacket(payload=info.payload, flags=flags, epoch=epoch, pts=info.pts, dts=info.dts)
 
+    def chapters(self) -> list[dict]:
+        """Chapter list as wire-format dicts (docs/PROTOCOL.md session_opened).
+
+        Each entry: {"start_s": float, "end_s": float | None, "title": str | None},
+        sorted by start. Empty when the container has no chapters.
+        """
+        with self._lock:
+            raw = self._container.chapters()
+        chapters = []
+        for chapter in raw:
+            time_base = chapter.get("time_base")
+            if time_base is None:
+                continue
+            start_s = float(chapter["start"] * time_base)
+            end = chapter.get("end")
+            end_s = float(end * time_base) if end is not None else None
+            title = (chapter.get("metadata") or {}).get("title")
+            chapters.append({
+                "start_s": max(0.0, start_s),
+                "end_s": end_s,
+                "title": title or None,
+            })
+        chapters.sort(key=lambda c: c["start_s"])
+        return chapters
+
     def duration_seconds(self) -> float | None:
         if self._stream.duration:
             return float(self._stream.duration * self.time_base)

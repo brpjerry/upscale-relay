@@ -90,6 +90,7 @@ class FakeSessionClient(FakeLibraryClient):
             downlink_codec="hevc", downlink_width=1920, downlink_height=1080,
             downlink_container="matroska", time_base=Fraction(1, 1000),
             duration_s=120.0, avg_rate=Fraction(24, 1),
+            chapters=getattr(self, "chapters", None),
         )
         return self.session
 
@@ -161,6 +162,46 @@ def test_server_session_uses_http_original_and_server_metadata(window):
         assert window.player.started[4] == Fraction(24, 1)
 
     asyncio.run(scenario())
+
+
+def test_session_chapters_populate_and_clear_controls(window):
+    async def scenario():
+        client = FakeSessionClient()
+        client.chapters = [
+            {"start_s": 0.0, "end_s": 40.0, "title": "Opening"},
+            {"start_s": 40.0, "end_s": 80.0, "title": None},
+            {"start_s": 80.0, "end_s": 120.0, "title": "Ending"},
+        ]
+        window.client = client
+        await window._start_session("Shows/Episode.mkv", source="server_file")
+
+        assert not window.chapter_combo.isHidden()
+        assert not window.chapter_prev_btn.isHidden()
+        assert window.chapter_combo.count() == 3
+        assert window.chapter_combo.itemText(0) == "01  Opening  (00:00)"
+        assert window.chapter_combo.itemText(1) == "02  Chapter 2  (00:40)"
+        assert window.chapter_combo.itemData(2) == 80.0
+        assert window.seek_slider._chapter_fractions == [40.0 / 120.0, 80.0 / 120.0]
+
+        window._on_position(45.0)
+        assert window.chapter_combo.currentIndex() == 1
+
+        window.client = None  # the fake has no teardown; skip the reconnect path
+        await window._teardown_session()
+        assert window.chapter_combo.isHidden()
+        assert window.chapter_combo.count() == 0
+        assert window.seek_slider._chapter_fractions == []
+
+    asyncio.run(scenario())
+
+
+def test_open_progress_indicator_toggles(window):
+    assert window.open_progress.isHidden()
+    window._on_open_progress({"message": "Preparing anime — TensorRT engine", "elapsed_s": 12.0})
+    assert not window.open_progress.isHidden()
+    assert window.statusBar().currentMessage() == "Preparing anime — TensorRT engine (12 s)"
+    window._set_opening(False)
+    assert window.open_progress.isHidden()
 
 
 def test_loopback_stream_delivers_queued_bytes_and_reports_stats():

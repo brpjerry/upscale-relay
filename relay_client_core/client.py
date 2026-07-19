@@ -52,6 +52,13 @@ _UPLINK_BATCH = 16  # packets demuxed+sent per loop-turn pair
 _DOWNLINK_BATCH = 8  # one Qt-loop wakeup per batch, not per lossless frame
 _DOWNLINK_SOCKET_BUFFER = 4 * 1024 * 1024
 
+# open_session inactivity window: each server session_progress keepalive
+# (docs/PROTOCOL.md — ticked during first-use TensorRT engine builds, which
+# run for minutes) refreshes the deadline, so a building server never times
+# out while a silent one still fails within this window. Against a server
+# without keepalives this degrades to the old fixed 240 s timeout.
+OPEN_SESSION_TIMEOUT_S = 240.0
+
 
 class _ThreadBridgeQueue:
     """A bounded queue written by a socket thread and awaited by asyncio.
@@ -161,6 +168,9 @@ class SessionInfo:
     avg_rate: Fraction | None = None
     fit_mode: str = "fit"
     resize_algorithm: str | None = None
+    # Wire-format chapter dicts ({start_s, end_s?, title?}), sorted by start_s;
+    # None when the source has none (docs/PROTOCOL.md session_opened).
+    chapters: list[dict] | None = None
 
 
 class RelayClient:
@@ -191,6 +201,10 @@ class RelayClient:
         self._downlink_sample_at = time.monotonic()
         self.errors: list[dict] = []
         self.buffered_ms = 0  # consumer updates; buffer_report loop sends it
+        # Optional UI hook: called with each session_progress message dict
+        # (from the control-reader task, i.e. on the event-loop thread).
+        self.on_progress = None
+        self._last_activity = time.monotonic()
 
     # -- control channel -------------------------------------------------------
 
@@ -208,11 +222,33 @@ class RelayClient:
         assert self._ws is not None
         await self._ws.send_str(json.dumps({"type": type_, **fields}))
 
-    async def _request(self, expect: str, type_: str, timeout: float = 30, **fields) -> dict:
+    async def _request(self, expect: str, type_: str, timeout: float = 30,
+                       keepalive: bool = False, **fields) -> dict:
         fut: asyncio.Future = asyncio.get_running_loop().create_future()
         self._pending[expect] = fut
+        self._last_activity = time.monotonic()
         await self._send(type_, **fields)
-        return await asyncio.wait_for(fut, timeout=timeout)
+        if not keepalive:
+            return await asyncio.wait_for(fut, timeout=timeout)
+        # Inactivity deadline: session_progress keepalives push it out, so a
+        # server that is visibly working (TensorRT engine build) never times
+        # out while a silent one still fails within ``timeout``.
+        try:
+            while True:
+                remaining = self._last_activity + timeout - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(
+                        f"{type_}: no reply or progress for {timeout:.0f}s")
+                try:
+                    return await asyncio.wait_for(
+                        asyncio.shield(fut), timeout=min(remaining, 2.0))
+                except asyncio.TimeoutError:
+                    continue
+        except BaseException:
+            if self._pending.get(expect) is fut:
+                del self._pending[expect]
+            fut.cancel()
+            raise
 
     async def _control_reader(self) -> None:
         assert self._ws is not None
@@ -221,6 +257,14 @@ class RelayClient:
                 continue
             msg = json.loads(raw.data)
             mtype = msg.get("type")
+            if mtype == "session_progress":
+                self._last_activity = time.monotonic()
+                if self.on_progress is not None:
+                    try:
+                        self.on_progress(msg)
+                    except Exception:
+                        log.exception("on_progress callback failed")
+                continue
             if mtype == "state":
                 self.state = msg["state"]
             elif mtype == "error":
@@ -246,11 +290,18 @@ class RelayClient:
         duration_s = self.track.duration_seconds() if self.track else None
         source = ("uplink" if cfg.source == "uplink" else
                   {"type": "server_file", "path": cfg.path})
-        # Generous timeout: a cold TensorRT engine build at session open can
-        # take a minute or two.
+        # keepalive=True: a cold TensorRT engine build at session open can run
+        # for minutes; the server's session_progress ticks keep the request
+        # alive (OPEN_SESSION_TIMEOUT_S is a window of *inactivity*, not a cap
+        # on total build time).
+        file_info = {"name": cfg.path, "duration_s": duration_s}
+        if self.track is not None:
+            chapters = self.track.chapters()
+            if chapters:
+                file_info["chapters"] = chapters
         fields = {
             "source": source,
-            "file": {"name": cfg.path, "duration_s": duration_s},
+            "file": file_info,
             "model": cfg.model,
             "quality_tier": cfg.quality_tier,
             "display": {"w": cfg.display_w, "h": cfg.display_h},
@@ -262,7 +313,8 @@ class RelayClient:
             fields["video"] = video
         try:
             msg = await self._request(
-                "session_opened", "open_session", timeout=240, **fields
+                "session_opened", "open_session",
+                timeout=OPEN_SESSION_TIMEOUT_S, keepalive=True, **fields,
             )
         except BaseException:
             if self.track is not None:
@@ -287,6 +339,7 @@ class RelayClient:
             avg_rate=Fraction(*msg["avg_rate"]) if msg.get("avg_rate") else None,
             fit_mode=msg.get("fit_mode", cfg.fit_mode),
             resize_algorithm=msg.get("resize_algorithm", cfg.resize_algorithm),
+            chapters=msg.get("chapters") or None,
         )
         return self.session
 
