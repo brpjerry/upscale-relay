@@ -84,6 +84,10 @@ separate CUDA Toolkit or TensorRT installation is needed. CI does not download
 or package the NVIDIA stack. The server packages do not load
 `desktop_client.mpv_view` and do not require libmpv.
 
+If setup fails, the GUI shows the actual installer error and the log path; its
+Close button exits the application immediately. Relaunching retries from a
+clean staging directory.
+
 The tray GUI's configuration window includes a **Write server log** checkbox,
 enabled by default. It applies immediately and writes normal server messages,
 Python fault stacks, and native crash attribution to:

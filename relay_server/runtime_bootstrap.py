@@ -25,6 +25,7 @@ from typing import Callable
 
 RUNTIME_INSTALL_ARG = "--install-nvidia-runtime"
 RUNTIME_INSTALL_CHECK_ARG = "--check-nvidia-runtime-installer"
+RUNTIME_INSTALL_SMOKE_ARG = "--smoke-nvidia-runtime-installer"
 RUNTIME_VALIDATE_ARG = "--validate-nvidia-runtime"
 RUNTIME_STACK_ID = (
     f"ort1.23.2-trt10.13.3-cuda12.9-"
@@ -121,21 +122,42 @@ def activate_runtime(path: Path | None = None, *, require_ready: bool = True) ->
     return True
 
 
-def _run_pip(target: Path) -> int:
+def _prepare_pip_resources() -> None:
+    """Teach distlib how to read resources collected by PyInstaller.
+
+    pip uses distlib to generate scripts while installing wheels. PyInstaller's
+    loader is not in distlib's built-in finder registry, even when every file
+    is present, which otherwise fails with "Unable to locate finder".
+    """
+    distlib = importlib.import_module("pip._vendor.distlib")
+    resources = importlib.import_module("pip._vendor.distlib.resources")
+    resources.register_finder(distlib.__loader__, resources.ResourceFinder)
+
+
+def _run_pip(
+    target: Path,
+    packages: tuple[str, ...] = NVIDIA_RUNTIME_PACKAGES,
+    *,
+    ignore_installed: bool = False,
+) -> int:
     # pip is deliberately collected into the frozen release.  Invoking its CLI
     # in this short-lived internal installer process avoids requiring Python on
     # the user's machine and keeps imports out of the long-running server.
     from pip._internal.cli.main import main as pip_main
 
-    return int(pip_main([
+    _prepare_pip_resources()
+    args = [
         "install",
         "--only-binary=:all:",
         "--no-cache-dir",
         "--disable-pip-version-check",
         "--extra-index-url", "https://pypi.nvidia.com",
         "--target", str(target),
-        *NVIDIA_RUNTIME_PACKAGES,
-    ]))
+    ]
+    if ignore_installed:
+        args.append("--ignore-installed")
+    args.extend(packages)
+    return int(pip_main(args))
 
 
 @contextmanager
@@ -282,7 +304,14 @@ def maybe_run_runtime_installer(argv: list[str] | None = None) -> int | None:
         # Frozen-build smoke test: prove pip's internal CLI was collected
         # without starting the multi-gigabyte network installation in CI.
         importlib.import_module("pip._internal.cli.main")
+        _prepare_pip_resources()
         return 0
+    if len(args) == 2 and args[0] == RUNTIME_INSTALL_SMOKE_ARG:
+        target = Path(args[1])
+        target.mkdir(parents=True, exist_ok=True)
+        return _run_pip(
+            target, ("humanfriendly==10.0",), ignore_installed=True,
+        )
     if len(args) == 2 and args[0] == RUNTIME_VALIDATE_ARG:
         try:
             _validate_runtime(Path(args[1]))

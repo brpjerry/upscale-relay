@@ -60,6 +60,7 @@ class RuntimeSetupDialog(QDialog):
     """Non-modal first-run progress for the large NVIDIA runtime download."""
 
     status = Signal(str)
+    closed = Signal()
 
     def __init__(self):
         super().__init__()
@@ -67,6 +68,7 @@ class RuntimeSetupDialog(QDialog):
         self.setMinimumWidth(520)
         self._process = None
         self.cancelled = False
+        self.failed = False
 
         self.label = QLabel(
             "Installing the pinned TensorRT/CUDA runtime. This one-time "
@@ -103,18 +105,27 @@ class RuntimeSetupDialog(QDialog):
     def reject(self) -> None:
         # Treat the title-bar close gesture exactly like the visible Cancel
         # button; never leave a several-GB installer running invisibly.
-        self.cancel()
+        if self.failed:
+            self.close_after_failure()
+        else:
+            self.cancel()
 
-    def show_failure(self) -> None:
+    def show_failure(self, detail: str) -> None:
+        self.failed = True
         self.progress.hide()
         self.label.setText(
-            "NVIDIA runtime setup failed. Check your network connection and "
-            "free disk space, then launch the server again."
+            "NVIDIA runtime setup failed:\n\n"
+            f"{detail or 'No error detail was reported.'}\n\n"
+            f"Full log: {diagnostics_log_path()}"
         )
         self.cancel_button.setText("Close")
         self.cancel_button.setEnabled(True)
         self.cancel_button.clicked.disconnect()
-        self.cancel_button.clicked.connect(QApplication.quit)
+        self.cancel_button.clicked.connect(self.close_after_failure)
+
+    def close_after_failure(self, _checked: bool = False) -> None:
+        self.hide()
+        self.closed.emit()
 
 
 async def ensure_runtime_gui() -> tuple[bool, RuntimeSetupDialog | None]:
@@ -126,8 +137,12 @@ async def ensure_runtime_gui() -> tuple[bool, RuntimeSetupDialog | None]:
 
     dialog = RuntimeSetupDialog()
     dialog.show()
+    last_line = ""
 
     def report(line: str) -> None:
+        nonlocal last_line
+        if line:
+            last_line = line
         log.info("runtime setup: %s", line)
         dialog.status.emit(line)
 
@@ -141,7 +156,15 @@ async def ensure_runtime_gui() -> tuple[bool, RuntimeSetupDialog | None]:
     if dialog.cancelled:
         dialog.hide()
     else:
-        dialog.show_failure()
+        dialog.show_failure(last_line)
+        closed = asyncio.get_running_loop().create_future()
+
+        def finish_close() -> None:
+            if not closed.done():
+                closed.set_result(None)
+
+        dialog.closed.connect(finish_close)
+        await closed
     return False, dialog
 
 
@@ -514,9 +537,6 @@ def main() -> None:
     with loop:
         runtime_ok, setup_dialog = loop.run_until_complete(ensure_runtime_gui())
         if not runtime_ok:
-            # Keep the failure dialog responsive until Close is selected.
-            if not setup_dialog or not setup_dialog.cancelled:
-                loop.run_forever()
             return
 
         tray = TrayApp(settings)

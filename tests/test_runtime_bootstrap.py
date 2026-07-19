@@ -84,7 +84,7 @@ def test_activate_adds_external_packages_and_native_dll_dirs(monkeypatch, tmp_pa
     assert runtime._dll_directory_handles
 
 
-def test_frozen_installer_dispatch_and_command(monkeypatch):
+def test_frozen_installer_dispatch_and_command(monkeypatch, tmp_path):
     monkeypatch.setattr(runtime, "install_runtime", lambda: 7)
     assert runtime.maybe_run_runtime_installer(["ordinary"]) is None
     assert runtime.maybe_run_runtime_installer([runtime.RUNTIME_INSTALL_ARG]) == 7
@@ -98,6 +98,20 @@ def test_frozen_installer_dispatch_and_command(monkeypatch):
         runtime.RUNTIME_VALIDATE_ARG, "C:/runtime-staging",
     ]) == 0
     assert validated == [Path("C:/runtime-staging")]
+
+    pip_calls = []
+    monkeypatch.setattr(
+        runtime, "_run_pip",
+        lambda target, packages, ignore_installed=False:
+            pip_calls.append((target, packages, ignore_installed)) or 0,
+    )
+    smoke_target = tmp_path / "pip-smoke"
+    assert runtime.maybe_run_runtime_installer([
+        runtime.RUNTIME_INSTALL_SMOKE_ARG, str(smoke_target),
+    ]) == 0
+    assert pip_calls == [(
+        smoke_target, ("humanfriendly==10.0",), True,
+    )]
 
     monkeypatch.setattr(sys, "frozen", True, raising=False)
     monkeypatch.setattr(sys, "executable", "server.exe")
