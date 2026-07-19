@@ -36,6 +36,7 @@ RUNTIME_STACK_ID = (
 # dependencies at install time; these pins prevent CUDA/TensorRT components
 # from silently drifting out of the validated combination.
 NVIDIA_RUNTIME_PACKAGES = (
+    "onnx==1.22.0",
     "onnxruntime-gpu==1.23.2",
     "tensorrt-cu12-libs==10.13.3.9.post1",
     "cuda-toolkit==12.9.2.0",

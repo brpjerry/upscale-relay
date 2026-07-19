@@ -45,6 +45,13 @@ def test_frozen_worker_dispatch_strips_internal_argument(monkeypatch):
     assert received == [["--check"]]
 
 
+def test_packaged_onnx_check(monkeypatch):
+    fake_onnx = ModuleType("onnx")
+    fake_onnx.__version__ = "1.22.0"
+    monkeypatch.setitem(sys.modules, "onnx", fake_onnx)
+    assert infer_worker.worker_main(["--onnx-check"]) == 0
+
+
 def test_frozen_release_reports_unavailable_tensorrt_clearly():
     with pytest.raises(RuntimeError, match="first-launch NVIDIA setup"):
         _should_use_tensorrt("tensorrt", {"DmlExecutionProvider", "CPUExecutionProvider"})

@@ -45,10 +45,12 @@ Release binaries stay small and use `relay_server/runtime_bootstrap.py` to
 install the pinned NVIDIA wheels into a versioned `%LOCALAPPDATA%` runtime on
 first launch. CI must not install or package the multi-GB `.[nvidia]` extra; it
 smoke-installs one small wheel through each frozen executable to exercise pip
-without downloading the NVIDIA stack. Runtime setup itself verifies TensorRT,
-CUDA, and CPU before publishing its ready marker.
+without downloading the NVIDIA stack, and separately asserts packaged ONNX can
+import so the uint8 graph wrapper cannot silently disappear. Runtime setup
+itself verifies TensorRT, CUDA, and CPU before publishing its ready marker.
 The tray GUI's optional file log is `Documents/upscale-relay-server.log` and is
-enabled by default through its persisted configuration checkbox.
+enabled by default through its persisted configuration checkbox. While enabled,
+the GUI server logs 2-second `relay.stats` samples and a final session sample.
 
 Client flags: `--debug` (faulthandler), `--trace` (consume-loop trace),
 `--mpv-osc` (mpv OSC overlay — known to destabilize seeks), `--no-hwdec`
