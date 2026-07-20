@@ -18,6 +18,7 @@ import socket
 
 from PySide6.QtWidgets import QApplication
 
+from relay_server import autostart
 from relay_server.gui_settings import EP_CHOICES, ServerSettings, available_ep_choices
 from relay_server.tray import (
     ConfigDialog,
@@ -52,6 +53,29 @@ def free_port_pair() -> int:
         except OSError:
             continue
     raise RuntimeError("no free port pair")
+
+
+_TEST_RUN_KEY = r"Software\upscale-relay-tests\Run"
+
+
+@pytest.fixture(autouse=True)
+def isolated_autostart(monkeypatch):
+    """Point every test at a private Run key.
+
+    ConfigDialog._on_apply() writes the autostart registration, so without
+    this the dialog tests would edit the user's real
+    HKCU\\...\\CurrentVersion\\Run entry.
+    """
+    monkeypatch.setattr(autostart, "_RUN_KEY", _TEST_RUN_KEY)
+    yield
+    if sys.platform == "win32":
+        import winreg
+
+        for key in (_TEST_RUN_KEY, r"Software\upscale-relay-tests"):
+            try:
+                winreg.DeleteKey(winreg.HKEY_CURRENT_USER, key)
+            except OSError:
+                pass
 
 
 @pytest.fixture()
@@ -97,6 +121,44 @@ def test_settings_reject_unknown_ep(settings):
 
 def test_make_icon_is_non_null(app):
     assert not make_icon().isNull()
+
+
+def test_autostart_launch_command_is_quoted():
+    command = autostart.launch_command()
+    assert command.startswith('"')
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows registry only")
+def test_autostart_registry_roundtrip():
+    import winreg
+
+    assert autostart.is_enabled() is False
+    autostart.set_enabled(True)
+    assert autostart.is_enabled() is True
+    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, autostart._RUN_KEY) as key:
+        value, kind = winreg.QueryValueEx(key, autostart._VALUE_NAME)
+    assert value == autostart.launch_command()
+    assert kind == winreg.REG_SZ
+    autostart.set_enabled(False)
+    assert autostart.is_enabled() is False
+    autostart.set_enabled(False)  # disabling twice must not raise
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows registry only")
+def test_config_dialog_autostart_checkbox(app, settings):
+    autostart.set_enabled(True)
+    dialog = ConfigDialog(settings)
+    try:
+        assert dialog.autostart_check.isChecked()
+        dialog.autostart_check.setChecked(False)
+        dialog._on_apply()
+        assert autostart.is_enabled() is False
+
+        dialog.autostart_check.setChecked(True)
+        dialog._on_apply()
+        assert autostart.is_enabled() is True
+    finally:
+        dialog.deleteLater()
 
 
 def test_runtime_setup_close_cancels_installer(app):

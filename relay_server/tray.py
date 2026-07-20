@@ -20,7 +20,7 @@ import sys
 from pathlib import Path
 
 from PySide6.QtCore import QStandardPaths, Qt, Signal
-from PySide6.QtGui import QAction, QColor, QFont, QIcon, QPainter, QPixmap
+from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -42,7 +42,9 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from . import autostart
 from .gui_settings import ServerSettings, available_ep_choices
+from .logo import make_icon, paint_logo  # noqa: F401  (re-exported; tests import from here)
 from .server import RelayServer
 
 log = logging.getLogger("relay.tray")
@@ -244,25 +246,6 @@ def configure_file_logging(enabled: bool) -> Path | None:
     return diagnostics_log_path()
 
 
-def make_icon() -> QIcon:
-    """A self-contained tray icon drawn at runtime (no bundled asset file)."""
-    pix = QPixmap(64, 64)
-    pix.fill(Qt.transparent)
-    painter = QPainter(pix)
-    painter.setRenderHint(QPainter.Antialiasing)
-    painter.setPen(Qt.NoPen)
-    painter.setBrush(QColor("#2d7d9a"))
-    painter.drawEllipse(4, 4, 56, 56)
-    font = QFont()
-    font.setBold(True)
-    font.setPointSize(30)
-    painter.setFont(font)
-    painter.setPen(QColor("white"))
-    painter.drawText(pix.rect(), Qt.AlignCenter, "U")
-    painter.end()
-    return QIcon(pix)
-
-
 class ServerController:
     """Owns the current ``RelayServer`` and rebuilds it on a config change.
 
@@ -354,6 +337,7 @@ class ConfigDialog(QDialog):
         self.logging_check = QCheckBox(
             f"Write server log to {diagnostics_log_path()}"
         )
+        self.autostart_check = QCheckBox("Start automatically when I sign in to Windows")
 
         form = QFormLayout(self)
         form.addRow("Execution provider:", self.ep_combo)
@@ -362,6 +346,10 @@ class ConfigDialog(QDialog):
         form.addRow("Models folder:", _folder_row(self.models_edit, self))
         form.addRow("", self.mdns_check)
         form.addRow("", self.logging_check)
+        if autostart.is_supported():
+            form.addRow("", self.autostart_check)
+        else:
+            self.autostart_check.hide()
 
         buttons = QDialogButtonBox(
             QDialogButtonBox.Apply | QDialogButtonBox.Close
@@ -381,6 +369,7 @@ class ConfigDialog(QDialog):
         self.models_edit.setText(s.models_dir)
         self.mdns_check.setChecked(s.mdns)
         self.logging_check.setChecked(s.file_logging)
+        self.autostart_check.setChecked(autostart.is_enabled())
 
     def _on_apply(self) -> None:
         s = self._settings
@@ -390,6 +379,11 @@ class ConfigDialog(QDialog):
         s.models_dir = self.models_edit.text().strip()
         s.mdns = self.mdns_check.isChecked()
         s.file_logging = self.logging_check.isChecked()
+        if autostart.is_supported():
+            try:
+                autostart.set_enabled(self.autostart_check.isChecked())
+            except OSError as err:
+                log.warning("could not update Windows autostart: %r", err)
         self.applied.emit()
 
 
@@ -535,6 +529,7 @@ def main() -> None:
 
     app = QApplication(sys.argv)
     app.setApplicationName(_APP_NAME)
+    app.setWindowIcon(make_icon())
     # A tray-only app: closing the config pane must not exit the process.
     app.setQuitOnLastWindowClosed(False)
 
