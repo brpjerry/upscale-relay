@@ -15,8 +15,10 @@ load-bearing), `docs/CLIENT_LINUX.md` (Linux setup), and
   `pipeline.py`. TensorRT inference runs in a **separate worker process**
   (`upscale_cli/infer_worker.py`) — do not move it back in-process (heap
   corruption, see Hard rules). Windows-only tray GUI in `tray.py` +
-  `gui_settings.py` (qasync, `relay-server-gui`); `server.py` stays
-  Qt-import-free so the headless CLI is unaffected.
+  `gui_settings.py` (qasync, `relay-server-gui`), with `autostart.py`
+  (HKCU Run key, GUI-only) and `logo.py` (runtime-drawn icon; regenerate
+  `packaging/icon.ico` via `packaging/make_icon.py` after changing it);
+  `server.py` stays Qt-import-free so the headless CLI is unaffected.
 - `relay_client_core/` — demux/uplink/control/downlink library + `relay-client`
   mock CLI (used by the integration tests).
 - `desktop_client/` — PySide6 + qasync + python-mpv player (`relay-desktop`).

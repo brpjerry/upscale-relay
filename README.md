@@ -46,8 +46,10 @@ includes the lightweight ONNX graph tooling required for the fast
 TensorRT, CUDA, and CPU providers before marking that versioned runtime ready;
 an interrupted or failed installation is retried on the next launch. The GUI
 shows setup progress, while the console build prints it. Its configuration pane sets the
-execution provider, control port, media library folder, models folder, and
-file logging, then restarts the listeners in place. GUI logging defaults on and
+execution provider, control port, media library folder, models folder,
+file logging, and whether the tray app starts automatically at Windows sign-in
+(an `HKCU` Run-key entry, GUI build only), then restarts the listeners in
+place. GUI logging defaults on and
 writes `upscale-relay-server.log` to the user's Documents folder. While a
 session is active it records a performance snapshot every two seconds plus a
 final snapshot on close. The headless

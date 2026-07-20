@@ -28,6 +28,7 @@ jobs:
         run: >
           pyinstaller --noconfirm --onedir --console
           --name upscale-relay-server
+          --icon packaging/icon.ico
           --collect-all pip
           --collect-submodules zeroconf
           packaging/server_entry.py
@@ -35,6 +36,7 @@ jobs:
         run: >
           pyinstaller --noconfirm --onedir --windowed
           --name upscale-relay-server-gui
+          --icon packaging/icon.ico
           --collect-all pip
           --collect-submodules zeroconf
           --collect-submodules relay_server
@@ -96,5 +98,5 @@ jobs:
           gh release create "$env:TAG" `
             --title "Upscale Relay Server $env:TAG" `
             --generate-notes `
-            --notes "Replaces recursive remote-library scans with shallow paginated directory listings and adds on-demand loading to the desktop client. This avoids blocking on full-share traversal; legacy full-tree clients are no longer supported. Small Windows server binaries keep the pinned TensorRT 10.13 / CUDA 12.9 runtime in the versioned first-launch cache rather than the release ZIP. The -gui ZIP is the tray app; the plain ZIP is the headless console server." `
+            --notes "The Windows binaries now carry an embedded application icon, and the tray app's configuration pane gains a 'start automatically at Windows sign-in' option (an HKCU Run-key entry, tray GUI only — the headless console server is unchanged). Small Windows server binaries keep the pinned TensorRT 10.13 / CUDA 12.9 runtime in the versioned first-launch cache rather than the release ZIP. The -gui ZIP is the tray app; the plain ZIP is the headless console server." `
             (Get-Item dist/*.zip).FullName
