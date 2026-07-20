@@ -13,6 +13,7 @@ import argparse
 import asyncio
 import json
 import logging
+from collections.abc import Callable
 from pathlib import Path
 
 from aiohttp import WSMsgType, web
@@ -71,6 +72,10 @@ class RelayServer:
         self.models = {name: info["path"] for name, info in self.models_info.items()}
         self.library = MediaLibrary(library_root) if library_root else None
         self.sessions: dict[str, Session] = {}  # keyed by media tokens AND id
+        # Optional GUI hook (kept Qt-free): called with a short human-readable
+        # line when a not-yet-seen IP connects or a session starts playing.
+        self.event_callback: Callable[[str], None] | None = None
+        self._seen_ips: set[str] = set()
         self.app = web.Application()
         self.app.router.add_get("/control", self.handle_control)
         self.app.router.add_get("/status", self.handle_status)
@@ -127,11 +132,25 @@ class RelayServer:
                     continue
                 self._log_session_stats(session)
 
+    def _emit_event(self, message: str) -> None:
+        if self.event_callback is not None:
+            try:
+                self.event_callback(message)
+            except Exception:
+                log.exception("event callback failed")
+
     # -- control channel -------------------------------------------------------
 
     async def handle_control(self, request: web.Request) -> web.WebSocketResponse:
         ws = web.WebSocketResponse(heartbeat=20)
         await ws.prepare(request)
+        peer_ip = request.remote or "unknown"
+        if peer_ip not in self._seen_ips:
+            self._seen_ips.add(peer_ip)
+            log.info("control connection from %s (new client)", peer_ip)
+            self._emit_event(f"New client connected: {peer_ip}")
+        else:
+            log.info("control connection from %s", peer_ip)
         session: Session | None = None
         try:
             async for raw in ws:
@@ -198,7 +217,13 @@ class RelayServer:
                         "message": f"'{mtype}' before open_session", "fatal": False,
                     }))
                 elif mtype == "play":
+                    starting = session.state == State.OPEN
                     await session.set_state(State.PLAYING)
+                    if starting:
+                        source = session.source_path or "client uplink"
+                        log.info("playback started: session %s source=%s client=%s",
+                                 session.id, source, peer_ip)
+                        self._emit_event(f"Playback started: {source} ({peer_ip})")
                 elif mtype == "pause":
                     await session.set_state(State.PAUSED)
                 elif mtype == "seek":

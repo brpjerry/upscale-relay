@@ -204,11 +204,17 @@ def test_controller_start_stop_binds_and_releases_port(app, settings, tmp_path):
     settings.models_dir = str(tmp_path)  # empty models dir is fine
     settings.port = free_port_pair()
     controller = ServerController(settings)
+    events = []
+    callback = events.append
+    controller.event_callback = callback
 
     async def scenario():
         await controller.start()
         assert controller.running
         assert controller.server.stats_interval == 2.0
+        # Connection/playback events must reach the tray callback on every
+        # (re)started instance.
+        assert controller.server.event_callback is callback
         # Applying a new port rebinds; the old listeners must be released so
         # the new instance can bind without EADDRINUSE.
         settings.port = free_port_pair()
@@ -241,6 +247,7 @@ def test_tray_app_start_failure_opens_config(app, settings, tmp_path, monkeypatc
     settings.port = free_port_pair()
     settings.library_dir = str(tmp_path / "missing")
     tray = TrayApp(settings)
+    assert tray.controller.event_callback == tray._server_event
     opened = []
     monkeypatch.setattr(tray, "open_config", lambda: opened.append(True))
 
