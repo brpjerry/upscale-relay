@@ -170,6 +170,41 @@ def test_seek_then_stream_from_target(sample_file):
     asyncio.run(scenario())
 
 
+def test_server_events_new_ip_and_playback_start(sample_file):
+    async def scenario():
+        server = await start_server()
+        events = []
+        server.event_callback = events.append
+        client = RelayClient("127.0.0.1", server.port)
+        try:
+            await client.connect()
+            assert events == ["New client connected: 127.0.0.1"]
+            await client.open_session(SessionConfig(path=sample_file, model="passthrough",
+                                                    display_w=320, display_h=180))
+            await client.attach_media()
+            await client.start_uplink()
+            await client.play()
+            await collect_downlink(client, stop_after=5)
+            assert events[1:] == ["Playback started: client uplink (127.0.0.1)"]
+
+            # pause -> play is a resume, not a fresh playback start
+            await client.pause()
+            await client.play()
+            await collect_downlink(client, stop_after=5)
+            assert len(events) == 2
+
+            # a second connection from an already-seen IP is not announced
+            other = RelayClient("127.0.0.1", server.port)
+            await other.connect()
+            await other.teardown()
+            assert len(events) == 2
+        finally:
+            await client.teardown()
+            await server.stop()
+
+    asyncio.run(scenario())
+
+
 def test_seek_storm(sample_file):
     async def scenario():
         server = await start_server()

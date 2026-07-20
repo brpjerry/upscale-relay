@@ -274,6 +274,9 @@ class ServerController:
     def __init__(self, settings: ServerSettings):
         self.settings = settings
         self.server: RelayServer | None = None
+        # Set by TrayApp; wired onto every new RelayServer instance so
+        # connection/playback events survive config-applied restarts.
+        self.event_callback = None
 
     @property
     def running(self) -> bool:
@@ -296,6 +299,7 @@ class ServerController:
             library_root=s.library_dir or None,
             mdns=s.mdns,
         )
+        server.event_callback = self.event_callback
         await server.start()
         self.server = server
 
@@ -395,6 +399,7 @@ class TrayApp:
     def __init__(self, settings: ServerSettings):
         self.settings = settings
         self.controller = ServerController(settings)
+        self.controller.event_callback = self._server_event
         self.dialog: ConfigDialog | None = None
 
         self.tray = QSystemTrayIcon(make_icon())
@@ -464,6 +469,15 @@ class TrayApp:
     def _on_activated(self, reason: QSystemTrayIcon.ActivationReason) -> None:
         if reason in (QSystemTrayIcon.Trigger, QSystemTrayIcon.DoubleClick):
             self.open_config()
+
+    def _server_event(self, message: str) -> None:
+        """Toast for server-side events (new client IP, playback start).
+
+        The server already logs these lines itself, so unlike _notify this
+        only raises the balloon and does not log again.
+        """
+        if self.tray.supportsMessages():
+            self.tray.showMessage(_APP_NAME, message, QSystemTrayIcon.Information, 5000)
 
     def _notify(self, message: str, *, error: bool = False) -> None:
         icon = QSystemTrayIcon.Critical if error else QSystemTrayIcon.Information
