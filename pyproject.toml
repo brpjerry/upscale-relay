@@ -31,7 +31,7 @@ server-gui = [
 nvidia = [
     "onnx==1.22.0",
     "onnxruntime-gpu==1.23.2",
-    "tensorrt-cu12-libs==10.13.3.9.post1",
+    "tensorrt-cu12-libs==11.1.0.106",
     "cuda-toolkit==12.9.2.0",
     "nvidia-cublas-cu12==12.9.2.10",
     "nvidia-cuda-nvrtc-cu12==12.9.86",
