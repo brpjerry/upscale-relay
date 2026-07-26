@@ -158,30 +158,44 @@ bump locks out every existing client; `seek_progress` is additive and
 server→client, and clients that do not know the type already skip it. This is
 the same convention `session_progress` was added under.
 
-## What is still open
+## What was still open — resolved client-side (2026-07-26)
 
-The server-side seek path is now ~3.9 s worst case (~0.35 s with step 2
-armed). The field capture was 20 s. The remaining ~16 s is not accounted for
-by anything measured here, and the client telemetry points away from the
-server: at +18 s the client had **217 MB queued locally** and mpv still had
-not restarted playback. 217 MB is roughly 17 s of `hevc-qp4` at 2960x1848 —
-the server had produced far more than a first frame's worth and the client had
-not drained it into mpv.
+The remaining ~16 s was the Android client waiting for **external audio**, and
+neither candidate below was the cause. Both are struck out; the measurement is
+in the Android repo (`docs/ANDROID_CLIENT.md`, Phase 2). In short:
 
-Two candidates, both client-side, neither confirmed:
+mpv positions an external demuxer at the current playback time *when the track
+is selected*, and during `loadfile` that time is still zero. The client passed
+the original file as `audio-file` / `sub-files-append` on the load, so those
+demuxers opened at the start of the original file while the relay stream began
+at the seek target. mpv's `--start` seek would normally reposition them, but
+the loopback stream is a live one-shot socket ("Cannot seek in this stream"),
+so the seek was rejected and mpv reached the epoch by *decoding forward*
+through everything before it. Hence a stall proportional to the seek target —
+and hence a stall that server-side profiling could never see.
 
-- **The client's queue → mpv sender is the bottleneck.** CLAUDE.md already
-  records that python-mpv's custom-stream adapter capped lossless HEVC near
-  200 Mbps on the desktop client, which is why the dedicated sender thread
-  exists. The Android client's equivalent path is worth profiling first.
-- **Backpressure primed from a phantom buffer.** The Android client kept the
-  previous epoch's `demuxer-cache-duration` while a new file loaded and
-  reported ~9.4 s of cache when the new stream had buffered nothing (fixed
-  separately in the Android repo). `HIGH_WATERMARK_MS` is 10 000, so 9.4 s
-  did not engage the pause on this capture — but it is close enough that a
-  slightly different stale value would have, and `handle_seek`'s
-  `note_buffer_report(0)` is undone by the very next stale report. Re-check
-  the watermark behaviour against a correctly-reporting client.
+Measured on a Tab S9 Ultra against this server, seeking within a 23:40 file:
+
+| Seek target | Video frame shown | `audio ready` (playback-restart) |
+|---|---|---|
+| 305 s (before) | +2.9 s | +12.8 s |
+| 678 s (before) | +3.3 s | +19.6 s |
+| any (after) | +1.0 s | **+1.5 s** |
+
+The fix attaches the original media with `audio-add` / `sub-add` after
+playback has started, when the position is known; each demuxer then issues one
+HTTP range seek. A/V error stayed at ~10–25 µs with zero decoder drops across
+an eight-action seek storm.
+
+~~**The client's queue → mpv sender is the bottleneck.**~~ Not it. The
+loopback sender was never behind; the 217 MB queue was the symptom of mpv not
+draining while it waited on audio, not the cause.
+
+~~**Backpressure primed from a phantom buffer.**~~ Not it either. The stale
+`demuxer-cache-duration` was a real bug and was fixed separately, but the
+watermark never engaged here.
 
 Reproduce any of this with `/status → sessions[].pipeline.last_seek`, or the
-`relay.pipeline` seek log line, on a real client seek.
+`relay.pipeline` seek log line, on a real client seek. For the client half,
+`msg-level=all=v` in the Android player engine prints `refresh seek to <pts>`
+per external demuxer, which is what made this visible.
