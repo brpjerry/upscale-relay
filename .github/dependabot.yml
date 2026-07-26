@@ -4,6 +4,25 @@ updates:
     directory: "/"
     schedule:
       interval: weekly
+    # The `nvidia` extra is one validated combination, not a set of independent
+    # pins, and Dependabot cannot propose it coherently: it bumps one name at a
+    # time, while these move together and periodically get renamed (CUDA 13
+    # dropped the "-cu12" suffix). It also only edits pyproject.toml, so every
+    # such PR fails the pin-sync test against NVIDIA_RUNTIME_PACKAGES in
+    # relay_server/runtime_bootstrap.py.
+    #
+    # It cannot judge them either. Alongside an ONNX Runtime bump it proposed
+    # TensorRT 11, whose nvinfer_11.dll that very release cannot load — its
+    # provider imports nvinfer_10.dll. Deciding that needs the artifacts, and
+    # confirming it needs a GPU, which CI does not have.
+    #
+    # Upgrade this stack by hand and validate it on the 5090; see PR #22.
+    ignore:
+      - dependency-name: "onnx"
+      - dependency-name: "onnxruntime-gpu"
+      - dependency-name: "tensorrt-*"
+      - dependency-name: "cuda-toolkit"
+      - dependency-name: "nvidia-*"
   - package-ecosystem: github-actions
     directory: "/"
     schedule:
