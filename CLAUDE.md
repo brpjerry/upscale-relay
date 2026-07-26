@@ -38,15 +38,20 @@ upscale-cli sample out.mkv --frames 240 --size 1920x1080 --fps 24     # make tes
 Server (runs on the Windows box, not the laptop):
 `relay-server --models-dir models --ep tensorrt` from `.venv-cuda`.
 `http://<server>:8590/status` returns per-session pipeline fps + per-stage ms —
-first stop for any performance question.
+first stop for any performance question. Its `pipeline.last_seek` (and the
+matching `relay.pipeline` log line) breaks down the most recent seek: keyframe
+gap, frames discarded, and wall time to the first frame and first packet —
+first stop for any *seek latency* question (`docs/SEEK_LATENCY_PLAN.md`).
 
 Client flags: `--debug` (faulthandler), `--trace` (consume-loop trace),
 `--mpv-osc` (mpv OSC overlay — known to destabilize seeks), `--no-hwdec`
 (force sw decode), `--mpv-scripts` (load user mpv scripts — off by default),
 `--headless` (null vo/ao), and `--settings-scope <name>` (isolate QSettings —
 tests MUST set this option or pass the equivalent `DesktopOptions`). Server
-env flag: `RELAY_NVDEC=1` (server hw source decode — crashed with NVENC
-concurrently, off by default). The desktop client loads the user's
+flags: `--seek-discard-max-s S` (seeks land keyframe-accurate rather than
+decoding a keyframe-to-target span longer than S — off by default, see
+`docs/SEEK_LATENCY_PLAN.md`). Server env flag: `RELAY_NVDEC=1` (server hw
+source decode — crashed with NVENC concurrently, off by default). The desktop client loads the user's
 `mpv.conf`/`input.conf`
 (prefs pass through; relay plumbing like `vo`/`rebase-start-time` is
 re-asserted post-init in `mpv_view.py` because the config file overrides
@@ -109,6 +114,13 @@ constructor options).
 
 ## Known issues / current debugging front
 
+- **Post-seek latency.** Server side is profiled and bounded: the
+  keyframe-to-target discard window is ~94% of it (~3.6 s for a 250-frame
+  1080p GOP), it scales with GOP length and *not* with seek distance, and
+  `--seek-discard-max-s` removes it at the cost of keyframe-accurate seeks.
+  The 20 s the Android client saw is mostly still unexplained and now looks
+  client-side (217 MB queued locally before mpv restarted playback).
+  `docs/SEEK_LATENCY_PLAN.md` has the numbers and what to check next.
 - **Intermittent server crash** (~1 in 5 full 4K lossless-hevc runs), native
   AV, cause not yet pinned — need a faulthandler stack from a crash (server
   prints it to its terminal). If it lands in NVENC, the plan is to move encode

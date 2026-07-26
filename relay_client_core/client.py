@@ -201,9 +201,11 @@ class RelayClient:
         self._downlink_sample_at = time.monotonic()
         self.errors: list[dict] = []
         self.buffered_ms = 0  # consumer updates; buffer_report loop sends it
-        # Optional UI hook: called with each session_progress message dict
-        # (from the control-reader task, i.e. on the event-loop thread).
+        # Optional UI hooks: called with each session_progress / seek_progress
+        # message dict (from the control-reader task, i.e. on the event-loop
+        # thread).
         self.on_progress = None
+        self.on_seek_progress = None
         self._last_activity = time.monotonic()
 
     # -- control channel -------------------------------------------------------
@@ -264,6 +266,15 @@ class RelayClient:
                         self.on_progress(msg)
                     except Exception:
                         log.exception("on_progress callback failed")
+                continue
+            if mtype == "seek_progress":
+                # Purely informational: seek_ready already acked the epoch, so
+                # this never resolves a pending request.
+                if self.on_seek_progress is not None:
+                    try:
+                        self.on_seek_progress(msg)
+                    except Exception:
+                        log.exception("on_seek_progress callback failed")
                 continue
             if mtype == "state":
                 self.state = msg["state"]

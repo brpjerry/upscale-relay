@@ -67,7 +67,8 @@ ignored; unknown types ⇒ `error{code:"bad_message"}`.
 | `session_opened` | `session_id:str`, `media_port:int`, `uplink_token:str?`, `downlink_token:str`, `epoch:int(=0)`, `source:str`, `time_base:[num,den]`, `duration_s:float?`, `avg_rate:[num,den]?`, `chapters:[{start_s:float, end_s:float?, title:str?}]?`, `downlink_width:int`, `downlink_height:int`, `fit_mode:str`, `resize_algorithm:str` | Returns the effective framing and resize choices; `uplink_token` is null for `server_file`. `chapters` is the authoritative chapter list, sorted by `start_s`: read from the file for `server_file`, echoed from `open_session.file.chapters` for uplink; null/absent when there are none. Chapter times are seconds in source-media time — clients seek to them by converting through `time_base`, exactly like any other seek target |
 | `state` | `state:"open"\|"playing"\|"paused"\|"closed"` | emitted on every transition |
 | `session_progress` | `stage:str`, `message:str`, `elapsed_s:float` | ticked ~every 2 s while a slow `open_session` is being processed (today: `stage:"pipeline_init"`, e.g. a first-use TensorRT engine build, which can run for minutes). Clients must treat it as a keepalive for the pending open — refresh the open_session timeout on every tick — and should surface `message` as a loading indicator. Quick opens send none |
-| `seek_ready` | `epoch:int` | server has flushed; client may start uplinking the new epoch |
+| `seek_ready` | `epoch:int` | server has flushed; client may start uplinking the new epoch. **Not a readiness signal for media** — it is dispatched within milliseconds, before any frame of the new epoch exists (§4) |
+| `seek_progress` | `epoch:int`, `target_pts:int`, `keyframe_pts:int?`, `frames_discarded:int`, `elapsed_s:float` | ticked ~every 500 ms while a seek has produced no downlink bytes yet, starting ~750 ms after the `seek`. Purely informational: the client renders it as seek progress so a long discard window (§4 step 4) is distinguishable from a wedged pipeline. `keyframe_pts` is null until the server's demuxer reports where the seek landed. A seek that produces media promptly sends none, and the server stops ticking after 60 s. Additive and safe to ignore — clients that do not know the type must skip it, so it carries no protocol-version change |
 | `stats` | `pipeline_fps:float`, `queue_depths:{...}`, `buffered_ahead_ms:int` | periodic, informational |
 | `error` | `code:str`, `message:str`, `fatal:bool` | non-fatal errors leave the session usable |
 | `closed` | | acknowledges teardown |
@@ -160,9 +161,19 @@ Epoch is a uint32 starting at 0 per session, incremented only by seeks.
    first packet flagged `discontinuity`, all packets stamped `E'`.
 4. Server decodes and discards frames with `pts < T`, then resumes inference/
    encode/downlink; downlink packets are stamped `E'`, first one flagged
-   `discontinuity` + `keyframe`.
+   `discontinuity` + `keyframe`. This discard window is serial dead time and
+   dominates post-seek latency — measured at ~3.6 s for a 250-frame 1080p GOP
+   (see [SEEK_LATENCY_PLAN.md](SEEK_LATENCY_PLAN.md)) — so the server sends
+   `seek_progress` while it runs.
 5. Client discards any downlink packet with `epoch < E'`, resets its decoder
    at the discontinuity, and resumes presentation at `pts >= T`.
+
+A server started with `--seek-discard-max-s S` trades step 4 away when the
+keyframe lands more than `S` seconds before `T`: it emits from the keyframe
+instead, so the first downlink packet carries `pts < T`. Absolute PTS stay
+authoritative, so the client's position readout remains correct — playback
+simply starts earlier than requested. Clients must therefore not assume the
+first packet of a new epoch has `pts >= T`. The default is off (frame-accurate).
 
 Coalescing: a `seek` arriving while a previous seek is being processed simply
 supersedes it — the server flushes again (cheap; queues are already empty),

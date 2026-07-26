@@ -61,13 +61,15 @@ class RelayServer:
                  library_root: str | None = None,
                  resize_algorithm: str = DEFAULT_RESIZE_ALGORITHM,
                  lossless_hevc_profile: str = DEFAULT_LOSSLESS_HEVC_PROFILE,
-                 mdns: bool = False):
+                 mdns: bool = False,
+                 seek_discard_max_s: float | None = None):
         self.port = port
         self.media_port = port + 1
         self.ep = ep
         self.stats_interval = stats_interval  # seconds; None = no periodic stats
         self.resize_algorithm = resize_algorithm
         self.lossless_hevc_profile = lossless_hevc_profile
+        self.seek_discard_max_s = seek_discard_max_s
         self.models_info = discover_models(models_dir)
         self.models = {name: info["path"] for name, info in self.models_info.items()}
         self.library = MediaLibrary(library_root) if library_root else None
@@ -200,6 +202,7 @@ class RelayServer:
                         ws, self.models, ep=self.ep, library=self.library,
                         default_resize_algorithm=self.resize_algorithm,
                         lossless_hevc_profile=self.lossless_hevc_profile,
+                        seek_discard_max_s=self.seek_discard_max_s,
                     )
                     session.media_port = self.media_port
                     self.sessions[session.uplink_token] = session
@@ -372,6 +375,7 @@ async def main_async(args) -> None:
         resize_algorithm=args.resize_algorithm,
         lossless_hevc_profile=args.lossless_hevc_profile,
         mdns=not args.no_mdns,
+        seek_discard_max_s=args.seek_discard_max_s,
     )
     await server.start()
     await asyncio.Event().wait()  # run forever
@@ -404,6 +408,13 @@ def main() -> None:
         "--lossless-hevc-profile", choices=LOSSLESS_HEVC_PROFILES,
         default=DEFAULT_LOSSLESS_HEVC_PROFILE,
         help="server-wide lossless HEVC encoder experiment",
+    )
+    parser.add_argument(
+        "--seek-discard-max-s", type=float, default=None, metavar="SECONDS",
+        help="trade seek accuracy for latency: when a seek lands on a keyframe "
+             "more than SECONDS before the target, start the new epoch at the "
+             "keyframe instead of decoding and dropping the frames in between "
+             "(default: off, seeks stay frame-accurate)",
     )
     parser.add_argument(
         "--no-mdns", action="store_true",

@@ -1,19 +1,18 @@
 # Seek Latency — First Frame After an Epoch Seek
 
-Far seeks take about twenty seconds to show a frame. Near seeks take under
-three. This document records what was measured, explains which part of the
-server produces the gap, and lists the candidate changes with their
-trade-offs.
+Far seeks took about twenty seconds to show a frame on the Android client.
+This document records the original field measurement, the server-side profile
+that followed it, and what changed as a result.
 
-The measurements below were taken **from the Android client**. Server-side
-timing has not been instrumented yet, so the attribution in
-[Where the time goes](#where-the-time-goes) is inference from client-visible
-behaviour plus a code read, not a profile. Step 1 of the roadmap fixes that
-before anything else changes.
+**Status:** step 1 (instrumentation) is done and the server-side gap is now
+attributed with real numbers. Step 2 (emit from the keyframe) is implemented
+behind `--seek-discard-max-s`, off by default. Step 4 (`seek_progress`) is
+done. Step 3 was measured and rejected. What remains unexplained is
+client-side, not server-side — see [What is still open](#what-is-still-open).
 
-## Measured behaviour
+## Measured behaviour (client, 2026-07-22)
 
-Captured 2026-07-22 on a Samsung Tab S9 Ultra against a live server:
+Captured on a Samsung Tab S9 Ultra against a live server:
 `2x_AnimeJaNai_HD_V3Sharp1_Compact`, tier `hevc-qp4`, output 2960x1848,
 source `[SubsPlease] Kimi ga Shinu made Koi wo Shitai - 02 (1080p)`.
 
@@ -37,132 +36,152 @@ no mpv activity at all**. Client-side buffer telemetry across that gap:
 +22 s   playback-restart
 ```
 
-For comparison, a near seek (to 20.5 s, while the pipeline was already
-producing nearby content) completed in **2.8 s** end to end.
+One conclusion holds up unchanged: **`seek_ready` is not a readiness signal.**
+It is dispatched before any media for the new epoch exists — `handle_seek`
+calls `start_server_source`, which only creates an asyncio task, and then
+sends the reply. Measured in-process it acks in **4–6 ms**.
 
-Two conclusions follow directly:
+## Server-side profile (2026-07-25)
 
-- **`seek_ready` is not a readiness signal.** It is dispatched 45 ms after the
-  request, before any media for the new epoch exists. `handle_seek`
-  (`relay_server/session.py:296`) calls `start_server_source`, which only
-  creates an asyncio task, and then sends the reply. The client cannot use it
-  to predict anything.
-- **The client is starved, not slow.** For roughly the first eight seconds
-  after a far seek the downlink is nearly idle. The delay is server-side
-  production latency, and it scales with seek distance.
+`PipelineStats.last_seek` now records one `SeekTrace` per seek
+(`relay_server/pipeline.py`), logged at info level and surfaced as
+`/status → sessions[].pipeline.last_seek`. Numbers below are from the real
+server run in-process against a synthetic long-GOP clip: 1080p, 24 fps, x264
+defaults (keyint 250 ⇒ ~10.3 s GOP), passthrough model, `lossless-hevc`
+(hevc_nvenc), on the RTX 5090 box.
 
-## Where the time goes
+| Seek target | Keyframe gap | Frames discarded | Discard decode | First frame | Client's first bytes |
+|---|---|---|---|---|---|
+| 26700 ms | 10.33 s | 248 | 3634 ms | +3648 ms | 3885 ms |
+| 37100 ms | 10.35 s | 249 | 3609 ms | +3627 ms | 3851 ms |
+| **26800 ms** | **0.05 s** | **2** | **103 ms** | **+116 ms** | **337 ms** |
+| 26740 ms | 10.37 s | 249 | 3729 ms | +3742 ms | 3966 ms |
 
-On a seek, `Pipeline.flush` (`relay_server/pipeline.py:351`) sets
-`_discard_until = target_pts`, and the source demuxer seeks **backward to the
-nearest keyframe at or before the target**:
+The discard window is **94% of the server-side wait** to the client's first
+bytes, and essentially 100% of the wait to the first surviving frame. Step 2
+is therefore the right lever, and step 1's question is answered.
 
-```python
-# relay_media/demux.py:74
-self._container.seek(from_pts, stream=self._stream, backward=True, any_frame=False)
-```
+Two things this profile corrects in the original write-up:
 
-Every frame decoded between that keyframe and `target_pts` is then thrown
-away in `_put_decoded` (`relay_server/pipeline.py:470`):
+- **The gap does not scale with seek distance.** It scales with the
+  keyframe-to-target span, which is bounded by one GOP. Rows 3 and 4 are the
+  proof: targets 60 ms apart, straddling a keyframe, same seek distance —
+  **337 ms vs 3966 ms**. The "near seek completed in 2.8 s" comparison in the
+  field capture was confounded; that seek landed on content the pipeline was
+  already producing.
+- **The source seek itself is free.** `VideoTrack.packets(from_pts)` →
+  `container.seek(..., backward=True)` measures **0.3–0.5 ms**. So is the
+  16-packet batch in `_server_source_loop`, which the original write-up
+  flagged as a secondary contributor: `flush_seen_ms` (flush call to the
+  decode stage dequeuing it) is 8–30 ms, inside the noise. Neither was
+  changed.
 
-```python
-if frame.pts is not None and self._discard_until is not None:
-    if frame.pts < self._discard_until:
-        return                      # dropped before reaching _q_dec
-    self._discard_until = None
-```
-
-The drop happens **before** the inference queue, so the discard window costs
-decode time only — GPU inference is not wasted on it. That is the right
-design. But it is also serial dead time: nothing can be emitted until the
-decoder has walked the entire keyframe-to-target span, and on a long-GOP
-animation encode that span can be many seconds of frames.
-
-This is the leading explanation for the distance-dependent gap, and it is
-consistent with the downlink being idle for the first eight seconds. It is
-**not yet confirmed by a server-side measurement** — see step 1.
-
-Two secondary contributors worth checking in the same pass:
-
-- **Batching.** `_server_source_loop` accumulates 16 packets before handing
-  work downstream (`relay_server/session.py:342`). Harmless in steady state;
-  it adds avoidable latency to the very first post-seek batch.
-- **Backpressure priming.** `handle_seek` calls `note_buffer_report(0)`, so
-  the `HIGH_WATERMARK_MS = 10_000` gate should not engage immediately after a
-  seek. Worth confirming it does not re-engage early from a stale report while
-  the client still shows nothing.
+The mechanism is unchanged from the original code read: `Pipeline.flush` sets
+`_discard_until = target_pts`, the demuxer seeks backward to the nearest
+keyframe, and `_put_decoded` drops every frame before the target. The drop
+happens *before* the inference queue, so no GPU work is wasted — that part of
+the design was and is right. It is just serial dead time: 250 frames × ~14.5
+ms of single-threaded 1080p decode.
 
 ## Roadmap
 
-### 1. Instrument the seek path (do this first)
+### 1. Instrument the seek path — **done**
 
-Nothing below should be attempted before the gap is attributed with real
-numbers. `PipelineStats` already carries `stage_ms` and is surfaced through
-`/status`; extend it with per-seek counters:
+`SeekTrace` carries, per seek: the keyframe-to-target span the source seek
+actually produced, frames discarded and their aggregate decode time, and the
+wall time from `flush` to the decode stage, to the first surviving frame, and
+to the first encoded packet handed to the downlink. One info line per seek:
 
-- wall time from `flush` to the first frame that survives `_discard_until`;
-- number of frames discarded, and their decode time in aggregate;
-- wall time from that first surviving frame to the first encoded packet
-  handed to the downlink;
-- the keyframe-to-target PTS distance actually seen.
+```
+relay.pipeline INFO seek epoch=1 target_pts=26700 mode=accurate: flush_seen=30ms
+  keyframe_gap=10.32s discarded=248 frames (3603ms decode) first_frame=+3636ms
+  first_packet=+3773ms
+```
 
-Log one line per seek at info level. That single line will say whether the
-discard window is 90% of the gap or 30% of it, and every choice below depends
-on the answer.
+### 2. Emit from the keyframe instead of discarding to the target — **implemented, opt-in**
 
-### 2. Emit from the keyframe instead of discarding to the target
+`relay-server --seek-discard-max-s SECONDS` takes the middle option: keep
+frame accuracy when the keyframe is within `SECONDS` of the target, emit from
+the keyframe beyond it. Measured on the same clip with `--seek-discard-max-s 2`:
 
-The largest available win, if step 1 confirms the discard window dominates.
-Rather than dropping decoded frames until `target_pts`, upscale and send from
-the keyframe onward and let the client land where the stream starts.
+| Seek target | Mode | First bytes (default) | First bytes (threshold 2 s) |
+|---|---|---|---|
+| 26700 ms | keyframe | 3885 ms | **349 ms** |
+| 37100 ms | keyframe | 3851 ms | **314 ms** |
+| 26800 ms | accurate | 337 ms | 371 ms |
+| 26740 ms | keyframe | 3966 ms | **326 ms** |
 
-- **Cost:** the seek becomes keyframe-accurate. The player lands up to one GOP
-  *before* the requested position instead of exactly on it.
-- **Benefit:** the discard window disappears entirely. First frame arrives
-  after one decode + infer + encode, independent of seek distance.
-- **Note:** absolute Matroska PTS remain authoritative either way, so the
-  client's position readout stays correct — it simply starts a little earlier
-  than requested. This is how most streaming players behave, and it is
-  probably the right default.
-- A middle option: keep frame accuracy only when the keyframe is within a
-  short threshold of the target (say under two seconds), and fall back to
-  keyframe-accurate beyond that.
+A ~12x improvement on long-GOP seeks, with near-keyframe seeks staying
+frame-accurate. The cost is that the player lands up to one GOP *before* the
+requested position. Absolute Matroska PTS remain authoritative, so the
+position readout stays correct — playback simply starts earlier.
 
-### 3. Speed up the discard window if it must stay
+**It is off by default on purpose.** It changes user-visible seek semantics to
+buy ~3.5 s, and the field gap it was proposed to fix is 20 s. Turn it on
+knowingly, not as a fix for something that was never measured.
 
-If frame-accurate seeking is a hard requirement, the discard span can be
-decoded faster than it is played:
+### 3. Speed up the discard window if it must stay — **measured, rejected**
 
-- The discarded frames are never displayed, but they **are** reference frames
-  for the target, so decoding cannot be skipped and loop-filter shortcuts will
-  introduce reconstruction drift. Measure any quality impact before adopting.
-- Decoding the discard window on a second, throwaway decoder in parallel with
-  the still-draining previous epoch is possible but adds real complexity.
+The obvious safe trick is `CodecContext.skip_frame`. Non-reference B-frames
+are by definition not used as references, so skipping them during the discard
+window introduces no reconstruction drift. Measured over a full 250-frame GOP:
 
-Prefer step 2 unless frame accuracy is genuinely required.
+| `skip_frame` | Frames decoded | Discard time | Note |
+|---|---|---|---|
+| `DEFAULT` | 249 | 3595 ms | — |
+| `NONREF` | 201 | 3184 ms | −11%; drops frames after the target too |
+| `BIDIR` | 177 | 2911 ms | −19%; skips reference B-frames ⇒ drift |
 
-### 4. Make `seek_ready` mean something, or add a progress message
+`NONREF` buys 11% because non-reference B-frames are the cheapest frames in
+the GOP — the expensive ones are exactly the ones that must be decoded. It
+also suppresses output for frames past the target, so it would need a margin
+and a mode switch mid-window. Not worth the complexity for 11%. `BIDIR` is
+not safe. Parallel decode on a throwaway decoder remains theoretically
+available and remains too complex to justify. Prefer step 2.
 
-Independent of the above, the client currently has no way to distinguish "the
-server is working" from "the pipeline is wedged" — it shows a spinner over a
-buffer readout that reads as full. Either:
+Note that the discard window is single-threaded decode by necessity:
+`RELAY_DECODE_THREADS` is opt-in because frame-threaded decode crashes this
+stack (see CLAUDE.md), so the usual "just thread it" answer is closed here.
 
-- delay `seek_ready` until the first encoded packet of the new epoch is
-  queued, so it is a genuine readiness signal; or
-- keep the fast ack and add a `seek_progress` message carrying discarded-frame
-  count and current PTS versus target.
+### 4. Make `seek_ready` mean something, or add a progress message — **done**
 
-The second is preferable: it keeps the existing epoch handshake intact and
-gives the client something to render a real progress indicator from. Adding a
-message type needs a `docs/PROTOCOL.md` update and a protocol-version bump.
+Took the second option, as recommended: the fast ack is unchanged and the
+server now sends `seek_progress` (`docs/PROTOCOL.md` §2) roughly every 500 ms
+while a seek has produced no downlink bytes, carrying `frames_discarded`,
+`keyframe_pts` and `elapsed_s`. Seeks that produce media promptly send none —
+in the table above, the 337 ms seek sent zero ticks and the 3.9 s ones sent
+six or seven. The ticker gives up after 60 s with a warning, so a genuinely
+wedged pipeline shows up in the log instead of narrating forever.
 
-## Client-side status
+No protocol-version bump. The server's `hello` check is strict equality, so a
+bump locks out every existing client; `seek_progress` is additive and
+server→client, and clients that do not know the type already skip it. This is
+the same convention `session_progress` was added under.
 
-A related client bug was fixed separately in the Android repo: mpv stops
-emitting `demuxer-cache-duration` while a new file loads, and the engine kept
-the previous epoch's value, so during the entire 20 s gap the client reported
-roughly 9.4 s of cache when the new stream had buffered nothing. That stale
-number also went to the server in `buffer_report`, which means **the server's
-backpressure logic may have been reading a phantom client buffer immediately
-after every seek**. Worth re-checking the watermark behaviour against a
-correctly-reporting client once that fix ships.
+## What is still open
+
+The server-side seek path is now ~3.9 s worst case (~0.35 s with step 2
+armed). The field capture was 20 s. The remaining ~16 s is not accounted for
+by anything measured here, and the client telemetry points away from the
+server: at +18 s the client had **217 MB queued locally** and mpv still had
+not restarted playback. 217 MB is roughly 17 s of `hevc-qp4` at 2960x1848 —
+the server had produced far more than a first frame's worth and the client had
+not drained it into mpv.
+
+Two candidates, both client-side, neither confirmed:
+
+- **The client's queue → mpv sender is the bottleneck.** CLAUDE.md already
+  records that python-mpv's custom-stream adapter capped lossless HEVC near
+  200 Mbps on the desktop client, which is why the dedicated sender thread
+  exists. The Android client's equivalent path is worth profiling first.
+- **Backpressure primed from a phantom buffer.** The Android client kept the
+  previous epoch's `demuxer-cache-duration` while a new file loaded and
+  reported ~9.4 s of cache when the new stream had buffered nothing (fixed
+  separately in the Android repo). `HIGH_WATERMARK_MS` is 10 000, so 9.4 s
+  did not engage the pause on this capture — but it is close enough that a
+  slightly different stale value would have, and `handle_seek`'s
+  `note_buffer_report(0)` is undone by the very next stale report. Re-check
+  the watermark behaviour against a correctly-reporting client.
+
+Reproduce any of this with `/status → sessions[].pipeline.last_seek`, or the
+`relay.pipeline` seek log line, on a real client seek.
