@@ -32,6 +32,30 @@ _NVIDIA_PROVIDERS = {
     "TensorrtExecutionProvider", "CUDAExecutionProvider", "CPUExecutionProvider",
 }
 
+# Providers that actually execute on the GPU.  CPUExecutionProvider appearing
+# in a session is normal and required — ORT runs ops the GPU provider does not
+# implement there — so what matters is which provider comes *first*, i.e. won
+# the bulk of the graph.
+#
+# This lives here rather than beside the EP tables in upscale_cli.infer because
+# that module imports onnxruntime at import time; the server must be able to
+# ask this question without dragging ORT in, and so must CI, which has no GPU
+# stack installed at all.
+_GPU_PROVIDERS = frozenset({
+    "TensorrtExecutionProvider", "CUDAExecutionProvider", "DmlExecutionProvider",
+})
+
+
+def is_gpu_provider(name: str | None) -> bool:
+    """True when `name` executes on the GPU.
+
+    ort.get_available_providers() reports what the build registers, not what
+    can actually load: a TensorRT provider whose CUDA libraries are missing is
+    still listed, and the session then quietly falls back to CPU.  Callers that
+    need real GPU execution must check the provider a session ended up with.
+    """
+    return name in _GPU_PROVIDERS
+
 # Input cap = TRT profile max; output cap covers scale 4x.
 _MAX_IN = (1440, 2560)
 _MAX_IN_BYTES = _MAX_IN[0] * _MAX_IN[1] * 3
@@ -73,7 +97,12 @@ def worker_main(argv: list[str] | None = None) -> int:
     # descriptors directly in that case so the GUI binary can host a worker.
     stdin = sys.stdin.buffer if sys.stdin is not None else os.fdopen(0, "rb", buffering=0)
     stdout = sys.stdout.buffer if sys.stdout is not None else os.fdopen(1, "wb", buffering=0)
-    stdout.write(f"READY {up.scale_factor or 0}\n".encode("ascii"))
+    # The provider the session actually got travels with READY: the parent
+    # cannot see it otherwise, and it is the only reliable evidence that this
+    # worker is running on the GPU rather than having fallen back to CPU.
+    stdout.write(
+        f"READY {up.scale_factor or 0} {up.active_provider}\n".encode("ascii")
+    )
     stdout.flush()
 
     try:
@@ -94,6 +123,16 @@ def worker_main(argv: list[str] | None = None) -> int:
     finally:
         shm_in.close()
         shm_out.close()
+
+
+def parse_ready_provider(line: bytes) -> str | None:
+    """Execution provider named in a worker's READY line, None if absent.
+
+    The provider the worker's session actually got cannot be observed from the
+    parent process any other way.
+    """
+    parts = line.decode("ascii", "replace").split()
+    return parts[2] if len(parts) > 2 else None
 
 
 def provider_check() -> int:
@@ -139,6 +178,7 @@ class SubprocessUpscaler:
         self._shm_out = shared_memory.SharedMemory(create=True, size=_MAX_OUT_BYTES)
         self._proc: subprocess.Popen | None = None
         self._first_frame_done = False
+        self.active_provider: str | None = None
         self._start_worker()
 
     def _start_worker(self) -> None:
@@ -177,6 +217,7 @@ class SubprocessUpscaler:
         if not line or not line.startswith(b"READY"):
             self._kill()
             raise RuntimeError(f"inference worker failed to start: {line!r}")
+        self.active_provider = parse_ready_provider(line)
 
     def _read_exact(self, n: int, timeout: float) -> bytes | None:
         """Next framed reply from the persistent reader (n is fixed = header)."""

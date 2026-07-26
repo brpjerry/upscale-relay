@@ -468,6 +468,7 @@ class Session:
                 ),
                 "fit_mode": p.fit_mode,
                 "resize_algorithm": p.resize_algorithm,
+                "provider": getattr(p.upscaler, "active_provider", None),
                 "last_seek": p.stats.last_seek.report() if p.stats.last_seek else None,
             },
         }

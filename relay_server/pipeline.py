@@ -64,6 +64,33 @@ def _should_use_tensorrt(ep: str, available_providers: set[str]) -> bool:
     return ep == "tensorrt" or (ep == "auto" and provider in available_providers)
 
 
+def _require_gpu_session(upscaler, ep: str) -> None:
+    """Refuse to stream from a session that landed on the CPU provider.
+
+    Relaying is a realtime job, and CPU inference is roughly two orders of
+    magnitude short of it — a session that falls back does not degrade, it
+    stops being usable.  The check is on the provider the session actually
+    got, because the availability list that `_should_use_tensorrt` consults
+    still reports a TensorRT provider whose native libraries failed to load;
+    the fallback is otherwise silent, and reads as an unexplained slowdown.
+
+    `--ep cpu` stays an explicit opt-in for offline experimentation.
+    """
+    from upscale_cli.infer_worker import is_gpu_provider
+
+    if ep == "cpu":
+        return
+    provider = getattr(upscaler, "active_provider", None)
+    if is_gpu_provider(provider):
+        return
+    raise RuntimeError(
+        f"inference fell back to {provider or 'an unknown provider'} with --ep "
+        f"{ep}; the relay needs GPU inference. Check that the NVIDIA runtime "
+        "installed cleanly (its libraries can be registered but still fail to "
+        "load), or pass --ep cpu to accept CPU speeds deliberately."
+    )
+
+
 @dataclass
 class SeekTrace:
     """Timing record for one seek, filled in as the flush walks the stages.
@@ -239,6 +266,7 @@ class Pipeline:
                 self.upscaler = OnnxUpscaler(model_path, ep=ep, tile_size=tile)
             if self.upscaler.scale_factor is None:
                 raise ValueError(f"model {model_path} needs a manifest with scale_factor")
+            _require_gpu_session(self.upscaler, ep)
             scale = self.upscaler.scale_factor
 
         # "fit" preserves the full image inside the display. "cover" crops the
