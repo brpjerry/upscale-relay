@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "upscale-cli"
 version = "0.13.0"
 description = "Video upscale relay - offline pipeline CLI (phase 1)"
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 dependencies = [
     "av>=13",
     "numpy>=1.26",

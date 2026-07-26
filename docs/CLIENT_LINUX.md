@@ -2,7 +2,8 @@
 
 The desktop client (PySide6 + libmpv + `relay_client_core`) is pure Python on
 top of two native pieces: libmpv and PyAV's bundled ffmpeg. Nothing in it is
-Windows-specific. Python 3.11+ required (3.12/3.13 fine).
+Windows-specific. Python 3.12+ required (3.13/3.14 fine); the Windows server
+binaries are built on 3.14, but the client is not tied to that version.
 
 ## 1. System packages
 
