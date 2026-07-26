@@ -42,7 +42,7 @@ the `.[server-gui,nvidia]` extras) starts the server from its last-saved
 configuration and drops an icon in the notification area. The downloadable ZIP
 includes the lightweight ONNX graph tooling required for the fast
 `uint8-wrapped` TensorRT path, while staying small: on first launch the program downloads the pinned TensorRT
-10.13/CUDA 12.9 stack into `%LOCALAPPDATA%\upscale-relay\runtimes`. It verifies
+10.16/CUDA 13.3 stack into `%LOCALAPPDATA%\upscale-relay\runtimes`. It verifies
 TensorRT, CUDA, and CPU providers before marking that versioned runtime ready;
 an interrupted or failed installation is retried on the next launch. The GUI
 shows setup progress, while the console build prints it. Its configuration pane sets the

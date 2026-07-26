@@ -28,25 +28,33 @@ RUNTIME_INSTALL_CHECK_ARG = "--check-nvidia-runtime-installer"
 RUNTIME_INSTALL_SMOKE_ARG = "--smoke-nvidia-runtime-installer"
 RUNTIME_VALIDATE_ARG = "--validate-nvidia-runtime"
 RUNTIME_STACK_ID = (
-    f"ort1.23.2-trt10.13.3-cuda12.9-"
+    f"ort1.28.0-trt10.16.1-cuda13.3-"
     f"py{sys.version_info.major}{sys.version_info.minor}-v1"
 )
 
 # All heavyweight packages are exact pins.  pip resolves their small Python
 # dependencies at install time; these pins prevent CUDA/TensorRT components
 # from silently drifting out of the validated combination.
+#
+# CUDA 13 dropped the "-cu12" suffix from the NVIDIA component wheels, so most
+# names here changed rather than just their versions.  TensorRT stays on 10.x:
+# ONNX Runtime 1.28.0's provider imports nvinfer_10.dll / nvonnxparser_10.dll,
+# so the cu13 build of TensorRT 10 is the only one it can load.
 NVIDIA_RUNTIME_PACKAGES = (
     "onnx==1.22.0",
-    "onnxruntime-gpu==1.23.2",
-    "tensorrt-cu12-libs==10.13.3.9.post1",
-    "cuda-toolkit==12.9.2.0",
-    "nvidia-cublas-cu12==12.9.2.10",
-    "nvidia-cuda-nvrtc-cu12==12.9.86",
-    "nvidia-cuda-runtime-cu12==12.9.79",
-    "nvidia-cudnn-cu12==9.24.0.43",
-    "nvidia-cufft-cu12==11.4.1.4",
-    "nvidia-nvjitlink-cu12==12.9.86",
+    "onnxruntime-gpu==1.28.0",
+    "tensorrt-cu13-libs==10.16.1.11",
+    "cuda-toolkit==13.3.1",
+    "nvidia-cublas==13.6.0.2",
+    "nvidia-cuda-nvrtc==13.3.33",
+    "nvidia-cuda-runtime==13.3.29",
+    "nvidia-cudnn-cu13==9.24.0.43",
+    "nvidia-cufft==12.3.0.29",
+    "nvidia-nvjitlink==13.3.33",
 )
+
+# TensorRT's soname major, which its Windows DLLs carry in their file names.
+_TENSORRT_MAJOR = "10"
 
 _REQUIRED_PROVIDERS = {
     "TensorrtExecutionProvider", "CUDAExecutionProvider", "CPUExecutionProvider",
@@ -83,10 +91,14 @@ def runtime_ready(path: Path | None = None) -> bool:
 
 
 def _native_dll_dirs(target: Path) -> list[Path]:
+    # The NVIDIA wheels do not agree on a layout: cuDNN keeps its libraries
+    # directly in nvidia/cudnn/bin, while the CUDA 13 components put theirs one
+    # level deeper in nvidia/cu13/bin/x86_64.  Matching directories by name
+    # would miss the latter, so select any directory that actually holds a DLL.
     dirs: list[Path] = []
     nvidia = target / "nvidia"
     if nvidia.is_dir():
-        dirs.extend(path for path in nvidia.rglob("bin") if path.is_dir())
+        dirs.extend(sorted({path.parent for path in nvidia.rglob("*.dll")}))
     for relative in ("tensorrt_libs", "onnxruntime/capi"):
         path = target / relative
         if path.is_dir():
@@ -213,6 +225,32 @@ def _validate_runtime(target: Path) -> None:
     verify_native_runtime(target)
 
 
+def _native_library_check(target: Path) -> tuple[list[Path], list[str]]:
+    """Return the libraries to load and the names that are absent.
+
+    Kept separate from loading so the required-file set stays testable on
+    hosts that cannot load the Windows DLLs.
+    """
+    tensorrt_libs = target / "tensorrt_libs"
+    libraries = [
+        tensorrt_libs / f"nvinfer_{_TENSORRT_MAJOR}.dll",
+        tensorrt_libs / f"nvinfer_plugin_{_TENSORRT_MAJOR}.dll",
+        tensorrt_libs / f"nvonnxparser_{_TENSORRT_MAJOR}.dll",
+        target / "onnxruntime" / "capi" / "onnxruntime_providers_tensorrt.dll",
+    ]
+    missing = [str(library) for library in libraries if not library.is_file()]
+
+    # Recent TensorRT splits the single nvinfer_builder_resource DLL into one
+    # per GPU architecture (nvinfer_builder_resource_sm120_10.dll is the
+    # Blackwell one).  Which of them ship depends on the build, so require the
+    # set to be non-empty rather than naming any one.  These are resource DLLs
+    # the builder loads on demand; loading them here would cost gigabytes.
+    pattern = f"nvinfer_builder_resource*_{_TENSORRT_MAJOR}.dll"
+    if not any(tensorrt_libs.glob(pattern)):
+        missing.append(str(tensorrt_libs / pattern))
+    return libraries, missing
+
+
 def verify_native_runtime(path: Path | None = None) -> None:
     """Load the native TensorRT and ORT provider DLLs, not just registry names."""
     target = path
@@ -226,14 +264,7 @@ def verify_native_runtime(path: Path | None = None) -> None:
 
     import ctypes
 
-    libraries = (
-        target / "tensorrt_libs" / "nvinfer_10.dll",
-        target / "tensorrt_libs" / "nvinfer_builder_resource_10.dll",
-        target / "tensorrt_libs" / "nvinfer_plugin_10.dll",
-        target / "tensorrt_libs" / "nvonnxparser_10.dll",
-        target / "onnxruntime" / "capi" / "onnxruntime_providers_tensorrt.dll",
-    )
-    missing = [str(library) for library in libraries if not library.is_file()]
+    libraries, missing = _native_library_check(target)
     if missing:
         raise RuntimeError(f"NVIDIA runtime is missing native libraries: {missing}")
     for library in libraries:

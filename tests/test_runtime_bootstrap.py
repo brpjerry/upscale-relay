@@ -62,10 +62,22 @@ def test_failed_install_is_not_activated(monkeypatch, tmp_path):
     assert not runtime.runtime_ready(target)
 
 
+def _write_dll(path: Path) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"MZ")
+    return path
+
+
 def test_activate_adds_external_packages_and_native_dll_dirs(monkeypatch, tmp_path):
     target = _use_temp_runtime(monkeypatch, tmp_path)
-    dll_dir = target / "nvidia" / "cudnn" / "bin"
-    dll_dir.mkdir(parents=True)
+    # cuDNN keeps its libraries directly under bin/, while the CUDA 13 wheels
+    # nest theirs one level deeper; both directories must be exposed.
+    cudnn_dir = _write_dll(
+        target / "nvidia" / "cudnn" / "bin" / "cudnn64_9.dll"
+    ).parent
+    cuda_dir = _write_dll(
+        target / "nvidia" / "cu13" / "bin" / "x86_64" / "cudart64_13.dll"
+    ).parent
     (target / ".runtime-ready.json").write_text(
         json.dumps({"stack_id": runtime.RUNTIME_STACK_ID}), encoding="utf-8",
     )
@@ -79,9 +91,46 @@ def test_activate_adds_external_packages_and_native_dll_dirs(monkeypatch, tmp_pa
 
     assert runtime.activate_runtime()
     assert str(target) in sys.path
-    assert str(dll_dir) in os.environ["PATH"]
-    assert handles == [str(dll_dir)]
+    assert str(cudnn_dir) in os.environ["PATH"]
+    assert str(cuda_dir) in os.environ["PATH"]
+    assert set(handles) == {str(cudnn_dir), str(cuda_dir)}
     assert runtime._dll_directory_handles
+
+
+def _populate_native_libraries(target: Path, builder_resources: tuple[str, ...]) -> None:
+    major = runtime._TENSORRT_MAJOR
+    for name in (
+        f"nvinfer_{major}.dll",
+        f"nvinfer_plugin_{major}.dll",
+        f"nvonnxparser_{major}.dll",
+        *builder_resources,
+    ):
+        _write_dll(target / "tensorrt_libs" / name)
+    _write_dll(
+        target / "onnxruntime" / "capi" / "onnxruntime_providers_tensorrt.dll"
+    )
+
+
+def test_native_library_check_accepts_per_architecture_builder_resources(tmp_path):
+    major = runtime._TENSORRT_MAJOR
+    # TensorRT ships the builder resource split per GPU architecture; sm120 is
+    # the Blackwell one.  The older single-file name must still satisfy it.
+    for resources in (
+        (f"nvinfer_builder_resource_sm120_{major}.dll",
+         f"nvinfer_builder_resource_ptx_{major}.dll"),
+        (f"nvinfer_builder_resource_{major}.dll",),
+    ):
+        target = tmp_path / f"runtime-{len(resources)}"
+        _populate_native_libraries(target, resources)
+        assert runtime._native_library_check(target)[1] == []
+
+
+def test_native_library_check_reports_absent_builder_resource(tmp_path):
+    target = tmp_path / "runtime"
+    _populate_native_libraries(target, ())
+    _, missing = runtime._native_library_check(target)
+    assert len(missing) == 1
+    assert "nvinfer_builder_resource" in missing[0]
 
 
 def test_frozen_installer_dispatch_and_command(monkeypatch, tmp_path):
