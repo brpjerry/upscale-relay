@@ -49,6 +49,56 @@ pip uninstall -y tensorrt-cu12 tensorrt-cu12-libs tensorrt-cu12-bindings \
     nvidia-cudnn-cu12 nvidia-cufft-cu12 nvidia-nvjitlink-cu12
 ```
 
+### The GPU environment (`.venv-cuda`)
+
+The GPU server runs from its own virtualenv, `.venv-cuda/` in the repository
+root — gitignored, and roughly 5.7 GB across 25 000 files once the NVIDIA
+stack is in it. Python 3.12+; 3.14 is what the current server box uses, and
+what the Windows release binaries are built with.
+
+```powershell
+py -3.14 -m venv .venv-cuda
+.\.venv-cuda\Scripts\python.exe -m pip install --extra-index-url https://pypi.nvidia.com -e ".[gui,nvidia]" pytest
+```
+
+Verify it before trusting a benchmark: the provider list must contain
+`TensorrtExecutionProvider`, or the server silently falls back to CPU.
+
+```powershell
+.\.venv-cuda\Scripts\python.exe -c "import onnxruntime as ort; print(ort.get_available_providers())"
+.\.venv-cuda\Scripts\upscale-cli.exe --help
+.\.venv-cuda\Scripts\python.exe -m pytest tests -q
+```
+
+**A virtualenv is not relocatable.** Moving or renaming `.venv-cuda`, or the
+repository directory above it, breaks it in ways that read as something else:
+
+- The `Scripts\*.exe` console-script launchers embed the absolute path of the
+  interpreter that generated them. After a move they exit with status 1 and
+  print *nothing* — indistinguishable at a glance from a CLI that crashed on
+  startup. `Scripts\python.exe` keeps working, because it resolves its home
+  through the adjacent `pyvenv.cfg`, so `python -m pytest` and `python -m pip`
+  succeed while `pytest.exe` and `pip.exe` fail. That split is the tell.
+- `pyvenv.cfg` and `Scripts\activate{,.bat,.fish}` record the old prefix.
+- An editable install records the *source tree's* absolute path in
+  `Lib\site-packages\__editable___*_finder.py`. That path tracks the
+  repository, not the venv, so it survives a venv-only move and breaks on a
+  repository move.
+
+Recreating the venv is the supported fix. When redownloading the multi-gigabyte
+NVIDIA wheels is not worth it, repair in place instead — reinstall the project
+to regenerate its five launchers and the editable path map, then rewrite the
+interpreter path left in every other launcher and in the activate scripts:
+
+```powershell
+.\.venv-cuda\Scripts\python.exe -m pip install -e . --no-deps --no-build-isolation
+.\.venv-cuda\Scripts\python.exe tools\relocate_venv.py "C:\old\path\.venv-cuda" .venv-cuda
+```
+
+`tools/relocate_venv.py` takes `--dry-run` and reports each file it would
+touch. `--no-build-isolation` keeps the reinstall offline by using the
+setuptools already in the venv.
+
 On Windows the server also ships as a double-click tray app: `relay-server-gui`
 (the `upscale-relay-server-gui.exe` release binary, installable from source with
 the `.[server-gui,nvidia]` extras) starts the server from its last-saved
