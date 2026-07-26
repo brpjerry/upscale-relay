@@ -73,7 +73,12 @@ def worker_main(argv: list[str] | None = None) -> int:
     # descriptors directly in that case so the GUI binary can host a worker.
     stdin = sys.stdin.buffer if sys.stdin is not None else os.fdopen(0, "rb", buffering=0)
     stdout = sys.stdout.buffer if sys.stdout is not None else os.fdopen(1, "wb", buffering=0)
-    stdout.write(f"READY {up.scale_factor or 0}\n".encode("ascii"))
+    # The provider the session actually got travels with READY: the parent
+    # cannot see it otherwise, and it is the only reliable evidence that this
+    # worker is running on the GPU rather than having fallen back to CPU.
+    stdout.write(
+        f"READY {up.scale_factor or 0} {up.active_provider}\n".encode("ascii")
+    )
     stdout.flush()
 
     try:
@@ -94,6 +99,16 @@ def worker_main(argv: list[str] | None = None) -> int:
     finally:
         shm_in.close()
         shm_out.close()
+
+
+def parse_ready_provider(line: bytes) -> str | None:
+    """Execution provider named in a worker's READY line, None if absent.
+
+    The provider the worker's session actually got cannot be observed from the
+    parent process any other way.
+    """
+    parts = line.decode("ascii", "replace").split()
+    return parts[2] if len(parts) > 2 else None
 
 
 def provider_check() -> int:
@@ -139,6 +154,7 @@ class SubprocessUpscaler:
         self._shm_out = shared_memory.SharedMemory(create=True, size=_MAX_OUT_BYTES)
         self._proc: subprocess.Popen | None = None
         self._first_frame_done = False
+        self.active_provider: str | None = None
         self._start_worker()
 
     def _start_worker(self) -> None:
@@ -177,6 +193,7 @@ class SubprocessUpscaler:
         if not line or not line.startswith(b"READY"):
             self._kill()
             raise RuntimeError(f"inference worker failed to start: {line!r}")
+        self.active_provider = parse_ready_provider(line)
 
     def _read_exact(self, n: int, timeout: float) -> bytes | None:
         """Next framed reply from the persistent reader (n is fixed = header)."""
