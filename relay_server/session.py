@@ -29,6 +29,16 @@ log = logging.getLogger("relay.session")
 PROGRESS_INITIAL_DELAY_S = 2.0
 PROGRESS_INTERVAL_S = 2.0
 
+# seek_progress pacing (docs/PROTOCOL.md, docs/SEEK_LATENCY_PLAN.md step 4).
+# A seek that produces its first packet promptly sends nothing; a slow one —
+# a long keyframe-to-target discard window — ticks so the client can show real
+# progress instead of a spinner over a stale buffer readout.
+SEEK_PROGRESS_INITIAL_DELAY_S = 0.75
+SEEK_PROGRESS_INTERVAL_S = 0.5
+# Give up narrating eventually: a seek past the last keyframe produces no
+# surviving frame at all, and silently ticking forever would hide that.
+SEEK_PROGRESS_MAX_S = 60.0
+
 _MAX_CHAPTERS = 512
 
 
@@ -65,7 +75,8 @@ class Session:
     def __init__(self, ws, models: dict[str, str], ep: str = "auto",
                  library: MediaLibrary | None = None,
                  default_resize_algorithm: str = DEFAULT_RESIZE_ALGORITHM,
-                 lossless_hevc_profile: str = DEFAULT_LOSSLESS_HEVC_PROFILE):
+                 lossless_hevc_profile: str = DEFAULT_LOSSLESS_HEVC_PROFILE,
+                 seek_discard_max_s: float | None = None):
         self.id = uuid.uuid4().hex[:12]
         self.ws = ws
         self.models = models  # name -> path
@@ -73,11 +84,13 @@ class Session:
         self.library = library
         self.default_resize_algorithm = default_resize_algorithm
         self.lossless_hevc_profile = lossless_hevc_profile
+        self.seek_discard_max_s = seek_discard_max_s
         self.source_kind = "uplink"
         self.source_path: str | None = None
         self.source_track: VideoTrack | None = None
         self._source_task: asyncio.Task | None = None
         self._open_task: asyncio.Task | None = None
+        self._seek_progress_task: asyncio.Task | None = None
         self.state = State.OPEN
         self.epoch = 0
         self.uplink_token = new_token()
@@ -254,6 +267,7 @@ class Session:
                 fit_mode=fit_mode,
                 resize_algorithm=resize_algorithm,
                 lossless_hevc_profile=self.lossless_hevc_profile,
+                seek_discard_max_s=self.seek_discard_max_s,
             )
         except Exception as err:
             await self.send("error", code="pipeline_error", message=str(err), fatal=True)
@@ -298,6 +312,7 @@ class Session:
         if new_epoch <= self.epoch or self.pipeline is None:
             return  # stale or premature
         self.epoch = new_epoch
+        await self._stop_seek_progress()
         # Drop everything queued for the downlink writer.
         try:
             while True:
@@ -306,10 +321,46 @@ class Session:
             pass
         self.pipeline.note_buffer_report(0)
         await self._stop_server_source()
-        await asyncio.to_thread(self.pipeline.flush, new_epoch, int(msg["target_pts"]))
+        trace = await asyncio.to_thread(
+            self.pipeline.flush, new_epoch, int(msg["target_pts"]))
         if self.downlink_attached:
             await self.start_server_source(int(msg["target_pts"]), discontinuity=True)
+        # seek_ready is only an ack that the epoch switched — the first media
+        # for it may be seconds away (docs/SEEK_LATENCY_PLAN.md). The ticker is
+        # what tells the client the server is working rather than wedged.
         await self.send("seek_ready", epoch=new_epoch)
+        self._seek_progress_task = asyncio.create_task(
+            self._seek_progress_loop(trace, new_epoch))
+
+    async def _stop_seek_progress(self) -> None:
+        task, self._seek_progress_task = self._seek_progress_task, None
+        if task is None:
+            return
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+    async def _seek_progress_loop(self, trace, epoch: int) -> None:
+        """Narrate a slow seek until its first downlink bytes are queued."""
+        await asyncio.sleep(SEEK_PROGRESS_INITIAL_DELAY_S)
+        while (trace.first_packet_ms is None and epoch == self.epoch
+               and self.state != State.CLOSED):
+            elapsed = time.perf_counter() - trace.requested_at
+            if elapsed > SEEK_PROGRESS_MAX_S:
+                log.warning(
+                    "session %s: seek to %d produced no downlink bytes in %.0fs "
+                    "(discarded %d frames) — giving up on progress ticks",
+                    self.id, trace.target_pts, elapsed, trace.frames_discarded,
+                )
+                return
+            await self.send(
+                "seek_progress",
+                epoch=epoch,
+                target_pts=trace.target_pts,
+                keyframe_pts=trace.keyframe_pts,
+                frames_discarded=trace.frames_discarded,
+                elapsed_s=round(elapsed, 2),
+            )
+            await asyncio.sleep(SEEK_PROGRESS_INTERVAL_S)
 
     async def start_server_source(self, from_pts: int | None = None,
                                   discontinuity: bool = False) -> None:
@@ -374,6 +425,7 @@ class Session:
         if self.state == State.CLOSED:
             return
         await self.set_state(State.CLOSED)
+        await self._stop_seek_progress()
         await self._stop_server_source()
         if self.pipeline:
             self.pipeline.close()
@@ -416,5 +468,6 @@ class Session:
                 ),
                 "fit_mode": p.fit_mode,
                 "resize_algorithm": p.resize_algorithm,
+                "last_seek": p.stats.last_seek.report() if p.stats.last_seek else None,
             },
         }

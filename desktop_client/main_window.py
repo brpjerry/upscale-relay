@@ -537,6 +537,19 @@ class MainWindow(QMainWindow):
             message = f"{message} ({elapsed:.0f} s)"
         self._set_opening(True, message)
 
+    def _on_seek_progress(self, msg: dict) -> None:
+        """seek_progress from the server: the new epoch has produced nothing
+        yet. Keep the status bar honest instead of letting the "seeking to X"
+        message time out into silence while the server decodes."""
+        elapsed = msg.get("elapsed_s")
+        discarded = msg.get("frames_discarded")
+        text = "seeking…"
+        if isinstance(discarded, int) and discarded:
+            text = f"seeking… (server decoded past {discarded} frames)"
+        if isinstance(elapsed, (int, float)):
+            text = f"{text} {elapsed:.1f} s"
+        self.statusBar().showMessage(text, 3000)
+
     def _error(self, title: str, message: str) -> None:
         self.statusBar().showMessage(message, 10_000)
         # Non-modal on purpose: a modal dialog spins the Qt event loop inside
@@ -551,6 +564,7 @@ class MainWindow(QMainWindow):
         """Install a connected control client and reflect its capabilities."""
         self.client = client
         client.on_progress = self._on_open_progress
+        client.on_seek_progress = self._on_seek_progress
         self.settings.server_host, self.settings.server_port = client.host, client.port
         current = self.model_combo.currentText()
         self.model_combo.clear()

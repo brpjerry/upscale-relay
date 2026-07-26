@@ -64,10 +64,58 @@ def _should_use_tensorrt(ep: str, available_providers: set[str]) -> bool:
     return ep == "tensorrt" or (ep == "auto" and provider in available_providers)
 
 
+@dataclass
+class SeekTrace:
+    """Timing record for one seek, filled in as the flush walks the stages.
+
+    docs/SEEK_LATENCY_PLAN.md step 1: attribute the post-seek gap before
+    changing anything. Every duration is milliseconds since ``requested_at``
+    (the moment ``Pipeline.flush`` ran), so the fields read as a timeline.
+
+    Written by two threads — decode fills everything except ``first_packet_ms``
+    (finish thread) — but each field has exactly one writer, and readers
+    (/status, the seek_progress ticker) tolerate partial records.
+    """
+
+    epoch: int
+    target_pts: int
+    requested_at: float  # perf_counter at flush()
+    mode: str = "accurate"  # "keyframe" when the discard window was skipped
+    flush_seen_ms: float | None = None  # -> decode stage dequeued the flush
+    keyframe_pts: int | None = None  # first frame the source seek landed on
+    keyframe_gap_s: float | None = None  # (target - keyframe) in seconds
+    frames_discarded: int = 0
+    discard_decode_ms: float = 0.0  # decode time spent on the discard window
+    first_frame_ms: float | None = None  # -> first frame that survived
+    first_frame_pts: int | None = None
+    first_packet_ms: float | None = None  # -> first downlink payload bytes
+
+    def report(self) -> dict:
+        def ms(v):
+            return None if v is None else round(v, 1)
+
+        return {
+            "epoch": self.epoch,
+            "target_pts": self.target_pts,
+            "mode": self.mode,
+            "keyframe_pts": self.keyframe_pts,
+            "keyframe_gap_s": (
+                None if self.keyframe_gap_s is None else round(self.keyframe_gap_s, 3)
+            ),
+            "frames_discarded": self.frames_discarded,
+            "discard_decode_ms": ms(self.discard_decode_ms),
+            "flush_seen_ms": ms(self.flush_seen_ms),
+            "first_frame_ms": ms(self.first_frame_ms),
+            "first_frame_pts": self.first_frame_pts,
+            "first_packet_ms": ms(self.first_packet_ms),
+        }
+
+
 @dataclass(slots=True)
 class _FlushCmd:
     epoch: int
     target_pts: int
+    trace: SeekTrace | None = None
 
 
 @dataclass(slots=True)
@@ -122,6 +170,7 @@ class PipelineStats:
     fps: float = 0.0
     paused_for_backpressure: bool = False
     stage_ms: dict = field(default_factory=dict)  # stage -> [count, total_ms]
+    last_seek: "SeekTrace | None" = None
     _window_start: float = field(default_factory=time.perf_counter)
     _window_frames: int = 0
 
@@ -159,6 +208,7 @@ class Pipeline:
         fit_mode: str = "fit",
         resize_algorithm: str = DEFAULT_RESIZE_ALGORITHM,
         lossless_hevc_profile: str = DEFAULT_LOSSLESS_HEVC_PROFILE,
+        seek_discard_max_s: float | None = None,
     ):
         self.video = video
         self.emit = emit
@@ -236,6 +286,16 @@ class Pipeline:
         self._decoder = self._open_decoder()
         self._epoch = 0  # decode-stage epoch (authoritative for stale drops)
         self._discard_until: int | None = None
+        # Post-seek accuracy knob (docs/SEEK_LATENCY_PLAN.md step 2). None keeps
+        # seeks frame-accurate: every frame between the source keyframe and the
+        # target is decoded and dropped, which costs one GOP of decode time. A
+        # number caps that — when the keyframe lands further than this many
+        # seconds before the target the stream is emitted from the keyframe
+        # instead, so the client lands early rather than waiting.
+        self.seek_discard_max_s = seek_discard_max_s
+        self._seek_trace: SeekTrace | None = None  # decode thread
+        self._finish_trace: SeekTrace | None = None  # finish thread
+        self._seek_keyframe_seen = False  # decode thread
         self._need_discontinuity = True
         self.client_buffered_ms = 0  # last buffer_report value (raw)
         self._client_buffered_at = time.monotonic()
@@ -348,8 +408,15 @@ class Pipeline:
             ms -= (time.monotonic() - self._client_buffered_at) * 1000.0
         return ms
 
-    def flush(self, epoch: int, target_pts: int) -> None:
-        """Drain pending input and schedule a reset. Called on seek."""
+    def flush(self, epoch: int, target_pts: int) -> SeekTrace:
+        """Drain pending input and schedule a reset. Called on seek.
+
+        Returns the (initially empty) trace the stages fill in; the session
+        polls it to narrate progress, and /status reports the last one.
+        """
+        trace = SeekTrace(epoch=epoch, target_pts=target_pts,
+                          requested_at=time.perf_counter())
+        self.stats.last_seek = trace
         self._flush_pending.set()  # breaks the backpressure wait immediately
         self._epoch = epoch  # downstream stages start dropping stale items now
         try:
@@ -357,7 +424,8 @@ class Pipeline:
                 self.in_q.get_nowait()
         except queue.Empty:
             pass
-        self.in_q.put(_FlushCmd(epoch=epoch, target_pts=target_pts))
+        self.in_q.put(_FlushCmd(epoch=epoch, target_pts=target_pts, trace=trace))
+        return trace
 
     def close(self) -> None:
         self._closed.set()
@@ -411,6 +479,12 @@ class Pipeline:
             if isinstance(item, _FlushCmd):
                 self._decoder = self._open_decoder()
                 self._discard_until = item.target_pts
+                self._seek_trace = item.trace
+                self._seek_keyframe_seen = False
+                if item.trace is not None:
+                    item.trace.flush_seen_ms = (
+                        time.perf_counter() - item.trace.requested_at
+                    ) * 1000.0
                 self._flush_pending.clear()
                 self.stats.paused_for_backpressure = False
                 self._safe_put(self._q_dec, item)
@@ -461,17 +535,53 @@ class Pipeline:
                 log.info("NVDEC decode failed at runtime; falling back to software")
                 self._decoder = self._open_decoder()
                 frames = self._decoder.decode(av_pkt)
-            self.stats.add_stage_time("decode", (time.perf_counter() - t0) * 1000)
+            decode_ms = (time.perf_counter() - t0) * 1000
+            self.stats.add_stage_time("decode", decode_ms)
+            trace = self._seek_trace
+            if trace is not None and trace.first_frame_ms is None:
+                # Everything decoded before the first surviving frame is the
+                # discard window's cost, whether or not the packet produced
+                # output (reordering delay counts too).
+                trace.discard_decode_ms += decode_ms
             for frame in frames:
                 self._put_decoded(frame, pkt.epoch)
 
     _HW_PIX_FMTS = {"cuda", "d3d11", "d3d11va_vld", "vaapi", "qsv"}
 
+    def _note_seek_keyframe(self, pts: int) -> None:
+        """First frame out of the decoder after a flush: this is where the
+        source seek actually landed. Decide here whether the keyframe-to-target
+        span is worth decoding at all."""
+        self._seek_keyframe_seen = True
+        gap_s = float((self._discard_until - pts) * self.video.time_base)
+        trace = self._seek_trace
+        if trace is not None:
+            trace.keyframe_pts = pts
+            trace.keyframe_gap_s = gap_s
+        if self.seek_discard_max_s is not None and gap_s > self.seek_discard_max_s:
+            if trace is not None:
+                trace.mode = "keyframe"
+            log.info(
+                "seek: keyframe %.2fs before target (> %.2fs) — emitting from "
+                "the keyframe instead of decoding the discard window",
+                gap_s, self.seek_discard_max_s,
+            )
+            self._discard_until = None
+
     def _put_decoded(self, frame: av.VideoFrame, epoch: int) -> None:
         if frame.pts is not None and self._discard_until is not None:
-            if frame.pts < self._discard_until:
-                return
-            self._discard_until = None
+            if not self._seek_keyframe_seen:
+                self._note_seek_keyframe(frame.pts)
+            if self._discard_until is not None:
+                if frame.pts < self._discard_until:
+                    if self._seek_trace is not None:
+                        self._seek_trace.frames_discarded += 1
+                    return
+                self._discard_until = None
+        trace = self._seek_trace
+        if trace is not None and trace.first_frame_ms is None:
+            trace.first_frame_ms = (time.perf_counter() - trace.requested_at) * 1000.0
+            trace.first_frame_pts = frame.pts
         if frame.format.name in self._HW_PIX_FMTS:
             # Download NVDEC frames on the decode thread (parallel with infer).
             cpu = frame.reformat(format="nv12")
@@ -515,6 +625,7 @@ class Pipeline:
                 return
             if isinstance(item, _FlushCmd):
                 self._open_mux()  # abandon the old epoch's container
+                self._finish_trace = item.trace
                 self._need_discontinuity = True
                 continue
             if isinstance(item, _Eos):
@@ -569,11 +680,27 @@ class Pipeline:
             self.stats.tick_out(item.pts if item.pts is not None else NO_TS)
             self._flush_chunk(item.epoch, item.pts, keyframe)
 
+    def _log_seek_trace(self, trace: SeekTrace) -> None:
+        log.info(
+            "seek epoch=%d target_pts=%d mode=%s: flush_seen=%.0fms "
+            "keyframe_gap=%s discarded=%d frames (%.0fms decode) "
+            "first_frame=+%.0fms first_packet=+%.0fms",
+            trace.epoch, trace.target_pts, trace.mode,
+            trace.flush_seen_ms or 0.0,
+            "n/a" if trace.keyframe_gap_s is None else f"{trace.keyframe_gap_s:.2f}s",
+            trace.frames_discarded, trace.discard_decode_ms,
+            trace.first_frame_ms or 0.0, trace.first_packet_ms or 0.0,
+        )
+
     def _flush_chunk(self, epoch: int, pts: int | None, keyframe: bool) -> None:
         """Ship whatever container bytes the muxer has produced so far."""
         data = self._sink_buf.drain()
         if not data:
             return
+        trace = self._finish_trace
+        if trace is not None and trace.first_packet_ms is None and epoch >= trace.epoch:
+            trace.first_packet_ms = (time.perf_counter() - trace.requested_at) * 1000.0
+            self._log_seek_trace(trace)
         flags = FLAG_KEYFRAME if keyframe else 0
         if self._need_discontinuity:
             flags |= FLAG_DISCONTINUITY
