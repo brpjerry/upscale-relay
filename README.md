@@ -36,6 +36,19 @@ relay-server --models-dir models --ep tensorrt
 relay-desktop
 ```
 
+The `nvidia` extra moved from CUDA 12 to CUDA 13, which renamed most of its
+wheels (`nvidia-cublas-cu12` became `nvidia-cublas`, and so on). pip sees no
+upgrade relationship between the old and new names, so an environment created
+before that change keeps both stacks installed. The two TensorRT builds are the
+problem: they ship the same `tensorrt_libs/nvinfer_10.dll` for different CUDA
+majors. Install into a fresh virtualenv, or drop the superseded packages first:
+
+```
+pip uninstall -y tensorrt-cu12 tensorrt-cu12-libs tensorrt-cu12-bindings \
+    nvidia-cublas-cu12 nvidia-cuda-nvrtc-cu12 nvidia-cuda-runtime-cu12 \
+    nvidia-cudnn-cu12 nvidia-cufft-cu12 nvidia-nvjitlink-cu12
+```
+
 On Windows the server also ships as a double-click tray app: `relay-server-gui`
 (the `upscale-relay-server-gui.exe` release binary, installable from source with
 the `.[server-gui,nvidia]` extras) starts the server from its last-saved
