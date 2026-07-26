@@ -32,6 +32,30 @@ _NVIDIA_PROVIDERS = {
     "TensorrtExecutionProvider", "CUDAExecutionProvider", "CPUExecutionProvider",
 }
 
+# Providers that actually execute on the GPU.  CPUExecutionProvider appearing
+# in a session is normal and required — ORT runs ops the GPU provider does not
+# implement there — so what matters is which provider comes *first*, i.e. won
+# the bulk of the graph.
+#
+# This lives here rather than beside the EP tables in upscale_cli.infer because
+# that module imports onnxruntime at import time; the server must be able to
+# ask this question without dragging ORT in, and so must CI, which has no GPU
+# stack installed at all.
+_GPU_PROVIDERS = frozenset({
+    "TensorrtExecutionProvider", "CUDAExecutionProvider", "DmlExecutionProvider",
+})
+
+
+def is_gpu_provider(name: str | None) -> bool:
+    """True when `name` executes on the GPU.
+
+    ort.get_available_providers() reports what the build registers, not what
+    can actually load: a TensorRT provider whose CUDA libraries are missing is
+    still listed, and the session then quietly falls back to CPU.  Callers that
+    need real GPU execution must check the provider a session ended up with.
+    """
+    return name in _GPU_PROVIDERS
+
 # Input cap = TRT profile max; output cap covers scale 4x.
 _MAX_IN = (1440, 2560)
 _MAX_IN_BYTES = _MAX_IN[0] * _MAX_IN[1] * 3

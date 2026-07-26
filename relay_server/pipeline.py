@@ -76,7 +76,7 @@ def _require_gpu_session(upscaler, ep: str) -> None:
 
     `--ep cpu` stays an explicit opt-in for offline experimentation.
     """
-    from upscale_cli.infer import is_gpu_provider
+    from upscale_cli.infer_worker import is_gpu_provider
 
     if ep == "cpu":
         return
