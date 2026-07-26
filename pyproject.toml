@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "upscale-cli"
 version = "0.13.0"
 description = "Video upscale relay - offline pipeline CLI (phase 1)"
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 dependencies = [
     "av>=13",
     "numpy>=1.26",
@@ -30,15 +30,15 @@ server-gui = [
 # release installs into its per-user runtime on first launch.
 nvidia = [
     "onnx==1.22.0",
-    "onnxruntime-gpu==1.23.2",
-    "tensorrt-cu12-libs==10.13.3.9.post1",
-    "cuda-toolkit==12.9.2.0",
-    "nvidia-cublas-cu12==12.9.2.10",
-    "nvidia-cuda-nvrtc-cu12==12.9.86",
-    "nvidia-cuda-runtime-cu12==12.9.79",
-    "nvidia-cudnn-cu12==9.24.0.43",
-    "nvidia-cufft-cu12==11.4.1.4",
-    "nvidia-nvjitlink-cu12==12.9.86",
+    "onnxruntime-gpu==1.28.0",
+    "tensorrt-cu13-libs==10.16.1.11",
+    "cuda-toolkit==13.3.1",
+    "nvidia-cublas==13.6.0.2",
+    "nvidia-cuda-nvrtc==13.3.33",
+    "nvidia-cuda-runtime==13.3.29",
+    "nvidia-cudnn-cu13==9.24.0.43",
+    "nvidia-cufft==12.3.0.29",
+    "nvidia-nvjitlink==13.3.33",
 ]
 
 [project.scripts]

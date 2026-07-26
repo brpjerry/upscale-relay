@@ -30,14 +30,19 @@ from .manifest import ModelManifest
 def _add_nvidia_dll_dirs() -> None:
     """cuDNN 9 lazy-loads engine sub-DLLs by bare name; when CUDA/cuDNN come
     from nvidia pip wheels their bin dirs must be on PATH before onnxruntime
-    loads. No-op when the wheels aren't installed (e.g. DirectML env)."""
+    loads. No-op when the wheels aren't installed (e.g. DirectML env).
+
+    The wheels disagree on layout — cuDNN keeps its libraries directly in
+    nvidia/cudnn/bin, while the CUDA 13 components nest theirs in
+    nvidia/cu13/bin/x86_64 — so select directories that actually hold a DLL
+    rather than directories named "bin"."""
     import os
 
     site = Path(np.__file__).resolve().parents[1]
     dirs = []
     nvidia = site / "nvidia"
     if nvidia.is_dir():
-        dirs += [str(p) for p in nvidia.rglob("bin") if p.is_dir()]
+        dirs += [str(p) for p in sorted({d.parent for d in nvidia.rglob("*.dll")})]
     dirs += [str(p) for p in site.glob("tensorrt_libs") if p.is_dir()]
     if dirs:
         os.environ["PATH"] = ";".join(dirs) + ";" + os.environ["PATH"]

@@ -36,13 +36,26 @@ relay-server --models-dir models --ep tensorrt
 relay-desktop
 ```
 
+The `nvidia` extra moved from CUDA 12 to CUDA 13, which renamed most of its
+wheels (`nvidia-cublas-cu12` became `nvidia-cublas`, and so on). pip sees no
+upgrade relationship between the old and new names, so an environment created
+before that change keeps both stacks installed. The two TensorRT builds are the
+problem: they ship the same `tensorrt_libs/nvinfer_10.dll` for different CUDA
+majors. Install into a fresh virtualenv, or drop the superseded packages first:
+
+```
+pip uninstall -y tensorrt-cu12 tensorrt-cu12-libs tensorrt-cu12-bindings \
+    nvidia-cublas-cu12 nvidia-cuda-nvrtc-cu12 nvidia-cuda-runtime-cu12 \
+    nvidia-cudnn-cu12 nvidia-cufft-cu12 nvidia-nvjitlink-cu12
+```
+
 On Windows the server also ships as a double-click tray app: `relay-server-gui`
 (the `upscale-relay-server-gui.exe` release binary, installable from source with
 the `.[server-gui,nvidia]` extras) starts the server from its last-saved
 configuration and drops an icon in the notification area. The downloadable ZIP
 includes the lightweight ONNX graph tooling required for the fast
 `uint8-wrapped` TensorRT path, while staying small: on first launch the program downloads the pinned TensorRT
-10.13/CUDA 12.9 stack into `%LOCALAPPDATA%\upscale-relay\runtimes`. It verifies
+10.16/CUDA 13.3 stack into `%LOCALAPPDATA%\upscale-relay\runtimes`. It verifies
 TensorRT, CUDA, and CPU providers before marking that versioned runtime ready;
 an interrupted or failed installation is retried on the next launch. The GUI
 shows setup progress, while the console build prints it. Its configuration pane sets the

@@ -74,7 +74,7 @@ collect those tests and therefore must also have `mpv-dev\libmpv-2.dll`.
 
 The downloadable `upscale-relay-server` and `upscale-relay-server-gui`
 packages are intentionally small and do not contain the multi-gigabyte NVIDIA
-stack. On first launch they install the pinned TensorRT 10.13/CUDA 12.9 runtime
+stack. On first launch they install the pinned TensorRT 10.16/CUDA 13.3 runtime
 under `%LOCALAPPDATA%\upscale-relay\runtimes`; the GUI shows a progress window
 and the console build prints progress. Setup verifies TensorRT, CUDA, and CPU
 providers before publishing the versioned runtime, so a partial download is
