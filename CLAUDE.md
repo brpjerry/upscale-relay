@@ -111,6 +111,18 @@ constructor options).
 - TRT builds engines from *live timing measurements*: engines built while the
   GPU is busy (user games on this box) are permanently slow — delete
   `models/.trt_cache` and rebuild with an idle GPU.
+- **Reproduce any playback bug on the `passthrough` model first.** This GPU is
+  shared with whatever the owner is doing on the box, so a model that normally
+  keeps up can quietly fall under realtime — and a starved pipeline produces
+  exactly the client-side symptoms you are usually trying to measure: dropped
+  frames, rebuffers, stalls. Passthrough takes inference out of the picture;
+  put the model back once the behaviour is understood. The tells that you are
+  measuring contention rather than the bug are `/status →
+  sessions[].pipeline.fps` below the source frame rate, the client's mpv
+  `cache` draining toward zero, and the client raising its own "server is not
+  keeping up" banner. This cost a round of confounded frame-drop measurements
+  on 2026-07-26. Match the *network* the same way: a tier the client's Wi-Fi
+  cannot carry starves it just as effectively, and looks identical.
 
 ## Known issues / current debugging front
 
@@ -118,9 +130,10 @@ constructor options).
   keyframe-to-target discard window is ~94% of it (~3.6 s for a 250-frame
   1080p GOP), it scales with GOP length and *not* with seek distance, and
   `--seek-discard-max-s` removes it at the cost of keyframe-accurate seeks.
-  The 20 s the Android client saw is mostly still unexplained and now looks
-  client-side (217 MB queued locally before mpv restarted playback).
-  `docs/SEEK_LATENCY_PLAN.md` has the numbers and what to check next.
+  The remaining ~16 s the Android client saw was client-side and is fixed
+  there (it attached the original file to mpv at load, which left the external
+  audio demuxer at the start of the file); `docs/SEEK_LATENCY_PLAN.md` has
+  both halves.
 - **Intermittent server crash** (~1 in 5 full 4K lossless-hevc runs), native
   AV, cause not yet pinned — need a faulthandler stack from a crash (server
   prints it to its terminal). If it lands in NVENC, the plan is to move encode
