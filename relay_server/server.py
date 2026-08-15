@@ -13,10 +13,11 @@ import argparse
 import asyncio
 import json
 import logging
+import sys
 from collections.abc import Callable
 from pathlib import Path
 
-from aiohttp import WSMsgType, web
+from aiohttp import WSMsgType, web, web_fileresponse
 
 from relay_protocol import (
     DIR_DOWNLINK,
@@ -41,6 +42,21 @@ from .session import Session, State
 from .library import SORT_KEYS as LIBRARY_SORT_KEYS, LibraryPathError, MediaLibrary
 
 log = logging.getLogger("relay.server")
+
+if sys.platform == "win32":
+    # `web.FileResponse` streams with the event loop's native sendfile, which on
+    # Windows is TransmitFile. That call takes at most 2,147,483,646 bytes, but
+    # asyncio clamps its block to 0xffff_ffff (CPython proactor_events), so any
+    # request whose remaining length exceeds 2 GiB raises WinError 87 — and
+    # aiohttp falls back to its own read loop only on NotImplementedError, never
+    # OSError. The error therefore lands *after* the response headers are on the
+    # wire: clients see a correct Content-Length and then a closed connection
+    # with zero bytes. mpv opens external media with `Range: bytes=0-`, so every
+    # remux over 2 GiB served the Android client no audio and no subtitles.
+    # Bounded ranges under the limit worked, which is what made it look like a
+    # client-side track-selection bug. NOSENDFILE is read per call, so setting
+    # it here does not depend on import order.
+    web_fileresponse.NOSENDFILE = True
 
 
 def discover_models(models_dir: str) -> dict[str, dict]:

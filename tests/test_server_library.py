@@ -4,8 +4,11 @@ import asyncio
 import os
 import shutil
 import socket
+import subprocess
+import sys
 from pathlib import Path
 
+import aiohttp
 import av
 import pytest
 
@@ -277,6 +280,43 @@ def test_library_http_range_and_server_source_pts(library_file):
             assert downlink_pts(packets) == source_pts(target)
         finally:
             await client.teardown()
+            await server.stop()
+
+    asyncio.run(scenario())
+
+
+def test_open_ended_range_streams_a_file_over_two_gibibytes(tmp_path):
+    """A remux larger than 2 GiB must stream, not just answer bounded ranges.
+
+    mpv opens external audio/subtitle sources with ``Range: bytes=0-``, so the
+    remaining length handed to the sendfile path is the whole file. On Windows
+    that used to exceed what TransmitFile accepts and the response was cut off
+    after its headers, delivering zero bytes (see the NOSENDFILE note in
+    ``relay_server.server``). Reading the first chunk is enough: the failure was
+    immediate, not partway through the transfer.
+    """
+    library = tmp_path / "library"
+    library.mkdir()
+    huge = library / "Huge.mkv"
+    huge.touch()
+    if sys.platform == "win32":
+        # Mark sparse before extending, so the test costs no real disk.
+        subprocess.run(["fsutil", "sparse", "setflag", str(huge)],
+                       check=False, capture_output=True)
+    with open(huge, "r+b") as handle:
+        handle.truncate((1 << 31) + 4096)
+
+    async def scenario():
+        server = RelayServer(str(ROOT / "models"), free_port_pair(), library_root=str(library))
+        await server.start()
+        try:
+            async with aiohttp.ClientSession() as http:
+                url = f"http://127.0.0.1:{server.port}/media/Huge.mkv"
+                async with http.get(url, headers={"Range": "bytes=0-"}) as response:
+                    assert response.status == 206
+                    assert response.headers["Content-Range"].endswith(f"/{(1 << 31) + 4096}")
+                    assert len(await response.content.readexactly(65536)) == 65536
+        finally:
             await server.stop()
 
     asyncio.run(scenario())
