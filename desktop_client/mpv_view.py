@@ -41,6 +41,10 @@ def _load_mpv():
 
 mpv = _load_mpv()
 
+# Start with a half-second mpv reserve once the first cluster is decodable.
+# Cache pause remains enabled for recovery; this only reduces its initial wait.
+CACHE_PAUSE_WAIT_S = 0.5
+
 
 def _native_display_params(app=None) -> dict[str, c_void_p]:
     """Return Qt's display handle in the form expected by libmpv.
@@ -310,6 +314,7 @@ class MpvPlayerView(QOpenGLWidget):
                 "rebase_start_time": "no",
                 "cache": "yes",
                 "cache_pause": "yes",
+                "cache_pause_wait": CACHE_PAUSE_WAIT_S,
                 "demuxer_readahead_secs": "15",
                 "demuxer_max_bytes": "768MiB",
                 "demuxer_max_back_bytes": "0",
@@ -333,6 +338,7 @@ class MpvPlayerView(QOpenGLWidget):
                 "input_default_bindings": "yes",
                 "cache": "yes",
                 "cache_pause": "yes",
+                "cache_pause_wait": CACHE_PAUSE_WAIT_S,
                 "demuxer_readahead_secs": "15",
                 "demuxer_max_bytes": "768MiB",
                 "demuxer_max_back_bytes": "0",
@@ -372,6 +378,7 @@ class MpvPlayerView(QOpenGLWidget):
             idle="yes",
             **extra,
         )
+        self._default_sub_fonts_dir = getattr(self.mpv, "sub_fonts_dir", "")
         if "config" in extra:
             # mpv.conf won over any constructor option it named; re-assert
             # the plumbing the relay breaks without (runtime sets beat the
@@ -383,6 +390,7 @@ class MpvPlayerView(QOpenGLWidget):
             self.mpv.idle = True
             self.mpv.cache = True  # live-stream buffering, sized for the
             self.mpv.cache_pause = True
+            self.mpv.cache_pause_wait = CACHE_PAUSE_WAIT_S
             self.mpv.demuxer_readahead_secs = 15  # ~200 Mbps lossless tiers
             self.mpv.demuxer_max_bytes = "768MiB"
             self.mpv.demuxer_max_back_bytes = 0
@@ -530,6 +538,12 @@ class MpvPlayerView(QOpenGLWidget):
             self.mpv.command(
                 "loadfile", self._buffer.uri, "replace", load_options)
         self._reloading = False
+
+    def set_subtitle_fonts_dir(self, path: Path | None) -> None:
+        """Point libass at the verified per-session attachment view."""
+        self.mpv.sub_fonts_dir = (
+            str(path) if path is not None else self._default_sub_fonts_dir
+        )
 
     def _retire_stream(self) -> None:
         """Stop and discard an epoch without waiting for its replacement."""

@@ -39,11 +39,10 @@ SEEK_PROGRESS_INTERVAL_S = 0.5
 # surviving frame at all, and silently ticking forever would hide that.
 SEEK_PROGRESS_MAX_S = 60.0
 
-# Attachments are written into the first Matroska payload of every epoch. A
-# font-heavy anime remux produced a 35 MiB first packet, adding ~3.5 seconds to
-# startup and every seek over the measured LAN. Above this bound, preserve the
-# original fonts/tracks through the seekable /media attachment path instead of
-# claiming a muxed session whose epoch replacement cannot be low latency.
+# Legacy clients embed attachments in the first Matroska payload of every
+# epoch. Above this bound, preserve fonts through /media rather than repeat a
+# huge header. Cache-capable clients negotiate verified font objects and do not
+# apply this limit because epoch containers omit their bodies.
 MAX_MUXED_ATTACHMENT_BYTES = 4 * 1024 * 1024
 
 _MAX_CHAPTERS = 512
@@ -97,8 +96,12 @@ class Session:
         self.source_track: VideoTrack | None = None
         self.aux_track: AuxiliaryTrack | None = None
         self.aux_track_mode = "external"
+        self.aux_attachment_mode = "embedded"
+        self.attachment_token: str | None = None
+        self.attachment_manifest: list[dict] = []
         self._source_task: asyncio.Task | None = None
         self._open_task: asyncio.Task | None = None
+        self._close_task: asyncio.Task | None = None
         self._seek_progress_task: asyncio.Task | None = None
         self.state = State.OPEN
         self.epoch = 0
@@ -111,6 +114,7 @@ class Session:
         self.last_buffer_report = time.monotonic()
         self.created = time.monotonic()
         self._loop = asyncio.get_running_loop()
+        self._final_pipeline_status: dict | None = None
 
     # -- helpers ---------------------------------------------------------------
 
@@ -221,6 +225,19 @@ class Session:
                 message="muxed auxiliary tracks require server_file", fatal=False,
             )
             return
+        requested_attachments = msg.get("aux_attachments", "embedded")
+        if requested_attachments not in ("embedded", "cached"):
+            await self.send(
+                "error", code="bad_message",
+                message="invalid aux_attachments", fatal=False,
+            )
+            return
+        if requested_attachments == "cached" and requested_aux != "muxed":
+            await self.send(
+                "error", code="bad_message",
+                message="cached attachments require muxed auxiliary tracks", fatal=False,
+            )
+            return
         resolved_path: str | None = None
         if source_kind == "server_file":
             if self.library is None:
@@ -242,7 +259,16 @@ class Session:
                         )
                     else:
                         attachment_bytes = self.aux_track.attachment_bytes
-                        if attachment_bytes > MAX_MUXED_ATTACHMENT_BYTES:
+                        if (
+                            requested_attachments == "cached"
+                            and self.aux_track.attachments
+                            and self.aux_track.attachment_cache_supported
+                        ):
+                            self.aux_track_mode = "muxed"
+                            self.aux_attachment_mode = "cached"
+                            self.attachment_manifest = self.aux_track.attachment_manifest()
+                            self.attachment_token = new_token()
+                        elif attachment_bytes > MAX_MUXED_ATTACHMENT_BYTES:
                             log.info(
                                 "session %s: %.1f MiB of attachments exceeds the "
                                 "live mux limit; using external auxiliary media",
@@ -317,14 +343,19 @@ class Session:
                 lossless_hevc_profile=self.lossless_hevc_profile,
                 seek_discard_max_s=self.seek_discard_max_s,
                 aux_source_path=(resolved_path if self.aux_track_mode == "muxed" else None),
+                embed_aux_attachments=self.aux_attachment_mode == "embedded",
             )
         except Exception as err:
             await self.send("error", code="pipeline_error", message=str(err), fatal=True)
-            await self.close()
+            # Do not await close from the open task: close must wait for this
+            # task before acknowledging teardown, and the two would deadlock.
+            asyncio.create_task(self.close())
             return
         finally:
             build_done.set()
             await keepalive
+        if self.state == State.CLOSED:
+            return
         duration_s = (self.source_track.duration_seconds() if self.source_track else
                       (msg.get("file") or {}).get("duration_s"))
         avg_rate = self.source_track.average_rate if self.source_track else cfg.avg_rate
@@ -353,6 +384,13 @@ class Session:
             avg_rate=[avg_rate.numerator, avg_rate.denominator] if avg_rate else None,
             chapters=chapters or None,
             aux_tracks=self.aux_track_mode,
+            aux_attachments=self.aux_attachment_mode,
+            attachment_manifest=(
+                self.attachment_manifest if self.aux_attachment_mode == "cached" else None
+            ),
+            attachment_token=(
+                self.attachment_token if self.aux_attachment_mode == "cached" else None
+            ),
         )
 
     media_port: int = 0  # set by server at construction
@@ -523,24 +561,93 @@ class Session:
             self.pipeline.note_buffer_report(int(msg.get("buffered_ms", 0)))
 
     async def close(self) -> None:
-        if self.state == State.CLOSED:
-            return
-        await self.set_state(State.CLOSED)
+        """Idempotent resource-release barrier for the control connection."""
+        if self._close_task is None:
+            self._close_task = asyncio.create_task(self._close_impl())
+        await asyncio.shield(self._close_task)
+
+    async def _close_impl(self) -> None:
+        errors: list[BaseException] = []
+        if self.state != State.CLOSED:
+            await self.set_state(State.CLOSED)
         await self._stop_seek_progress()
         await self._stop_server_source()
-        if self.pipeline:
-            self.pipeline.close()
+
+        # A cancelled asyncio.to_thread build keeps running. Wait for the open
+        # task and its _open_and_reap finally block so it cannot publish a late
+        # pipeline after this barrier has opened.
+        open_task = self._open_task
+        if open_task is not None and open_task is not asyncio.current_task():
+            result = await asyncio.gather(open_task, return_exceptions=True)
+            if result and isinstance(result[0], BaseException):
+                errors.append(result[0])
+        self._open_task = None
+
+        pipeline, self.pipeline = self.pipeline, None
+        if pipeline is not None:
+            if hasattr(pipeline, "stats"):
+                self._final_pipeline_status = self._pipeline_status(pipeline)
+            try:
+                await asyncio.to_thread(pipeline.close)
+            except BaseException as err:
+                errors.append(err)
+            finally:
+                # Keep the completed run's diagnostics available to callers
+                # holding a Session reference after the teardown barrier.
+                if hasattr(pipeline, "stats"):
+                    final_status = self._pipeline_status(pipeline)
+                    if self._final_pipeline_status is not None:
+                        final_status["provider"] = (
+                            final_status["provider"]
+                            or self._final_pipeline_status["provider"]
+                        )
+                    self._final_pipeline_status = final_status
+
         if self.source_track is not None:
-            await asyncio.to_thread(self.source_track.close)
-            self.source_track = None
+            source, self.source_track = self.source_track, None
+            try:
+                await asyncio.to_thread(source.close)
+            except BaseException as err:
+                errors.append(err)
         if self.aux_track is not None:
-            await asyncio.to_thread(self.aux_track.close)
-            self.aux_track = None
-        # Wake the downlink writer so it exits.
+            auxiliary, self.aux_track = self.aux_track, None
+            try:
+                await asyncio.to_thread(auxiliary.close)
+            except BaseException as err:
+                errors.append(err)
+
+        # Wake the downlink writer even when a native owner timed out; the
+        # control socket will close without a successful acknowledgement.
         try:
             self.down_q.put_nowait(None)
         except asyncio.QueueFull:
             pass
+        if errors:
+            raise errors[0]
+
+    def _pipeline_status(self, p: Pipeline) -> dict:
+        return {
+            "frames_in": p.stats.frames_in,
+            "frames_out": p.stats.frames_out,
+            "fps": round(p.stats.fps, 2),
+            "in_queue": p.in_q.qsize(),
+            "down_queue": self.down_q.qsize(),
+            "paused_for_backpressure": p.stats.paused_for_backpressure,
+            "stage_ms": p.stats.stage_report(),
+            "client_buffered_ms": p.client_buffered_ms,
+            "client_buffered_ms_est": round(p.buffered_ms_now()),
+            "output": f"{p.out_w}x{p.out_h}",
+            "codec": p.downlink_codec,
+            "encoder": p.encoder_name,
+            "quality_tier": p.quality_tier,
+            "lossless_hevc_profile": (
+                p.lossless_hevc_profile if p.quality_tier == "lossless-hevc" else None
+            ),
+            "fit_mode": p.fit_mode,
+            "resize_algorithm": p.resize_algorithm,
+            "provider": getattr(p.upscaler, "active_provider", None),
+            "last_seek": p.stats.last_seek.report() if p.stats.last_seek else None,
+        }
 
     def status(self) -> dict:
         p = self.pipeline
@@ -552,28 +659,6 @@ class Session:
             "downlink_attached": self.downlink_attached,
             "source": self.source_kind,
             "aux_tracks": self.aux_track_mode,
-            "pipeline": None
-            if p is None
-            else {
-                "frames_in": p.stats.frames_in,
-                "frames_out": p.stats.frames_out,
-                "fps": round(p.stats.fps, 2),
-                "in_queue": p.in_q.qsize(),
-                "down_queue": self.down_q.qsize(),
-                "paused_for_backpressure": p.stats.paused_for_backpressure,
-                "stage_ms": p.stats.stage_report(),
-                "client_buffered_ms": p.client_buffered_ms,
-                "client_buffered_ms_est": round(p.buffered_ms_now()),
-                "output": f"{p.out_w}x{p.out_h}",
-                "codec": p.downlink_codec,
-                "encoder": p.encoder_name,
-                "quality_tier": p.quality_tier,
-                "lossless_hevc_profile": (
-                    p.lossless_hevc_profile if p.quality_tier == "lossless-hevc" else None
-                ),
-                "fit_mode": p.fit_mode,
-                "resize_algorithm": p.resize_algorithm,
-                "provider": getattr(p.upscaler, "active_provider", None),
-                "last_seek": p.stats.last_seek.report() if p.stats.last_seek else None,
-            },
+            "aux_attachments": self.aux_attachment_mode,
+            "pipeline": self._pipeline_status(p) if p is not None else self._final_pipeline_status,
         }

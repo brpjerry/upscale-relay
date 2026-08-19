@@ -273,6 +273,7 @@ def test_capabilities_without_library_advertise_no_sort_keys():
             caps = await client.connect()
             assert caps["library"] is False
             assert caps["muxed_aux_tracks"] is False
+            assert caps["attachment_cache"] == 0
             assert caps.get("library_sort", []) == []
         finally:
             await client.teardown()
@@ -292,6 +293,7 @@ def test_library_http_range_and_server_source_pts(library_file):
             caps = await client.connect()
             assert caps["library"] is True
             assert caps["muxed_aux_tracks"] is True
+            assert caps["attachment_cache"] == 1
             assert caps["library_sort"] == ["name", "mtime"]
             assert caps["default_resize_algorithm"] == "lanczos"
             assert "area" in caps["resize_algorithms"]

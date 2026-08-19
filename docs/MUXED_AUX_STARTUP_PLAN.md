@@ -1,6 +1,16 @@
 # Muxed auxiliary-track startup and attachment caching
 
-Status: diagnosed; implementation pending
+Status: immediate fixes and negotiated attachment cache implemented;
+Linux/Windows live timing and cache tuning pending
+
+Implemented on 2026-08-18: a 100 ms `max_interleave_delta`, immediate delivery
+of each epoch's discontinuity packet, a conservative 0.5 s mpv
+`cache-pause-wait`, and an additive cached-attachment protocol. The server
+publishes sanitized SHA-256 font manifests through a session bearer token;
+the Qt client uses a bounded verified content-addressed cache and per-session
+libass font directory, while old clients keep embedded attachments. The live
+measurement matrix below remains the authority for choosing a different
+interleave/cache reserve.
 
 ## Scope
 

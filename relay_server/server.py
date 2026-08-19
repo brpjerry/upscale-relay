@@ -13,6 +13,7 @@ import argparse
 import asyncio
 import json
 import logging
+import re
 import sys
 from collections.abc import Callable
 from pathlib import Path
@@ -42,6 +43,7 @@ from .session import Session, State
 from .library import SORT_KEYS as LIBRARY_SORT_KEYS, LibraryPathError, MediaLibrary
 
 log = logging.getLogger("relay.server")
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
 if sys.platform == "win32":
     # `web.FileResponse` streams with the event loop's native sendfile, which on
@@ -90,6 +92,7 @@ class RelayServer:
         self.models = {name: info["path"] for name, info in self.models_info.items()}
         self.library = MediaLibrary(library_root) if library_root else None
         self.sessions: dict[str, Session] = {}  # keyed by media tokens AND id
+        self.native_teardown_error: dict | None = None
         # Optional GUI hook (kept Qt-free): called with a short human-readable
         # line when a not-yet-seen IP connects or a session starts playing.
         self.event_callback: Callable[[str], None] | None = None
@@ -100,6 +103,7 @@ class RelayServer:
         if self.library is not None:
             self.app.router.add_get("/library", self.handle_library)
             self.app.router.add_get("/media/{path:.*}", self.handle_media_file)
+            self.app.router.add_get("/attachments/{digest}", self.handle_attachment)
         self._stats_task = None
         self._mdns = MdnsAdvertiser(
             port=self.port,
@@ -157,6 +161,41 @@ class RelayServer:
             except Exception:
                 log.exception("event callback failed")
 
+    async def _close_control_session(
+        self, session: Session, ws: web.WebSocketResponse,
+        acknowledge: bool,
+    ) -> bool:
+        """Release a session and optionally publish the teardown barrier."""
+        self._log_session_stats(session, final=True)
+        cleanup_ok = False
+        try:
+            await session.close()
+            cleanup_ok = True
+        except Exception as err:
+            self.native_teardown_error = {
+                "session_id": session.id,
+                "error": repr(err),
+                "restart_required": True,
+            }
+            log.exception(
+                "session %s native teardown did not complete; server restart required",
+                session.id,
+            )
+        finally:
+            for key in (session.uplink_token, session.downlink_token, session.id):
+                self.sessions.pop(key, None)
+        if acknowledge and cleanup_ok and not ws.closed:
+            try:
+                await ws.send_str(json.dumps({"type": "closed"}))
+            except (ConnectionResetError, RuntimeError):
+                pass
+        elif acknowledge and not cleanup_ok and not ws.closed:
+            await ws.close(
+                code=1011,
+                message=b"native teardown incomplete; server restart required",
+            )
+        return cleanup_ok
+
     # -- control channel -------------------------------------------------------
 
     async def handle_control(self, request: web.Request) -> web.WebSocketResponse:
@@ -170,6 +209,7 @@ class RelayServer:
         else:
             log.info("control connection from %s", peer_ip)
         session: Session | None = None
+        teardown_ack_requested = False
         try:
             async for raw in ws:
                 if raw.type != WSMsgType.TEXT:
@@ -207,11 +247,22 @@ class RelayServer:
                         # /media external-track path until they explicitly
                         # request muxed auxiliary tracks in open_session.
                         "muxed_aux_tracks": self.library is not None,
+                        "attachment_cache": 1 if self.library is not None else 0,
                         "library_sort": (
                             list(LIBRARY_SORT_KEYS) if self.library is not None else []
                         ),
                     }))
                 elif mtype == "open_session":
+                    if self.native_teardown_error is not None:
+                        await ws.send_str(json.dumps({
+                            "type": "error", "code": "server_restart_required",
+                            "message": (
+                                "a previous native session teardown did not complete; "
+                                "restart the relay server before opening another session"
+                            ),
+                            "fatal": True,
+                        }))
+                        break
                     if session is not None:
                         await ws.send_str(json.dumps({
                             "type": "error", "code": "bad_message",
@@ -254,16 +305,15 @@ class RelayServer:
                 elif mtype == "buffer_report":
                     session.handle_buffer_report(msg)
                 elif mtype == "teardown":
-                    await session.send("closed")
+                    teardown_ack_requested = True
                     break
                 else:
                     await session.send("error", code="bad_message", message=mtype, fatal=False)
         finally:
             if session is not None:
-                self._log_session_stats(session, final=True)
-                await session.close()
-                for key in (session.uplink_token, session.downlink_token, session.id):
-                    self.sessions.pop(key, None)
+                await self._close_control_session(
+                    session, ws, teardown_ack_requested,
+                )
         return ws
 
     # -- media sockets -----------------------------------------------------------
@@ -331,6 +381,8 @@ class RelayServer:
             "protocol_version": PROTOCOL_VERSION,
             "default_resize_algorithm": self.resize_algorithm,
             "lossless_hevc_profile": self.lossless_hevc_profile,
+            "restart_required": self.native_teardown_error is not None,
+            "native_teardown_error": self.native_teardown_error,
             "models": list(self.models_info) + ["passthrough"],
             "sessions": [s.status() for s in unique.values()],
         })
@@ -360,6 +412,38 @@ class RelayServer:
         # aiohttp FileResponse implements byte ranges, conditional requests,
         # and streaming without reading the whole media file into memory.
         return web.FileResponse(path)
+
+    async def handle_attachment(self, request: web.Request) -> web.Response:
+        """Serve one immutable object authorized by an active session manifest."""
+        auth = request.headers.get("Authorization", "")
+        if not auth.startswith("Bearer "):
+            raise web.HTTPUnauthorized()
+        token = auth.removeprefix("Bearer ").strip()
+        digest = request.match_info["digest"].lower()
+        if not _SHA256_RE.fullmatch(digest):
+            raise web.HTTPNotFound()
+        session = next(
+            (
+                item for item in {value.id: value for value in self.sessions.values()}.values()
+                if item.attachment_token == token and item.state != State.CLOSED
+            ),
+            None,
+        )
+        if session is None or session.aux_track is None:
+            raise web.HTTPUnauthorized()
+        attachment = session.aux_track.attachment_by_hash(digest)
+        if attachment is None or not any(
+            entry.get("sha256") == digest for entry in session.attachment_manifest
+        ):
+            raise web.HTTPNotFound()
+        return web.Response(
+            body=attachment.data,
+            content_type=attachment.mimetype,
+            headers={
+                "Cache-Control": "private, max-age=31536000, immutable",
+                "X-Content-Type-Options": "nosniff",
+            },
+        )
 
     # -- lifecycle ------------------------------------------------------------------
 

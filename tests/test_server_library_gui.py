@@ -39,6 +39,7 @@ class FakePlayer(QWidget):
         super().__init__()
         self.client = None
         self.started = None
+        self.font_dir = None
 
     def start(self, session, queue, time_base, source_path=None, avg_rate=None):
         self.started = (session, queue, time_base, source_path, avg_rate)
@@ -51,6 +52,9 @@ class FakePlayer(QWidget):
 
     def set_paused(self, value):
         pass
+
+    def set_subtitle_fonts_dir(self, path):
+        self.font_dir = path
 
     def set_sub_delay(self, value):
         pass
@@ -98,6 +102,7 @@ class FakeSessionClient(FakeLibraryClient):
         self.track = None
         self.opened_config = None
         self.queue = asyncio.Queue()
+        self.attachment_cache_root = None
 
     async def open_session(self, config):
         self.opened_config = config
@@ -107,8 +112,13 @@ class FakeSessionClient(FakeLibraryClient):
             duration_s=120.0, avg_rate=Fraction(24, 1),
             chapters=getattr(self, "chapters", None),
             aux_tracks=config.aux_tracks,
+            aux_attachments=config.aux_attachments,
         )
         return self.session
+
+    async def prepare_attachments(self, cache_root):
+        self.attachment_cache_root = cache_root
+        return "C:/verified-fonts" if self.opened_config.aux_attachments == "cached" else None
 
     async def attach_media(self):
         pass
@@ -222,6 +232,21 @@ def test_server_session_opts_into_muxed_tracks_and_skips_http_original(window):
 
         assert client.opened_config.aux_tracks == "muxed"
         assert window.player.started[3] is None
+
+    asyncio.run(scenario())
+
+
+def test_server_session_negotiates_cached_fonts_before_player_load(window):
+    async def scenario():
+        client = FakeSessionClient()
+        window.client = client
+        window._server_caps = {"muxed_aux_tracks": True, "attachment_cache": 1}
+        await window._start_session("Shows/Episode.mkv", source="server_file")
+
+        assert client.opened_config.aux_attachments == "cached"
+        assert client.attachment_cache_root.name == "attachments"
+        assert window.player.font_dir == "C:/verified-fonts"
+        assert window.player.started is not None
 
     asyncio.run(scenario())
 

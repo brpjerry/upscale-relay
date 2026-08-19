@@ -68,8 +68,10 @@ one downlink attachment. Server-library sessions omit the uplink attachment.
    lossless FFV1. Clients present approximate P95 bandwidth labels supplied by
    the server instead of encoder QP numbers. HEVC is the Android-compatible
    path; FFV1 remains desktop-only.
-6. **Audio and subtitles stay with the original.** libmpv attaches them as
-   external tracks and aligns them to returned video using the original PTS.
+6. **Audio and subtitles preserve original packets and PTS.** Server-library
+   sessions normally stream-copy them into each epoch; local/legacy sessions
+   retain the external original-media path. Large immutable ASS font bundles
+   use a negotiated verified attachment cache instead of repeating per seek.
 7. **The client remains protocol-thin.** The server and protocol do not depend
    on PySide6 or other desktop-specific behavior, leaving room for Android.
 
@@ -99,6 +101,12 @@ one downlink attachment. Server-library sessions omit the uplink attachment.
 - Epoch-safe seek/flush, decode-and-discard to the target, stale packet
   rejection, and seek-storm coalescing.
 - Live buffer-report pacing with stale-report decay and bounded queues.
+- Synchronous pipeline teardown: `closed` is a barrier after every native
+  stage owner, mux, encoder stream, and inference worker has released state.
+- A failed native teardown sets `/status.restart_required` and blocks new
+  sessions, preventing an unconfirmed NVENC owner from overlapping a reopen.
+- A 100 ms mux interleave bound prevents sparse subtitles from withholding the
+  first playable cluster.
 - Model discovery from `--models-dir` and execution-provider selection.
 - Configurable post-ONNX resize filters (`fast-bilinear`, `bilinear`, `bicubic`,
   `area`, `bicublin`, `gaussian`, `sinc`, `lanczos`, and `spline`), advertised
@@ -130,6 +138,9 @@ decode was fast enough for the measured pipeline.
 - Dedicated blocking downlink socket receiver with a bounded bridge into the
   qasync loop. This replaced per-callback asyncio reads that could not sustain
   lossless traffic under Qt.
+- Immediate publication of each epoch's discontinuity packet while retaining
+  eight-packet batching for steady-state qasync throughput.
+- Verified, bounded, content-addressed attachment download/cache support.
 - Headless `relay-client` CLI used by integration tests and diagnostics.
 
 ### Desktop client (`desktop_client/`)
@@ -141,10 +152,9 @@ decode was fast enough for the measured pipeline.
   track and delay, fullscreen, telemetry, and local fallback controls. Changing
   a session-fixed model, quality, framing, or resize setting restarts active
   playback at its current position.
-- External audio/subtitle attachment from a local file or server `/media`
-  URL. One raw-argument `audio-add` runs after the live epoch reaches its
-  absolute PTS, so arbitrary paths work and the original demuxer seeks directly
-  to the current epoch instead of decoding forward from zero.
+- Embedded server-library audio/subtitles with cached font registration;
+  external local/legacy tracks retain the one post-restart raw-argument
+  `audio-add` path.
 - Per-load localhost `tcp://` stream between the Python buffer and mpv. The
   previous python-mpv custom callback copied each byte in Python and saturated
   near 200 Mbps; the native socket removes that ceiling.

@@ -1,6 +1,15 @@
 # NVENC session teardown and encoder admission
 
-Status: proposed
+Status: implemented in source and deterministic tests; Windows/NVENC live
+cycle verification pending
+
+Implemented on 2026-08-18: synchronous/idempotent pipeline close with one
+deadline, finish-owner mux/stream cleanup, inference-owner ordering, late-open
+reaping, post-cleanup `closed` acknowledgement, client barrier waiting and UI
+warning, cached successful probes, and diagnostic probe failures. Failed
+native teardown is retained in `/status` as restart-required and blocks new
+session admission. The live 20-cycle Windows gate below remains required
+before this is considered hardware-accepted.
 
 ## Problem
 

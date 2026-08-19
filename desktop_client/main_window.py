@@ -6,7 +6,7 @@ import asyncio
 import time
 from pathlib import Path
 
-from PySide6.QtCore import QDir, QEvent, Qt, QTimer
+from PySide6.QtCore import QDir, QEvent, QStandardPaths, Qt, QTimer
 from PySide6.QtGui import (
     QCursor,
     QIcon,
@@ -41,7 +41,7 @@ from PySide6.QtWidgets import (
 )
 from qasync import asyncSlot
 
-from relay_client_core import RelayClient, SessionConfig
+from relay_client_core import RelayClient, SessionConfig, TeardownNotConfirmedError
 
 from .chapters import (
     Chapter,
@@ -958,12 +958,31 @@ class MainWindow(QMainWindow):
                 if source == "server_file" and self._server_caps.get("muxed_aux_tracks")
                 else "external"
             ),
+            aux_attachments=(
+                "cached"
+                if (
+                    source == "server_file"
+                    and self._server_caps.get("muxed_aux_tracks")
+                    and self._server_caps.get("attachment_cache", 0) >= 1
+                )
+                else "embedded"
+            ),
         )
         self.settings.model = cfg.model
         self.settings.quality_tier = cfg.quality_tier
         self._set_opening(True, f"opening session for {Path(path).name}…")
         try:
             session = await self.client.open_session(cfg)
+            attachment_root = (
+                Path(QStandardPaths.writableLocation(QStandardPaths.CacheLocation))
+                / "attachments"
+            )
+            font_dir = (
+                await self.client.prepare_attachments(attachment_root)
+                if hasattr(self.client, "prepare_attachments") else None
+            )
+            if hasattr(self.player, "set_subtitle_fonts_dir"):
+                self.player.set_subtitle_fonts_dir(font_dir)
             await self.client.attach_media()
             await self.client.start_uplink()
         except Exception as err:
@@ -1296,7 +1315,17 @@ class MainWindow(QMainWindow):
             # Close the whole client (server tears the session down with the
             # WS) and reconnect fresh: one session per connection in v1.
             host, port = self.client.host, self.client.port
-            await self.client.teardown()
+            try:
+                await self.client.teardown()
+            except TeardownNotConfirmedError as err:
+                # The local sockets are already closed, but reconnecting could
+                # overlap a wedged NVENC owner. Make the risk visible and stop.
+                self.client = None
+                self._remove_server_tab()
+                self.conn_label.setText("server teardown unconfirmed")
+                self.connect_btn.setText("Connect")
+                self._error("Server cleanup not confirmed", str(err))
+                return
             client = RelayClient(host, port)
             try:
                 caps = await client.connect()

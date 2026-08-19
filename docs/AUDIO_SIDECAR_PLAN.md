@@ -156,8 +156,9 @@ multi-track live Matroska epoch correctly.
 
 - A server without a library advertises `muxed_aux_tracks: false`; a library
   server advertises true.
-- Negotiation defaults to `external` and confirms `muxed` only when requested
-  and the file's attachments do not exceed the live-header limit.
+- Negotiation defaults to `external` and confirms `muxed` only when requested.
+  Embedded mode retains the live-header limit; cache-capable clients can keep
+  muxed tracks for large supported font sets without repeating their bodies.
 - A multi-track source produces one downlink video track plus all original
   audio/subtitle tracks in source order with matching codecs and metadata.
 - Initial and post-seek auxiliary PTS match the source within muxer time-base
@@ -201,9 +202,9 @@ multi-track live Matroska epoch correctly.
    a mid-play HEVC tier change reopened the session at that position while
    keeping muxed auxiliary mode.
    A rendered live timing run later found the same remux's first muxed packet
-   was 35.3 MiB of attachment-heavy header data. The server now confirms
-   `external` for attachment sets above 4 MiB rather than retransmitting that
-   block at startup and on every seek.
+   was 35.3 MiB of attachment-heavy header data. Legacy embedded mode confirms
+   `external` above 4 MiB; the new negotiated attachment cache transfers each
+   verified font hash once and omits its body from every epoch header.
 4. Validate SSA attachment fonts and obtain a PGS/VobSub sample for the
    stateful-subtitle gate.
 5. Implement Android negotiation and delete the external attach path only for

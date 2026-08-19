@@ -11,7 +11,10 @@ channels per session:
 
 Status/metrics: `GET /status` on the control port returns JSON (not part of
 the session protocol; consumed by GUIs and tests). The server-library HTTP
-surface is documented in [SERVER_LIBRARY.md](SERVER_LIBRARY.md).
+surface is documented in [SERVER_LIBRARY.md](SERVER_LIBRARY.md). If a bounded
+native session close fails, `restart_required` is true and
+`native_teardown_error` identifies the failed session; the server rejects new
+sessions until it is restarted.
 
 Design invariants:
 - **PTS is never rewritten.** All timestamps are integer ticks in the *source
@@ -52,26 +55,26 @@ ignored; unknown types ⇒ `error{code:"bad_message"}`.
 | type | fields | notes |
 |---|---|---|
 | `hello` | `protocol_version:int`, `client_name:str`, `display:{w:int,h:int}` | first message; server replies `capabilities` |
-| `open_session` | `source:"uplink" \| {type:"server_file",path:str}` plus `file:{name:str, duration_s:float?, chapters:[{start_s:float, end_s:float?, title:str?}]?}`, `video:{codec:str, extradata_b64:str?, width:int, height:int, time_base:[num,den], avg_rate:[num,den]?}`, `model:str`, `quality_tier:str`, `display:{w:int,h:int}`, `fit_mode:str?`, `resize_algorithm:str?`, `aux_tracks:"external"\|"muxed"?` | `source` defaults to `"uplink"`; `video` is omitted for `server_file`; omitting `resize_algorithm` selects the server default. `file.chapters` carries the source container's chapter marks for uplink sessions (only the client can read them). `aux_tracks` defaults to `"external"`; `"muxed"` is valid only for `server_file` when advertised and asks the server to put original audio/subtitle tracks in each downlink Matroska epoch |
+| `open_session` | `source:"uplink" \| {type:"server_file",path:str}` plus `file:{name:str, duration_s:float?, chapters:[{start_s:float, end_s:float?, title:str?}]?}`, `video:{codec:str, extradata_b64:str?, width:int, height:int, time_base:[num,den], avg_rate:[num,den]?}`, `model:str`, `quality_tier:str`, `display:{w:int,h:int}`, `fit_mode:str?`, `resize_algorithm:str?`, `aux_tracks:"external"\|"muxed"?`, `aux_attachments:"embedded"\|"cached"?` | `source` defaults to `"uplink"`; `video` is omitted for `server_file`; omitting `resize_algorithm` selects the server default. `file.chapters` carries the source container's chapter marks for uplink sessions (only the client can read them). `aux_tracks` defaults to `"external"`; `"muxed"` is valid only for `server_file` when advertised. `aux_attachments` defaults to `"embedded"`; `"cached"` requires muxed tracks and capability `attachment_cache >= 1` |
 | `play` | | |
 | `pause` | | |
 | `seek` | `target_pts:int`, `epoch:int` | epoch = client's current epoch + 1; see §4 |
 | `buffer_report` | `buffered_ms:int`, `playing_pts:int?` | send ~every 500 ms while media attached |
-| `teardown` | | graceful close; server replies `closed` |
+| `teardown` | | graceful close; `closed` is sent only after pipeline workers and native encoder/mux/inference owners have released their resources |
 
 ### server → client
 
 | type | fields | notes |
 |---|---|---|
-| `capabilities` | `protocol_version:int`, `server_name:str`, `models:[{name, scale_factor}]`, `quality_tiers:[str]`, `quality_options:[{id,label,codec,lossless,android_supported,p95_mbps}]`, `resize_algorithms:[str]`, `default_resize_algorithm:str`, `library:bool`, `library_sort:[str]`, `muxed_aux_tracks:bool` | `quality_tiers` remains the authoritative ID list; `quality_options` supplies presentation metadata. `p95_mbps` is a coarse content-dependent estimate or null. `library` means `GET /library` and `/media/<path>` are available. `library_sort` lists the sort keys `GET /library` accepts (today `["name","mtime"]`). `muxed_aux_tracks` permits the opt-in `open_session` mode; absent means false |
-| `session_opened` | `session_id:str`, `media_port:int`, `uplink_token:str?`, `downlink_token:str`, `epoch:int(=0)`, `source:str`, `time_base:[num,den]`, `duration_s:float?`, `avg_rate:[num,den]?`, `chapters:[{start_s:float, end_s:float?, title:str?}]?`, `downlink_width:int`, `downlink_height:int`, `fit_mode:str`, `resize_algorithm:str`, `aux_tracks:"external"\|"muxed"` | Returns the effective framing, resize, and auxiliary-track choices; `uplink_token` is null for `server_file`. A client must omit `/media` attachment only after `aux_tracks:"muxed"` is confirmed; absent means `"external"`. `chapters` is the authoritative chapter list, sorted by `start_s`: read from the file for `server_file`, echoed from `open_session.file.chapters` for uplink; null/absent when there are none. Chapter times are seconds in source-media time — clients seek to them by converting through `time_base`, exactly like any other seek target |
+| `capabilities` | `protocol_version:int`, `server_name:str`, `models:[{name, scale_factor}]`, `quality_tiers:[str]`, `quality_options:[{id,label,codec,lossless,android_supported,p95_mbps}]`, `resize_algorithms:[str]`, `default_resize_algorithm:str`, `library:bool`, `library_sort:[str]`, `muxed_aux_tracks:bool`, `attachment_cache:int` | `quality_tiers` remains the authoritative ID list; `quality_options` supplies presentation metadata. `library` means the library HTTP API is available. `muxed_aux_tracks` permits the opt-in mode. `attachment_cache >= 1` permits authenticated content-addressed attachment manifests; absent/zero means embedded attachments only |
+| `session_opened` | `session_id:str`, `media_port:int`, `uplink_token:str?`, `downlink_token:str`, `epoch:int(=0)`, `source:str`, `time_base:[num,den]`, `duration_s:float?`, `avg_rate:[num,den]?`, `chapters:[...]?`, `downlink_width:int`, `downlink_height:int`, `fit_mode:str`, `resize_algorithm:str`, `aux_tracks:"external"\|"muxed"`, `aux_attachments:"embedded"\|"cached"`, `attachment_manifest:[{name,mimetype,size,sha256}]?`, `attachment_token:str?` | Effective choices are authoritative. A client omits `/media` only after muxed confirmation and omits in-container attachment bodies only after cached confirmation. Cached manifests contain sanitized immutable font objects; the bearer token expires with the session. Absent auxiliary fields mean `external` and `embedded` |
 | `state` | `state:"open"\|"playing"\|"paused"\|"closed"` | emitted on every transition |
 | `session_progress` | `stage:str`, `message:str`, `elapsed_s:float` | ticked ~every 2 s while a slow `open_session` is being processed (today: `stage:"pipeline_init"`, e.g. a first-use TensorRT engine build, which can run for minutes). Clients must treat it as a keepalive for the pending open — refresh the open_session timeout on every tick — and should surface `message` as a loading indicator. Quick opens send none |
 | `seek_ready` | `epoch:int` | server has flushed; client may start uplinking the new epoch. **Not a readiness signal for media** — it is dispatched within milliseconds, before any frame of the new epoch exists (§4) |
 | `seek_progress` | `epoch:int`, `target_pts:int`, `keyframe_pts:int?`, `frames_discarded:int`, `elapsed_s:float` | ticked ~every 500 ms while a seek has produced no downlink bytes yet, starting ~750 ms after the `seek`. Purely informational: the client renders it as seek progress so a long discard window (§4 step 4) is distinguishable from a wedged pipeline. `keyframe_pts` is null until the server's demuxer reports where the seek landed. A seek that produces media promptly sends none, and the server stops ticking after 60 s. Additive and safe to ignore — clients that do not know the type must skip it, so it carries no protocol-version change |
 | `stats` | `pipeline_fps:float`, `queue_depths:{...}`, `buffered_ahead_ms:int` | periodic, informational |
 | `error` | `code:str`, `message:str`, `fatal:bool` | non-fatal errors leave the session usable |
-| `closed` | | acknowledges teardown |
+| `closed` | | resource-release barrier acknowledging successful teardown; no acknowledgement is sent if a native owner times out |
 
 `fit_mode` (default `"fit"`) chooses how the output frame relates to `display`.
 `"fit"` preserves the full image and returns the largest same-aspect frame that
@@ -144,13 +147,33 @@ offset size  field
   demuxer-based player consumes it directly; the packet-header `pts` field
   holds the newest video PTS muxed into that chunk (buffer accounting only).
   A negotiated server-file session may also contain stream-copied original
-  audio/subtitle tracks and attachments; a server may confirm `external` when
-  a file cannot be remuxed efficiently (including oversized attachment sets).
+  audio/subtitle tracks. Attachments are either embedded in every epoch or,
+  when explicitly negotiated as cached, omitted and supplied through the
+  authenticated manifest endpoint. A server may confirm `external` when a
+  file cannot be remuxed efficiently.
   The outer framing is unchanged. Each
   epoch is its own complete container stream: the first chunk after session
   start or a seek carries the `discontinuity` flag and begins with a fresh
   container header — the receiver reopens its demuxer there. Chunk boundaries
   otherwise carry no meaning.
+
+### 3.3 Cached attachment objects
+
+For a session confirming `aux_attachments:"cached"`, the client fetches each
+missing manifest object with:
+
+```text
+GET /attachments/<lowercase-sha256>
+Authorization: Bearer <attachment_token>
+```
+
+The server accepts only hashes declared by that active session, never accepts
+a client-selected source path, and expires the token at teardown. Clients must
+enforce object/session size bounds, verify the declared SHA-256 before an
+atomic cache publish, and discard partial or mismatched downloads. The current
+cache-capable server confirms this mode only when every attachment is a font
+type supported by the desktop libass font-directory path; otherwise it embeds
+attachments or falls back to external auxiliary media.
 
 ## 4. Seek protocol (epochs)
 
@@ -223,6 +246,8 @@ are allowed without a version bump (receivers ignore unknown fields).
 ## 7. Security status
 
 The random media tokens authenticate TCP attachments to an already-open
-session; they are not user authentication. Control-channel pairing, persistent
-client credentials, TLS, and authorization for `/library` and `/media` are
-planned but not implemented. The current server is intended for a trusted LAN.
+session; the short-lived attachment bearer token authorizes only hashes in one
+active manifest. Neither is user authentication. Control-channel pairing,
+persistent client credentials, TLS, and authorization for `/library` and
+`/media` are planned but not implemented. The current server is intended for a
+trusted LAN.

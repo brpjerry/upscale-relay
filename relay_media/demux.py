@@ -3,7 +3,11 @@
 from __future__ import annotations
 
 import base64
+from collections import OrderedDict
+import hashlib
 import io
+import os
+import re
 import threading
 from dataclasses import dataclass
 from fractions import Fraction
@@ -15,6 +19,24 @@ from relay_protocol import FLAG_KEYFRAME, NO_TS, MediaPacket
 
 
 _AUDIO_PREROLL_S = 0.25
+_SAFE_ATTACHMENT_CHAR = re.compile(r"[^A-Za-z0-9._-]+")
+_FONT_MIME_TYPES = {
+    "application/x-truetype-font",
+    "application/x-font-ttf",
+    "application/vnd.ms-opentype",
+    "application/x-font-opentype",
+    "font/ttf",
+    "font/otf",
+}
+_MAX_CACHED_ATTACHMENT_BYTES = 64 * 1024 * 1024
+_MAX_CACHED_MANIFEST_BYTES = 256 * 1024 * 1024
+_SERVER_ATTACHMENT_CACHE_BYTES = 512 * 1024 * 1024
+_SERVER_ATTACHMENT_CACHE_ENTRIES = 1024
+_ATTACHMENT_INFO_CACHE: OrderedDict[
+    tuple[str, int, int], tuple["AttachmentInfo", ...]
+] = OrderedDict()
+_ATTACHMENT_INFO_CACHE_SIZE = 0
+_ATTACHMENT_INFO_CACHE_LOCK = threading.Lock()
 
 
 @dataclass
@@ -38,6 +60,42 @@ class AuxiliaryPacketInfo:
     packet: av.Packet
     stream_index: int
     order_s: float
+
+
+@dataclass(frozen=True, slots=True)
+class AttachmentInfo:
+    name: str
+    mimetype: str
+    size: int
+    sha256: str
+    data: bytes
+
+    @property
+    def cache_supported(self) -> bool:
+        return self.mimetype.lower() in _FONT_MIME_TYPES
+
+    def manifest_entry(self) -> dict:
+        return {
+            "name": self.name,
+            "mimetype": self.mimetype,
+            "size": self.size,
+            "sha256": self.sha256,
+        }
+
+
+def sanitize_attachment_name(name: str, fallback: str = "attachment") -> str:
+    """Return a bounded basename safe for a client-side cache directory."""
+    basename = str(name).replace("\\", "/").rsplit("/", 1)[-1]
+    basename = "".join(ch for ch in basename if ch >= " " and ch != "\x7f")
+    basename = _SAFE_ATTACHMENT_CHAR.sub("_", basename).strip(" ._")
+    if not basename or basename in (".", ".."):
+        basename = fallback
+    return basename[:128]
+
+
+def _source_identity(path: str) -> tuple[str, int, int]:
+    stat = os.stat(path)
+    return os.path.abspath(path), stat.st_size, stat.st_mtime_ns
 
 
 class VideoTrack:
@@ -171,17 +229,67 @@ class AuxiliaryTrack:
             stream for stream in self._container.streams
             if stream.type in ("audio", "subtitle")
         ]
-        attachments = list(self._container.streams.attachments)
-        self.attachment_bytes = sum(len(attachment.data) for attachment in attachments)
+        raw_attachments = list(self._container.streams.attachments)
+        self.attachments = self._cached_attachment_info(path, raw_attachments)
+        self.attachment_bytes = sum(attachment.size for attachment in self.attachments)
         self._lock = threading.Lock()
         self._iter_gen = 0
         try:
-            self._validate_matroska_mux(attachments)
+            self._validate_matroska_mux(self.attachments)
         except Exception:
             self._container.close()
             raise
 
-    def _validate_matroska_mux(self, attachments: list) -> None:
+    @staticmethod
+    def _attachment_info(attachment) -> AttachmentInfo:
+        metadata = dict(attachment.metadata)
+        raw_name = metadata.get("filename") or attachment.name or f"attachment-{attachment.index}"
+        name = sanitize_attachment_name(raw_name, f"attachment-{attachment.index}")
+        mimetype = attachment.mimetype or metadata.get("mimetype") or "application/octet-stream"
+        data = bytes(attachment.data)
+        return AttachmentInfo(
+            name=name,
+            mimetype=str(mimetype),
+            size=len(data),
+            sha256=hashlib.sha256(data).hexdigest(),
+            data=data,
+        )
+
+    @classmethod
+    def _cached_attachment_info(cls, path: str, raw: list) -> tuple[AttachmentInfo, ...]:
+        """Cache immutable hashes/bodies by path, size, and nanosecond mtime."""
+        global _ATTACHMENT_INFO_CACHE_SIZE
+        identity = _source_identity(path)
+        with _ATTACHMENT_INFO_CACHE_LOCK:
+            cached = _ATTACHMENT_INFO_CACHE.get(identity)
+            if cached is not None:
+                _ATTACHMENT_INFO_CACHE.move_to_end(identity)
+                return cached
+        created = tuple(cls._attachment_info(attachment) for attachment in raw)
+        created_size = sum(item.size for item in created)
+        # Do not let one pathological file evict the whole reusable cache; the
+        # active AuxiliaryTrack still owns this tuple for its session.
+        if created_size > _SERVER_ATTACHMENT_CACHE_BYTES:
+            return created
+        with _ATTACHMENT_INFO_CACHE_LOCK:
+            existing = _ATTACHMENT_INFO_CACHE.get(identity)
+            if existing is not None:
+                _ATTACHMENT_INFO_CACHE.move_to_end(identity)
+                return existing
+            _ATTACHMENT_INFO_CACHE[identity] = created
+            _ATTACHMENT_INFO_CACHE_SIZE += created_size
+            while (
+                (
+                    _ATTACHMENT_INFO_CACHE_SIZE > _SERVER_ATTACHMENT_CACHE_BYTES
+                    or len(_ATTACHMENT_INFO_CACHE) > _SERVER_ATTACHMENT_CACHE_ENTRIES
+                )
+                and _ATTACHMENT_INFO_CACHE
+            ):
+                _old_key, old = _ATTACHMENT_INFO_CACHE.popitem(last=False)
+                _ATTACHMENT_INFO_CACHE_SIZE -= sum(item.size for item in old)
+        return created
+
+    def _validate_matroska_mux(self, attachments: tuple[AttachmentInfo, ...]) -> None:
         """Fail early when any source auxiliary codec cannot be remuxed.
 
         Server libraries also accept containers such as MP4. A codec like
@@ -196,14 +304,28 @@ class AuxiliaryTrack:
             for stream in self._streams:
                 output.add_stream_from_template(stream)
             for attachment in attachments:
-                metadata = dict(attachment.metadata)
-                name = metadata.get("filename") or attachment.name or f"attachment-{attachment.index}"
-                mimetype = attachment.mimetype or metadata.get("mimetype") or "application/octet-stream"
-                output.add_attachment(name, mimetype, attachment.data)
+                output.add_attachment(attachment.name, attachment.mimetype, attachment.data)
 
     @property
     def has_streams(self) -> bool:
         return bool(self._streams)
+
+    @property
+    def attachment_cache_supported(self) -> bool:
+        return (
+            all(
+                attachment.cache_supported
+                and attachment.size <= _MAX_CACHED_ATTACHMENT_BYTES
+                for attachment in self.attachments
+            )
+            and self.attachment_bytes <= _MAX_CACHED_MANIFEST_BYTES
+        )
+
+    def attachment_manifest(self) -> list[dict]:
+        return [attachment.manifest_entry() for attachment in self.attachments]
+
+    def attachment_by_hash(self, digest: str) -> AttachmentInfo | None:
+        return next((item for item in self.attachments if item.sha256 == digest), None)
 
     def packets(self, target_s: float | None = None) -> Iterator[AuxiliaryPacketInfo]:
         """Iterate original auxiliary packets, optionally from ``target_s``.

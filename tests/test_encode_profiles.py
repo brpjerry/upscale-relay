@@ -49,13 +49,17 @@ def test_nvenc_qp_ladder_is_constant_qp_and_not_lossless_tuned():
 
 
 def test_select_encoder_uses_requested_profile(monkeypatch):
-    monkeypatch.setattr(encode, "probe_encoder", lambda *args, **kwargs: True)
-    codec, _, options = encode.select_encoder(
-        "lossless-hevc", lossless_hevc_profile="nvenc-p4-low-delay",
-    )
-    assert codec == "hevc_nvenc"
-    assert options["preset"] == "p4"
-    assert options["bf"] == "0"
+    monkeypatch.setattr(encode, "_probe_encoder_or_raise", lambda *args, **kwargs: None)
+    encode._PROBE_SUCCESSES.clear()
+    try:
+        codec, _, options = encode.select_encoder(
+            "lossless-hevc", lossless_hevc_profile="nvenc-p4-low-delay",
+        )
+        assert codec == "hevc_nvenc"
+        assert options["preset"] == "p4"
+        assert options["bf"] == "0"
+    finally:
+        encode._PROBE_SUCCESSES.clear()
 
 
 def test_select_encoder_rejects_unknown_profile():

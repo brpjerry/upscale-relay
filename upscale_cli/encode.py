@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import sys
+import threading
 from fractions import Fraction
 
 import av
@@ -180,10 +181,35 @@ for _qp in (2, 4, 6, 10, 14, 18):
 
 LEGACY_TIER_ALIASES = {"visually-lossless": "hevc-qp18"}
 
+_PROBE_LOCK = threading.Lock()
+_PROBE_SUCCESSES: set[tuple[str, str, tuple[tuple[str, str], ...]]] = set()
 
-def probe_encoder(codec: str, options: dict[str, str], width: int = 256, height: int = 256,
-                  pix_fmt: str = "yuv420p") -> bool:
-    """Can this encoder actually open here? (Codec present AND hardware usable.)"""
+
+def _probe_key(codec: str, pix_fmt: str, options: dict[str, str]):
+    return codec, pix_fmt, tuple(sorted(options.items()))
+
+
+def _encoder_failure_category(error: BaseException) -> str:
+    text = str(error).lower()
+    if any(term in text for term in (
+        "no free", "resource", "session", "out of memory", "too many",
+    )):
+        return "session/resource exhaustion"
+    if any(term in text for term in ("option", "invalid argument", "not supported")):
+        return "unsupported options"
+    if any(term in text for term in ("not found", "unknown encoder", "driver", "library")):
+        return "missing encoder/driver"
+    if any(term in text for term in ("device", "cuda", "nvenc", "hardware")):
+        return "device/driver failure"
+    return "encoder open failure"
+
+
+def _probe_encoder_or_raise(
+    codec: str, options: dict[str, str], width: int = 256, height: int = 256,
+    pix_fmt: str = "yuv420p",
+) -> None:
+    """Open one probe context and drop its final reference deterministically."""
+    ctx = None
     try:
         ctx = av.CodecContext.create(codec, "w")
         ctx.width = width
@@ -191,7 +217,18 @@ def probe_encoder(codec: str, options: dict[str, str], width: int = 256, height:
         ctx.pix_fmt = pix_fmt
         ctx.time_base = Fraction(1, 30)
         ctx.options = options
-        ctx.open()  # context is freed on GC; PyAV has no explicit close
+        ctx.open()
+    finally:
+        # PyAV exposes no CodecContext.close(). In CPython this final reference
+        # drop immediately releases the underlying AVCodecContext/NVENC slot.
+        ctx = None
+
+
+def probe_encoder(codec: str, options: dict[str, str], width: int = 256, height: int = 256,
+                  pix_fmt: str = "yuv420p") -> bool:
+    """Can this encoder actually open here? (Codec present AND hardware usable.)"""
+    try:
+        _probe_encoder_or_raise(codec, options, width, height, pix_fmt)
         return True
     except Exception:
         return False
@@ -214,8 +251,18 @@ def select_encoder(
         LOSSLESS_HEVC_PROFILES[lossless_hevc_profile]
         if tier == "lossless-hevc" else TIERS[tier]
     )
+    failures: list[tuple[str, str, BaseException]] = []
     for codec, pix_fmt, options in candidates:
-        if probe_encoder(codec, options, pix_fmt=pix_fmt):
+        key = _probe_key(codec, pix_fmt, options)
+        try:
+            with _PROBE_LOCK:
+                if key not in _PROBE_SUCCESSES:
+                    _probe_encoder_or_raise(codec, options, pix_fmt=pix_fmt)
+                    _PROBE_SUCCESSES.add(key)
+        except Exception as err:
+            failures.append((codec, _encoder_failure_category(err), err))
+            continue
+        else:
             profile_text = (
                 f" profile '{lossless_hevc_profile}'" if tier == "lossless-hevc" else ""
             )
@@ -228,6 +275,11 @@ def select_encoder(
     profile_text = (
         f", profile '{lossless_hevc_profile}'" if tier == "lossless-hevc" else ""
     )
-    raise RuntimeError(
-        f"no encoder available for tier '{requested_tier}'{profile_text} (tried: {tried})"
+    detail = "; ".join(
+        f"{codec} [{category}]: {error!r}"
+        for codec, category, error in failures
     )
+    raise RuntimeError(
+        f"no encoder available for tier '{requested_tier}'{profile_text} "
+        f"(tried: {tried}); {detail}"
+    ) from (failures[-1][2] if failures else None)

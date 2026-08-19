@@ -45,10 +45,10 @@ desktop retains its local-only browser appearance.
 - The `capabilities` message includes `library: true` and
   `library_sort: ["name", "mtime"]` while the feature is configured
   (`library_sort` is `[]` otherwise).
-- `muxed_aux_tracks: true` advertises the opt-in path that stream-copies
-  original audio/subtitle tracks and reasonably sized attachment sets into
-  each downlink epoch. A file whose attachments exceed 4 MiB confirms
-  `external` instead: otherwise those bytes block startup and every seek.
+- `muxed_aux_tracks: true` advertises the opt-in stream-copy path.
+  `attachment_cache: 1` additionally permits clients to fetch verified fonts
+  once by content hash. Legacy/embedded requests still fall back to `external`
+  when attachments exceed 4 MiB; cached mode avoids that repeated header.
 - `open_session.source` accepts `{type: "server_file", path: "..."}`.
 - Server-file sessions create a shared `relay_media.VideoTrack` locally and do
   not allocate or wait for an uplink attachment.
@@ -86,11 +86,13 @@ server-source PTS equivalence, seeks, capability-driven UI, and media URLs.
 The default/legacy pipeline remains video-only. When a server-file client opts
 in, a separate seekable auxiliary demuxer feeds original audio/subtitle packets
 through the same bounded epoch pipeline without decoding them; the finish
-thread stream-copies them into the fresh Matroska container and copies source
-attachments into its header. Oversized attachment sets fall back per-file to
-external media, preserving fonts without putting tens of megabytes in every
-epoch header. Relay seeks replace the whole container, so a confirmed muxed
-session does not need a seekable external demuxer. See
+thread stream-copies them into the fresh Matroska container. Attachments remain
+embedded for old clients. Cache-capable desktop clients receive a sanitized
+hash manifest, download missing font objects through a session bearer token,
+verify them before atomic publication, and point libass at a per-session font
+view; cached epoch headers omit the bodies. Unsupported attachment types retain
+the embedded/external fallback. Relay seeks replace the whole container, so a
+confirmed muxed session does not need a seekable external demuxer. See
 [AUDIO_SIDECAR_PLAN.md](AUDIO_SIDECAR_PLAN.md).
 
 ## SMB and network shares
