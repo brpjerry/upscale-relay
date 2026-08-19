@@ -39,6 +39,13 @@ SEEK_PROGRESS_INTERVAL_S = 0.5
 # surviving frame at all, and silently ticking forever would hide that.
 SEEK_PROGRESS_MAX_S = 60.0
 
+# Attachments are written into the first Matroska payload of every epoch. A
+# font-heavy anime remux produced a 35 MiB first packet, adding ~3.5 seconds to
+# startup and every seek over the measured LAN. Above this bound, preserve the
+# original fonts/tracks through the seekable /media attachment path instead of
+# claiming a muxed session whose epoch replacement cannot be low latency.
+MAX_MUXED_ATTACHMENT_BYTES = 4 * 1024 * 1024
+
 _MAX_CHAPTERS = 512
 
 
@@ -234,7 +241,17 @@ class Session:
                             self.id, relative, err,
                         )
                     else:
-                        self.aux_track_mode = "muxed"
+                        attachment_bytes = self.aux_track.attachment_bytes
+                        if attachment_bytes > MAX_MUXED_ATTACHMENT_BYTES:
+                            log.info(
+                                "session %s: %.1f MiB of attachments exceeds the "
+                                "live mux limit; using external auxiliary media",
+                                self.id, attachment_bytes / (1024 * 1024),
+                            )
+                            await asyncio.to_thread(self.aux_track.close)
+                            self.aux_track = None
+                        else:
+                            self.aux_track_mode = "muxed"
             except Exception as err:
                 if self.aux_track is not None:
                     await asyncio.to_thread(self.aux_track.close)

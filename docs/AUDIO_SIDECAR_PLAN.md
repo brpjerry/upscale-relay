@@ -1,6 +1,7 @@
 # In-band audio/subtitle tracks in the epoch downlink
 
-**Status:** implementation in progress. The former persistent `/media-audio`
+**Status:** server and Qt client implemented; Android negotiation and remaining
+subtitle/device gates are in progress. The former persistent `/media-audio`
 sidecar/cache proposal was replaced on 2026-08-18 by negotiated auxiliary
 tracks in the existing per-epoch Matroska downlink.
 
@@ -119,7 +120,11 @@ When `session_opened.aux_tracks == "muxed"`:
 - load the epoch loopback stream by itself;
 - enumerate embedded audio/subtitle tracks after every reload;
 - reapply explicit track choices to the deterministic ids;
-- keep the existing pause/prebuffer and A/V drift behavior.
+- expose audio and subtitle track/delay controls with the same behavior as the
+  Android player's track sheet;
+- let mpv own cache prebuffering and release a muxed epoch after its
+  `playback-restart`; external desktop epochs release after the post-restart
+  `audio-add` returns because `audio-pts` is unavailable while held paused.
 
 The Qt client is the first implementation/test client. Android support follows
 after the server/Qt stream and seek gates pass; Android can then remove its
@@ -151,7 +156,8 @@ multi-track live Matroska epoch correctly.
 
 - A server without a library advertises `muxed_aux_tracks: false`; a library
   server advertises true.
-- Negotiation defaults to `external` and confirms `muxed` only when requested.
+- Negotiation defaults to `external` and confirms `muxed` only when requested
+  and the file's attachments do not exceed the live-header limit.
 - A multi-track source produces one downlink video track plus all original
   audio/subtitle tracks in source order with matching codecs and metadata.
 - Initial and post-seek auxiliary PTS match the source within muxer time-base
@@ -188,6 +194,16 @@ multi-track live Matroska epoch correctly.
    equivalence coverage.
 3. **Implemented:** the Qt offscreen tests and a real headless Qt/libmpv smoke
    confirm that the negotiated stream loads without attaching the source file.
+   A live passthrough run against the multi-track library remux on 2026-08-18
+   exposed two audio and ten subtitle tracks, switched to the non-default audio
+   track, retained both track choices across a 60 s epoch seek, and settled at
+   60.018 s with sub-millisecond reported A/V drift. The same run verified that
+   a mid-play HEVC tier change reopened the session at that position while
+   keeping muxed auxiliary mode.
+   A rendered live timing run later found the same remux's first muxed packet
+   was 35.3 MiB of attachment-heavy header data. The server now confirms
+   `external` for attachment sets above 4 MiB rather than retransmitting that
+   block at startup and on every seek.
 4. Validate SSA attachment fonts and obtain a PGS/VobSub sample for the
    stateful-subtitle gate.
 5. Implement Android negotiation and delete the external attach path only for

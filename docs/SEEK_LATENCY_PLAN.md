@@ -182,10 +182,12 @@ Measured on a Tab S9 Ultra against this server, seeking within a 23:40 file:
 | 678 s (before) | +3.3 s | +19.6 s |
 | any (after) | +1.0 s | **+1.5 s** |
 
-The fix attaches the original media with `audio-add` / `sub-add` after
-playback has started, when the position is known; each demuxer then issues one
-HTTP range seek. A/V error stayed at ~10–25 µs with zero decoder drops across
-an eight-action seek storm.
+The fix attaches the original media with one `audio-add` after playback has
+started, when the position is known. mpv exposes every audio/subtitle track
+from that one demuxer, which then issues one HTTP range seek; a second
+`sub-add` only duplicated the parse and track list. A/V error stayed at
+~10–25 µs with zero decoder drops across an eight-action seek storm. The
+Linux client now uses the same lifecycle.
 
 ~~**The client's queue → mpv sender is the bottleneck.**~~ Not it. The
 loopback sender was never behind; the 217 MB queue was the symptom of mpv not

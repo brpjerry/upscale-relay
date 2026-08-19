@@ -99,8 +99,13 @@ constructor options).
 - mpv OSC (LuaJIT) intermittently crashes mpv's event thread on stream
   reloads → OSC off by default. LuaJIT's caught SEH exception `0xe24c4a02`
   in faulthandler output is *benign noise*, not a crash.
-- The audio/subs come from the original file via `audio-file`/`sub-files`
-  loadfile options (plain `external-files` tracks are not auto-selected).
+- For external auxiliary media, load the video-only epoch paused, then issue
+  exactly one raw-argument `audio-add` after mpv's `playback-restart`; that
+  demuxer contributes both audio and subtitle tracks. Attaching during
+  `loadfile` positions the original demuxer at zero and makes far seeks decode
+  through old media. On desktop, release the load-time hold when `audio-add`
+  returns (`audio-pts` is not reliable while paused), and preserve the caller's
+  pause intent across that hold.
 
 **GPU stacks (server box: RTX 5090 "Blackwell", Windows)**
 - ORT TensorRT EP corrupts the process heap under streaming → it lives in a

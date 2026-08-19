@@ -3,9 +3,10 @@
 Status: **implemented**, except for shared-mount path mapping.
 
 The server can expose a local folder, mounted share, or Windows UNC path as a
-media library. Clients browse the server tree, ask the server to demux and
-upscale a selected file, and let mpv read the original audio/subtitles through
-the server's Range-capable HTTP endpoint.
+media library. Clients browse the server tree and ask the server to demux and
+upscale a selected file. Capable clients negotiate original audio/subtitles in
+the epoch downlink; the Range-capable HTTP endpoint remains the compatibility
+path for older/external-mode clients.
 
 ## Run it
 
@@ -45,7 +46,9 @@ desktop retains its local-only browser appearance.
   `library_sort: ["name", "mtime"]` while the feature is configured
   (`library_sort` is `[]` otherwise).
 - `muxed_aux_tracks: true` advertises the opt-in path that stream-copies
-  original audio/subtitle tracks and attachments into each downlink epoch.
+  original audio/subtitle tracks and reasonably sized attachment sets into
+  each downlink epoch. A file whose attachments exceed 4 MiB confirms
+  `external` instead: otherwise those bytes block startup and every seek.
 - `open_session.source` accepts `{type: "server_file", path: "..."}`.
 - Server-file sessions create a shared `relay_media.VideoTrack` locally and do
   not allocate or wait for an uplink attachment.
@@ -84,8 +87,10 @@ The default/legacy pipeline remains video-only. When a server-file client opts
 in, a separate seekable auxiliary demuxer feeds original audio/subtitle packets
 through the same bounded epoch pipeline without decoding them; the finish
 thread stream-copies them into the fresh Matroska container and copies source
-attachments into its header. Relay seeks replace the whole container, so mpv
-does not need a seekable external demuxer. See
+attachments into its header. Oversized attachment sets fall back per-file to
+external media, preserving fonts without putting tens of megabytes in every
+epoch header. Relay seeks replace the whole container, so a confirmed muxed
+session does not need a seekable external demuxer. See
 [AUDIO_SIDECAR_PLAN.md](AUDIO_SIDECAR_PLAN.md).
 
 ## SMB and network shares
@@ -105,7 +110,8 @@ The application does not store SMB credentials and does not use ffmpeg's
 
 ## Remaining planned work: shared-mount mapping
 
-HTTP delivery is the only implemented original-track path for server files.
+HTTP delivery is the only implemented *external-file* original-track path for
+server files; negotiated clients normally use muxed auxiliary tracks instead.
 When both machines mount the same share under different roots, a future option
 can map one library-relative identity to each machine's local root, for example:
 

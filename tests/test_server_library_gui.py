@@ -27,6 +27,7 @@ class FakePlayer(QWidget):
     stats_changed = Signal(str)
     position_changed = Signal(float)
     track_list_changed = Signal(list, object)
+    audio_track_list_changed = Signal(list, object)
     rebuffering = Signal(bool)
     seek_requested = Signal(float)
     finished = Signal()
@@ -54,7 +55,13 @@ class FakePlayer(QWidget):
     def set_sub_delay(self, value):
         pass
 
+    def set_audio_delay(self, value):
+        pass
+
     def select_subtitle(self, sid):
+        pass
+
+    def select_audio(self, aid):
         pass
 
     def play_local_fallback(self, position_s):
@@ -248,6 +255,32 @@ def test_session_chapters_populate_and_clear_controls(window):
         assert window.seek_slider._chapter_fractions == []
 
     asyncio.run(scenario())
+
+
+def test_media_metadata_cannot_expand_transport_minimum_width(window):
+    """Track titles and telemetry must not resize the splitter on load."""
+    app = QApplication.instance()
+    window._duration_s = 120.0
+    window._set_chapters([main_window.Chapter(0.0, "A")])
+    window._on_audio_tracks([(1, "A")], 1)
+    window._on_tracks([(1, "S")], 1)
+    window.player_status.setText("ok")
+    window.show()
+    app.processEvents()
+    baseline = window.controls_panel.minimumSizeHint().width()
+
+    long_title = "A very long muxed track title " * 20
+    window._set_chapters([main_window.Chapter(0.0, long_title)])
+    window._on_audio_tracks([(1, long_title)], 1)
+    window._on_tracks([(1, long_title)], 1)
+    window.player_status.setText("cache / decode / drift telemetry " * 30)
+    app.processEvents()
+
+    assert window.controls_panel.minimumSizeHint().width() == baseline
+
+
+def test_splitter_defers_expensive_video_resize_until_release(window):
+    assert not window.split.opaqueResize()
 
 
 def test_open_progress_indicator_toggles(window):

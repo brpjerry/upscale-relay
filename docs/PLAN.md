@@ -16,7 +16,7 @@ contract and [SERVER_LIBRARY.md](SERVER_LIBRARY.md) for server-hosted media.
 |---|---|---|
 | Offline upscale pipeline | **Implemented** | `upscale-cli` decode, ONNX inference, tiling, fit/cover sizing, tiered encoding, verification, sample generation, and benchmarks |
 | Streaming server and protocol | **Implemented** | aiohttp WebSocket control, framed TCP media, sessions, seeks/epochs, Matroska downlink, pacing, and `/status` |
-| Desktop client | **Implemented** | PySide6/qasync UI, local browser, embedded libmpv, uplink, playback, seek, subtitles, quality/model controls, and local fallback |
+| Desktop client | **Implemented** | PySide6/qasync UI, local browser, embedded libmpv, uplink, playback, seek, audio/subtitle track and delay controls, quality/model controls, and local fallback |
 | Lossless playback path | **Implemented** | blocking downlink receiver plus native localhost `tcp://` handoff to mpv; avoids qasync and python-mpv callback throughput ceilings |
 | Server-side media library | **Implemented; muxed tracks in progress** | `--library`, sandboxed listing and Range HTTP delivery, server demux/seek, capability-driven Server tab, and negotiated in-band original audio/subtitle tracks |
 | Server-side framing and resize filters | **Implemented** | Fit preserves the full frame; Cover center-crops before encode; the final post-ONNX downscale is selectable per server or session |
@@ -137,10 +137,14 @@ decode was fast enough for the measured pipeline.
 - PySide6 UI with native libmpv render API support on Wayland, X11, and
   Windows.
 - Local filesystem browser plus a capability-driven Server library tab.
-- Model, quality, fit/cover, resize filter, play/pause, seek, subtitle track, subtitle delay,
-  fullscreen, telemetry, and local fallback controls.
+- Model, quality, fit/cover, resize filter, play/pause, seek, audio/subtitle
+  track and delay, fullscreen, telemetry, and local fallback controls. Changing
+  a session-fixed model, quality, framing, or resize setting restarts active
+  playback at its current position.
 - External audio/subtitle attachment from a local file or server `/media`
-  URL.
+  URL. One raw-argument `audio-add` runs after the live epoch reaches its
+  absolute PTS, so arbitrary paths work and the original demuxer seeks directly
+  to the current epoch instead of decoding forward from zero.
 - Per-load localhost `tcp://` stream between the Python buffer and mpv. The
   previous python-mpv custom callback copied each byte in Python and saturated
   near 200 Mbps; the native socket removes that ceiling.
@@ -194,9 +198,9 @@ shared-mount path mapping remains planned; see
   `smb://` browser with credential storage is not implemented.
 - **Discovery and pairing:** add mDNS advertisement/browsing, a first-connect
   code, persistent client credentials, and optional TLS.
-- **Model management:** discovery and selection work now. Add directory
-  watching, manifest validation UX, benchmark metadata in capabilities, and
-  mid-play model switching.
+- **Model management:** discovery, selection, and mid-play switching work now.
+  Add directory watching, manifest validation UX, and benchmark metadata in
+  capabilities.
 - **Recovery:** cleanup and manual local fallback work now. Add automatic
   reconnect with session resume, keepalives/timeouts, and chaos coverage for
   network outages.

@@ -144,7 +144,9 @@ offset size  field
   demuxer-based player consumes it directly; the packet-header `pts` field
   holds the newest video PTS muxed into that chunk (buffer accounting only).
   A negotiated server-file session may also contain stream-copied original
-  audio/subtitle tracks and attachments; the outer framing is unchanged. Each
+  audio/subtitle tracks and attachments; a server may confirm `external` when
+  a file cannot be remuxed efficiently (including oversized attachment sets).
+  The outer framing is unchanged. Each
   epoch is its own complete container stream: the first chunk after session
   start or a seek carries the `discontinuity` flag and begins with a fresh
   container header — the receiver reopens its demuxer there. Chunk boundaries

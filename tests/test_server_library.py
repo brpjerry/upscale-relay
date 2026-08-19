@@ -426,6 +426,41 @@ def test_unmuxable_auxiliary_codec_confirms_external_fallback(library_file, monk
     asyncio.run(scenario())
 
 
+def test_large_attachment_set_confirms_external_fallback(library_file, monkeypatch):
+    root, _target = library_file
+    instances = []
+
+    class FontHeavyAuxiliaryTrack:
+        attachment_bytes = session_module.MAX_MUXED_ATTACHMENT_BYTES + 1
+
+        def __init__(self, _path):
+            self.closed = False
+            instances.append(self)
+
+        def close(self):
+            self.closed = True
+
+    monkeypatch.setattr(session_module, "AuxiliaryTrack", FontHeavyAuxiliaryTrack)
+
+    async def scenario():
+        server = RelayServer(str(ROOT / "models"), free_port_pair(), library_root=str(root))
+        await server.start()
+        client = RelayClient("127.0.0.1", server.port)
+        try:
+            await client.connect()
+            session = await client.open_session(SessionConfig(
+                path="Shows/Sample.MKV", source="server_file", model="passthrough",
+                display_w=320, display_h=180, aux_tracks="muxed",
+            ))
+            assert session.aux_tracks == "external"
+            assert instances and instances[0].closed
+        finally:
+            await client.teardown()
+            await server.stop()
+
+    asyncio.run(scenario())
+
+
 def test_server_source_seek_restarts_muxed_audio_near_target(multitrack_library_file):
     root, _target = multitrack_library_file
 

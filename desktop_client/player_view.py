@@ -25,6 +25,7 @@ class VideoPreviewView(QWidget):
     stats_changed = Signal(str)
     position_changed = Signal(float)
     track_list_changed = Signal(list)
+    audio_track_list_changed = Signal(list, object)
     rebuffering = Signal(bool)
     finished = Signal()
     failed = Signal(str)
@@ -62,7 +63,13 @@ class VideoPreviewView(QWidget):
     def select_subtitle(self, sid) -> None:
         pass
 
+    def select_audio(self, aid) -> None:
+        pass
+
     def set_sub_delay(self, seconds: float) -> None:
+        pass
+
+    def set_audio_delay(self, seconds: float) -> None:
         pass
 
     def play_local_fallback(self, position_s: float) -> None:

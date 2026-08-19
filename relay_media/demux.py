@@ -171,15 +171,17 @@ class AuxiliaryTrack:
             stream for stream in self._container.streams
             if stream.type in ("audio", "subtitle")
         ]
+        attachments = list(self._container.streams.attachments)
+        self.attachment_bytes = sum(len(attachment.data) for attachment in attachments)
         self._lock = threading.Lock()
         self._iter_gen = 0
         try:
-            self._validate_matroska_mux()
+            self._validate_matroska_mux(attachments)
         except Exception:
             self._container.close()
             raise
 
-    def _validate_matroska_mux(self) -> None:
+    def _validate_matroska_mux(self, attachments: list) -> None:
         """Fail early when any source auxiliary codec cannot be remuxed.
 
         Server libraries also accept containers such as MP4. A codec like
@@ -187,7 +189,6 @@ class AuxiliaryTrack:
         must downgrade that file to the external path before a pipeline/model
         is built, not fail playback minutes later.
         """
-        attachments = list(self._container.streams.attachments)
         if not self._streams and not attachments:
             return
         target = io.BytesIO()
@@ -225,13 +226,27 @@ class AuxiliaryTrack:
             if self._iter_gen != gen:
                 return
             if target_s is not None:
-                # No stream= means AV_TIME_BASE units. This lets libav choose
-                # the best indexed point for a mixed audio/subtitle demux.
-                self._container.seek(
-                    max(0, int(target_s * av.time_base)),
-                    backward=True,
-                    any_frame=False,
+                # Anchor mixed demux on a dense audio index when available.
+                # With no stream, libav may choose a sparse subtitle index and
+                # next(iterator) then walks minutes of subtitle packets before
+                # the timestamp merge can emit the first post-seek video.
+                audio = next(
+                    (stream for stream in self._streams if stream.type == "audio"),
+                    None,
                 )
+                if audio is not None and audio.time_base is not None:
+                    self._container.seek(
+                        max(0, int(target_s / float(audio.time_base))),
+                        stream=audio,
+                        backward=True,
+                        any_frame=False,
+                    )
+                else:
+                    self._container.seek(
+                        max(0, int(target_s * av.time_base)),
+                        backward=True,
+                        any_frame=False,
+                    )
             iterator = self._container.demux(self._streams)
         while True:
             with self._lock:
