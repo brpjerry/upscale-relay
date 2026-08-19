@@ -2,8 +2,9 @@
 
 Video Upscale Relay plays local, mounted-share, or server-hosted media while a
 GPU server upscales the video through ONNX models. The returned video keeps the
-source timestamps, and the desktop client uses the original file for audio and
-subtitles.
+source timestamps. Client-local media uses the original file for audio and
+subtitles; negotiated server-library sessions stream-copy those tracks into
+each Matroska downlink epoch.
 
 This document describes the current implementation first and keeps only
 unfinished work in the roadmap. See [PROTOCOL.md](PROTOCOL.md) for the wire
@@ -17,7 +18,7 @@ contract and [SERVER_LIBRARY.md](SERVER_LIBRARY.md) for server-hosted media.
 | Streaming server and protocol | **Implemented** | aiohttp WebSocket control, framed TCP media, sessions, seeks/epochs, Matroska downlink, pacing, and `/status` |
 | Desktop client | **Implemented** | PySide6/qasync UI, local browser, embedded libmpv, uplink, playback, seek, subtitles, quality/model controls, and local fallback |
 | Lossless playback path | **Implemented** | blocking downlink receiver plus native localhost `tcp://` handoff to mpv; avoids qasync and python-mpv callback throughput ceilings |
-| Server-side media library | **Implemented** | `--library`, sandboxed listing and Range HTTP delivery, server demux/seek, capability-driven Server tab |
+| Server-side media library | **Implemented; muxed tracks in progress** | `--library`, sandboxed listing and Range HTTP delivery, server demux/seek, capability-driven Server tab, and negotiated in-band original audio/subtitle tracks |
 | Server-side framing and resize filters | **Implemented** | Fit preserves the full frame; Cover center-crops before encode; the final post-ONNX downscale is selectable per server or session |
 | Shared-mount path mapping | **Planned** | server library currently delivers original audio/subtitles over HTTP; mapping one relative path to different client/server mount roots is not implemented |
 | Polish phase | **Partial** | model discovery/picker, metrics, manual host configuration, mounted shares, and fallback exist; discovery, pairing, hot model reload, and reconnect/resume remain |
@@ -39,7 +40,8 @@ Server decode -> ONNX inference -> fit/cover -> encode/mux
 
 Original audio/subtitles
   local source: client path -> libmpv external tracks
-  server source: Range HTTP /media URL -> libmpv external tracks
+  server source (negotiated): stream copy -> epoch Matroska downlink
+  server source (legacy): Range HTTP /media URL -> libmpv external tracks
 ```
 
 The control channel is WebSocket on port 8590. Media uses framed TCP on port

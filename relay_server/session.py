@@ -12,8 +12,8 @@ from enum import Enum
 from fractions import Fraction
 from typing import Any
 
-from relay_protocol import FLAG_EOS, MediaPacket, new_token
-from relay_media import VideoTrack
+from relay_protocol import FLAG_EOS, NO_TS, MediaPacket, new_token
+from relay_media import AuxiliaryTrack, VideoTrack
 from upscale_cli.encode import DEFAULT_LOSSLESS_HEVC_PROFILE
 from upscale_cli.fit import DEFAULT_RESIZE_ALGORITHM, RESIZE_ALGORITHMS
 
@@ -88,6 +88,8 @@ class Session:
         self.source_kind = "uplink"
         self.source_path: str | None = None
         self.source_track: VideoTrack | None = None
+        self.aux_track: AuxiliaryTrack | None = None
+        self.aux_track_mode = "external"
         self._source_task: asyncio.Task | None = None
         self._open_task: asyncio.Task | None = None
         self._seek_progress_task: asyncio.Task | None = None
@@ -202,6 +204,17 @@ class Session:
             await self.send("error", code="bad_message", message="invalid source", fatal=False)
             return
         self.source_kind = source_kind
+        requested_aux = msg.get("aux_tracks", "external")
+        if requested_aux not in ("external", "muxed"):
+            await self.send("error", code="bad_message", message="invalid aux_tracks", fatal=False)
+            return
+        if source_kind != "server_file" and requested_aux == "muxed":
+            await self.send(
+                "error", code="bad_message",
+                message="muxed auxiliary tracks require server_file", fatal=False,
+            )
+            return
+        resolved_path: str | None = None
         if source_kind == "server_file":
             if self.library is None:
                 await self.send("error", code="bad_message", message="server has no library", fatal=False)
@@ -209,8 +222,26 @@ class Session:
             relative = source.get("path") if isinstance(source, dict) else None
             try:
                 resolved = self.library.resolve_file(relative or "")
-                self.source_track = await asyncio.to_thread(VideoTrack, str(resolved))
+                resolved_path = str(resolved)
+                self.source_track = await asyncio.to_thread(VideoTrack, resolved_path)
+                if requested_aux == "muxed":
+                    try:
+                        self.aux_track = await asyncio.to_thread(AuxiliaryTrack, resolved_path)
+                    except Exception as err:
+                        log.warning(
+                            "session %s: cannot mux auxiliary tracks for %s; "
+                            "falling back to external media: %s",
+                            self.id, relative, err,
+                        )
+                    else:
+                        self.aux_track_mode = "muxed"
             except Exception as err:
+                if self.aux_track is not None:
+                    await asyncio.to_thread(self.aux_track.close)
+                    self.aux_track = None
+                if self.source_track is not None:
+                    await asyncio.to_thread(self.source_track.close)
+                    self.source_track = None
                 await self.send("error", code="decode_error", message=str(err), fatal=False)
                 return
             self.source_path = relative
@@ -268,6 +299,7 @@ class Session:
                 resize_algorithm=resize_algorithm,
                 lossless_hevc_profile=self.lossless_hevc_profile,
                 seek_discard_max_s=self.seek_discard_max_s,
+                aux_source_path=(resolved_path if self.aux_track_mode == "muxed" else None),
             )
         except Exception as err:
             await self.send("error", code="pipeline_error", message=str(err), fatal=True)
@@ -303,6 +335,7 @@ class Session:
             duration_s=duration_s,
             avg_rate=[avg_rate.numerator, avg_rate.denominator] if avg_rate else None,
             chapters=chapters or None,
+            aux_tracks=self.aux_track_mode,
         )
 
     media_port: int = 0  # set by server at construction
@@ -383,8 +416,56 @@ class Session:
     async def _server_source_loop(self, from_pts: int | None,
                                   discontinuity: bool, epoch: int) -> None:
         assert self.source_track is not None and self.pipeline is not None
-        iterator = self.source_track.packets(from_pts)
+        video_iterator = self.source_track.packets(from_pts)
+        target_s = (
+            float(from_pts * self.source_track.time_base) if from_pts is not None else None
+        )
         first = True
+
+        def merged_packets():
+            """Merge independently seekable demuxers in source timestamp order."""
+            sentinel = object()
+            video = next(video_iterator, sentinel)
+            aux_target_s = target_s
+            # The optional low-latency seek mode deliberately emits video from
+            # a distant preceding keyframe. Match auxiliary tracks to that
+            # effective start instead of leaving seconds of silent video.
+            if (
+                video is not sentinel
+                and target_s is not None
+                and self.pipeline.seek_discard_max_s is not None
+                and video.pts != NO_TS
+            ):
+                video_start_s = float(video.pts * self.source_track.time_base)
+                if target_s - video_start_s > self.pipeline.seek_discard_max_s:
+                    aux_target_s = video_start_s
+            aux_iterator = (
+                self.aux_track.packets(aux_target_s)
+                if self.aux_track is not None else iter(())
+            )
+            auxiliary = next(aux_iterator, sentinel)
+            while video is not sentinel or auxiliary is not sentinel:
+                if video is sentinel:
+                    yield "aux", auxiliary
+                    auxiliary = next(aux_iterator, sentinel)
+                    continue
+                if auxiliary is sentinel:
+                    yield "video", video
+                    video = next(video_iterator, sentinel)
+                    continue
+                video_stamp = video.dts if video.dts != NO_TS else video.pts
+                video_s = (
+                    float(video_stamp * self.source_track.time_base)
+                    if video_stamp != NO_TS else float("inf")
+                )
+                if video_s <= auxiliary.order_s:
+                    yield "video", video
+                    video = next(video_iterator, sentinel)
+                else:
+                    yield "aux", auxiliary
+                    auxiliary = next(aux_iterator, sentinel)
+
+        iterator = merged_packets()
 
         def next_batch() -> list:
             batch = []
@@ -399,12 +480,15 @@ class Session:
                 batch = await asyncio.to_thread(next_batch)
                 if epoch != self.epoch:
                     return
-                for info in batch:
-                    pkt = self.source_track.media_packet(
-                        info, epoch, discontinuity=discontinuity and first
-                    )
-                    first = False
-                    await asyncio.to_thread(self.pipeline.feed, pkt)
+                for kind, info in batch:
+                    if kind == "video":
+                        pkt = self.source_track.media_packet(
+                            info, epoch, discontinuity=discontinuity and first
+                        )
+                        first = False
+                        await asyncio.to_thread(self.pipeline.feed, pkt)
+                    else:
+                        await asyncio.to_thread(self.pipeline.feed_aux, info, epoch)
                 if len(batch) < 16:
                     await asyncio.to_thread(
                         self.pipeline.feed,
@@ -432,6 +516,9 @@ class Session:
         if self.source_track is not None:
             await asyncio.to_thread(self.source_track.close)
             self.source_track = None
+        if self.aux_track is not None:
+            await asyncio.to_thread(self.aux_track.close)
+            self.aux_track = None
         # Wake the downlink writer so it exits.
         try:
             self.down_q.put_nowait(None)
@@ -447,6 +534,7 @@ class Session:
             "uplink_attached": self.uplink_attached,
             "downlink_attached": self.downlink_attached,
             "source": self.source_kind,
+            "aux_tracks": self.aux_track_mode,
             "pipeline": None
             if p is None
             else {

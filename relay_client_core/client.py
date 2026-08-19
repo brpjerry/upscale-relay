@@ -149,6 +149,10 @@ class SessionConfig:
     source: str = "uplink"
     # None asks the server to use its configured default.
     resize_algorithm: str | None = None
+    # Server-library sessions can ask a capable server to stream-copy original
+    # audio/subtitle tracks into each epoch's Matroska downlink. "external"
+    # retains the /media attachment path used by older clients and servers.
+    aux_tracks: str = "external"
 
 
 @dataclass
@@ -171,6 +175,7 @@ class SessionInfo:
     # Wire-format chapter dicts ({start_s, end_s?, title?}), sorted by start_s;
     # None when the source has none (docs/PROTOCOL.md session_opened).
     chapters: list[dict] | None = None
+    aux_tracks: str = "external"
 
 
 class RelayClient:
@@ -296,6 +301,10 @@ class RelayClient:
     async def open_session(self, cfg: SessionConfig) -> SessionInfo:
         if cfg.source not in ("uplink", "server_file"):
             raise ValueError(f"unknown session source: {cfg.source}")
+        if cfg.aux_tracks not in ("external", "muxed"):
+            raise ValueError(f"unknown auxiliary-track mode: {cfg.aux_tracks}")
+        if cfg.source != "server_file" and cfg.aux_tracks != "external":
+            raise ValueError("muxed auxiliary tracks require a server_file session")
         self.track = VideoTrack(cfg.path) if cfg.source == "uplink" else None
         video = self.track.open_session_video_dict() if self.track else None
         duration_s = self.track.duration_seconds() if self.track else None
@@ -317,6 +326,7 @@ class RelayClient:
             "quality_tier": cfg.quality_tier,
             "display": {"w": cfg.display_w, "h": cfg.display_h},
             "fit_mode": cfg.fit_mode,
+            "aux_tracks": cfg.aux_tracks,
         }
         if cfg.resize_algorithm is not None:
             fields["resize_algorithm"] = cfg.resize_algorithm
@@ -351,6 +361,7 @@ class RelayClient:
             fit_mode=msg.get("fit_mode", cfg.fit_mode),
             resize_algorithm=msg.get("resize_algorithm", cfg.resize_algorithm),
             chapters=msg.get("chapters") or None,
+            aux_tracks=msg.get("aux_tracks", "external"),
         )
         return self.session
 

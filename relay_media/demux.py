@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import io
 import threading
 from dataclasses import dataclass
 from fractions import Fraction
@@ -13,12 +14,30 @@ import av
 from relay_protocol import FLAG_KEYFRAME, NO_TS, MediaPacket
 
 
+_AUDIO_PREROLL_S = 0.25
+
+
 @dataclass
 class PacketInfo:
     payload: bytes
     pts: int
     dts: int
     keyframe: bool
+
+
+@dataclass
+class AuxiliaryPacketInfo:
+    """One original audio/subtitle packet retained for stream-copy muxing.
+
+    The packet itself is handed off intact so codec side data (notably audio
+    skip samples and Matroska block additions) is not lost by serializing it
+    through bytes. Ownership moves from the demux worker to the pipeline finish
+    thread; no container or codec is shared between those threads.
+    """
+
+    packet: av.Packet
+    stream_index: int
+    order_s: float
 
 
 class VideoTrack:
@@ -132,4 +151,117 @@ class VideoTrack:
 
     def close(self) -> None:
         with self._lock:
+            self._iter_gen += 1
+            self._container.close()
+
+
+class AuxiliaryTrack:
+    """Seekable audio/subtitle demuxer for a server-hosted source.
+
+    It deliberately owns a second input container. The video demuxer can be
+    blocked or cancelled independently during an epoch change without two
+    threads ever touching one native container. Source reads may therefore be
+    duplicated, but only the compact selected packets are sent to the client.
+    """
+
+    def __init__(self, path: str):
+        self.path = path
+        self._container = av.open(path)
+        self._streams = [
+            stream for stream in self._container.streams
+            if stream.type in ("audio", "subtitle")
+        ]
+        self._lock = threading.Lock()
+        self._iter_gen = 0
+        try:
+            self._validate_matroska_mux()
+        except Exception:
+            self._container.close()
+            raise
+
+    def _validate_matroska_mux(self) -> None:
+        """Fail early when any source auxiliary codec cannot be remuxed.
+
+        Server libraries also accept containers such as MP4. A codec like
+        mov_text may be valid there but unsupported by Matroska; negotiation
+        must downgrade that file to the external path before a pipeline/model
+        is built, not fail playback minutes later.
+        """
+        attachments = list(self._container.streams.attachments)
+        if not self._streams and not attachments:
+            return
+        target = io.BytesIO()
+        with av.open(target, "w", format="matroska") as output:
+            for stream in self._streams:
+                output.add_stream_from_template(stream)
+            for attachment in attachments:
+                metadata = dict(attachment.metadata)
+                name = metadata.get("filename") or attachment.name or f"attachment-{attachment.index}"
+                mimetype = attachment.mimetype or metadata.get("mimetype") or "application/octet-stream"
+                output.add_attachment(name, mimetype, attachment.data)
+
+    @property
+    def has_streams(self) -> bool:
+        return bool(self._streams)
+
+    def packets(self, target_s: float | None = None) -> Iterator[AuxiliaryPacketInfo]:
+        """Iterate original auxiliary packets, optionally from ``target_s``.
+
+        A small audio preroll is retained and subtitle packets whose declared
+        duration overlaps the target survive. mpv's initial audio sync trims
+        samples before the first video PTS; keeping them is safer than starting
+        codecs such as Opus/AAC without decoder preroll.
+        """
+        with self._lock:
+            self._iter_gen = gen = self._iter_gen + 1
+        return self._packet_iter(gen, target_s)
+
+    def _packet_iter(
+        self, gen: int, target_s: float | None,
+    ) -> Iterator[AuxiliaryPacketInfo]:
+        if not self._streams:
+            return
+        with self._lock:
+            if self._iter_gen != gen:
+                return
+            if target_s is not None:
+                # No stream= means AV_TIME_BASE units. This lets libav choose
+                # the best indexed point for a mixed audio/subtitle demux.
+                self._container.seek(
+                    max(0, int(target_s * av.time_base)),
+                    backward=True,
+                    any_frame=False,
+                )
+            iterator = self._container.demux(self._streams)
+        while True:
+            with self._lock:
+                if self._iter_gen != gen:
+                    return
+                try:
+                    packet = next(iterator)
+                except StopIteration:
+                    return
+            if packet.pts is None and packet.dts is None and packet.size == 0:
+                continue
+            time_base = packet.time_base or packet.stream.time_base
+            stamp = packet.dts if packet.dts is not None else packet.pts
+            order_s = float(stamp * time_base) if stamp is not None and time_base else float("inf")
+            if target_s is not None and packet.pts is not None and time_base is not None:
+                start_s = float(packet.pts * time_base)
+                duration_s = float((packet.duration or 0) * time_base)
+                end_s = start_s + duration_s
+                if packet.stream.type == "audio":
+                    if start_s < target_s - _AUDIO_PREROLL_S and end_s <= target_s:
+                        continue
+                elif start_s < target_s and end_s <= target_s:
+                    continue
+            yield AuxiliaryPacketInfo(
+                packet=packet,
+                stream_index=packet.stream.index,
+                order_s=order_s,
+            )
+
+    def close(self) -> None:
+        with self._lock:
+            self._iter_gen += 1
             self._container.close()

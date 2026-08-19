@@ -1,11 +1,11 @@
 """libmpv-backed player view.
 
 The downlink is a streaming Matroska byte stream with original PTS
-(docs/PROTOCOL.md §3.2), fed to mpv through a localhost TCP stream. The
-original file is attached via --external-files, so its audio (master clock)
-and subtitle tracks play alongside the network video, all aligned by real
-timestamps — including after seeks, where a fresh container starts at the
-seek target and mpv reloads it.
+(docs/PROTOCOL.md §3.2), fed to mpv through a localhost TCP stream.
+Audio/subtitles either arrive as negotiated embedded tracks (server-library
+sessions) or from the original external file (local/legacy sessions). Both
+paths align by absolute timestamps, including after a seek reloads a fresh
+container at the epoch target.
 
 The DLL is looked up in <repo>/mpv-dev (see _load_mpv).
 """
@@ -376,6 +376,8 @@ class MpvPlayerView(QOpenGLWidget):
         self._pending_start: float | None = None  # seek target for next reload
         self._epoch_base = 0  # frames fed before the current epoch's stream
         self._tracks_reported = False
+        self._chosen_subtitle_id: int | None = None
+        self._subtitle_choice_made = False
         self._reloading = False
         self.client = None
 
@@ -440,6 +442,8 @@ class MpvPlayerView(QOpenGLWidget):
         self._fps = float(avg_rate) if avg_rate else 30.0
         self._source_path = source_path
         self._tracks_reported = False
+        self._chosen_subtitle_id = None
+        self._subtitle_choice_made = False
         self._task = asyncio.create_task(self._consume(downlink_q))
         self._stats_task = asyncio.create_task(self._stats_loop())
 
@@ -463,6 +467,10 @@ class MpvPlayerView(QOpenGLWidget):
             await asyncio.sleep(0.15)
         self._buffer = _LoopbackStream()
         self._fed = 0
+        # A seek is a new Matroska file. Embedded auxiliary tracks get fresh
+        # mpv ids from an identical deterministic header, so enumerate them
+        # again and reapply the user's explicit subtitle choice.
+        self._tracks_reported = False
         self.mpv.pause = True
         options = {}
         if self._source_path:
@@ -552,7 +560,12 @@ class MpvPlayerView(QOpenGLWidget):
         flag, so mpv selects none. Prefer the source's default track, else
         the first. Same fallback for audio (mpv sometimes selects none on
         live-stream loads)."""
-        if self.mpv.sid in (None, False, "no"):
+        if self._subtitle_choice_made:
+            self.mpv.sid = (
+                self._chosen_subtitle_id
+                if self._chosen_subtitle_id is not None else "no"
+            )
+        elif self.mpv.sid in (None, False, "no"):
             subs = [t for t in tracks if t.get("type") == "sub"]
             if subs:
                 pick = next((t for t in subs if t.get("default")), subs[0])
@@ -563,6 +576,8 @@ class MpvPlayerView(QOpenGLWidget):
                 self.mpv.aid = audio[0]["id"]
 
     def select_subtitle(self, sid: int | None) -> None:
+        self._chosen_subtitle_id = sid
+        self._subtitle_choice_made = True
         self.mpv.sid = sid if sid is not None else "no"
 
     def set_sub_delay(self, seconds: float) -> None:

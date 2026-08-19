@@ -25,6 +25,7 @@ from typing import Callable
 
 import av
 
+from relay_media import AuxiliaryPacketInfo
 from relay_protocol import (
     FLAG_DISCONTINUITY,
     FLAG_EOS,
@@ -160,6 +161,14 @@ class _Frame:
     rgb: object | None = None  # ndarray path (after inference)
 
 
+@dataclass(slots=True)
+class _AuxPacket:
+    """Original audio/subtitle packet moving unchanged to the mux thread."""
+
+    epoch: int
+    info: AuxiliaryPacketInfo
+
+
 class _SinkBuffer:
     """Write target for the output muxer. Deliberately has no seek/tell so
     the Matroska muxer runs in streaming (non-seekable) mode."""
@@ -236,6 +245,7 @@ class Pipeline:
         resize_algorithm: str = DEFAULT_RESIZE_ALGORITHM,
         lossless_hevc_profile: str = DEFAULT_LOSSLESS_HEVC_PROFILE,
         seek_discard_max_s: float | None = None,
+        aux_source_path: str | None = None,
     ):
         self.video = video
         self.emit = emit
@@ -296,6 +306,10 @@ class Pipeline:
         self.encoder_name = self._enc_codec
         self._mux = None
         self._enc_stream = None
+        self._aux_template_container = (
+            av.open(aux_source_path) if aux_source_path is not None else None
+        )
+        self._aux_streams: dict[int, av.stream.Stream] = {}
         self._sink_buf = _SinkBuffer()
         self._open_mux()
         self.downlink_container = "matroska"
@@ -412,12 +426,33 @@ class Pipeline:
         self._enc_stream.width = self.out_w
         self._enc_stream.height = self.out_h
         self._enc_stream.pix_fmt = self._enc_pix_fmt
+        self._aux_streams = {}
+        if self._aux_template_container is not None:
+            for template in self._aux_template_container.streams:
+                if template.type not in ("audio", "subtitle"):
+                    continue
+                stream = self._mux.add_stream_from_template(template)
+                stream.metadata.update({
+                    key: value for key, value in template.metadata.items()
+                    if key.upper() != "DURATION"
+                })
+                stream.disposition = template.disposition
+                self._aux_streams[template.index] = stream
+            for attachment in self._aux_template_container.streams.attachments:
+                metadata = dict(attachment.metadata)
+                name = metadata.get("filename") or attachment.name or f"attachment-{attachment.index}"
+                mimetype = attachment.mimetype or metadata.get("mimetype") or "application/octet-stream"
+                self._mux.add_attachment(name, mimetype, attachment.data)
 
     # -- public API (called from asyncio thread) ------------------------------
 
     def feed(self, pkt: MediaPacket) -> None:
         """Blocking put -- caller runs it in an executor for natural backpressure."""
         self.in_q.put(pkt)
+
+    def feed_aux(self, info: AuxiliaryPacketInfo, epoch: int) -> None:
+        """Queue one original audio/subtitle packet for stream-copy muxing."""
+        self.in_q.put(_AuxPacket(epoch=epoch, info=info))
 
     def note_buffer_report(self, buffered_ms: int) -> None:
         self.client_buffered_ms = buffered_ms
@@ -494,6 +529,22 @@ class Pipeline:
                         downstream.put_nowait(None)  # make sure the next stage exits
                     except queue.Full:
                         pass
+                elif fn.__name__ == "_finish_work":
+                    # The finish thread is the sole owner after construction.
+                    # Close native mux/template state here, never from the
+                    # asyncio thread racing a still-running worker.
+                    if self._mux is not None:
+                        try:
+                            self._mux.close()
+                        except Exception:
+                            pass
+                        self._mux = None
+                    if self._aux_template_container is not None:
+                        try:
+                            self._aux_template_container.close()
+                        except Exception:
+                            pass
+                        self._aux_template_container = None
         return run
 
     # Stage 1: packets -> decoded frames (+ discard window + backpressure)
@@ -516,6 +567,11 @@ class Pipeline:
                 self._flush_pending.clear()
                 self.stats.paused_for_backpressure = False
                 self._safe_put(self._q_dec, item)
+                continue
+
+            if isinstance(item, _AuxPacket):
+                if item.epoch >= self._epoch:
+                    self._safe_put(self._q_dec, item)
                 continue
 
             pkt: MediaPacket = item
@@ -626,7 +682,7 @@ class Pipeline:
             if item is None:
                 self._q_up.put(None)
                 return
-            if isinstance(item, (_FlushCmd, _Eos)):
+            if isinstance(item, (_FlushCmd, _Eos, _AuxPacket)):
                 self._safe_put(self._q_up, item)
                 continue
             if item.epoch < self._epoch:
@@ -668,6 +724,14 @@ class Pipeline:
                 self._open_mux()  # ready in case another epoch follows
                 continue
             if item.epoch < self._epoch:
+                continue
+            if isinstance(item, _AuxPacket):
+                stream = self._aux_streams.get(item.info.stream_index)
+                if stream is None:
+                    continue
+                packet = item.info.packet
+                packet.stream = stream
+                self._mux.mux(packet)
                 continue
 
             t0 = time.perf_counter()

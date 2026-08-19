@@ -119,6 +119,7 @@ class MainWindow(QMainWindow):
         self.resize(1200, 700)
         self.settings = AppSettings(self.options.settings_scope)
         self.client: RelayClient | None = None
+        self._server_caps: dict = {}
 
         # -- toolbar: server + session config --------------------------------
         bar = QToolBar("server")
@@ -563,6 +564,7 @@ class MainWindow(QMainWindow):
     async def _adopt_connected_client(self, client: RelayClient, caps: dict) -> None:
         """Install a connected control client and reflect its capabilities."""
         self.client = client
+        self._server_caps = dict(caps)
         client.on_progress = self._on_open_progress
         client.on_seek_progress = self._on_seek_progress
         self.settings.server_host, self.settings.server_port = client.host, client.port
@@ -833,6 +835,11 @@ class MainWindow(QMainWindow):
             fit_mode=self._fit_mode(),
             source=source,
             resize_algorithm=self._resize_algorithm(),
+            aux_tracks=(
+                "muxed"
+                if source == "server_file" and self._server_caps.get("muxed_aux_tracks")
+                else "external"
+            ),
         )
         self.settings.model = cfg.model
         self.settings.quality_tier = cfg.quality_tier
@@ -855,7 +862,11 @@ class MainWindow(QMainWindow):
             self._error("Session failed", "Server did not provide the source time base.")
             await self._teardown_session()
             return
-        original_media = path if source == "uplink" else self.client.media_url(path)
+        original_media = (
+            None
+            if getattr(session, "aux_tracks", "external") == "muxed"
+            else (path if source == "uplink" else self.client.media_url(path))
+        )
         self._session_source = source
         self._session_path = path
         self._session_time_base = time_base

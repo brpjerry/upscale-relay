@@ -99,6 +99,7 @@ class FakeSessionClient(FakeLibraryClient):
             downlink_container="matroska", time_base=Fraction(1, 1000),
             duration_s=120.0, avg_rate=Fraction(24, 1),
             chapters=getattr(self, "chapters", None),
+            aux_tracks=config.aux_tracks,
         )
         return self.session
 
@@ -201,6 +202,19 @@ def test_server_session_uses_http_original_and_server_metadata(window):
             "http://media-server:8590/media/Shows/Episode.mkv"
         )
         assert window.player.started[4] == Fraction(24, 1)
+
+    asyncio.run(scenario())
+
+
+def test_server_session_opts_into_muxed_tracks_and_skips_http_original(window):
+    async def scenario():
+        client = FakeSessionClient()
+        window.client = client
+        window._server_caps = {"muxed_aux_tracks": True}
+        await window._start_session("Shows/Episode.mkv", source="server_file")
+
+        assert client.opened_config.aux_tracks == "muxed"
+        assert window.player.started[3] is None
 
     asyncio.run(scenario())
 

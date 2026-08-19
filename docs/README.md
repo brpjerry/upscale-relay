@@ -15,6 +15,9 @@ instructions remain at the root.
 - [Seek latency plan](SEEK_LATENCY_PLAN.md) — measured first-frame latency
   after an epoch seek, the keyframe discard window that produces it, and the
   candidate changes.
+- [In-band audio/subtitle plan](AUDIO_SIDECAR_PLAN.md) — negotiated stream-copy
+  of original auxiliary tracks into each Matroska epoch, avoiding full-source
+  client transfer while preserving relay seeks.
 - [Android client plan](https://github.com/brpjerry/upscale-relay-android/blob/main/docs/ANDROID_CLIENT.md) — selected architecture, robust
   server-library MVP, feature-parity phases, and device acceptance gates.
 - [Android device validation](https://github.com/brpjerry/upscale-relay-android/blob/main/docs/ANDROID_DEVICE_NOTES.md) — Phase 1 robustness and

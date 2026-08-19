@@ -44,6 +44,8 @@ desktop retains its local-only browser appearance.
 - The `capabilities` message includes `library: true` and
   `library_sort: ["name", "mtime"]` while the feature is configured
   (`library_sort` is `[]` otherwise).
+- `muxed_aux_tracks: true` advertises the opt-in path that stream-copies
+  original audio/subtitle tracks and attachments into each downlink epoch.
 - `open_session.source` accepts `{type: "server_file", path: "..."}`.
 - Server-file sessions create a shared `relay_media.VideoTrack` locally and do
   not allocate or wait for an uplink attachment.
@@ -66,8 +68,9 @@ desktop retains its local-only browser appearance.
   `Load more` footer without discarding already loaded entries.
 - Double-clicking a server file opens a `server_file` session without creating
   a client `VideoTrack` or uplink sender.
-- libmpv attaches `/media` as both `audio-file` and `sub-files`, so original
-  audio and subtitles remain aligned by absolute PTS.
+- The Qt client requests muxed auxiliary tracks from capable servers and does
+  not open `/media` after `session_opened` confirms them. Older/external-mode
+  sessions still attach `/media` for audio/subtitles.
 - Local fallback is hidden for server files because the client has no local
   source to play directly.
 
@@ -75,16 +78,15 @@ Coverage lives in `tests/test_server_library.py` and
 `tests/test_server_library_gui.py`, including path sandboxing, HTTP Range,
 server-source PTS equivalence, seeks, capability-driven UI, and media URLs.
 
-## Why the main pipeline did not change
+## Auxiliary tracks in the main pipeline
 
-The pipeline consumes encoded video packets and produces a streaming Matroska
-downlink. Whether those input packets come from the client's framed uplink or a
-server-local `VideoTrack` does not affect decode, inference, fit/cover,
-encoding, muxing, epochs, or pacing.
-
-Audio and subtitles deliberately remain outside the upscaled downlink. Muxing
-them into every epoch would complicate seek remuxing and duplicate a path mpv
-already handles correctly.
+The default/legacy pipeline remains video-only. When a server-file client opts
+in, a separate seekable auxiliary demuxer feeds original audio/subtitle packets
+through the same bounded epoch pipeline without decoding them; the finish
+thread stream-copies them into the fresh Matroska container and copies source
+attachments into its header. Relay seeks replace the whole container, so mpv
+does not need a seekable external demuxer. See
+[AUDIO_SIDECAR_PLAN.md](AUDIO_SIDECAR_PLAN.md).
 
 ## SMB and network shares
 

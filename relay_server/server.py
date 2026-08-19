@@ -203,6 +203,10 @@ class RelayServer:
                         "resize_algorithms": list(RESIZE_ALGORITHMS),
                         "default_resize_algorithm": self.resize_algorithm,
                         "library": self.library is not None,
+                        # Opt-in: old clients keep the video-only downlink and
+                        # /media external-track path until they explicitly
+                        # request muxed auxiliary tracks in open_session.
+                        "muxed_aux_tracks": self.library is not None,
                         "library_sort": (
                             list(LIBRARY_SORT_KEYS) if self.library is not None else []
                         ),
