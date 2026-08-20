@@ -116,32 +116,38 @@ class RelayServer:
 
     @staticmethod
     def _log_session_stats(session: Session, *, final: bool = False) -> None:
-        """Persist the live /status performance fields in a readable line."""
+        """Persist live performance fields without affecting session cleanup."""
         p = session.pipeline
         if p is None:
             return
-        depths = p.queue_depths()
-        stage = p.stats.stage_report()
-        infer_ms = stage.get("infer")
-        infer_fps = f"{1000.0 / infer_ms:5.1f}" if infer_ms else "  n/a"
-        stage_str = " ".join(f"{k}={v}ms" for k, v in stage.items()) or "stages=n/a"
-        cached = depths["decoded"] + depths["upscaled"] + session.down_q.qsize()
-        stats_log = logging.getLogger("relay.stats")
-        stats_log.info(
-            "session %s %s%s epoch=%d source=%s | pipeline %5.1f fps | "
-            "onnx %s fps | %s | output=%dx%d codec=%s encoder=%s tier=%s | "
-            "cached frames: in-flight=%d (dec=%d up=%d down=%d) uplink-pkts=%d | "
-            "client buffer %5d ms (est %5d) | %s | frames %d in / %d out",
-            session.id[:6], session.state.value, " FINAL" if final else "",
-            session.epoch, session.source_kind,
-            p.stats.fps, infer_fps, stage_str,
-            p.out_w, p.out_h, p.downlink_codec, p.encoder_name, p.quality_tier,
-            cached, depths["decoded"], depths["upscaled"],
-            session.down_q.qsize(), depths["in"],
-            p.client_buffered_ms, p.buffered_ms_now(),
-            "PAUSED(watermark)" if p.stats.paused_for_backpressure else "flowing",
-            p.stats.frames_in, p.stats.frames_out,
-        )
+        try:
+            depths = p.queue_depths()
+            stage = p.stats.stage_report()
+            infer_ms = stage.get("infer")
+            infer_fps = f"{1000.0 / infer_ms:5.1f}" if infer_ms else "  n/a"
+            stage_str = " ".join(f"{k}={v}ms" for k, v in stage.items()) or "stages=n/a"
+            cached = depths["decoded"] + depths["upscaled"] + session.down_q.qsize()
+            stats_log = logging.getLogger("relay.stats")
+            stats_log.info(
+                "session %s %s%s epoch=%d source=%s | pipeline %5.1f fps | "
+                "onnx %s fps | %s | output=%dx%d codec=%s encoder=%s tier=%s | "
+                "cached frames: in-flight=%d (dec=%d up=%d down=%d) uplink-pkts=%d | "
+                "client buffer %5d ms (est %5d) | %s | frames %d in / %d out",
+                session.id[:6], session.state.value, " FINAL" if final else "",
+                session.epoch, session.source_kind,
+                p.stats.fps, infer_fps, stage_str,
+                p.out_w, p.out_h, p.downlink_codec, p.encoder_name, p.quality_tier,
+                cached, depths["decoded"], depths["upscaled"],
+                session.down_q.qsize(), depths["in"],
+                p.client_buffered_ms, p.buffered_ms_now(),
+                "PAUSED(watermark)" if p.stats.paused_for_backpressure else "flowing",
+                p.stats.frames_in, p.stats.frames_out,
+            )
+        except Exception:
+            # Stats are optional diagnostics. A partial pipeline (notably one
+            # still opening or a test/fallback implementation) must never
+            # prevent the teardown acknowledgement and resource cleanup.
+            log.debug("session %s stats unavailable", session.id[:6], exc_info=True)
 
     async def _stats_loop(self) -> None:
         """One line per active session every stats_interval seconds: queue/cache
