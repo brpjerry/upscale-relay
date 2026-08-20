@@ -18,11 +18,11 @@ contract and [SERVER_LIBRARY.md](SERVER_LIBRARY.md) for server-hosted media.
 | Streaming server and protocol | **Implemented** | aiohttp WebSocket control, framed TCP media, sessions, seeks/epochs, Matroska downlink, pacing, and `/status` |
 | Desktop client | **Implemented** | PySide6/qasync UI, local browser, embedded libmpv, uplink, playback, seek, audio/subtitle track and delay controls, quality/model controls, and local fallback |
 | Lossless playback path | **Implemented** | blocking downlink receiver plus native localhost `tcp://` handoff to mpv; avoids qasync and python-mpv callback throughput ceilings |
-| Server-side media library | **Implemented; muxed tracks in progress** | `--library`, sandboxed listing and Range HTTP delivery, server demux/seek, capability-driven Server tab, and negotiated in-band original audio/subtitle tracks |
+| Server-side media library | **Implemented** | `--library`, sandboxed listing and Range compatibility delivery, server demux/seek, capability-driven Server tab, negotiated in-band audio/subtitles, and cached subtitle fonts |
 | Server-side framing and resize filters | **Implemented** | Fit preserves the full frame; Cover center-crops before encode; the final post-ONNX downscale is selectable per server or session |
-| Shared-mount path mapping | **Planned** | server library currently delivers original audio/subtitles over HTTP; mapping one relative path to different client/server mount roots is not implemented |
+| Shared-mount path mapping | **Planned** | Negotiated clients use muxed tracks; mapping one relative path to different client/server mount roots for legacy/external or direct-access workflows is not implemented |
 | Polish phase | **Partial** | model discovery/picker, metrics, manual host configuration, mounted shares, and fallback exist; discovery, pairing, hot model reload, and reconnect/resume remain |
-| Android client | **Phase 4 host-verified; device gate pending** | The tablet client now adds SAF local files, encoded MediaExtractor uplink, persistent local recents, and direct fallback to the Phase 3 shell and Phase 2 A/V/seek core; PGS/VobSub remains unrun because the configured library has no bitmap-subtitle sample |
+| Android client | **Phase 5.5 device-verified; muxed aux pending** | Server/local playback, recovery, discovery, adaptive UI, background media, and system controls are device-verified; server-library audio/subtitles still use external `/media` until the negotiated muxed-aux migration lands, and PGS/VobSub remains unrun for lack of a sample |
 
 ## Architecture
 
@@ -130,6 +130,9 @@ decode was fast enough for the measured pipeline.
 - PTS/DTS, keyframe, discontinuity, EOS, token, and epoch handling.
 - A shared, lock-serialized `VideoTrack` used for client uplink sources and
   server-library sources.
+- A separately owned `AuxiliaryTrack` that stream-copies original audio and
+  subtitles into server-file epochs, seeks on video keyframe cues, and exposes
+  sanitized content-addressed attachment manifests.
 
 ### Client core (`relay_client_core/`)
 
@@ -196,8 +199,9 @@ features.
 ### Server-side library extension: implemented
 
 This post-MVP extension supports server-hosted media through `--library`,
-including Range delivery of original tracks and the desktop Server tab. Only
-shared-mount path mapping remains planned; see
+including negotiated muxed original tracks, cached subtitle fonts, Range
+fallback for legacy clients, and the desktop Server tab. Only shared-mount
+path mapping remains planned; see
 [SERVER_LIBRARY.md](SERVER_LIBRARY.md).
 
 ## Remaining roadmap
@@ -260,6 +264,8 @@ on desktop but is intentionally excluded from Android because it requires
 continuous software decode and the associated battery/thermal cost.
 See [https://github.com/brpjerry/upscale-relay-android/blob/main/docs/ANDROID_CLIENT.md](https://github.com/brpjerry/upscale-relay-android/blob/main/docs/ANDROID_CLIENT.md) for the phases and
 [https://github.com/brpjerry/upscale-relay-android/blob/main/docs/ANDROID_DEVICE_NOTES.md](https://github.com/brpjerry/upscale-relay-android/blob/main/docs/ANDROID_DEVICE_NOTES.md) for the validation record.
+The remaining negotiated muxed-track and verified-font-cache migration is
+specified in the [Android muxed-aux plan](https://github.com/brpjerry/upscale-relay-android/blob/main/docs/MUXED_AUX_TRACKS_PLAN.md).
 
 ## Future/stretch work
 

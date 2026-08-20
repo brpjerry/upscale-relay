@@ -114,6 +114,10 @@ constructor options).
   through old media. On desktop, release the load-time hold when `audio-add`
   returns (`audio-pts` is not reliable while paused), and preserve the caller's
   pause intent across that hold.
+- For a server-file session confirmed as `aux_tracks:"muxed"`, never attach
+  `/media` or issue `audio-add`. Prepare any confirmed cached font view before
+  the first `loadfile`, then re-enumerate and remap track choices after every
+  fresh epoch. Requested mode alone is not authoritative.
 
 **GPU stacks (server box: RTX 5090 "Blackwell", Windows)**
 - ORT TensorRT EP corrupts the process heap under streaming → it lives in a

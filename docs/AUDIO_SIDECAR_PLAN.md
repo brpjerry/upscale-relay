@@ -1,7 +1,7 @@
 # In-band audio/subtitle tracks in the epoch downlink
 
-**Status:** server and Qt client implemented; Android negotiation and remaining
-subtitle/device gates are in progress. The former persistent `/media-audio`
+**Status:** server and Qt client implemented and live-verified; Android
+negotiation and remaining subtitle/device gates are next. The former persistent `/media-audio`
 sidecar/cache proposal was replaced on 2026-08-18 by negotiated auxiliary
 tracks in the existing per-epoch Matroska downlink.
 
@@ -12,11 +12,13 @@ the complete pre-upscale container to the client. Preserve arbitrary relay
 seeks, every audio/subtitle track, absolute timestamps, metadata, attachments,
 and explicit client track choices.
 
-Today the upscaled video arrives through the relay downlink while mpv opens
-`GET /media/<path>` as an external file. Matroska interleaves all tracks, so a
-client wanting roughly 1 Mbps of audio still downloads the source video. On
-the measured 27.54 GiB remux, video was 97.4% of the bytes: a full watch moved
-about 27.5 GiB to use about 0.9 GiB of audio/subtitle data.
+The compatibility path sends upscaled video through the relay downlink while
+mpv opens `GET /media/<path>` as an external file. Matroska interleaves all
+tracks, so a client wanting roughly 1 Mbps of audio still downloads the source
+video. On the measured 27.54 GiB remux, video was 97.4% of the bytes: a full
+watch moved about 27.5 GiB to use about 0.9 GiB of audio/subtitle data. The Qt
+client now avoids that path after the server confirms muxed mode; Android and
+legacy/external confirmations still use it.
 
 ## Key observation
 
@@ -76,6 +78,11 @@ pass unchanged through the decode and inference queues and are muxed only by
 the finish thread. Keeping the actual `av.Packet` preserves packet side data;
 containers and codecs never have concurrent owners.
 
+The auxiliary container uses the source video stream as its seek anchor even
+though it emits only audio/subtitle packets. A real Matroska file took 13.085 s
+to seek by its unindexed audio stream and 0.057 s by video cue; the corrected
+full Linux UI seek reached its target in 0.86 s.
+
 This can read the interleaved source twice on the server/NAS, but it fixes the
 client/Wi-Fi bandwidth problem on the first play without a build delay or disk
 cache. A later optimization may replace the two readers with a unified
@@ -89,8 +96,9 @@ and recreates, in source order:
 - language, title, disposition, time base, codec parameters, and extradata;
 - Matroska attachments such as SSA/ASS fonts.
 
-The encoded video remains track 0. Auxiliary output headers are deterministic
-across epochs so mpv track ids remain stable for the session.
+The encoded video remains track 0 and auxiliary output order is deterministic.
+Clients must still re-enumerate each fresh epoch and remap an explicit choice
+by track metadata; a numeric mpv track id is not protocol identity.
 
 ### Seek boundary
 
@@ -119,15 +127,15 @@ When `session_opened.aux_tracks == "muxed"`:
 - do not construct or attach `/media`;
 - load the epoch loopback stream by itself;
 - enumerate embedded audio/subtitle tracks after every reload;
-- reapply explicit track choices to the deterministic ids;
+- remap explicit track choices by metadata rather than assuming numeric ids;
 - expose audio and subtitle track/delay controls with the same behavior as the
   Android player's track sheet;
 - let mpv own cache prebuffering and release a muxed epoch after its
   `playback-restart`; external desktop epochs release after the post-restart
   `audio-add` returns because `audio-pts` is unavailable while held paused.
 
-The Qt client is the first implementation/test client. Android support follows
-after the server/Qt stream and seek gates pass; Android can then remove its
+The Qt client is the reference implementation/test client. Its server/stream
+and seek gates pass; Android can now remove its
 per-epoch `audio-add`, HTTP range seek, audio-ready attach hold, and external
 demuxer drift path for negotiated sessions.
 
@@ -190,9 +198,9 @@ multi-track live Matroska epoch correctly.
 1. **Implemented (initial slice):** capability/request/confirmation fields,
    `AuxiliaryTrack`, timestamp-merged bounded pipeline path, stream-copy
    muxing, attachments, and Qt opt-in.
-2. **Partial:** synthetic AAC initial/seek PTS coverage and all existing
-   video-only tests pass. Add synthetic subtitle fixtures and subtitle PTS
-   equivalence coverage.
+2. **Implemented:** synthetic AAC initial/seek PTS coverage and existing
+   video-only tests pass. Subtitle PTS equivalence and bitmap-subtitle device
+   coverage remain validation work rather than a transport design gap.
 3. **Implemented:** the Qt offscreen tests and a real headless Qt/libmpv smoke
    confirm that the negotiated stream loads without attaching the source file.
    A live passthrough run against the multi-track library remux on 2026-08-18
@@ -207,7 +215,9 @@ multi-track live Matroska epoch correctly.
    verified font hash once and omits its body from every epoch header.
 4. Validate SSA attachment fonts and obtain a PGS/VobSub sample for the
    stateful-subtitle gate.
-5. Implement Android negotiation and delete the external attach path only for
-   confirmed muxed sessions.
+5. Implement Android negotiation and bypass the external attach path only for
+   confirmed muxed sessions; retain it for local/uplink and negotiated
+   external fallback. See the
+   [Android muxed-aux plan](https://github.com/brpjerry/upscale-relay-android/blob/main/docs/MUXED_AUX_TRACKS_PLAN.md).
 6. Measure client `/media` bytes, downlink bitrate, seek latency, server source
    I/O, and A/V drift on the original 27.54 GiB remux; record results here.

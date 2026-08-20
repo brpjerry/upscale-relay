@@ -27,6 +27,9 @@ instructions remain at the root.
   server-library MVP, feature-parity phases, and device acceptance gates.
 - [Android device validation](https://github.com/brpjerry/upscale-relay-android/blob/main/docs/ANDROID_DEVICE_NOTES.md) — Phase 1 robustness and
   Phase 2 A/V, controls, seek, tier, and subtitle evidence.
+- [Android muxed-aux migration](https://github.com/brpjerry/upscale-relay-android/blob/main/docs/MUXED_AUX_TRACKS_PLAN.md) — protocol negotiation,
+  attachment caching, player lifecycle changes, compatibility fallback, and
+  device acceptance gates.
 
 ## Setup and operations
 

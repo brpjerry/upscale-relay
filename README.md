@@ -4,7 +4,9 @@ Play local/SMB video on a thin client while a GPU server upscales every frame
 through .onnx super-resolution models in real time — video streams to the
 server as-is, comes back upscaled in the selected quality tier, and the client
 plays it in sync with the original file's audio and subtitles. The server can
-also host the source through its optional media library.
+also host the source through its optional media library; capable desktop
+clients receive original audio/subtitles inside each relay epoch and cache
+subtitle fonts by content hash instead of reopening the full source file.
 
 - **[Documentation](docs/README.md)** — documentation index
 - **[Architecture and roadmap](docs/PLAN.md)** — current implementation,

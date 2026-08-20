@@ -74,6 +74,9 @@ desktop retains its local-only browser appearance.
 - The Qt client requests muxed auxiliary tracks from capable servers and does
   not open `/media` after `session_opened` confirms them. Older/external-mode
   sessions still attach `/media` for audio/subtitles.
+- The Android client currently uses the external compatibility path; its
+  protocol/player migration is specified in the
+  [Android muxed-aux plan](https://github.com/brpjerry/upscale-relay-android/blob/main/docs/MUXED_AUX_TRACKS_PLAN.md).
 - Local fallback is hidden for server files because the client has no local
   source to play directly.
 

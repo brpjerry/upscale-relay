@@ -77,6 +77,14 @@ relay-desktop
 - Enter the server as `<windows-box-ip>:8590` in the toolbar and Connect.
 - Settings persist in `~/.config/upscale-relay/`.
 
+When a capable server-library session confirms muxed auxiliary tracks, the
+desktop client gets audio and subtitles from the relay Matroska stream and does
+not reopen the full source through `/media`. Subtitle fonts are downloaded by
+SHA-256 into the Qt standard cache location, verified before use, and reused
+across seeks and later sessions until bounded eviction. A seek never downloads
+the font bodies again. Local files and old/external server confirmations retain
+the original-media attach path.
+
 ## 5. Open the server's firewall (on the Windows box, once)
 
 The server listens on 8590 (control/status) and 8591 (media). From an
