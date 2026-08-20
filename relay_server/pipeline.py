@@ -25,6 +25,7 @@ from typing import Callable
 
 import av
 
+from relay_media import AuxiliaryPacketInfo
 from relay_protocol import (
     FLAG_DISCONTINUITY,
     FLAG_EOS,
@@ -51,6 +52,12 @@ HIGH_WATERMARK_MS = 10_000
 RESUME_WATERMARK_MS = 9_500
 
 _QUEUE_DEPTH = 4  # frames buffered between stages
+PIPELINE_CLOSE_TIMEOUT_S = 15.0
+MUX_MAX_INTERLEAVE_DELTA_US = 100_000
+
+
+class PipelineCloseError(RuntimeError):
+    """A pipeline worker failed to release its native owner before timeout."""
 
 
 def _should_use_tensorrt(ep: str, available_providers: set[str]) -> bool:
@@ -160,6 +167,14 @@ class _Frame:
     rgb: object | None = None  # ndarray path (after inference)
 
 
+@dataclass(slots=True)
+class _AuxPacket:
+    """Original audio/subtitle packet moving unchanged to the mux thread."""
+
+    epoch: int
+    info: AuxiliaryPacketInfo
+
+
 class _SinkBuffer:
     """Write target for the output muxer. Deliberately has no seek/tell so
     the Matroska muxer runs in streaming (non-seekable) mode."""
@@ -236,7 +251,17 @@ class Pipeline:
         resize_algorithm: str = DEFAULT_RESIZE_ALGORITHM,
         lossless_hevc_profile: str = DEFAULT_LOSSLESS_HEVC_PROFILE,
         seek_discard_max_s: float | None = None,
+        aux_source_path: str | None = None,
+        embed_aux_attachments: bool = True,
     ):
+        # close() is a native-resource barrier. Install its coordination before
+        # constructing any native state so every fully published Pipeline has
+        # one observable, idempotent shutdown attempt.
+        self._close_lock = threading.Lock()
+        self._close_complete = threading.Event()
+        self._close_started = False
+        self._close_error: BaseException | None = None
+        self._finish_cleanup_error: BaseException | None = None
         self.video = video
         self.emit = emit
         self.on_error = on_error
@@ -296,6 +321,11 @@ class Pipeline:
         self.encoder_name = self._enc_codec
         self._mux = None
         self._enc_stream = None
+        self._aux_template_container = (
+            av.open(aux_source_path) if aux_source_path is not None else None
+        )
+        self._embed_aux_attachments = embed_aux_attachments
+        self._aux_streams: dict[int, av.stream.Stream] = {}
         self._sink_buf = _SinkBuffer()
         self._open_mux()
         self.downlink_container = "matroska"
@@ -404,7 +434,12 @@ class Pipeline:
         options.setdefault("g", "48")
         self._mux = av.open(
             self._sink_buf, mode="w", format="matroska",
-            container_options={"cluster_time_limit": "100"},
+            container_options={
+                "cluster_time_limit": "100",
+                # libavformat otherwise waits seconds for sparse subtitle
+                # streams before releasing the first playable Cluster.
+                "max_interleave_delta": str(MUX_MAX_INTERLEAVE_DELTA_US),
+            },
         )
         self._enc_stream = self._mux.add_stream(
             self._enc_codec, rate=self.video.avg_rate, options=options
@@ -412,12 +447,34 @@ class Pipeline:
         self._enc_stream.width = self.out_w
         self._enc_stream.height = self.out_h
         self._enc_stream.pix_fmt = self._enc_pix_fmt
+        self._aux_streams = {}
+        if self._aux_template_container is not None:
+            for template in self._aux_template_container.streams:
+                if template.type not in ("audio", "subtitle"):
+                    continue
+                stream = self._mux.add_stream_from_template(template)
+                stream.metadata.update({
+                    key: value for key, value in template.metadata.items()
+                    if key.upper() != "DURATION"
+                })
+                stream.disposition = template.disposition
+                self._aux_streams[template.index] = stream
+            if self._embed_aux_attachments:
+                for attachment in self._aux_template_container.streams.attachments:
+                    metadata = dict(attachment.metadata)
+                    name = metadata.get("filename") or attachment.name or f"attachment-{attachment.index}"
+                    mimetype = attachment.mimetype or metadata.get("mimetype") or "application/octet-stream"
+                    self._mux.add_attachment(name, mimetype, attachment.data)
 
     # -- public API (called from asyncio thread) ------------------------------
 
     def feed(self, pkt: MediaPacket) -> None:
         """Blocking put -- caller runs it in an executor for natural backpressure."""
         self.in_q.put(pkt)
+
+    def feed_aux(self, info: AuxiliaryPacketInfo, epoch: int) -> None:
+        """Queue one original audio/subtitle packet for stream-copy muxing."""
+        self.in_q.put(_AuxPacket(epoch=epoch, info=info))
 
     def note_buffer_report(self, buffered_ms: int) -> None:
         self.client_buffered_ms = buffered_ms
@@ -455,19 +512,113 @@ class Pipeline:
         self.in_q.put(_FlushCmd(epoch=epoch, target_pts=target_pts, trace=trace))
         return trace
 
-    def close(self) -> None:
-        self._closed.set()
+    @staticmethod
+    def _replace_queue_with_stop(q: queue.Queue) -> None:
+        """Discard stale work and wake a worker blocked in Queue.get()."""
         try:
             while True:
-                self.in_q.get_nowait()
+                q.get_nowait()
         except queue.Empty:
             pass
-        self.in_q.put(None)
-        if self.upscaler is not None and hasattr(self.upscaler, "close"):
-            try:
-                self.upscaler.close()
-            except Exception:
-                pass
+        q.put_nowait(None)
+
+    def close(self, timeout: float = PIPELINE_CLOSE_TIMEOUT_S) -> None:
+        """Synchronously release every stage-owned native resource.
+
+        Exactly one caller initiates shutdown. Concurrent/subsequent callers
+        wait for and observe that same result, making this the barrier used by
+        the control protocol before it sends ``closed``.
+        """
+        with self._close_lock:
+            owner = not self._close_started
+            if owner:
+                self._close_started = True
+
+        if not owner:
+            if not self._close_complete.wait(timeout=max(0.0, timeout)):
+                raise PipelineCloseError("pipeline close barrier timed out")
+            if self._close_error is not None:
+                raise self._close_error
+            return
+
+        started = time.perf_counter()
+        deadline = started + max(0.0, timeout)
+        survivors: list[str] = []
+        try:
+            self.playing = False
+            self._closed.set()
+            self._flush_pending.set()
+            # Wake every stage directly. A stage can be inside a native call;
+            # after it returns _safe_put sees _closed and cannot repopulate the
+            # queues that were retired here.
+            for q in (self.in_q, self._q_dec, self._q_up):
+                self._replace_queue_with_stop(q)
+
+            for thread in self._threads:
+                remaining = max(0.0, deadline - time.perf_counter())
+                thread.join(remaining)
+            survivors = [thread.name for thread in self._threads if thread.is_alive()]
+            if survivors:
+                raise PipelineCloseError(
+                    "pipeline close timed out; surviving workers: "
+                    + ", ".join(survivors)
+                )
+            if self._finish_cleanup_error is not None:
+                raise PipelineCloseError(
+                    f"finish-stage native cleanup failed: {self._finish_cleanup_error!r}"
+                ) from self._finish_cleanup_error
+
+            # The inference owner is gone, so its native/subprocess state can
+            # now be closed without racing an in-flight inference call.
+            upscaler = self.upscaler
+            if upscaler is not None and hasattr(upscaler, "close"):
+                close_errors: list[BaseException] = []
+
+                def close_upscaler() -> None:
+                    try:
+                        upscaler.close()
+                    except BaseException as err:
+                        close_errors.append(err)
+
+                close_thread = threading.Thread(
+                    target=close_upscaler,
+                    daemon=True,
+                    name="pl-upscaler-close",
+                )
+                close_thread.start()
+                close_thread.join(max(0.0, deadline - time.perf_counter()))
+                if close_thread.is_alive():
+                    survivors.append(close_thread.name)
+                    raise PipelineCloseError(
+                        "pipeline close timed out; surviving workers: "
+                        + ", ".join(survivors)
+                    )
+                if close_errors:
+                    raise close_errors[0]
+            self.upscaler = None
+
+            # Their owner threads have exited. Clear remaining references so
+            # PyAV/FFmpeg contexts are destructed before the barrier opens.
+            self._decoder = None
+            self._reformatter = None
+            self._crop_reformatter = None
+            self._in_reformatter = None
+            elapsed = time.perf_counter() - started
+            log.info(
+                "pipeline close complete tier=%s encoder=%s duration=%.3fs workers=all-stopped",
+                self.quality_tier, self.encoder_name, elapsed,
+            )
+        except BaseException as err:
+            self._close_error = err
+            elapsed = time.perf_counter() - started
+            log.error(
+                "pipeline close failed tier=%s encoder=%s duration=%.3fs survivors=%s: %s",
+                self.quality_tier, self.encoder_name, elapsed,
+                survivors or [t.name for t in self._threads if t.is_alive()], err,
+            )
+            raise
+        finally:
+            self._close_complete.set()
 
     @property
     def epoch(self) -> int:
@@ -494,12 +645,33 @@ class Pipeline:
                         downstream.put_nowait(None)  # make sure the next stage exits
                     except queue.Full:
                         pass
+                elif fn.__name__ == "_finish_work":
+                    # The finish thread is the sole owner after construction.
+                    # Close native mux/template state here, never from the
+                    # asyncio thread racing a still-running worker.
+                    if self._mux is not None:
+                        try:
+                            self._mux.close()
+                        except Exception as err:
+                            self._finish_cleanup_error = err
+                        self._mux = None
+                    # A PyAV Stream retains its CodecContext. Drop it only
+                    # after the finish owner has closed the container.
+                    self._enc_stream = None
+                    self._aux_streams = {}
+                    if self._aux_template_container is not None:
+                        try:
+                            self._aux_template_container.close()
+                        except Exception as err:
+                            if self._finish_cleanup_error is None:
+                                self._finish_cleanup_error = err
+                        self._aux_template_container = None
         return run
 
     # Stage 1: packets -> decoded frames (+ discard window + backpressure)
 
     def _decode_work(self) -> None:
-        while not self._closed.is_set():
+        while True:
             item = self.in_q.get()
             if item is None:
                 self._q_dec.put(None)
@@ -516,6 +688,11 @@ class Pipeline:
                 self._flush_pending.clear()
                 self.stats.paused_for_backpressure = False
                 self._safe_put(self._q_dec, item)
+                continue
+
+            if isinstance(item, _AuxPacket):
+                if item.epoch >= self._epoch:
+                    self._safe_put(self._q_dec, item)
                 continue
 
             pkt: MediaPacket = item
@@ -621,12 +798,12 @@ class Pipeline:
     # Stage 2: decoded frames -> upscaled rgb (GPU inference)
 
     def _infer_work(self) -> None:
-        while not self._closed.is_set():
+        while True:
             item = self._q_dec.get()
             if item is None:
                 self._q_up.put(None)
                 return
-            if isinstance(item, (_FlushCmd, _Eos)):
+            if isinstance(item, (_FlushCmd, _Eos, _AuxPacket)):
                 self._safe_put(self._q_up, item)
                 continue
             if item.epoch < self._epoch:
@@ -647,7 +824,7 @@ class Pipeline:
     # Stage 3: upscaled frames -> fit -> encode -> downlink packets
 
     def _finish_work(self) -> None:
-        while not self._closed.is_set():
+        while True:
             item = self._q_up.get()
             if item is None:
                 return
@@ -668,6 +845,14 @@ class Pipeline:
                 self._open_mux()  # ready in case another epoch follows
                 continue
             if item.epoch < self._epoch:
+                continue
+            if isinstance(item, _AuxPacket):
+                stream = self._aux_streams.get(item.info.stream_index)
+                if stream is None:
+                    continue
+                packet = item.info.packet
+                packet.stream = stream
+                self._mux.mux(packet)
                 continue
 
             t0 = time.perf_counter()

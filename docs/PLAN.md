@@ -2,8 +2,9 @@
 
 Video Upscale Relay plays local, mounted-share, or server-hosted media while a
 GPU server upscales the video through ONNX models. The returned video keeps the
-source timestamps, and the desktop client uses the original file for audio and
-subtitles.
+source timestamps. Client-local media uses the original file for audio and
+subtitles; negotiated server-library sessions stream-copy those tracks into
+each Matroska downlink epoch.
 
 This document describes the current implementation first and keeps only
 unfinished work in the roadmap. See [PROTOCOL.md](PROTOCOL.md) for the wire
@@ -15,13 +16,13 @@ contract and [SERVER_LIBRARY.md](SERVER_LIBRARY.md) for server-hosted media.
 |---|---|---|
 | Offline upscale pipeline | **Implemented** | `upscale-cli` decode, ONNX inference, tiling, fit/cover sizing, tiered encoding, verification, sample generation, and benchmarks |
 | Streaming server and protocol | **Implemented** | aiohttp WebSocket control, framed TCP media, sessions, seeks/epochs, Matroska downlink, pacing, and `/status` |
-| Desktop client | **Implemented** | PySide6/qasync UI, local browser, embedded libmpv, uplink, playback, seek, subtitles, quality/model controls, and local fallback |
+| Desktop client | **Implemented** | PySide6/qasync UI, local browser, embedded libmpv, uplink, playback, seek, audio/subtitle track and delay controls, quality/model controls, and local fallback |
 | Lossless playback path | **Implemented** | blocking downlink receiver plus native localhost `tcp://` handoff to mpv; avoids qasync and python-mpv callback throughput ceilings |
-| Server-side media library | **Implemented** | `--library`, sandboxed listing and Range HTTP delivery, server demux/seek, capability-driven Server tab |
+| Server-side media library | **Implemented** | `--library`, sandboxed listing and Range compatibility delivery, server demux/seek, capability-driven Server tab, negotiated in-band audio/subtitles, and cached subtitle fonts |
 | Server-side framing and resize filters | **Implemented** | Fit preserves the full frame; Cover center-crops before encode; the final post-ONNX downscale is selectable per server or session |
-| Shared-mount path mapping | **Planned** | server library currently delivers original audio/subtitles over HTTP; mapping one relative path to different client/server mount roots is not implemented |
+| Shared-mount path mapping | **Planned** | Negotiated clients use muxed tracks; mapping one relative path to different client/server mount roots for legacy/external or direct-access workflows is not implemented |
 | Polish phase | **Partial** | model discovery/picker, metrics, manual host configuration, mounted shares, and fallback exist; discovery, pairing, hot model reload, and reconnect/resume remain |
-| Android client | **Phase 4 host-verified; device gate pending** | The tablet client now adds SAF local files, encoded MediaExtractor uplink, persistent local recents, and direct fallback to the Phase 3 shell and Phase 2 A/V/seek core; PGS/VobSub remains unrun because the configured library has no bitmap-subtitle sample |
+| Android client | **Phase 5.5 device-verified; muxed aux pending** | Server/local playback, recovery, discovery, adaptive UI, background media, and system controls are device-verified; server-library audio/subtitles still use external `/media` until the negotiated muxed-aux migration lands, and PGS/VobSub remains unrun for lack of a sample |
 
 ## Architecture
 
@@ -39,7 +40,8 @@ Server decode -> ONNX inference -> fit/cover -> encode/mux
 
 Original audio/subtitles
   local source: client path -> libmpv external tracks
-  server source: Range HTTP /media URL -> libmpv external tracks
+  server source (negotiated): stream copy -> epoch Matroska downlink
+  server source (legacy): Range HTTP /media URL -> libmpv external tracks
 ```
 
 The control channel is WebSocket on port 8590. Media uses framed TCP on port
@@ -66,8 +68,10 @@ one downlink attachment. Server-library sessions omit the uplink attachment.
    lossless FFV1. Clients present approximate P95 bandwidth labels supplied by
    the server instead of encoder QP numbers. HEVC is the Android-compatible
    path; FFV1 remains desktop-only.
-6. **Audio and subtitles stay with the original.** libmpv attaches them as
-   external tracks and aligns them to returned video using the original PTS.
+6. **Audio and subtitles preserve original packets and PTS.** Server-library
+   sessions normally stream-copy them into each epoch; local/legacy sessions
+   retain the external original-media path. Large immutable ASS font bundles
+   use a negotiated verified attachment cache instead of repeating per seek.
 7. **The client remains protocol-thin.** The server and protocol do not depend
    on PySide6 or other desktop-specific behavior, leaving room for Android.
 
@@ -97,6 +101,12 @@ one downlink attachment. Server-library sessions omit the uplink attachment.
 - Epoch-safe seek/flush, decode-and-discard to the target, stale packet
   rejection, and seek-storm coalescing.
 - Live buffer-report pacing with stale-report decay and bounded queues.
+- Synchronous pipeline teardown: `closed` is a barrier after every native
+  stage owner, mux, encoder stream, and inference worker has released state.
+- A failed native teardown sets `/status.restart_required` and blocks new
+  sessions, preventing an unconfirmed NVENC owner from overlapping a reopen.
+- A 100 ms mux interleave bound prevents sparse subtitles from withholding the
+  first playable cluster.
 - Model discovery from `--models-dir` and execution-provider selection.
 - Configurable post-ONNX resize filters (`fast-bilinear`, `bilinear`, `bicubic`,
   `area`, `bicublin`, `gaussian`, `sinc`, `lanczos`, and `spline`), advertised
@@ -120,6 +130,9 @@ decode was fast enough for the measured pipeline.
 - PTS/DTS, keyframe, discontinuity, EOS, token, and epoch handling.
 - A shared, lock-serialized `VideoTrack` used for client uplink sources and
   server-library sources.
+- A separately owned `AuxiliaryTrack` that stream-copies original audio and
+  subtitles into server-file epochs, seeks on video keyframe cues, and exposes
+  sanitized content-addressed attachment manifests.
 
 ### Client core (`relay_client_core/`)
 
@@ -128,6 +141,9 @@ decode was fast enough for the measured pipeline.
 - Dedicated blocking downlink socket receiver with a bounded bridge into the
   qasync loop. This replaced per-callback asyncio reads that could not sustain
   lossless traffic under Qt.
+- Immediate publication of each epoch's discontinuity packet while retaining
+  eight-packet batching for steady-state qasync throughput.
+- Verified, bounded, content-addressed attachment download/cache support.
 - Headless `relay-client` CLI used by integration tests and diagnostics.
 
 ### Desktop client (`desktop_client/`)
@@ -135,10 +151,13 @@ decode was fast enough for the measured pipeline.
 - PySide6 UI with native libmpv render API support on Wayland, X11, and
   Windows.
 - Local filesystem browser plus a capability-driven Server library tab.
-- Model, quality, fit/cover, resize filter, play/pause, seek, subtitle track, subtitle delay,
-  fullscreen, telemetry, and local fallback controls.
-- External audio/subtitle attachment from a local file or server `/media`
-  URL.
+- Model, quality, fit/cover, resize filter, play/pause, seek, audio/subtitle
+  track and delay, fullscreen, telemetry, and local fallback controls. Changing
+  a session-fixed model, quality, framing, or resize setting restarts active
+  playback at its current position.
+- Embedded server-library audio/subtitles with cached font registration;
+  external local/legacy tracks retain the one post-restart raw-argument
+  `audio-add` path.
 - Per-load localhost `tcp://` stream between the Python buffer and mpv. The
   previous python-mpv custom callback copied each byte in Python and saturated
   near 200 Mbps; the native socket removes that ceiling.
@@ -180,8 +199,9 @@ features.
 ### Server-side library extension: implemented
 
 This post-MVP extension supports server-hosted media through `--library`,
-including Range delivery of original tracks and the desktop Server tab. Only
-shared-mount path mapping remains planned; see
+including negotiated muxed original tracks, cached subtitle fonts, Range
+fallback for legacy clients, and the desktop Server tab. Only shared-mount
+path mapping remains planned; see
 [SERVER_LIBRARY.md](SERVER_LIBRARY.md).
 
 ## Remaining roadmap
@@ -192,9 +212,9 @@ shared-mount path mapping remains planned; see
   `smb://` browser with credential storage is not implemented.
 - **Discovery and pairing:** add mDNS advertisement/browsing, a first-connect
   code, persistent client credentials, and optional TLS.
-- **Model management:** discovery and selection work now. Add directory
-  watching, manifest validation UX, benchmark metadata in capabilities, and
-  mid-play model switching.
+- **Model management:** discovery, selection, and mid-play switching work now.
+  Add directory watching, manifest validation UX, and benchmark metadata in
+  capabilities.
 - **Recovery:** cleanup and manual local fallback work now. Add automatic
   reconnect with session resume, keepalives/timeouts, and chaos coverage for
   network outages.
@@ -244,6 +264,8 @@ on desktop but is intentionally excluded from Android because it requires
 continuous software decode and the associated battery/thermal cost.
 See [https://github.com/brpjerry/upscale-relay-android/blob/main/docs/ANDROID_CLIENT.md](https://github.com/brpjerry/upscale-relay-android/blob/main/docs/ANDROID_CLIENT.md) for the phases and
 [https://github.com/brpjerry/upscale-relay-android/blob/main/docs/ANDROID_DEVICE_NOTES.md](https://github.com/brpjerry/upscale-relay-android/blob/main/docs/ANDROID_DEVICE_NOTES.md) for the validation record.
+The remaining negotiated muxed-track and verified-font-cache migration is
+specified in the [Android muxed-aux plan](https://github.com/brpjerry/upscale-relay-android/blob/main/docs/MUXED_AUX_TRACKS_PLAN.md).
 
 ## Future/stretch work
 

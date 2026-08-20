@@ -6,8 +6,15 @@ import asyncio
 import time
 from pathlib import Path
 
-from PySide6.QtCore import QDir, QEvent, Qt, QTimer
-from PySide6.QtGui import QCursor, QIcon, QPainter, QStandardItem, QStandardItemModel
+from PySide6.QtCore import QDir, QEvent, QStandardPaths, Qt, QTimer
+from PySide6.QtGui import (
+    QCursor,
+    QIcon,
+    QPainter,
+    QPalette,
+    QStandardItem,
+    QStandardItemModel,
+)
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -20,6 +27,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QPushButton,
+    QSizePolicy,
     QSlider,
     QSplitter,
     QStatusBar,
@@ -33,7 +41,7 @@ from PySide6.QtWidgets import (
 )
 from qasync import asyncSlot
 
-from relay_client_core import RelayClient, SessionConfig
+from relay_client_core import RelayClient, SessionConfig, TeardownNotConfirmedError
 
 from .chapters import (
     Chapter,
@@ -119,6 +127,7 @@ class MainWindow(QMainWindow):
         self.resize(1200, 700)
         self.settings = AppSettings(self.options.settings_scope)
         self.client: RelayClient | None = None
+        self._server_caps: dict = {}
 
         # -- toolbar: server + session config --------------------------------
         bar = QToolBar("server")
@@ -245,7 +254,11 @@ class MainWindow(QMainWindow):
             self._icon("media-skip-forward", QStyle.SP_MediaSkipForward))
         self.chapter_next_btn.setToolTip("Next chapter (PgUp)")
         self.chapter_combo = QComboBox()
-        self.chapter_combo.setSizeAdjustPolicy(QComboBox.AdjustToContents)
+        self.chapter_combo.setSizeAdjustPolicy(
+            QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        self.chapter_combo.setMinimumContentsLength(12)
+        self.chapter_combo.setMaximumWidth(240)
+        self.chapter_combo.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
         self.chapter_combo.setToolTip("Jump to a chapter")
         # Hidden until a session with chapters starts (_set_chapters).
         for w in (self.chapter_prev_btn, self.chapter_combo, self.chapter_next_btn):
@@ -257,6 +270,13 @@ class MainWindow(QMainWindow):
         self.fallback_btn.setEnabled(False)
         self.fallback_btn.setToolTip("Drop the upscaler and play the original file directly")
         self.player_status = QLabel("")
+        # Live telemetry can be much wider than the player.  QLabel's default
+        # minimum size hint includes the complete text, which used to make the
+        # transport row resize the top-level window and squeeze the browser as
+        # soon as the first stats sample arrived.  Give it remaining space,
+        # but never let its contents establish the row's minimum width.
+        self.player_status.setMinimumWidth(0)
+        self.player_status.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
 
         self.seek_slider = SeekSlider(Qt.Horizontal)
         self.seek_slider.setRange(0, 1000)
@@ -269,11 +289,22 @@ class MainWindow(QMainWindow):
         self.sub_combo = QComboBox()
         self.sub_combo.addItem("no subs", None)
         self.sub_combo.setEnabled(False)
+        self._bound_track_combo(self.sub_combo)
         self.sub_delay = QDoubleSpinBox()
         self.sub_delay.setRange(-30.0, 30.0)
         self.sub_delay.setSingleStep(0.1)
         self.sub_delay.setSuffix(" s")
         self.sub_delay.setEnabled(False)
+
+        self.audio_combo = QComboBox()
+        self.audio_combo.addItem("no audio", None)
+        self.audio_combo.setEnabled(False)
+        self._bound_track_combo(self.audio_combo)
+        self.audio_delay = QDoubleSpinBox()
+        self.audio_delay.setRange(-30.0, 30.0)
+        self.audio_delay.setSingleStep(0.1)
+        self.audio_delay.setSuffix(" s")
+        self.audio_delay.setEnabled(False)
 
         transport = QHBoxLayout()
         transport.addWidget(self.play_btn)
@@ -283,16 +314,28 @@ class MainWindow(QMainWindow):
         transport.addWidget(self.chapter_next_btn)
         transport.addWidget(self.fullscreen_btn)
         transport.addWidget(self.fallback_btn)
-        transport.addWidget(QLabel(" subs "))
-        transport.addWidget(self.sub_combo)
-        transport.addWidget(self.sub_delay)
         transport.addWidget(self.player_status, stretch=1)
+        # Track selectors used to share the transport row with chapters and
+        # telemetry.  Once a video populated all of them, that single row had
+        # an ~900 px minimum and Qt enlarged the window (or stole width from
+        # the browser) to satisfy it.  A dedicated row stays usable at the
+        # player's 480 px minimum and makes metadata updates geometry-neutral.
+        track_controls = QHBoxLayout()
+        track_controls.addWidget(QLabel("audio"))
+        track_controls.addWidget(self.audio_combo)
+        track_controls.addWidget(self.audio_delay)
+        track_controls.addSpacing(8)
+        track_controls.addWidget(QLabel("subs"))
+        track_controls.addWidget(self.sub_combo)
+        track_controls.addWidget(self.sub_delay)
+        track_controls.addStretch(1)
         # Controls live in one hideable panel so fullscreen is just the video.
         self.controls_panel = QWidget()
         cv = QVBoxLayout(self.controls_panel)
         cv.setContentsMargins(0, 0, 0, 0)
         cv.addLayout(seek_row)
         cv.addLayout(transport)
+        cv.addLayout(track_controls)
         player_page = QWidget()
         pv = QVBoxLayout(player_page)
         pv.setContentsMargins(0, 0, 0, 0)
@@ -311,6 +354,10 @@ class MainWindow(QMainWindow):
         self.player.installEventFilter(self)  # reposition overlay on resize
 
         self.split = QSplitter()
+        # Resizing a QOpenGLWidget on every handle mouse-move forces mpv and Qt
+        # to rebuild/render its backing FBO continuously. Use Qt's rubber-band
+        # preview and perform the expensive video resize once on release.
+        self.split.setOpaqueResize(False)
         self.split.addWidget(self.browser_panel)
         self.split.addWidget(player_page)
         self.split.setStretchFactor(1, 1)
@@ -341,6 +388,10 @@ class MainWindow(QMainWindow):
         )
         self.fit_combo.currentIndexChanged.connect(self.on_fit_mode_changed)
         self.resize_combo.currentIndexChanged.connect(self.on_resize_algorithm_changed)
+        # activated fires only for a user choice, avoiding a restart while
+        # capability refreshes repopulate these menus.
+        self.model_combo.activated.connect(self.on_model_changed)
+        self.tier_combo.activated.connect(self.on_quality_tier_changed)
         self.deband_check.toggled.connect(self.on_deband_changed)
         self.fullscreen_btn.clicked.connect(self.toggle_fullscreen)
         if hasattr(self.player, "fullscreen_toggled"):
@@ -358,9 +409,13 @@ class MainWindow(QMainWindow):
             self.player.chapter_step_requested.connect(self.on_chapter_step)
         self.sub_combo.currentIndexChanged.connect(self.on_sub_selected)
         self.sub_delay.valueChanged.connect(lambda v: self.player.set_sub_delay(v))
+        self.audio_combo.currentIndexChanged.connect(self.on_audio_selected)
+        self.audio_delay.valueChanged.connect(lambda v: self.player.set_audio_delay(v))
         self.player.stats_changed.connect(self.player_status.setText)
         self.player.position_changed.connect(self._on_position)
         self.player.track_list_changed.connect(self._on_tracks)
+        if hasattr(self.player, "audio_track_list_changed"):
+            self.player.audio_track_list_changed.connect(self._on_audio_tracks)
         self.player.rebuffering.connect(self._on_rebuffering)
         if hasattr(self.player, "seek_requested"):
             self.player.seek_requested.connect(self.on_seek_relative)
@@ -390,8 +445,72 @@ class MainWindow(QMainWindow):
     # -- helpers ------------------------------------------------------------------
 
     def _icon(self, theme_name: str, fallback: QStyle.StandardPixmap) -> QIcon:
-        icon = QIcon.fromTheme(theme_name)
-        return icon if not icon.isNull() else self.style().standardIcon(fallback)
+        source = QIcon.fromTheme(theme_name)
+        if source.isNull():
+            source = self.style().standardIcon(fallback)
+        # Many icon themes ship a fixed black or white SVG variant selected by
+        # the desktop theme name. That becomes unreadable when a bundled Qt
+        # adopts a different palette (or the system switches at runtime).
+        # Preserve the source alpha/shape and tint action icons from QPalette.
+        result = QIcon()
+        modes = (
+            (QIcon.Normal, QPalette.Active),
+            (QIcon.Active, QPalette.Active),
+            (QIcon.Selected, QPalette.Active),
+            (QIcon.Disabled, QPalette.Disabled),
+        )
+        for size in (16, 22, 32, 48):
+            base = source.pixmap(size, size)
+            if base.isNull():
+                continue
+            for mode, group in modes:
+                tinted = base.copy()
+                painter = QPainter(tinted)
+                painter.setCompositionMode(QPainter.CompositionMode_SourceIn)
+                painter.fillRect(
+                    tinted.rect(), self.palette().color(group, QPalette.ButtonText))
+                painter.end()
+                result.addPixmap(tinted, mode)
+        return result if not result.isNull() else source
+
+    def _refresh_action_icons(self) -> None:
+        """Rebuild palette-tinted icons after a light/dark or style change."""
+        definitions = (
+            ("browser_toggle", "folder", QStyle.SP_DirIcon),
+            ("up_btn", "go-up", QStyle.SP_FileDialogToParent),
+            ("home_btn", "go-home", QStyle.SP_DirHomeIcon),
+            ("stop_btn", "media-playback-stop", QStyle.SP_MediaStop),
+            ("chapter_prev_btn", "media-skip-backward", QStyle.SP_MediaSkipBackward),
+            ("chapter_next_btn", "media-skip-forward", QStyle.SP_MediaSkipForward),
+            ("fullscreen_btn", "view-fullscreen", QStyle.SP_TitleBarMaxButton),
+            ("server_refresh_btn", "view-refresh", QStyle.SP_BrowserReload),
+        )
+        for name, theme_name, fallback in definitions:
+            widget = getattr(self, name, None)
+            if widget is not None:
+                widget.setIcon(self._icon(theme_name, fallback))
+        self._icon_play = self._icon("media-playback-start", QStyle.SP_MediaPlay)
+        self._icon_pause = self._icon("media-playback-pause", QStyle.SP_MediaPause)
+        if hasattr(self, "play_btn"):
+            self.play_btn.setIcon(
+                self._icon_play if getattr(self, "_paused", False) else self._icon_pause)
+
+    def changeEvent(self, event) -> None:
+        super().changeEvent(event)
+        if event.type() in (
+            QEvent.PaletteChange,
+            QEvent.ApplicationPaletteChange,
+            QEvent.StyleChange,
+        ):
+            self._refresh_action_icons()
+
+    @staticmethod
+    def _bound_track_combo(combo: QComboBox) -> None:
+        """Keep metadata labels from changing the transport's minimum width."""
+        combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        combo.setMinimumContentsLength(10)
+        combo.setMaximumWidth(220)
+        combo.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
 
     def _set_browse_root(self, path: str) -> None:
         p = Path(path).expanduser()
@@ -563,6 +682,7 @@ class MainWindow(QMainWindow):
     async def _adopt_connected_client(self, client: RelayClient, caps: dict) -> None:
         """Install a connected control client and reflect its capabilities."""
         self.client = client
+        self._server_caps = dict(caps)
         client.on_progress = self._on_open_progress
         client.on_seek_progress = self._on_seek_progress
         self.settings.server_host, self.settings.server_port = client.host, client.port
@@ -833,15 +953,38 @@ class MainWindow(QMainWindow):
             fit_mode=self._fit_mode(),
             source=source,
             resize_algorithm=self._resize_algorithm(),
+            aux_tracks=(
+                "muxed"
+                if source == "server_file" and self._server_caps.get("muxed_aux_tracks")
+                else "external"
+            ),
+            aux_attachments=(
+                "cached"
+                if (
+                    source == "server_file"
+                    and self._server_caps.get("muxed_aux_tracks")
+                    and self._server_caps.get("attachment_cache", 0) >= 1
+                )
+                else "embedded"
+            ),
         )
         self.settings.model = cfg.model
         self.settings.quality_tier = cfg.quality_tier
         self._set_opening(True, f"opening session for {Path(path).name}…")
         try:
             session = await self.client.open_session(cfg)
+            attachment_root = (
+                Path(QStandardPaths.writableLocation(QStandardPaths.CacheLocation))
+                / "attachments"
+            )
+            font_dir = (
+                await self.client.prepare_attachments(attachment_root)
+                if hasattr(self.client, "prepare_attachments") else None
+            )
+            if hasattr(self.player, "set_subtitle_fonts_dir"):
+                self.player.set_subtitle_fonts_dir(font_dir)
             await self.client.attach_media()
             await self.client.start_uplink()
-            await self.client.play()
         except Exception as err:
             self._error("Session failed", str(err))
             return
@@ -855,7 +998,11 @@ class MainWindow(QMainWindow):
             self._error("Session failed", "Server did not provide the source time base.")
             await self._teardown_session()
             return
-        original_media = path if source == "uplink" else self.client.media_url(path)
+        original_media = (
+            None
+            if getattr(session, "aux_tracks", "external") == "muxed"
+            else (path if source == "uplink" else self.client.media_url(path))
+        )
         self._session_source = source
         self._session_path = path
         self._session_time_base = time_base
@@ -867,6 +1014,16 @@ class MainWindow(QMainWindow):
             source_path=original_media,
             avg_rate=avg_rate,
         )
+        # Match Android's ordering: give mpv its per-load loopback first, then
+        # release the server pipeline. Previously the server could produce into
+        # the bridge while the player had not even begun opening its socket.
+        await asyncio.sleep(0)
+        try:
+            await self.client.play()
+        except Exception as err:
+            self._error("Session failed", str(err))
+            await self._teardown_session()
+            return
         self._apply_panscan()
         self._duration_s = duration_s
         # session_opened.chapters is authoritative (server file or echo); an
@@ -883,6 +1040,8 @@ class MainWindow(QMainWindow):
         self.fallback_btn.setEnabled(source == "uplink")
         self.sub_combo.setEnabled(True)
         self.sub_delay.setEnabled(True)
+        self.audio_combo.setEnabled(True)
+        self.audio_delay.setEnabled(True)
         self.play_btn.setIcon(self._icon_pause)
         self.play_btn.setToolTip("Pause (Space)")
         self._paused = False
@@ -935,6 +1094,24 @@ class MainWindow(QMainWindow):
         # mpv.conf cannot apply a second client-side crop.
         self.player.set_panscan(0.0)
 
+    async def _restart_for_playback_setting(self) -> None:
+        """Apply a session-fixed setting without losing the playback place."""
+        if (self.client is not None and self.client.session is not None
+                and self._session_path is not None and self._session_source is not None):
+            await self._start_session(
+                self._session_path, source=self._session_source, resume_s=self._position_s
+            )
+
+    @asyncSlot(int)
+    async def on_model_changed(self, _index: int) -> None:
+        self.settings.model = self.model_combo.currentText()
+        await self._restart_for_playback_setting()
+
+    @asyncSlot(int)
+    async def on_quality_tier_changed(self, _index: int) -> None:
+        self.settings.quality_tier = self._quality_tier()
+        await self._restart_for_playback_setting()
+
     @asyncSlot()
     async def on_fit_mode_changed(self) -> None:
         self.settings.fit_mode = self._fit_mode()
@@ -942,20 +1119,12 @@ class MainWindow(QMainWindow):
         # The requested resolution changes with the mode (fit vs cover), and
         # that is fixed at open_session — so a live session must be re-opened.
         # Restart at the current position; nothing to do if idle.
-        if (self.client is not None and self.client.session is not None
-                and self._session_path is not None and self._session_source is not None):
-            await self._start_session(
-                self._session_path, source=self._session_source, resume_s=self._position_s
-            )
+        await self._restart_for_playback_setting()
 
     @asyncSlot()
     async def on_resize_algorithm_changed(self) -> None:
         self.settings.resize_algorithm = self._resize_algorithm() or ""
-        if (self.client is not None and self.client.session is not None
-                and self._session_path is not None and self._session_source is not None):
-            await self._start_session(
-                self._session_path, source=self._session_source, resume_s=self._position_s
-            )
+        await self._restart_for_playback_setting()
 
     def on_deband_changed(self, enabled: bool) -> None:
         self.settings.deband_enabled = enabled
@@ -1029,6 +1198,11 @@ class MainWindow(QMainWindow):
     def on_sub_selected(self, index: int) -> None:
         self.player.select_subtitle(self.sub_combo.itemData(index))
 
+    def on_audio_selected(self, index: int) -> None:
+        aid = self.audio_combo.itemData(index)
+        if aid is not None:
+            self.player.select_audio(aid)
+
     def _set_chapters(self, chapters: list[Chapter]) -> None:
         self._chapters = chapters
         visible = bool(chapters)
@@ -1065,6 +1239,18 @@ class MainWindow(QMainWindow):
         idx = self.sub_combo.findData(selected_sid)
         self.sub_combo.setCurrentIndex(idx if idx >= 0 else 0)
         self.sub_combo.blockSignals(False)
+
+    def _on_audio_tracks(self, audio: list, selected_aid=None) -> None:
+        self.audio_combo.blockSignals(True)
+        self.audio_combo.clear()
+        if not audio:
+            self.audio_combo.addItem("no audio", None)
+        else:
+            for aid, title in audio:
+                self.audio_combo.addItem(title, aid)
+        idx = self.audio_combo.findData(selected_aid)
+        self.audio_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        self.audio_combo.blockSignals(False)
 
     def _on_position(self, pos_s: float) -> None:
         if self._pending_seek_s is not None:
@@ -1120,6 +1306,8 @@ class MainWindow(QMainWindow):
         self.seek_slider.setEnabled(False)
         self.sub_combo.setEnabled(False)
         self.sub_delay.setEnabled(False)
+        self.audio_combo.setEnabled(False)
+        self.audio_delay.setEnabled(False)
         self._session_source = None
         self._session_path = None
         self._session_time_base = None
@@ -1127,7 +1315,17 @@ class MainWindow(QMainWindow):
             # Close the whole client (server tears the session down with the
             # WS) and reconnect fresh: one session per connection in v1.
             host, port = self.client.host, self.client.port
-            await self.client.teardown()
+            try:
+                await self.client.teardown()
+            except TeardownNotConfirmedError as err:
+                # The local sockets are already closed, but reconnecting could
+                # overlap a wedged NVENC owner. Make the risk visible and stop.
+                self.client = None
+                self._remove_server_tab()
+                self.conn_label.setText("server teardown unconfirmed")
+                self.connect_btn.setText("Connect")
+                self._error("Server cleanup not confirmed", str(err))
+                return
             client = RelayClient(host, port)
             try:
                 caps = await client.connect()

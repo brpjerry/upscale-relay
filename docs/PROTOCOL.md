@@ -7,18 +7,28 @@ channels per session:
 |----------|----------------------------|-------------------------------------------|
 | control  | WebSocket `/control`       | JSON messages (this spec, §2)             |
 | uplink   | TCP, framed packets (§3)   | source video elementary stream, client→server |
-| downlink | TCP, framed packets (§3)   | upscaled encoded video, server→client     |
+| downlink | TCP, framed packets (§3)   | chunks of an epoch Matroska stream, server→client |
 
 Status/metrics: `GET /status` on the control port returns JSON (not part of
 the session protocol; consumed by GUIs and tests). The server-library HTTP
-surface is documented in [SERVER_LIBRARY.md](SERVER_LIBRARY.md).
+surface is documented in [SERVER_LIBRARY.md](SERVER_LIBRARY.md). If a bounded
+native session close fails, `restart_required` is true and
+`native_teardown_error` identifies the failed session; the server rejects new
+sessions until it is restarted.
 
 Design invariants:
-- **PTS is never rewritten.** All timestamps are integer ticks in the *source
-  video stream's* `time_base`, end to end. The downlink carries the same PTS
-  values the uplink delivered.
+- **Video PTS is never rewritten.** Outer packet timestamps and pipeline video
+  timestamps are integer ticks in the *source video stream's* `time_base`, end
+  to end. A server-file downlink carries the source video PTS just as an uplink
+  session carries the client's. Muxed auxiliary streams retain their own
+  source timestamps/time bases and the Matroska muxer performs only the normal
+  container rescale.
 - **Epochs guard seeks.** Every media packet carries the epoch it was produced
   in; anything from an older epoch is discarded on arrival (§4).
+- **Confirmed auxiliary mode is authoritative.** A client uses in-band
+  audio/subtitles only after `session_opened.aux_tracks == "muxed"`; otherwise
+  it retains the external original-media path. Request fields alone never
+  authorize a client to omit that fallback.
 - Transport is assumed ordered and reliable per connection (TCP now; QUIC
   streams later — nothing in the spec depends on TCP specifics).
 
@@ -35,7 +45,8 @@ IDLE ──────open_session────► OPEN ──play──► PLAY
 ```
 
 - `OPEN`: pipeline allocated, media connections may attach, pre-buffering may
-  begin. `play` is valid once both media connections are attached.
+  begin. `play` is valid once the downlink is attached and, for an `uplink`
+  source, its uplink is attached. A `server_file` session has no uplink.
 - `PLAYING` vs `PAUSED` gate downlink pacing only; the server may keep filling
   the client buffer up to the watermark in both states.
 - Any fatal error ⇒ server sends `error{fatal:true}` and moves to CLOSED.
@@ -45,33 +56,35 @@ IDLE ──────open_session────► OPEN ──play──► PLAY
 ## 2. Control channel (JSON over WebSocket)
 
 Every message: `{"type": "<name>", ...fields}`. Unknown fields must be
-ignored; unknown types ⇒ `error{code:"bad_message"}`.
+ignored. A server returns `error{code:"bad_message"}` for an unknown client
+request type; a client ignores an unknown server event type so additive
+notifications remain backward compatible.
 
 ### client → server
 
 | type | fields | notes |
 |---|---|---|
 | `hello` | `protocol_version:int`, `client_name:str`, `display:{w:int,h:int}` | first message; server replies `capabilities` |
-| `open_session` | `source:"uplink" \| {type:"server_file",path:str}` plus `file:{name:str, duration_s:float?, chapters:[{start_s:float, end_s:float?, title:str?}]?}`, `video:{codec:str, extradata_b64:str?, width:int, height:int, time_base:[num,den], avg_rate:[num,den]?}`, `model:str`, `quality_tier:str`, `display:{w:int,h:int}`, `fit_mode:str?`, `resize_algorithm:str?` | `source` defaults to `"uplink"`; `video` is omitted for `server_file`; omitting `resize_algorithm` selects the server default. `file.chapters` carries the source container's chapter marks for uplink sessions (only the client can read them) |
+| `open_session` | `source:"uplink" \| {type:"server_file",path:str}` plus `file:{name:str, duration_s:float?, chapters:[{start_s:float, end_s:float?, title:str?}]?}`, `video:{codec:str, extradata_b64:str?, width:int, height:int, time_base:[num,den], avg_rate:[num,den]?}`, `model:str`, `quality_tier:str`, `display:{w:int,h:int}`, `fit_mode:str?`, `resize_algorithm:str?`, `aux_tracks:"external"\|"muxed"?`, `aux_attachments:"embedded"\|"cached"?` | `source` defaults to `"uplink"`; `video` is omitted for `server_file`; omitting `resize_algorithm` selects the server default. `file.chapters` carries the source container's chapter marks for uplink sessions (only the client can read them). `aux_tracks` defaults to `"external"`; request `"muxed"` only for `server_file` after `capabilities.muxed_aux_tracks == true`. `aux_attachments` defaults to `"embedded"`; request `"cached"` only together with muxed tracks after `attachment_cache >= 1`. The server may still confirm a fallback mode |
 | `play` | | |
 | `pause` | | |
 | `seek` | `target_pts:int`, `epoch:int` | epoch = client's current epoch + 1; see §4 |
 | `buffer_report` | `buffered_ms:int`, `playing_pts:int?` | send ~every 500 ms while media attached |
-| `teardown` | | graceful close; server replies `closed` |
+| `teardown` | | graceful close; `closed` is sent only after pipeline workers and native encoder/mux/inference owners have released their resources |
 
 ### server → client
 
 | type | fields | notes |
 |---|---|---|
-| `capabilities` | `protocol_version:int`, `server_name:str`, `models:[{name, scale_factor}]`, `quality_tiers:[str]`, `quality_options:[{id,label,codec,lossless,android_supported,p95_mbps}]`, `resize_algorithms:[str]`, `default_resize_algorithm:str`, `library:bool`, `library_sort:[str]` | `quality_tiers` remains the authoritative ID list; `quality_options` supplies presentation metadata. `p95_mbps` is a coarse content-dependent estimate or null. `library` means `GET /library` and `/media/<path>` are available. `library_sort` lists the sort keys `GET /library` accepts (today `["name","mtime"]`); empty or absent when no library is configured, and clients must only pass `sort=` keys present here (absent means the server predates sorting) |
-| `session_opened` | `session_id:str`, `media_port:int`, `uplink_token:str?`, `downlink_token:str`, `epoch:int(=0)`, `source:str`, `time_base:[num,den]`, `duration_s:float?`, `avg_rate:[num,den]?`, `chapters:[{start_s:float, end_s:float?, title:str?}]?`, `downlink_width:int`, `downlink_height:int`, `fit_mode:str`, `resize_algorithm:str` | Returns the effective framing and resize choices; `uplink_token` is null for `server_file`. `chapters` is the authoritative chapter list, sorted by `start_s`: read from the file for `server_file`, echoed from `open_session.file.chapters` for uplink; null/absent when there are none. Chapter times are seconds in source-media time — clients seek to them by converting through `time_base`, exactly like any other seek target |
+| `capabilities` | `protocol_version:int`, `server_name:str`, `models:[{name, scale_factor}]`, `quality_tiers:[str]`, `quality_options:[{id,label,codec,lossless,android_supported,p95_mbps}]`, `resize_algorithms:[str]`, `default_resize_algorithm:str`, `library:bool`, `library_sort:[str]`, `muxed_aux_tracks:bool`, `attachment_cache:int` | `quality_tiers` remains the authoritative ID list; `quality_options` supplies presentation metadata. `library` means the library HTTP API is available. `muxed_aux_tracks` permits the opt-in mode. `attachment_cache >= 1` permits authenticated content-addressed attachment manifests; absent/zero means embedded attachments only |
+| `session_opened` | `session_id:str`, `media_port:int`, `uplink_token:str?`, `downlink_token:str`, `epoch:int(=0)`, `source:str`, `time_base:[num,den]`, `duration_s:float?`, `avg_rate:[num,den]?`, `chapters:[...]?`, `downlink_container:"matroska"`, `downlink_codec:str`, `downlink_extradata_b64:str?`, `downlink_width:int`, `downlink_height:int`, `fit_mode:str`, `resize_algorithm:str`, `aux_tracks:"external"\|"muxed"`, `aux_attachments:"embedded"\|"cached"`, `attachment_manifest:[{name,mimetype,size,sha256}]?`, `attachment_token:str?` | Effective choices are authoritative. A client omits its external original-media source only after muxed confirmation. `cached` means attachment bodies are omitted from every epoch and both manifest and token are required; `embedded` means any accepted attachments remain in each Matroska header. Absent auxiliary fields mean `external` and `embedded` |
 | `state` | `state:"open"\|"playing"\|"paused"\|"closed"` | emitted on every transition |
 | `session_progress` | `stage:str`, `message:str`, `elapsed_s:float` | ticked ~every 2 s while a slow `open_session` is being processed (today: `stage:"pipeline_init"`, e.g. a first-use TensorRT engine build, which can run for minutes). Clients must treat it as a keepalive for the pending open — refresh the open_session timeout on every tick — and should surface `message` as a loading indicator. Quick opens send none |
-| `seek_ready` | `epoch:int` | server has flushed; client may start uplinking the new epoch. **Not a readiness signal for media** — it is dispatched within milliseconds, before any frame of the new epoch exists (§4) |
+| `seek_ready` | `epoch:int` | server has flushed; an uplink client may start sending the new epoch. A server-file source is restarted by the server. **Not a readiness signal for media** — it is dispatched within milliseconds, before any frame of the new epoch exists (§4) |
 | `seek_progress` | `epoch:int`, `target_pts:int`, `keyframe_pts:int?`, `frames_discarded:int`, `elapsed_s:float` | ticked ~every 500 ms while a seek has produced no downlink bytes yet, starting ~750 ms after the `seek`. Purely informational: the client renders it as seek progress so a long discard window (§4 step 4) is distinguishable from a wedged pipeline. `keyframe_pts` is null until the server's demuxer reports where the seek landed. A seek that produces media promptly sends none, and the server stops ticking after 60 s. Additive and safe to ignore — clients that do not know the type must skip it, so it carries no protocol-version change |
 | `stats` | `pipeline_fps:float`, `queue_depths:{...}`, `buffered_ahead_ms:int` | periodic, informational |
 | `error` | `code:str`, `message:str`, `fatal:bool` | non-fatal errors leave the session usable |
-| `closed` | | acknowledges teardown |
+| `closed` | | resource-release barrier acknowledging successful teardown; no acknowledgement is sent if a native owner times out |
 
 `fit_mode` (default `"fit"`) chooses how the output frame relates to `display`.
 `"fit"` preserves the full image and returns the largest same-aspect frame that
@@ -95,8 +108,8 @@ name from the ID. Android filters on `android_supported` and therefore omits
 FFV1.
 
 Error codes (initial set): `bad_message`, `unsupported_version`,
-`unknown_model`, `unknown_tier`, `unknown_resize_algorithm`, `decode_error`, `pipeline_error`,
-`media_timeout`, `internal`.
+`unknown_model`, `unknown_tier`, `unknown_resize_algorithm`, `decode_error`,
+`pipeline_error`, `media_timeout`, `server_restart_required`, `internal`.
 
 ## 3. Media framing (uplink and downlink)
 
@@ -107,7 +120,7 @@ After TCP connect, the peer sends exactly 41 bytes:
 ```
 magic     6 bytes   "UPRLY1"
 direction 1 byte    0x01 = uplink, 0x02 = downlink
-token     34 bytes  ASCII hex token from session_opened (padded, see note)
+token     34 bytes  ASCII hex token from session_opened
 ```
 
 Tokens are 17-byte random values hex-encoded (34 ASCII chars). The server
@@ -117,8 +130,10 @@ validates the token, associates the socket with the session, and replies with
 
 ### 3.2 Packet format
 
-All integers little-endian. One packet = one encoded video packet (access
-unit).
+All integers little-endian. An uplink packet contains one encoded video access
+unit. A downlink packet contains one opaque chunk of the epoch's Matroska byte
+stream and can therefore include header, video, audio, subtitle, attachment,
+cluster, cue, or trailer bytes.
 
 ```
 offset size  field
@@ -127,13 +142,14 @@ offset size  field
 5      4     epoch (uint32)
 9      8     pts (int64, ticks in source stream time_base; INT64_MIN = none)
 17     8     dts (int64, INT64_MIN = none)
-25     n     payload (encoded bitstream data)
+25     n     payload (uplink access unit or downlink Matroska bytes)
 ```
 
-- `discontinuity` is set on the first packet after a seek (new epoch) — the
-  receiver resets its decoder before consuming it.
+- `discontinuity` is set on the first packet after a seek (new epoch). On
+  uplink it resets the server decoder; on downlink it begins a fresh container
+  and the client replaces its demuxer/player input.
 - `end_of_stream`: payload_len = 0; uplink: file fully sent; downlink: pipeline
-  fully drained (only sent after uplink EOS, never during a seek flush).
+  fully drained after its source iterator(s) end (never during a seek flush).
 - Uplink payloads are in the source codec's storage format (e.g. length-
   prefixed AVCC for H.264, as extracted; codec-specific detail is carried by
   `open_session.video.codec` + `extradata_b64`).
@@ -142,11 +158,78 @@ offset size  field
   `session_opened`, alongside informational `downlink_codec` and
   `downlink_width/height`). The container carries the original PTS, so any
   demuxer-based player consumes it directly; the packet-header `pts` field
-  holds the newest PTS muxed into that chunk (buffer accounting only). Each
+  identifies the video frame that triggered that chunk's flush (buffer
+  accounting only, and `INT64_MIN` for header/trailer-only flushes).
+  A negotiated server-file session may also contain stream-copied original
+  audio/subtitle tracks. Attachments are either embedded in every epoch or,
+  when explicitly negotiated as cached, omitted and supplied through the
+  authenticated manifest endpoint. A server may confirm `external` when a
+  file cannot be remuxed efficiently.
+  The outer framing is unchanged. Each
   epoch is its own complete container stream: the first chunk after session
   start or a seek carries the `discontinuity` flag and begins with a fresh
   container header — the receiver reopens its demuxer there. Chunk boundaries
   otherwise carry no meaning.
+
+### 3.3 Negotiated auxiliary-track behavior
+
+The negotiation matrix is:
+
+| Source / confirmation | Client media behavior |
+|---|---|
+| `uplink` | Relay downlink plus the client-local original as external audio/subtitles |
+| `server_file`, `aux_tracks:"external"` (including absent field) | Relay downlink plus `GET /media/<path>` as one external original-media source |
+| `server_file`, `aux_tracks:"muxed"` | Relay downlink alone; audio/subtitles are stream-copied into every epoch |
+
+For a confirmed muxed session, clients must not also attach `/media`: one
+`audio-add` exposes all tracks from that external file, so doing both creates
+duplicate tracks, duplicate source reads, and a second seek lifecycle. Each
+epoch is a fresh Matroska file. Clients must re-enumerate its tracks after
+reload and reapply the user's explicit audio/subtitle choice (including
+subtitles off); track IDs are not a cross-protocol identity.
+
+`aux_attachments:"embedded"` needs no separate client transfer. With
+`aux_attachments:"cached"`, clients must materialize and register the verified
+font view before loading the first epoch. Seeks within that session reuse the
+same view and perform no attachment HTTP reads. A later session or another
+file reuses objects by SHA-256, subject to bounded eviction. If a requested
+mode is not confirmed, follow the confirmed fallback; never infer that
+attachments were omitted merely because `cached` was requested.
+
+The server's auxiliary input is a second demuxer. It seeks against the source
+video stream's keyframe cues while emitting only audio/subtitle packets;
+Matroska audio streams are commonly not indexed, and using audio as the seek
+anchor can force a long linear scan. Original auxiliary PTS and codec packets
+are preserved. A small audio preroll and subtitle events overlapping the seek
+target may precede the first video PTS; the player performs normal timestamp
+synchronization.
+
+### 3.4 Cached attachment objects
+
+For a session confirming `aux_attachments:"cached"`, the client fetches each
+missing manifest object with:
+
+```text
+GET /attachments/<lowercase-sha256>
+Authorization: Bearer <attachment_token>
+```
+
+The server accepts only hashes declared by that active session, never accepts
+a client-selected source path, and expires the token at teardown. Clients must
+enforce object/session size bounds, verify the declared SHA-256 before an
+atomic cache publish, and discard partial or mismatched downloads. The current
+cache-capable server confirms this mode only when every attachment is a
+recognized font type that a client can register with libass; otherwise it
+embeds attachments or falls back to external auxiliary media.
+
+`name` is a sanitized basename for a per-session font view, `mimetype` is
+informational, `size` is the exact response size, and `sha256` is 64 lowercase
+hexadecimal characters. Duplicate hashes describe one object. The current
+client/server safety limits are 64 MiB per object and 256 MiB per manifest;
+clients should also bound their persistent object store (the desktop default
+is 512 MiB). Responses use `Cache-Control: private, max-age=31536000,
+immutable`, but the content hash—not HTTP freshness—is the integrity check.
+Bearer tokens and source paths must not be written to ordinary logs.
 
 ## 4. Seek protocol (epochs)
 
@@ -157,16 +240,21 @@ Epoch is a uint32 starting at 0 per session, incremented only by seeks.
 2. Server: aborts in-flight work, flushes decoder/inference/encoder queues,
    discards any uplink packet with `epoch < E'` (already-buffered or still
    arriving), then replies `seek_ready{epoch:E'}`.
-3. Client restarts the uplink from the nearest keyframe at or before `T`,
-   first packet flagged `discontinuity`, all packets stamped `E'`.
-4. Server decodes and discards frames with `pts < T`, then resumes inference/
+3. For an `uplink` source, the client restarts its demux/uplink from the
+   nearest keyframe at or before `T`, first packet flagged `discontinuity`, all
+   packets stamped `E'`. For `server_file`, the server restarts both its video
+   and (when muxed) auxiliary iterators; the client starts no uplink.
+4. Server decodes and discards video frames with `pts < T`, then resumes inference/
    encode/downlink; downlink packets are stamped `E'`, first one flagged
    `discontinuity` + `keyframe`. This discard window is serial dead time and
    dominates post-seek latency — measured at ~3.6 s for a 250-frame 1080p GOP
    (see [SEEK_LATENCY_PLAN.md](SEEK_LATENCY_PLAN.md)) — so the server sends
    `seek_progress` while it runs.
-5. Client discards any downlink packet with `epoch < E'`, resets its decoder
-   at the discontinuity, and resumes presentation at `pts >= T`.
+5. Client discards any downlink packet with `epoch < E'`, retires the old
+   localhost stream, and opens the new epoch as a fresh Matroska file. It does
+   not pass `start=`: absolute Matroska PTS place the epoch. A muxed session
+   gets its new audio/subtitle tracks from that file; an external session
+   reattaches its one original-media demuxer after playback restart.
 
 A server started with `--seek-discard-max-s S` trades step 4 away when the
 keyframe lands more than `S` seconds before `T`: it emits from the keyframe
@@ -219,6 +307,8 @@ are allowed without a version bump (receivers ignore unknown fields).
 ## 7. Security status
 
 The random media tokens authenticate TCP attachments to an already-open
-session; they are not user authentication. Control-channel pairing, persistent
-client credentials, TLS, and authorization for `/library` and `/media` are
-planned but not implemented. The current server is intended for a trusted LAN.
+session; the short-lived attachment bearer token authorizes only hashes in one
+active manifest. Neither is user authentication. Control-channel pairing,
+persistent client credentials, TLS, and authorization for `/library` and
+`/media` are planned but not implemented. The current server is intended for a
+trusted LAN.

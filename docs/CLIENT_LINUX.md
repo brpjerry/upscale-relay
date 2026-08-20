@@ -29,6 +29,14 @@ your GPU's VA-API/NVDEC userspace:
 
 FFV1 has no hardware decoder on any platform — it always decodes on the CPU.
 
+The embedded Qt/OpenGL player uses mpv's safe copy-back hardware decode mode on
+Linux. In particular, it overrides `hwdec=vaapi` from a user's `mpv.conf` with
+`auto-copy-safe`: a captured Intel iHD crash landed in
+`paintGL → mpv_render_context_render → vaSyncSurface` when the zero-copy VA-API
+surface was retired during live playback. Decode still runs on the GPU; only
+the decoded frame is copied before Qt renders it. Use `--no-hwdec` to disable
+hardware decode completely.
+
 ## 2. Get the code onto the laptop
 
 Clone or pull the repository normally. To copy an existing working tree from
@@ -68,6 +76,14 @@ relay-desktop
   useful XWayland fallback.
 - Enter the server as `<windows-box-ip>:8590` in the toolbar and Connect.
 - Settings persist in `~/.config/upscale-relay/`.
+
+When a capable server-library session confirms muxed auxiliary tracks, the
+desktop client gets audio and subtitles from the relay Matroska stream and does
+not reopen the full source through `/media`. Subtitle fonts are downloaded by
+SHA-256 into the Qt standard cache location, verified before use, and reused
+across seeks and later sessions until bounded eviction. A seek never downloads
+the font bodies again. Local files and old/external server confirmations retain
+the original-media attach path.
 
 ## 5. Open the server's firewall (on the Windows box, once)
 

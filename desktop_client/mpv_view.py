@@ -1,11 +1,11 @@
 """libmpv-backed player view.
 
 The downlink is a streaming Matroska byte stream with original PTS
-(docs/PROTOCOL.md §3.2), fed to mpv through a localhost TCP stream. The
-original file is attached via --external-files, so its audio (master clock)
-and subtitle tracks play alongside the network video, all aligned by real
-timestamps — including after seeks, where a fresh container starts at the
-seek target and mpv reloads it.
+(docs/PROTOCOL.md §3.2), fed to mpv through a localhost TCP stream.
+Audio/subtitles either arrive as negotiated embedded tracks (server-library
+sessions) or from the original external file (local/legacy sessions). Both
+paths align by absolute timestamps, including after a seek reloads a fresh
+container at the epoch target.
 
 The DLL is looked up in <repo>/mpv-dev (see _load_mpv).
 """
@@ -17,6 +17,7 @@ from collections import deque
 from ctypes import c_void_p
 import os
 import socket
+import sys
 import threading
 import time
 from fractions import Fraction
@@ -40,6 +41,25 @@ def _load_mpv():
 
 
 mpv = _load_mpv()
+
+# Start with a half-second mpv reserve once the first cluster is decodable.
+# Cache pause remains enabled for recovery; this only reduces its initial wait.
+CACHE_PAUSE_WAIT_S = 0.5
+
+
+def _render_hwdec_mode(no_hwdec: bool, platform: str | None = None) -> str:
+    """Return the hardware decode mode safe for the embedded render path.
+
+    Intel's zero-copy VA-API path can let Qt paint a surface while iHD is
+    retiring it during a live-stream transition.  The captured crash was
+    paintGL -> mpv_render_context_render -> vaSyncSurface -> iHD.  Copy-back
+    keeps hardware decode but gives the render API an ordinary software frame.
+    Other platforms retain mpv's safe automatic selection.
+    """
+    if no_hwdec:
+        return "no"
+    platform = platform or sys.platform
+    return "auto-copy-safe" if platform.startswith("linux") else "auto-safe"
 
 
 def _native_display_params(app=None) -> dict[str, c_void_p]:
@@ -251,6 +271,7 @@ class MpvPlayerView(QOpenGLWidget):
     stats_changed = Signal(str)
     position_changed = Signal(float)  # seconds
     track_list_changed = Signal(list, object)  # [(sid, title)] subs, selected sid
+    audio_track_list_changed = Signal(list, object)  # [(aid, title)] audio, selected aid
     rebuffering = Signal(bool)
     seek_requested = Signal(float)  # relative seconds (arrow keys)
     chapter_step_requested = Signal(int)  # +1 next / -1 previous (PgUp/PgDn)
@@ -259,6 +280,8 @@ class MpvPlayerView(QOpenGLWidget):
     fullscreen_toggled = Signal()  # F key / double-click; the window fullscreens
     mouse_moved = Signal(int, int)  # cursor x, y in the view; drives fullscreen control reveal
     _frame_ready = Signal()  # mpv render thread -> queued repaint on GUI thread
+    _playback_restarted = Signal(int)  # libmpv event thread -> GUI thread
+    _external_media_ready = Signal(int)  # attach worker -> GUI thread
 
     # Bare keys the app reserves: arrows are NOT forwarded (mpv can't seek
     # the live stream — they emit seek_requested for a relay-protocol seek),
@@ -276,7 +299,9 @@ class MpvPlayerView(QOpenGLWidget):
     # the whole player view with it — never forwarded.
     _BLOCKED_KEYS = {"q", "Q", "POWER", "CLOSE_WIN"}
 
-    PREBUFFER_S = 1.5
+    # mpv owns cache sizing/pause. Waiting for 1.5 seconds of packets in Python
+    # added that interval to every start and could race loadfile's pause state.
+    STARTUP_PACKETS = 1
 
     def __init__(self, parent=None, options: DesktopOptions | None = None):
         super().__init__(parent)
@@ -294,7 +319,22 @@ class MpvPlayerView(QOpenGLWidget):
         self._frame_ready.connect(self.update)  # queued: emitter is mpv thread
 
         if self.options.headless:
-            extra = {"vo": "null", "ao": "null", "osc": "no"}
+            extra = {
+                "vo": "null",
+                "ao": "null",
+                "osc": "no",
+                # Headless runs exercise the same absolute-PTS epoch protocol
+                # as the rendered UI. Without this, every post-seek Matroska
+                # stream is rebased to zero and its position/audio clock no
+                # longer matches the relay target.
+                "rebase_start_time": "no",
+                "cache": "yes",
+                "cache_pause": "yes",
+                "cache_pause_wait": CACHE_PAUSE_WAIT_S,
+                "demuxer_readahead_secs": "15",
+                "demuxer_max_bytes": "768MiB",
+                "demuxer_max_back_bytes": "0",
+            }
         else:
             # Deep readahead: mpv's default is ~1s beyond playback, so any
             # pipeline hiccup >1s stuttered even with plenty buffered client-
@@ -313,21 +353,22 @@ class MpvPlayerView(QOpenGLWidget):
                 # via keyPressEvent forwarding below.
                 "input_default_bindings": "yes",
                 "cache": "yes",
+                "cache_pause": "yes",
+                "cache_pause_wait": CACHE_PAUSE_WAIT_S,
                 "demuxer_readahead_secs": "15",
                 "demuxer_max_bytes": "768MiB",
+                "demuxer_max_back_bytes": "0",
                 # Keep original timestamps: post-seek streams begin at the
                 # seek target's absolute PTS. With rebasing (mpv default) the
                 # timeline restarts at 0, which desyncs the external audio
                 # and made `start=<target>` seek beyond the data (freeze).
                 "rebase_start_time": "no",
             }
-            # Hardware decode (NVDEC/D3D11 on Windows, VAAPI on Linux) for the
-            # HEVC tiers; FFV1 has no hw decoder and mpv falls back silently.
-            # The earlier hwdec crash was an OSC(LuaJIT)-reload interaction —
-            # with the OSC off, seek batteries run clean with hwdec on.
-            # --no-hwdec disables.
-            if not self.options.no_hwdec:
-                extra["hwdec"] = "auto-safe"
+            # Hardware decode for the HEVC tiers; FFV1 has no hw decoder and
+            # mpv falls back silently. Linux uses copy-back: an actual core
+            # captured Intel iHD crashing in vaSyncSurface from paintGL when a
+            # user's mpv.conf forced zero-copy hwdec=vaapi. --no-hwdec disables.
+            extra["hwdec"] = _render_hwdec_mode(self.options.no_hwdec)
             # OSC is OFF by default: it's a LuaJIT script that re-initializes
             # on every stream reload (seek), and that path intermittently
             # crashed mpv's event thread (native AV, exception 0xe24c4a02 =
@@ -351,20 +392,25 @@ class MpvPlayerView(QOpenGLWidget):
             idle="yes",
             **extra,
         )
+        self._default_sub_fonts_dir = getattr(self.mpv, "sub_fonts_dir", "")
         if "config" in extra:
             # mpv.conf won over any constructor option it named; re-assert
             # the plumbing the relay breaks without (runtime sets beat the
-            # config file). User prefs — hwdec, shaders, volume, subtitle
-            # style, screenshots — stand.
+            # config file). User prefs — shaders, volume, subtitle style,
+            # screenshots — stand. hwdec is relay plumbing on the embedded
+            # Linux render path: zero-copy VA-API can expose retired surfaces
+            # to Qt's paintGL, so reassert the safe copy-back mode below.
             self.mpv.vo = "libmpv"  # render API; a conf vo= would pop a window
             self.mpv.rebase_start_time = False  # docs/PROTOCOL.md PTS semantics
             self.mpv.keep_open = False
             self.mpv.idle = True
             self.mpv.cache = True  # live-stream buffering, sized for the
+            self.mpv.cache_pause = True
+            self.mpv.cache_pause_wait = CACHE_PAUSE_WAIT_S
             self.mpv.demuxer_readahead_secs = 15  # ~200 Mbps lossless tiers
             self.mpv.demuxer_max_bytes = "768MiB"
-            if self.options.no_hwdec:
-                self.mpv.hwdec = "no"
+            self.mpv.demuxer_max_back_bytes = 0
+            self.mpv.hwdec = _render_hwdec_mode(self.options.no_hwdec)
             if not self.options.mpv_osc:
                 self.mpv.osc = False
         self._buffer: _LoopbackStream | None = None
@@ -376,8 +422,30 @@ class MpvPlayerView(QOpenGLWidget):
         self._pending_start: float | None = None  # seek target for next reload
         self._epoch_base = 0  # frames fed before the current epoch's stream
         self._tracks_reported = False
+        self._chosen_subtitle_id: int | None = None
+        self._subtitle_choice_made = False
+        self._chosen_audio_id: int | None = None
+        self._audio_choice_made = False
         self._reloading = False
+        self._load_generation = 0
+        self._reload_settle_until = 0.0
+        self._accept_playback_restart = False
+        self._restart_seen = False
+        self._external_attach_started = False
+        self._external_ready = False
+        self._prebuffer_ready = False
+        self._epoch_released = False
+        self._caller_paused = False
         self.client = None
+        self._playback_restarted.connect(self._on_playback_restarted)
+        self._external_media_ready.connect(self._on_external_media_ready)
+
+        @self.mpv.event_callback("playback-restart")
+        def on_restart(_event):
+            # libmpv invokes callbacks on its event thread. Hop back to Qt's
+            # thread before changing properties or starting the attach worker.
+            if self._accept_playback_restart:
+                self._playback_restarted.emit(self._load_generation)
 
         @self.mpv.event_callback("end-file")
         def on_end(event):
@@ -440,50 +508,155 @@ class MpvPlayerView(QOpenGLWidget):
         self._fps = float(avg_rate) if avg_rate else 30.0
         self._source_path = source_path
         self._tracks_reported = False
+        self._chosen_subtitle_id = None
+        self._subtitle_choice_made = False
+        self._chosen_audio_id = None
+        self._audio_choice_made = False
+        self._caller_paused = False
         self._task = asyncio.create_task(self._consume(downlink_q))
         self._stats_task = asyncio.create_task(self._stats_loop())
 
     async def _load_stream(self) -> None:
         """(Re)start mpv on a fresh buffer — session start and every seek.
 
-        On reload the old file is stopped first, then we YIELD to the event
-        loop before loading the new one. Doing stop+load back-to-back
-        synchronously (or polling mpv properties in between) raced mpv's event
-        thread and crashed (native AV) intermittently on cold start.
+        prepare_seek() normally retires the old file immediately, before the
+        server seek. We still preserve the stop/load settle interval here:
+        doing them back-to-back raced mpv's event thread and crashed natively.
         """
         if self._buffer is not None:
-            self._reloading = True
-            self._buffer.close()  # old catchall reader returns -> EOF
-            try:
-                self.mpv.command("stop")
-            except Exception:
-                pass
-            # Let mpv's own threads process the stop/EOF before we touch it
-            # again. No synchronous property reads here.
-            await asyncio.sleep(0.15)
+            self._retire_stream()
+        settle = self._reload_settle_until - time.monotonic()
+        if settle > 0:
+            await asyncio.sleep(settle)
         self._buffer = _LoopbackStream()
+        self._load_generation += 1
         self._fed = 0
-        self.mpv.pause = True
-        options = {}
-        if self._source_path:
-            # Audio (master clock) + subtitle tracks come from the original.
-            # audio-file/sub-files mark the tracks for auto-selection;
-            # plain external-files tracks are NOT auto-selected by mpv.
-            options["audio-file"] = self._source_path
-            options["sub-files"] = self._source_path
+        # A seek is a new Matroska file. Embedded auxiliary tracks get fresh
+        # mpv ids from an identical deterministic header, so enumerate them
+        # again and reapply the user's explicit subtitle choice.
+        self._tracks_reported = False
+        self._restart_seen = False
+        self._external_attach_started = False
+        self._external_ready = self._source_path is None
+        self._prebuffer_ready = False
+        self._epoch_released = False
+        self._accept_playback_restart = True
         # No `start=` option: with rebase-start-time=no the stream's own
-        # timestamps place playback at the seek target, and the external
-        # audio aligns by absolute time. (A start-seek on the not-yet-cached
-        # live stream wedged mpv permanently.)
+        # timestamps place playback at the seek target. External media is
+        # attached after playback-restart, when mpv knows that absolute time.
         self._pending_start = None
-        self.mpv.loadfile(self._buffer.uri, **options)
+        load_options = "pause=yes"
+        if self.mpv.mpv_version_tuple >= (0, 38, 0):
+            self.mpv.command(
+                "loadfile", self._buffer.uri, "replace", -1, load_options)
+        else:
+            self.mpv.command(
+                "loadfile", self._buffer.uri, "replace", load_options)
         self._reloading = False
+
+    def set_subtitle_fonts_dir(self, path: Path | None) -> None:
+        """Point libass at the verified per-session attachment view."""
+        self.mpv.sub_fonts_dir = (
+            str(path) if path is not None else self._default_sub_fonts_dir
+        )
+
+    def _retire_stream(self) -> None:
+        """Stop and discard an epoch without waiting for its replacement."""
+        self._accept_playback_restart = False
+        self._load_generation += 1  # invalidates a late external-media worker
+        self._reloading = True
+        old = self._buffer
+        self._buffer = None
+        if old is not None:
+            old.abort()
+        try:
+            self.mpv.command("stop")
+        except Exception:
+            pass
+        self._reload_settle_until = time.monotonic() + 0.15
+        self._fed = 0
+        self._restart_seen = False
+        self._external_ready = False
+        self._prebuffer_ready = False
+        self._epoch_released = False
+        if self.client is not None:
+            self.client.buffered_ms = 0
+
+    def _on_playback_restarted(self, generation: int) -> None:
+        if (generation != self._load_generation
+                or not self._accept_playback_restart or self._restart_seen):
+            return
+        self._restart_seen = True
+        if self._source_path is None:
+            self._external_ready = True
+            self._maybe_release_epoch()
+            return
+        if self._external_attach_started:
+            return
+        self._external_attach_started = True
+        source = self._source_path
+        chosen_audio = self._chosen_audio_id
+        chosen_subtitle = self._chosen_subtitle_id
+        subtitle_choice_made = self._subtitle_choice_made
+
+        def attach() -> None:
+            error: Exception | None = None
+            try:
+                # Add the original once, after the live stream has established
+                # its absolute PTS. mpv exposes all of that demuxer's audio and
+                # subtitle tracks; adding it twice needlessly opens/parses the
+                # same file twice and materially slows every load.
+                self.mpv.command(
+                    "audio-add", source,
+                    "select" if chosen_audio is None else "auto",
+                )
+                if chosen_audio is not None:
+                    self.mpv.aid = chosen_audio
+                if subtitle_choice_made:
+                    self.mpv.sid = (
+                        chosen_subtitle if chosen_subtitle is not None else "no")
+                elif chosen_subtitle is not None:
+                    self.mpv.sid = chosen_subtitle
+
+                # Unlike Android's MediaCodec build, desktop mpv does not
+                # reliably publish audio-pts while pause=yes holds the epoch.
+                # Waiting for it is circular and intermittently strands the
+                # first frame. audio-add itself returns only after the original
+                # demuxer is open/positioned; release then and let mpv's normal
+                # cache/audio-sync path finish decoding.
+            except Exception as err:
+                error = err
+            if generation == self._load_generation:
+                if error is not None:
+                    self.failed.emit(f"external audio attach: {error!r}")
+                self._external_media_ready.emit(generation)
+
+        threading.Thread(
+            target=attach,
+            name=f"mpv-external-media-{generation}",
+            daemon=True,
+        ).start()
+
+    def _on_external_media_ready(self, generation: int) -> None:
+        if generation != self._load_generation:
+            return
+        self._external_ready = True
+        self._maybe_release_epoch()
+
+    def _maybe_release_epoch(self) -> None:
+        if (self._epoch_released or not self._restart_seen
+                or not self._external_ready or not self._prebuffer_ready):
+            return
+        self._epoch_released = True
+        self.mpv.pause = self._caller_paused
 
     def stop(self) -> None:
         for task in (self._task, self._stats_task):
             if task is not None:
                 task.cancel()
         self._task = self._stats_task = None
+        self._accept_playback_restart = False
+        self._load_generation += 1
         if self._buffer is not None:
             self._buffer.close()
             self._buffer = None
@@ -491,9 +664,17 @@ class MpvPlayerView(QOpenGLWidget):
             self.mpv.command("stop")
         except Exception:
             pass
+        self._reloading = False
+        self._epoch_released = False
+        self._caller_paused = False
 
     def set_paused(self, paused: bool) -> None:
-        self.mpv.pause = paused
+        self._caller_paused = paused
+        # Each epoch is deliberately held until mpv reaches its first frame
+        # and external audio (if any) catches up. Preserve user intent without
+        # prematurely releasing that hold.
+        if self._epoch_released:
+            self.mpv.pause = paused
 
     def set_panscan(self, value: float) -> None:
         """0.0 = fit (letterbox); 1.0 = fill the window, cropping overflow.
@@ -515,8 +696,9 @@ class MpvPlayerView(QOpenGLWidget):
             pass
 
     def prepare_seek(self, target_s: float) -> None:
-        """Arm the next stream reload to start at the seek target."""
+        """Discard the old epoch before the relay starts building the new one."""
         self._pending_start = target_s
+        self._retire_stream()
 
     def keyPressEvent(self, event) -> None:
         key = event.key()
@@ -552,21 +734,45 @@ class MpvPlayerView(QOpenGLWidget):
         flag, so mpv selects none. Prefer the source's default track, else
         the first. Same fallback for audio (mpv sometimes selects none on
         live-stream loads)."""
-        if self.mpv.sid in (None, False, "no"):
+        if self._subtitle_choice_made:
+            self.mpv.sid = (
+                self._chosen_subtitle_id
+                if self._chosen_subtitle_id is not None else "no"
+            )
+        elif self._chosen_subtitle_id is not None:
+            # Preserve the initially auto-selected track across epochs too.
+            # mpv's own default choice can change when a seek begins between
+            # subtitle packets even though every stream remains in the header.
+            self.mpv.sid = self._chosen_subtitle_id
+        elif self.mpv.sid in (None, False, "no"):
             subs = [t for t in tracks if t.get("type") == "sub"]
             if subs:
                 pick = next((t for t in subs if t.get("default")), subs[0])
                 self.mpv.sid = pick["id"]
-        if self.mpv.aid in (None, False, "no"):
+        if self._audio_choice_made:
+            self.mpv.aid = self._chosen_audio_id
+        elif self._chosen_audio_id is not None:
+            self.mpv.aid = self._chosen_audio_id
+        elif self.mpv.aid in (None, False, "no"):
             audio = [t for t in tracks if t.get("type") == "audio"]
             if audio:
                 self.mpv.aid = audio[0]["id"]
 
+    def select_audio(self, aid: int) -> None:
+        self._chosen_audio_id = aid
+        self._audio_choice_made = True
+        self.mpv.aid = aid
+
     def select_subtitle(self, sid: int | None) -> None:
+        self._chosen_subtitle_id = sid
+        self._subtitle_choice_made = True
         self.mpv.sid = sid if sid is not None else "no"
 
     def set_sub_delay(self, seconds: float) -> None:
         self.mpv.sub_delay = seconds
+
+    def set_audio_delay(self, seconds: float) -> None:
+        self.mpv.audio_delay = seconds
 
     def play_local_fallback(self, position_s: float) -> None:
         """Direct playback of the original file (server lost)."""
@@ -587,8 +793,6 @@ class MpvPlayerView(QOpenGLWidget):
         trace = self.options.trace
         try:
             await self._load_stream()  # initial stream open on the consume task
-            prebuffer_packets = int(self.PREBUFFER_S * self._fps)
-            unpaused = False
             first = True
             while True:
                 pkt = await q.get()
@@ -598,8 +802,8 @@ class MpvPlayerView(QOpenGLWidget):
                 if pkt.eos:
                     if self._buffer is not None:
                         self._buffer.finish()  # mpv plays out and emits eof
-                    if not unpaused:
-                        self.mpv.pause = False
+                    self._prebuffer_ready = True
+                    self._maybe_release_epoch()
                     return
                 if pkt.discontinuity and not first:
                     if trace:
@@ -608,18 +812,23 @@ class MpvPlayerView(QOpenGLWidget):
                     await self._load_stream()
                     if trace:
                         print("[trace] reload done", flush=True, file=_sys.stderr)
-                    unpaused = False
                 first = False
                 if pkt.payload and self._buffer is not None:
                     self._buffer.feed(pkt.payload)
                     self._fed += 1
                     if trace and self._fed % 48 == 0:
-                        print(f"[trace] fed={self._fed} unpaused={unpaused}", flush=True, file=_sys.stderr)
-                if not unpaused and self._fed >= prebuffer_packets:
+                        print(
+                            f"[trace] fed={self._fed} released={self._epoch_released}",
+                            flush=True, file=_sys.stderr,
+                        )
+                if not self._prebuffer_ready and self._fed >= self.STARTUP_PACKETS:
+                    self._prebuffer_ready = True
                     if trace:
-                        print(f"[trace] unpausing after {self._fed}", flush=True, file=_sys.stderr)
-                    self.mpv.pause = False
-                    unpaused = True
+                        print(
+                            f"[trace] mpv owns buffering after {self._fed} packet(s)",
+                            flush=True, file=_sys.stderr,
+                        )
+                    self._maybe_release_epoch()
         except asyncio.CancelledError:
             raise
         except Exception as err:
@@ -676,13 +885,34 @@ class MpvPlayerView(QOpenGLWidget):
                     f"hw {hwdec} | drift {avsync if avsync is not None else 0:+.3f}s | "
                     f"dropped {drop or 0}"
                 )
-            if not self._tracks_reported:
+            # During an epoch reload mpv can retain the old file's track-list
+            # through stop() and briefly after loadfile(). Publishing it here
+            # makes the UI show stale ids while the new file independently
+            # auto-selects another track. The path changes to the per-epoch
+            # loopback URI only once mpv has adopted the fresh Matroska file.
+            current_uri = self._buffer.uri if self._buffer is not None else None
+            tracks_belong_to_current_epoch = (
+                current_uri is not None
+                and not self._reloading
+                and _prop("path") == current_uri
+                and (self._source_path is None or self._external_ready)
+            )
+            if not self._tracks_reported and tracks_belong_to_current_epoch:
                 tracks = self.mpv.track_list or []
+                audio = [(t.get("id"), t.get("title") or t.get("lang") or f"track {t.get('id')}")
+                         for t in tracks if t.get("type") == "audio"]
                 subs = [(t.get("id"), t.get("title") or t.get("lang") or f"track {t.get('id')}")
                         for t in tracks if t.get("type") == "sub"]
                 if tracks:
                     self._tracks_reported = True
                     self._autoselect_tracks(tracks)
+                    aid = self.mpv.aid
+                    if not self._audio_choice_made and type(aid) is int:
+                        self._chosen_audio_id = aid
+                    self.audio_track_list_changed.emit(
+                        audio, aid if type(aid) is int else None)
                     sid = self.mpv.sid
+                    if not self._subtitle_choice_made and type(sid) is int:
+                        self._chosen_subtitle_id = sid
                     self.track_list_changed.emit(
-                        subs, sid if isinstance(sid, int) else None)
+                        subs, sid if type(sid) is int else None)

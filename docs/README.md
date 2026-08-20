@@ -15,10 +15,21 @@ instructions remain at the root.
 - [Seek latency plan](SEEK_LATENCY_PLAN.md) — measured first-frame latency
   after an epoch seek, the keyframe discard window that produces it, and the
   candidate changes.
+- [In-band audio/subtitle plan](AUDIO_SIDECAR_PLAN.md) — negotiated stream-copy
+  of original auxiliary tracks into each Matroska epoch, avoiding full-source
+  client transfer while preserving relay seeks.
+- [Muxed auxiliary startup and attachment cache](MUXED_AUX_STARTUP_PLAN.md) —
+  measured startup delay, bounded interleaving, immediate epoch publication,
+  cache reserve, and verified font caching.
+- [NVENC session teardown](NVENC_SESSION_TEARDOWN_PLAN.md) — native-owner
+  shutdown ordering and the `closed` resource-release barrier.
 - [Android client plan](https://github.com/brpjerry/upscale-relay-android/blob/main/docs/ANDROID_CLIENT.md) — selected architecture, robust
   server-library MVP, feature-parity phases, and device acceptance gates.
 - [Android device validation](https://github.com/brpjerry/upscale-relay-android/blob/main/docs/ANDROID_DEVICE_NOTES.md) — Phase 1 robustness and
   Phase 2 A/V, controls, seek, tier, and subtitle evidence.
+- [Android muxed-aux migration](https://github.com/brpjerry/upscale-relay-android/blob/main/docs/MUXED_AUX_TRACKS_PLAN.md) — protocol negotiation,
+  attachment caching, player lifecycle changes, compatibility fallback, and
+  device acceptance gates.
 
 ## Setup and operations
 

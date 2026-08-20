@@ -45,3 +45,15 @@ def test_performance_snapshot_includes_status_fields(caplog):
     assert "output=3840x2160 codec=hevc encoder=hevc_nvenc tier=hevc-qp4" in message
     assert "client buffer  8400 ms (est  8123)" in message
     assert "frames 120 in / 118 out" in message
+
+
+def test_missing_optional_stats_never_blocks_cleanup(caplog):
+    session = SimpleNamespace(
+        id="partial123456",
+        pipeline=SimpleNamespace(),
+    )
+
+    with caplog.at_level(logging.DEBUG, logger="relay.server"):
+        RelayServer._log_session_stats(session, final=True)
+
+    assert "stats unavailable" in caplog.records[-1].getMessage()

@@ -27,6 +27,7 @@ class FakePlayer(QWidget):
     stats_changed = Signal(str)
     position_changed = Signal(float)
     track_list_changed = Signal(list, object)
+    audio_track_list_changed = Signal(list, object)
     rebuffering = Signal(bool)
     seek_requested = Signal(float)
     finished = Signal()
@@ -38,6 +39,7 @@ class FakePlayer(QWidget):
         super().__init__()
         self.client = None
         self.started = None
+        self.font_dir = None
 
     def start(self, session, queue, time_base, source_path=None, avg_rate=None):
         self.started = (session, queue, time_base, source_path, avg_rate)
@@ -51,10 +53,19 @@ class FakePlayer(QWidget):
     def set_paused(self, value):
         pass
 
+    def set_subtitle_fonts_dir(self, path):
+        self.font_dir = path
+
     def set_sub_delay(self, value):
         pass
 
+    def set_audio_delay(self, value):
+        pass
+
     def select_subtitle(self, sid):
+        pass
+
+    def select_audio(self, aid):
         pass
 
     def play_local_fallback(self, position_s):
@@ -91,6 +102,7 @@ class FakeSessionClient(FakeLibraryClient):
         self.track = None
         self.opened_config = None
         self.queue = asyncio.Queue()
+        self.attachment_cache_root = None
 
     async def open_session(self, config):
         self.opened_config = config
@@ -99,8 +111,14 @@ class FakeSessionClient(FakeLibraryClient):
             downlink_container="matroska", time_base=Fraction(1, 1000),
             duration_s=120.0, avg_rate=Fraction(24, 1),
             chapters=getattr(self, "chapters", None),
+            aux_tracks=config.aux_tracks,
+            aux_attachments=config.aux_attachments,
         )
         return self.session
+
+    async def prepare_attachments(self, cache_root):
+        self.attachment_cache_root = cache_root
+        return "C:/verified-fonts" if self.opened_config.aux_attachments == "cached" else None
 
     async def attach_media(self):
         pass
@@ -205,6 +223,34 @@ def test_server_session_uses_http_original_and_server_metadata(window):
     asyncio.run(scenario())
 
 
+def test_server_session_opts_into_muxed_tracks_and_skips_http_original(window):
+    async def scenario():
+        client = FakeSessionClient()
+        window.client = client
+        window._server_caps = {"muxed_aux_tracks": True}
+        await window._start_session("Shows/Episode.mkv", source="server_file")
+
+        assert client.opened_config.aux_tracks == "muxed"
+        assert window.player.started[3] is None
+
+    asyncio.run(scenario())
+
+
+def test_server_session_negotiates_cached_fonts_before_player_load(window):
+    async def scenario():
+        client = FakeSessionClient()
+        window.client = client
+        window._server_caps = {"muxed_aux_tracks": True, "attachment_cache": 1}
+        await window._start_session("Shows/Episode.mkv", source="server_file")
+
+        assert client.opened_config.aux_attachments == "cached"
+        assert client.attachment_cache_root.name == "attachments"
+        assert window.player.font_dir == "C:/verified-fonts"
+        assert window.player.started is not None
+
+    asyncio.run(scenario())
+
+
 def test_session_chapters_populate_and_clear_controls(window):
     async def scenario():
         client = FakeSessionClient()
@@ -234,6 +280,32 @@ def test_session_chapters_populate_and_clear_controls(window):
         assert window.seek_slider._chapter_fractions == []
 
     asyncio.run(scenario())
+
+
+def test_media_metadata_cannot_expand_transport_minimum_width(window):
+    """Track titles and telemetry must not resize the splitter on load."""
+    app = QApplication.instance()
+    window._duration_s = 120.0
+    window._set_chapters([main_window.Chapter(0.0, "A")])
+    window._on_audio_tracks([(1, "A")], 1)
+    window._on_tracks([(1, "S")], 1)
+    window.player_status.setText("ok")
+    window.show()
+    app.processEvents()
+    baseline = window.controls_panel.minimumSizeHint().width()
+
+    long_title = "A very long muxed track title " * 20
+    window._set_chapters([main_window.Chapter(0.0, long_title)])
+    window._on_audio_tracks([(1, long_title)], 1)
+    window._on_tracks([(1, long_title)], 1)
+    window.player_status.setText("cache / decode / drift telemetry " * 30)
+    app.processEvents()
+
+    assert window.controls_panel.minimumSizeHint().width() == baseline
+
+
+def test_splitter_defers_expensive_video_resize_until_release(window):
+    assert not window.split.opaqueResize()
 
 
 def test_open_progress_indicator_toggles(window):

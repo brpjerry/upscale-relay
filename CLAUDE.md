@@ -73,6 +73,9 @@ constructor options).
 - `frame.reformat()` / `to_ndarray()` rebuild a swscale context per call —
   ruinous at 4K (90 ms/frame). Use a cached `VideoReformatter`, one per thread.
 - Report bitstream codec names to peers ("hevc"), not encoder names ("hevc_nvenc").
+- For server-file muxed auxiliary tracks, seek the auxiliary container against
+  the video stream's keyframe cues. Matroska audio streams are often not
+  indexed; using audio as the seek anchor caused a measured 7-second scan.
 
 **asyncio / Qt (qasync)**
 - **No modal dialogs / exec() / processEvents from coroutine context** — the
@@ -99,8 +102,22 @@ constructor options).
 - mpv OSC (LuaJIT) intermittently crashes mpv's event thread on stream
   reloads → OSC off by default. LuaJIT's caught SEH exception `0xe24c4a02`
   in faulthandler output is *benign noise*, not a crash.
-- The audio/subs come from the original file via `audio-file`/`sub-files`
-  loadfile options (plain `external-files` tracks are not auto-selected).
+- On Linux's embedded Qt/OpenGL render path, re-assert `hwdec=auto-copy-safe`
+  after loading `mpv.conf`. A real core landed in
+  `paintGL → mpv_render_context_render → vaSyncSurface → iHD` when the user's
+  `hwdec=vaapi` exposed a retired zero-copy Intel surface. Copy-back retains
+  hardware decode; never restore zero-copy VA-API as the default here.
+- For external auxiliary media, load the video-only epoch paused, then issue
+  exactly one raw-argument `audio-add` after mpv's `playback-restart`; that
+  demuxer contributes both audio and subtitle tracks. Attaching during
+  `loadfile` positions the original demuxer at zero and makes far seeks decode
+  through old media. On desktop, release the load-time hold when `audio-add`
+  returns (`audio-pts` is not reliable while paused), and preserve the caller's
+  pause intent across that hold.
+- For a server-file session confirmed as `aux_tracks:"muxed"`, never attach
+  `/media` or issue `audio-add`. Prepare any confirmed cached font view before
+  the first `loadfile`, then re-enumerate and remap track choices after every
+  fresh epoch. Requested mode alone is not authoritative.
 
 **GPU stacks (server box: RTX 5090 "Blackwell", Windows)**
 - ORT TensorRT EP corrupts the process heap under streaming → it lives in a

@@ -3,9 +3,10 @@
 Status: **implemented**, except for shared-mount path mapping.
 
 The server can expose a local folder, mounted share, or Windows UNC path as a
-media library. Clients browse the server tree, ask the server to demux and
-upscale a selected file, and let mpv read the original audio/subtitles through
-the server's Range-capable HTTP endpoint.
+media library. Clients browse the server tree and ask the server to demux and
+upscale a selected file. Capable clients negotiate original audio/subtitles in
+the epoch downlink; the Range-capable HTTP endpoint remains the compatibility
+path for older/external-mode clients.
 
 ## Run it
 
@@ -44,6 +45,10 @@ desktop retains its local-only browser appearance.
 - The `capabilities` message includes `library: true` and
   `library_sort: ["name", "mtime"]` while the feature is configured
   (`library_sort` is `[]` otherwise).
+- `muxed_aux_tracks: true` advertises the opt-in stream-copy path.
+  `attachment_cache: 1` additionally permits clients to fetch verified fonts
+  once by content hash. Legacy/embedded requests still fall back to `external`
+  when attachments exceed 4 MiB; cached mode avoids that repeated header.
 - `open_session.source` accepts `{type: "server_file", path: "..."}`.
 - Server-file sessions create a shared `relay_media.VideoTrack` locally and do
   not allocate or wait for an uplink attachment.
@@ -66,8 +71,12 @@ desktop retains its local-only browser appearance.
   `Load more` footer without discarding already loaded entries.
 - Double-clicking a server file opens a `server_file` session without creating
   a client `VideoTrack` or uplink sender.
-- libmpv attaches `/media` as both `audio-file` and `sub-files`, so original
-  audio and subtitles remain aligned by absolute PTS.
+- The Qt client requests muxed auxiliary tracks from capable servers and does
+  not open `/media` after `session_opened` confirms them. Older/external-mode
+  sessions still attach `/media` for audio/subtitles.
+- The Android client currently uses the external compatibility path; its
+  protocol/player migration is specified in the
+  [Android muxed-aux plan](https://github.com/brpjerry/upscale-relay-android/blob/main/docs/MUXED_AUX_TRACKS_PLAN.md).
 - Local fallback is hidden for server files because the client has no local
   source to play directly.
 
@@ -75,16 +84,23 @@ Coverage lives in `tests/test_server_library.py` and
 `tests/test_server_library_gui.py`, including path sandboxing, HTTP Range,
 server-source PTS equivalence, seeks, capability-driven UI, and media URLs.
 
-## Why the main pipeline did not change
+## Auxiliary tracks in the main pipeline
 
-The pipeline consumes encoded video packets and produces a streaming Matroska
-downlink. Whether those input packets come from the client's framed uplink or a
-server-local `VideoTrack` does not affect decode, inference, fit/cover,
-encoding, muxing, epochs, or pacing.
-
-Audio and subtitles deliberately remain outside the upscaled downlink. Muxing
-them into every epoch would complicate seek remuxing and duplicate a path mpv
-already handles correctly.
+The default/legacy pipeline remains video-only. When a server-file client opts
+in, a separate seekable auxiliary demuxer feeds original audio/subtitle packets
+through the same bounded epoch pipeline without decoding them; the finish
+thread stream-copies them into the fresh Matroska container. The auxiliary
+demuxer anchors seeks on the source video stream's keyframe cues
+while emitting only auxiliary packets. Matroska commonly does not index its
+audio stream, so using audio as the anchor can otherwise force a long linear
+scan before any post-seek video reaches the pipeline. Attachments remain
+embedded for old clients. Cache-capable desktop clients receive a sanitized
+hash manifest, download missing font objects through a session bearer token,
+verify them before atomic publication, and point libass at a per-session font
+view; cached epoch headers omit the bodies. Unsupported attachment types retain
+the embedded/external fallback. Relay seeks replace the whole container, so a
+confirmed muxed session does not need a seekable external demuxer. See
+[AUDIO_SIDECAR_PLAN.md](AUDIO_SIDECAR_PLAN.md).
 
 ## SMB and network shares
 
@@ -103,7 +119,8 @@ The application does not store SMB credentials and does not use ffmpeg's
 
 ## Remaining planned work: shared-mount mapping
 
-HTTP delivery is the only implemented original-track path for server files.
+HTTP delivery is the only implemented *external-file* original-track path for
+server files; negotiated clients normally use muxed auxiliary tracks instead.
 When both machines mount the same share under different roots, a future option
 can map one library-relative identity to each machine's local root, for example:
 

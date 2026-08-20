@@ -6,15 +6,19 @@ import shutil
 import socket
 import subprocess
 import sys
+from fractions import Fraction
 from pathlib import Path
 
 import aiohttp
 import av
+import numpy as np
 import pytest
 
 from relay_client_core import RelayClient, SessionConfig
+from relay_media import AuxiliaryTrack
 from relay_server.library import LibraryPathError, MediaLibrary
 from relay_server.server import RelayServer
+import relay_server.session as session_module
 from upscale_cli.encode import DEFAULT_LOSSLESS_HEVC_PROFILE
 
 
@@ -53,6 +57,55 @@ def library_file(tmp_path) -> tuple[Path, Path]:
     return library, target
 
 
+@pytest.fixture()
+def multitrack_library_file(tmp_path) -> tuple[Path, Path]:
+    """Short Matroska source with independently timestamped H.264 + AAC."""
+    library = tmp_path / "library"
+    target = library / "Shows" / "WithAudio.mkv"
+    target.parent.mkdir(parents=True)
+    fps = 30
+    sample_rate = 48_000
+    frames = 60
+    with av.open(str(target), "w") as container:
+        video = container.add_stream(
+            "libx264", rate=Fraction(fps, 1), options={"crf": "18", "preset": "fast"},
+        )
+        video.width = 320
+        video.height = 180
+        video.pix_fmt = "yuv420p"
+        audio = container.add_stream("aac", rate=sample_rate)
+        audio.layout = "stereo"
+        audio.metadata.update({"language": "jpn", "title": "Test tone"})
+        audio_samples = 0
+        for index in range(frames):
+            image = np.zeros((180, 320, 3), dtype=np.uint8)
+            image[..., index % 3] = (index * 7) % 255
+            frame = av.VideoFrame.from_ndarray(image, format="rgb24").reformat(format="yuv420p")
+            frame.pts = index
+            frame.time_base = Fraction(1, fps)
+            for packet in video.encode(frame):
+                container.mux(packet)
+
+            target_samples = (index + 1) * sample_rate // fps
+            while audio_samples < target_samples:
+                count = 1024
+                positions = np.arange(audio_samples, audio_samples + count, dtype=np.float32)
+                tone = (0.08 * np.sin(positions * (2 * np.pi * 440 / sample_rate))).astype(np.float32)
+                samples = np.stack((tone, tone))
+                audio_frame = av.AudioFrame.from_ndarray(samples, format="fltp", layout="stereo")
+                audio_frame.sample_rate = sample_rate
+                audio_frame.pts = audio_samples
+                audio_frame.time_base = Fraction(1, sample_rate)
+                for packet in audio.encode(audio_frame):
+                    container.mux(packet)
+                audio_samples += count
+        for packet in video.encode(None):
+            container.mux(packet)
+        for packet in audio.encode(None):
+            container.mux(packet)
+    return library, target
+
+
 def source_pts(path: Path) -> list[int]:
     with av.open(str(path)) as container:
         stream = container.streams.video[0]
@@ -70,6 +123,32 @@ def downlink_pts(packets, source_tb_den: int = 1000) -> list[int]:
             if packet.pts is not None:
                 result.append(round(float(packet.pts * stream.time_base) * source_tb_den))
     return sorted(result)
+
+
+def stream_packet_times(path_or_blob, stream_type: str) -> tuple[list[dict], list[float]]:
+    import io
+
+    source = io.BytesIO(path_or_blob) if isinstance(path_or_blob, bytes) else str(path_or_blob)
+    with av.open(source) as container:
+        streams = [stream for stream in container.streams if stream.type == stream_type]
+        descriptors = [
+            {
+                "codec": stream.codec_context.name,
+                # Matroska synthesizes DURATION at finalize time; it is not a
+                # source track identity field and changes with an epoch cut.
+                "metadata": {
+                    key: value for key, value in stream.metadata.items()
+                    if key.upper() != "DURATION"
+                },
+            }
+            for stream in streams
+        ]
+        times = sorted(
+            float(packet.pts * packet.time_base)
+            for packet in container.demux(streams)
+            if packet.pts is not None
+        )
+    return descriptors, times
 
 
 async def collect(client: RelayClient):
@@ -194,6 +273,8 @@ def test_capabilities_without_library_advertise_no_sort_keys():
         try:
             caps = await client.connect()
             assert caps["library"] is False
+            assert caps["muxed_aux_tracks"] is False
+            assert caps["attachment_cache"] == 0
             assert caps.get("library_sort", []) == []
         finally:
             await client.teardown()
@@ -212,6 +293,8 @@ def test_library_http_range_and_server_source_pts(library_file):
         try:
             caps = await client.connect()
             assert caps["library"] is True
+            assert caps["muxed_aux_tracks"] is True
+            assert caps["attachment_cache"] == 1
             assert caps["library_sort"] == ["name", "mtime"]
             assert caps["default_resize_algorithm"] == "lanczos"
             assert "area" in caps["resize_algorithms"]
@@ -283,6 +366,226 @@ def test_library_http_range_and_server_source_pts(library_file):
             await server.stop()
 
     asyncio.run(scenario())
+
+
+def test_server_source_muxes_original_audio_into_each_epoch(multitrack_library_file):
+    root, target = multitrack_library_file
+
+    async def scenario():
+        server = RelayServer(str(ROOT / "models"), free_port_pair(), library_root=str(root))
+        await server.start()
+        client = RelayClient("127.0.0.1", server.port)
+        try:
+            await client.connect()
+            session = await client.open_session(SessionConfig(
+                path="Shows/WithAudio.mkv", source="server_file", model="passthrough",
+                display_w=320, display_h=180, aux_tracks="muxed",
+            ))
+            assert session.aux_tracks == "muxed"
+            await client.attach_media()
+            await client.play()
+            packets = await collect(client)
+            blob = b"".join(packet.payload for packet in packets if packet.payload)
+
+            source_streams, source_audio = stream_packet_times(target, "audio")
+            output_streams, output_audio = stream_packet_times(blob, "audio")
+            assert output_streams == source_streams
+            assert len(output_audio) == len(source_audio)
+            assert output_audio[0] == pytest.approx(source_audio[0], abs=0.002)
+            assert output_audio[-1] == pytest.approx(source_audio[-1], abs=0.002)
+        finally:
+            await client.teardown()
+            await server.stop()
+
+    asyncio.run(scenario())
+
+
+def test_unmuxable_auxiliary_codec_confirms_external_fallback(library_file, monkeypatch):
+    root, _target = library_file
+
+    def unsupported(_path):
+        raise ValueError("matroska does not support this subtitle codec")
+
+    monkeypatch.setattr(session_module, "AuxiliaryTrack", unsupported)
+
+    async def scenario():
+        server = RelayServer(str(ROOT / "models"), free_port_pair(), library_root=str(root))
+        await server.start()
+        client = RelayClient("127.0.0.1", server.port)
+        try:
+            await client.connect()
+            session = await client.open_session(SessionConfig(
+                path="Shows/Sample.MKV", source="server_file", model="passthrough",
+                display_w=320, display_h=180, aux_tracks="muxed",
+            ))
+            assert session.aux_tracks == "external"
+            await client.attach_media()
+            await client.play()
+            assert (await collect(client))[-1].eos
+        finally:
+            await client.teardown()
+            await server.stop()
+
+    asyncio.run(scenario())
+
+
+def test_large_attachment_set_confirms_external_fallback(library_file, monkeypatch):
+    root, _target = library_file
+    instances = []
+
+    class FontHeavyAuxiliaryTrack:
+        attachment_bytes = session_module.MAX_MUXED_ATTACHMENT_BYTES + 1
+
+        def __init__(self, _path):
+            self.closed = False
+            instances.append(self)
+
+        def close(self):
+            self.closed = True
+
+    monkeypatch.setattr(session_module, "AuxiliaryTrack", FontHeavyAuxiliaryTrack)
+
+    async def scenario():
+        server = RelayServer(str(ROOT / "models"), free_port_pair(), library_root=str(root))
+        await server.start()
+        client = RelayClient("127.0.0.1", server.port)
+        try:
+            await client.connect()
+            session = await client.open_session(SessionConfig(
+                path="Shows/Sample.MKV", source="server_file", model="passthrough",
+                display_w=320, display_h=180, aux_tracks="muxed",
+            ))
+            assert session.aux_tracks == "external"
+            assert instances and instances[0].closed
+        finally:
+            await client.teardown()
+            await server.stop()
+
+    asyncio.run(scenario())
+
+
+def test_server_source_seek_restarts_muxed_audio_near_target(multitrack_library_file):
+    root, _target = multitrack_library_file
+
+    async def scenario():
+        server = RelayServer(str(ROOT / "models"), free_port_pair(), library_root=str(root))
+        await server.start()
+        client = RelayClient("127.0.0.1", server.port)
+        try:
+            await client.connect()
+            session = await client.open_session(SessionConfig(
+                path="Shows/WithAudio.mkv", source="server_file", model="passthrough",
+                display_w=320, display_h=180, aux_tracks="muxed",
+            ))
+            await client.attach_media()
+            await client.play()
+            await collect_some(client, 3)
+
+            target_s = 1.0
+            target_pts = int(target_s / float(session.time_base))
+            await client.seek(target_pts)
+            packets = await collect(client)
+            assert all(packet.epoch == 1 for packet in packets)
+            blob = b"".join(packet.payload for packet in packets if packet.payload)
+            _streams, audio_times = stream_packet_times(blob, "audio")
+            assert audio_times
+            assert target_s - 0.3 <= audio_times[0] <= target_s + 0.1
+            assert audio_times[-1] > target_s + 0.5
+        finally:
+            await client.teardown()
+            await server.stop()
+
+    asyncio.run(scenario())
+
+
+def test_auxiliary_seek_anchors_on_video_cues(multitrack_library_file):
+    _root, target = multitrack_library_file
+    track = AuxiliaryTrack(str(target))
+    try:
+        # Matroska usually has video-keyframe cues but no dense audio index.
+        # The auxiliary demuxer must use those cues even though it emits only
+        # the original audio/subtitle packets.
+        assert track._seek_stream.type == "video"
+        first = next(track.packets(1.0))
+        assert first.packet.stream.type == "audio"
+        assert 0.7 <= first.order_s <= 1.1
+    finally:
+        track.close()
+
+
+def test_qt_headless_mpv_reads_muxed_audio_without_external_file(
+    multitrack_library_file, monkeypatch,
+):
+    """Exercise the real Qt/libmpv client, not only the fake GUI adapter."""
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    pytest.importorskip("PySide6")
+    pytest.importorskip("qasync")
+    root, _target = multitrack_library_file
+
+    async def scenario():
+        from PySide6.QtWidgets import QApplication
+
+        from desktop_client.mpv_view import MpvPlayerView
+        from desktop_client.options import DesktopOptions
+
+        app = QApplication.instance() or QApplication([])
+        server = RelayServer(str(ROOT / "models"), free_port_pair(), library_root=str(root))
+        await server.start()
+        client = RelayClient("127.0.0.1", server.port)
+        player = None
+        try:
+            await client.connect()
+            session = await client.open_session(SessionConfig(
+                path="Shows/WithAudio.mkv", source="server_file", model="passthrough",
+                display_w=320, display_h=180, aux_tracks="muxed",
+            ))
+            await client.attach_media()
+            await client.play()
+            packets = await collect(client)
+
+            queue = asyncio.Queue()
+            for packet in packets:
+                queue.put_nowait(packet)
+            player = MpvPlayerView(options=DesktopOptions(
+                headless=True, no_hwdec=True, settings_scope="test-muxed-audio-mpv",
+            ))
+            player.start(
+                session, queue, session.time_base,
+                source_path=None, avg_rate=session.avg_rate,
+            )
+            deadline = asyncio.get_running_loop().time() + 10.0
+            audio_seen = False
+            while asyncio.get_running_loop().time() < deadline:
+                try:
+                    tracks = player.mpv.track_list or []
+                    audio_seen = any(track.get("type") == "audio" for track in tracks)
+                except Exception:
+                    audio_seen = False
+                if audio_seen:
+                    break
+                app.processEvents()
+                await asyncio.sleep(0.05)
+            assert audio_seen
+            assert player._source_path is None
+        finally:
+            if player is not None:
+                player.stop()
+                player.mpv.terminate()
+            await client.teardown()
+            await server.stop()
+
+    # LuaJIT uses a caught Windows SEH exception internally. Pytest's global
+    # faulthandler prints it as a fatal stack dump even though mpv continues
+    # normally (the repository hard rules document code 0xe24c4a02 as noise).
+    import faulthandler
+
+    restore_faulthandler = faulthandler.is_enabled()
+    faulthandler.disable()
+    try:
+        asyncio.run(scenario())
+    finally:
+        if restore_faulthandler:
+            faulthandler.enable()
 
 
 def test_open_ended_range_streams_a_file_over_two_gibibytes(tmp_path):

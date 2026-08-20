@@ -24,6 +24,7 @@ import threading
 import time
 from dataclasses import dataclass
 from fractions import Fraction
+from pathlib import Path
 from urllib.parse import quote
 
 import aiohttp
@@ -40,6 +41,7 @@ from relay_protocol import (
 )
 
 from .demux import VideoTrack
+from .attachments import materialize_attachment_cache, remove_attachment_view
 
 log = logging.getLogger("relay.client")
 
@@ -58,6 +60,32 @@ _DOWNLINK_SOCKET_BUFFER = 4 * 1024 * 1024
 # out while a silent one still fails within this window. Against a server
 # without keepalives this degrades to the old fixed 240 s timeout.
 OPEN_SESSION_TIMEOUT_S = 240.0
+TEARDOWN_TIMEOUT_S = 30.0
+
+
+class TeardownNotConfirmedError(RuntimeError):
+    """The client closed locally without the server's native-release barrier."""
+
+
+def _take_downlink_batch(
+    batch: list[MediaPacket | None], pkt: MediaPacket, current_epoch: int,
+) -> list[MediaPacket | None] | None:
+    """Route one packet, publishing epoch boundaries without qasync delay."""
+    if batch and batch[0] is not None and batch[0].epoch < current_epoch:
+        batch.clear()
+    if pkt.epoch < current_epoch:
+        return None
+    if pkt.discontinuity:
+        # A new epoch must never sit behind a stale partial batch. Publishing
+        # this one packet costs exactly one extra event-loop wakeup per epoch.
+        batch.clear()
+        return [pkt]
+    batch.append(pkt)
+    if len(batch) >= _DOWNLINK_BATCH or pkt.eos:
+        ready = list(batch)
+        batch.clear()
+        return ready
+    return None
 
 
 class _ThreadBridgeQueue:
@@ -149,6 +177,13 @@ class SessionConfig:
     source: str = "uplink"
     # None asks the server to use its configured default.
     resize_algorithm: str | None = None
+    # Server-library sessions can ask a capable server to stream-copy original
+    # audio/subtitle tracks into each epoch's Matroska downlink. "external"
+    # retains the /media attachment path used by older clients and servers.
+    aux_tracks: str = "external"
+    # "cached" asks a capable server to omit immutable font bodies from each
+    # epoch and expose a verified content-addressed manifest instead.
+    aux_attachments: str = "embedded"
 
 
 @dataclass
@@ -171,6 +206,10 @@ class SessionInfo:
     # Wire-format chapter dicts ({start_s, end_s?, title?}), sorted by start_s;
     # None when the source has none (docs/PROTOCOL.md session_opened).
     chapters: list[dict] | None = None
+    aux_tracks: str = "external"
+    aux_attachments: str = "embedded"
+    attachment_manifest: list[dict] | None = None
+    attachment_token: str | None = None
 
 
 class RelayClient:
@@ -182,6 +221,7 @@ class RelayClient:
         self._ws: aiohttp.ClientWebSocketResponse | None = None
         self.capabilities: dict | None = None
         self.session: SessionInfo | None = None
+        self._has_server_session = False
         self.track: VideoTrack | None = None
         self.epoch = 0
         self.state = "idle"
@@ -207,6 +247,7 @@ class RelayClient:
         self.on_progress = None
         self.on_seek_progress = None
         self._last_activity = time.monotonic()
+        self._attachment_view_dir: Path | None = None
 
     # -- control channel -------------------------------------------------------
 
@@ -231,7 +272,13 @@ class RelayClient:
         self._last_activity = time.monotonic()
         await self._send(type_, **fields)
         if not keepalive:
-            return await asyncio.wait_for(fut, timeout=timeout)
+            try:
+                return await asyncio.wait_for(fut, timeout=timeout)
+            except BaseException:
+                if self._pending.get(expect) is fut:
+                    del self._pending[expect]
+                fut.cancel()
+                raise
         # Inactivity deadline: session_progress keepalives push it out, so a
         # server that is visibly working (TensorRT engine build) never times
         # out while a silent one still fails within ``timeout``.
@@ -254,48 +301,64 @@ class RelayClient:
 
     async def _control_reader(self) -> None:
         assert self._ws is not None
-        async for raw in self._ws:
-            if raw.type != aiohttp.WSMsgType.TEXT:
-                continue
-            msg = json.loads(raw.data)
-            mtype = msg.get("type")
-            if mtype == "session_progress":
-                self._last_activity = time.monotonic()
-                if self.on_progress is not None:
-                    try:
-                        self.on_progress(msg)
-                    except Exception:
-                        log.exception("on_progress callback failed")
-                continue
-            if mtype == "seek_progress":
-                # Purely informational: seek_ready already acked the epoch, so
-                # this never resolves a pending request.
-                if self.on_seek_progress is not None:
-                    try:
-                        self.on_seek_progress(msg)
-                    except Exception:
-                        log.exception("on_seek_progress callback failed")
-                continue
-            if mtype == "state":
-                self.state = msg["state"]
-            elif mtype == "error":
-                log.warning("server error: %s", msg)
-                self.errors.append(msg)
-                # Requests are sequential; an error while any request is
-                # pending is that request's answer — fail it immediately.
-                for fut in self._pending.values():
-                    if not fut.done():
-                        fut.set_exception(
-                            RuntimeError(f"{msg.get('code')}: {msg.get('message', '')}")
-                        )
-                self._pending.clear()
-            fut = self._pending.pop(mtype, None)
-            if fut is not None and not fut.done():
-                fut.set_result(msg)
+        try:
+            async for raw in self._ws:
+                if raw.type != aiohttp.WSMsgType.TEXT:
+                    continue
+                msg = json.loads(raw.data)
+                mtype = msg.get("type")
+                if mtype == "session_progress":
+                    self._last_activity = time.monotonic()
+                    if self.on_progress is not None:
+                        try:
+                            self.on_progress(msg)
+                        except Exception:
+                            log.exception("on_progress callback failed")
+                    continue
+                if mtype == "seek_progress":
+                    # Purely informational: seek_ready already acked the epoch, so
+                    # this never resolves a pending request.
+                    if self.on_seek_progress is not None:
+                        try:
+                            self.on_seek_progress(msg)
+                        except Exception:
+                            log.exception("on_seek_progress callback failed")
+                    continue
+                if mtype == "state":
+                    self.state = msg["state"]
+                elif mtype == "error":
+                    log.warning("server error: %s", msg)
+                    self.errors.append(msg)
+                    # Requests are sequential; an error while any request is
+                    # pending is that request's answer — fail it immediately.
+                    for fut in self._pending.values():
+                        if not fut.done():
+                            fut.set_exception(
+                                RuntimeError(f"{msg.get('code')}: {msg.get('message', '')}")
+                            )
+                    self._pending.clear()
+                fut = self._pending.pop(mtype, None)
+                if fut is not None and not fut.done():
+                    fut.set_result(msg)
+        finally:
+            # Wake a teardown/open/seek request immediately when the control
+            # connection disappears instead of stranding it until timeout.
+            for fut in self._pending.values():
+                if not fut.done():
+                    fut.set_exception(ConnectionError("control connection closed"))
+            self._pending.clear()
 
     async def open_session(self, cfg: SessionConfig) -> SessionInfo:
         if cfg.source not in ("uplink", "server_file"):
             raise ValueError(f"unknown session source: {cfg.source}")
+        if cfg.aux_tracks not in ("external", "muxed"):
+            raise ValueError(f"unknown auxiliary-track mode: {cfg.aux_tracks}")
+        if cfg.source != "server_file" and cfg.aux_tracks != "external":
+            raise ValueError("muxed auxiliary tracks require a server_file session")
+        if cfg.aux_attachments not in ("embedded", "cached"):
+            raise ValueError(f"unknown auxiliary attachment mode: {cfg.aux_attachments}")
+        if cfg.aux_attachments == "cached" and cfg.aux_tracks != "muxed":
+            raise ValueError("cached attachments require muxed auxiliary tracks")
         self.track = VideoTrack(cfg.path) if cfg.source == "uplink" else None
         video = self.track.open_session_video_dict() if self.track else None
         duration_s = self.track.duration_seconds() if self.track else None
@@ -317,12 +380,15 @@ class RelayClient:
             "quality_tier": cfg.quality_tier,
             "display": {"w": cfg.display_w, "h": cfg.display_h},
             "fit_mode": cfg.fit_mode,
+            "aux_tracks": cfg.aux_tracks,
+            "aux_attachments": cfg.aux_attachments,
         }
         if cfg.resize_algorithm is not None:
             fields["resize_algorithm"] = cfg.resize_algorithm
         if video is not None:
             fields["video"] = video
         try:
+            self._has_server_session = True
             msg = await self._request(
                 "session_opened", "open_session",
                 timeout=OPEN_SESSION_TIMEOUT_S, keepalive=True, **fields,
@@ -351,8 +417,31 @@ class RelayClient:
             fit_mode=msg.get("fit_mode", cfg.fit_mode),
             resize_algorithm=msg.get("resize_algorithm", cfg.resize_algorithm),
             chapters=msg.get("chapters") or None,
+            aux_tracks=msg.get("aux_tracks", "external"),
+            aux_attachments=msg.get("aux_attachments", "embedded"),
+            attachment_manifest=msg.get("attachment_manifest") or None,
+            attachment_token=msg.get("attachment_token"),
         )
         return self.session
+
+    async def prepare_attachments(self, cache_root: Path) -> Path | None:
+        """Materialize negotiated cached fonts before mpv loads the epoch."""
+        session = self.session
+        if session is None or session.aux_attachments != "cached":
+            return None
+        token = session.attachment_token
+        if not token:
+            raise RuntimeError("cached attachment session omitted its token")
+        await remove_attachment_view(self._attachment_view_dir)
+        self._attachment_view_dir = await materialize_attachment_cache(
+            self._http,
+            f"http://{self.host}:{self.port}",
+            session.session_id,
+            session.attachment_manifest or [],
+            token,
+            Path(cache_root),
+        )
+        return self._attachment_view_dir
 
     async def fetch_library_page(
         self, path: str = "", *, cursor: str | None = None, limit: int = 100,
@@ -505,16 +594,10 @@ class RelayClient:
                 with self._downlink_stats_lock:
                     self._downlink_bytes_total += len(pkt.payload)
                     self._downlink_packets_total += 1
-                epoch = self.epoch
-                if batch and batch[0] is not None and batch[0].epoch < epoch:
-                    batch.clear()
-                if pkt.epoch < epoch:
-                    continue
-                batch.append(pkt)
-                if len(batch) >= _DOWNLINK_BATCH or pkt.eos:
-                    if not self._down_q.put_batch_from_thread(batch):
+                ready_batch = _take_downlink_batch(batch, pkt, self.epoch)
+                if ready_batch is not None:
+                    if not self._down_q.put_batch_from_thread(ready_batch):
                         return
-                    batch = []
         except (EOFError, OSError, ConnectionError, RuntimeError) as err:
             if not ready:
                 try:
@@ -615,13 +698,27 @@ class RelayClient:
         for task in (self._uplink_task, getattr(self, "_report_task", None)):
             if task is not None:
                 task.cancel()
-        if self._ws is not None and not self._ws.closed:
+        barrier_error: BaseException | None = None
+        if self._has_server_session and self._ws is not None and not self._ws.closed:
             try:
-                await self._send("teardown")
-                await asyncio.sleep(0.1)
-            except (ConnectionResetError, RuntimeError):
-                pass
-        await self.close()
+                await self._request(
+                    "closed", "teardown", timeout=TEARDOWN_TIMEOUT_S,
+                )
+            except (asyncio.TimeoutError, ConnectionError, ConnectionResetError,
+                    RuntimeError) as err:
+                barrier_error = err
+        elif self._has_server_session:
+            barrier_error = ConnectionError(
+                "control connection was already closed before teardown"
+            )
+        try:
+            await self.close()
+        finally:
+            if barrier_error is not None:
+                raise TeardownNotConfirmedError(
+                    "server did not confirm native session resource release; "
+                    "do not open a replacement session until the server is checked"
+                ) from barrier_error
 
     async def close(self) -> None:
         tasks = [t for t in (self._uplink_task, self._reader_task,
@@ -642,4 +739,6 @@ class RelayClient:
             self.track.close()
         if self._ws is not None:
             await self._ws.close()
+        await remove_attachment_view(self._attachment_view_dir)
+        self._attachment_view_dir = None
         await self._http.close()
