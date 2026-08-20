@@ -15,6 +15,7 @@ import numpy as np
 import pytest
 
 from relay_client_core import RelayClient, SessionConfig
+from relay_media import AuxiliaryTrack
 from relay_server.library import LibraryPathError, MediaLibrary
 from relay_server.server import RelayServer
 import relay_server.session as session_module
@@ -495,6 +496,21 @@ def test_server_source_seek_restarts_muxed_audio_near_target(multitrack_library_
             await server.stop()
 
     asyncio.run(scenario())
+
+
+def test_auxiliary_seek_anchors_on_video_cues(multitrack_library_file):
+    _root, target = multitrack_library_file
+    track = AuxiliaryTrack(str(target))
+    try:
+        # Matroska usually has video-keyframe cues but no dense audio index.
+        # The auxiliary demuxer must use those cues even though it emits only
+        # the original audio/subtitle packets.
+        assert track._seek_stream.type == "video"
+        first = next(track.packets(1.0))
+        assert first.packet.stream.type == "audio"
+        assert 0.7 <= first.order_s <= 1.1
+    finally:
+        track.close()
 
 
 def test_qt_headless_mpv_reads_muxed_audio_without_external_file(

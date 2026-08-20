@@ -229,6 +229,15 @@ class AuxiliaryTrack:
             stream for stream in self._container.streams
             if stream.type in ("audio", "subtitle")
         ]
+        # Matroska normally indexes video keyframes, not every audio packet.
+        # Seeking this auxiliary-only demuxer against an audio stream can make
+        # libav scan from a much earlier cue before packets() yields anything
+        # (7 s on a real 23-minute anime file).  Anchor on the video's cue
+        # index while still asking demux() for audio/subtitle packets only.
+        self._seek_stream = next(
+            iter(self._container.streams.video),
+            next((stream for stream in self._streams if stream.type == "audio"), None),
+        )
         raw_attachments = list(self._container.streams.attachments)
         self.attachments = self._cached_attachment_info(path, raw_attachments)
         self.attachment_bytes = sum(attachment.size for attachment in self.attachments)
@@ -348,18 +357,14 @@ class AuxiliaryTrack:
             if self._iter_gen != gen:
                 return
             if target_s is not None:
-                # Anchor mixed demux on a dense audio index when available.
-                # With no stream, libav may choose a sparse subtitle index and
-                # next(iterator) then walks minutes of subtitle packets before
-                # the timestamp merge can emit the first post-seek video.
-                audio = next(
-                    (stream for stream in self._streams if stream.type == "audio"),
-                    None,
-                )
-                if audio is not None and audio.time_base is not None:
+                # Always name an indexed anchor: omitting the stream lets
+                # libav choose a sparse subtitle index, while naming audio is
+                # also slow for Matroska files whose cues index video only.
+                anchor = self._seek_stream
+                if anchor is not None and anchor.time_base is not None:
                     self._container.seek(
-                        max(0, int(target_s / float(audio.time_base))),
-                        stream=audio,
+                        max(0, int(target_s / float(anchor.time_base))),
+                        stream=anchor,
                         backward=True,
                         any_frame=False,
                     )

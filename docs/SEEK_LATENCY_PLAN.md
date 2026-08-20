@@ -4,11 +4,11 @@ Far seeks took about twenty seconds to show a frame on the Android client.
 This document records the original field measurement, the server-side profile
 that followed it, and what changed as a result.
 
-**Status:** step 1 (instrumentation) is done and the server-side gap is now
-attributed with real numbers. Step 2 (emit from the keyframe) is implemented
-behind `--seek-discard-max-s`, off by default. Step 4 (`seek_progress`) is
-done. Step 3 was measured and rejected. What remains unexplained is
-client-side, not server-side — see [What is still open](#what-is-still-open).
+**Status:** instrumentation and progress reporting are done. Accurate seek
+latency is normally bounded by the source GOP's decode time; optional
+keyframe-fast mode remains available behind `--seek-discard-max-s`. A later
+muxed-auxiliary regression was separately measured and fixed by seeking its
+demuxer against Matroska's video cues (see the 2026-08-19 result below).
 
 ## Measured behaviour (client, 2026-07-22)
 
@@ -201,3 +201,29 @@ Reproduce any of this with `/status → sessions[].pipeline.last_seek`, or the
 `relay.pipeline` seek log line, on a real client seek. For the client half,
 `msg-level=all=v` in the Android player engine prints `refresh seek to <pts>`
 per external demuxer, which is what made this visible.
+
+## Muxed auxiliary seek regression — resolved server-side (2026-08-19)
+
+The Linux UI later showed a 7.88 s seek on a server-hosted 23-minute Matroska
+file even though `/status` reported a 0.771 s keyframe gap and only 254 ms of
+decoder work. The same target reached the UI in 0.82 s when auxiliary tracks
+were switched to the external path. Server timings made the split explicit:
+
+| Auxiliary mode | First surviving frame | First output packet | UI position |
+|---|---:|---:|---:|
+| muxed (before) | 7092 ms | 7095 ms | 7882 ms |
+| external control | 277 ms | 601 ms | 821 ms |
+
+The delay was in `AuxiliaryTrack`: its second input container sought against
+the audio stream. Matroska commonly cues video keyframes rather than every
+audio packet, so libav could scan forward through minutes of auxiliary packets
+before the 16-item timestamp merge returned its first batch to the decoder.
+`AuxiliaryTrack` now seeks against the source video's indexed keyframe stream
+but continues to demux and emit only audio/subtitle packets. This preserves
+exact target filtering and codec preroll without changing the protocol or
+falling back from muxed auxiliary tracks.
+
+A direct PyAV range-read against the live server's `/media` endpoint at the
+same 783.554 s target measured the seek call itself at **13.085 s with the
+audio anchor versus 0.057 s with the video anchor**. The first usable
+auxiliary packet was available after 0.091 s on the corrected path.

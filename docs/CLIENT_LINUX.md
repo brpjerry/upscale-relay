@@ -29,6 +29,14 @@ your GPU's VA-API/NVDEC userspace:
 
 FFV1 has no hardware decoder on any platform — it always decodes on the CPU.
 
+The embedded Qt/OpenGL player uses mpv's safe copy-back hardware decode mode on
+Linux. In particular, it overrides `hwdec=vaapi` from a user's `mpv.conf` with
+`auto-copy-safe`: a captured Intel iHD crash landed in
+`paintGL → mpv_render_context_render → vaSyncSurface` when the zero-copy VA-API
+surface was retired during live playback. Decode still runs on the GPU; only
+the decoded frame is copied before Qt renders it. Use `--no-hwdec` to disable
+hardware decode completely.
+
 ## 2. Get the code onto the laptop
 
 Clone or pull the repository normally. To copy an existing working tree from

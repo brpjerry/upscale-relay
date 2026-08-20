@@ -86,7 +86,11 @@ server-source PTS equivalence, seeks, capability-driven UI, and media URLs.
 The default/legacy pipeline remains video-only. When a server-file client opts
 in, a separate seekable auxiliary demuxer feeds original audio/subtitle packets
 through the same bounded epoch pipeline without decoding them; the finish
-thread stream-copies them into the fresh Matroska container. Attachments remain
+thread stream-copies them into the fresh Matroska container. The auxiliary
+demuxer anchors seeks on the source video stream's keyframe cues
+while emitting only auxiliary packets. Matroska commonly does not index its
+audio stream, so using audio as the anchor can otherwise force a long linear
+scan before any post-seek video reaches the pipeline. Attachments remain
 embedded for old clients. Cache-capable desktop clients receive a sanitized
 hash manifest, download missing font objects through a session bearer token,
 verify them before atomic publication, and point libass at a per-session font

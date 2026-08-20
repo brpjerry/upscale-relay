@@ -17,6 +17,7 @@ from collections import deque
 from ctypes import c_void_p
 import os
 import socket
+import sys
 import threading
 import time
 from fractions import Fraction
@@ -44,6 +45,21 @@ mpv = _load_mpv()
 # Start with a half-second mpv reserve once the first cluster is decodable.
 # Cache pause remains enabled for recovery; this only reduces its initial wait.
 CACHE_PAUSE_WAIT_S = 0.5
+
+
+def _render_hwdec_mode(no_hwdec: bool, platform: str | None = None) -> str:
+    """Return the hardware decode mode safe for the embedded render path.
+
+    Intel's zero-copy VA-API path can let Qt paint a surface while iHD is
+    retiring it during a live-stream transition.  The captured crash was
+    paintGL -> mpv_render_context_render -> vaSyncSurface -> iHD.  Copy-back
+    keeps hardware decode but gives the render API an ordinary software frame.
+    Other platforms retain mpv's safe automatic selection.
+    """
+    if no_hwdec:
+        return "no"
+    platform = platform or sys.platform
+    return "auto-copy-safe" if platform.startswith("linux") else "auto-safe"
 
 
 def _native_display_params(app=None) -> dict[str, c_void_p]:
@@ -348,13 +364,11 @@ class MpvPlayerView(QOpenGLWidget):
                 # and made `start=<target>` seek beyond the data (freeze).
                 "rebase_start_time": "no",
             }
-            # Hardware decode (NVDEC/D3D11 on Windows, VAAPI on Linux) for the
-            # HEVC tiers; FFV1 has no hw decoder and mpv falls back silently.
-            # The earlier hwdec crash was an OSC(LuaJIT)-reload interaction —
-            # with the OSC off, seek batteries run clean with hwdec on.
-            # --no-hwdec disables.
-            if not self.options.no_hwdec:
-                extra["hwdec"] = "auto-safe"
+            # Hardware decode for the HEVC tiers; FFV1 has no hw decoder and
+            # mpv falls back silently. Linux uses copy-back: an actual core
+            # captured Intel iHD crashing in vaSyncSurface from paintGL when a
+            # user's mpv.conf forced zero-copy hwdec=vaapi. --no-hwdec disables.
+            extra["hwdec"] = _render_hwdec_mode(self.options.no_hwdec)
             # OSC is OFF by default: it's a LuaJIT script that re-initializes
             # on every stream reload (seek), and that path intermittently
             # crashed mpv's event thread (native AV, exception 0xe24c4a02 =
@@ -382,8 +396,10 @@ class MpvPlayerView(QOpenGLWidget):
         if "config" in extra:
             # mpv.conf won over any constructor option it named; re-assert
             # the plumbing the relay breaks without (runtime sets beat the
-            # config file). User prefs — hwdec, shaders, volume, subtitle
-            # style, screenshots — stand.
+            # config file). User prefs — shaders, volume, subtitle style,
+            # screenshots — stand. hwdec is relay plumbing on the embedded
+            # Linux render path: zero-copy VA-API can expose retired surfaces
+            # to Qt's paintGL, so reassert the safe copy-back mode below.
             self.mpv.vo = "libmpv"  # render API; a conf vo= would pop a window
             self.mpv.rebase_start_time = False  # docs/PROTOCOL.md PTS semantics
             self.mpv.keep_open = False
@@ -394,8 +410,7 @@ class MpvPlayerView(QOpenGLWidget):
             self.mpv.demuxer_readahead_secs = 15  # ~200 Mbps lossless tiers
             self.mpv.demuxer_max_bytes = "768MiB"
             self.mpv.demuxer_max_back_bytes = 0
-            if self.options.no_hwdec:
-                self.mpv.hwdec = "no"
+            self.mpv.hwdec = _render_hwdec_mode(self.options.no_hwdec)
             if not self.options.mpv_osc:
                 self.mpv.osc = False
         self._buffer: _LoopbackStream | None = None
