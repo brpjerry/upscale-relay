@@ -18,7 +18,7 @@ contract and [SERVER_LIBRARY.md](SERVER_LIBRARY.md) for server-hosted media.
 | Streaming server and protocol | **Implemented** | aiohttp WebSocket control, framed TCP media, sessions, seeks/epochs, Matroska downlink, pacing, and `/status` |
 | Desktop client | **Implemented** | PySide6/qasync UI, local browser, embedded libmpv, uplink, playback, seek, audio/subtitle track and delay controls, quality/model controls, and local fallback |
 | Lossless playback path | **Implemented** | blocking downlink receiver plus native localhost `tcp://` handoff to mpv; avoids qasync and python-mpv callback throughput ceilings |
-| Server-side media library | **Implemented** | `--library`, sandboxed listing and Range compatibility delivery, server demux/seek, capability-driven Server tab, negotiated in-band audio/subtitles, and cached subtitle fonts |
+| Server-side media library | **Implemented** | Repeatable `--library`, sandboxed single/multi-root listing and Range compatibility delivery, server demux/seek, capability-driven Server tab, negotiated in-band audio/subtitles, and cached subtitle fonts |
 | Server-side framing and resize filters | **Implemented** | Fit preserves the full frame; Cover center-crops before encode; the final post-ONNX downscale is selectable per server or session |
 | Shared-mount path mapping | **Planned** | Negotiated clients use muxed tracks; mapping one relative path to different client/server mount roots for legacy/external or direct-access workflows is not implemented |
 | Polish phase | **Partial** | model discovery/picker, metrics, manual host configuration, mounted shares, and fallback exist; discovery, pairing, hot model reload, and reconnect/resume remain |
@@ -117,7 +117,7 @@ one downlink attachment. Server-library sessions omit the uplink attachment.
 - Server-wide lossless-HEVC experiment profiles spanning low-delay NVENC,
   long-GOP NVENC, and x265 software encoding. These remain server flags until
   device testing identifies profiles worth exposing through the protocol.
-- Optional sandboxed server library from local, UNC, or mounted paths. See
+- Optional sandboxed server library from one or more local, UNC, or mounted paths. See
   [SERVER_LIBRARY.md](SERVER_LIBRARY.md).
 
 Server-side NVDEC remains opt-in through `RELAY_NVDEC=1`: concurrent NVDEC and
@@ -198,7 +198,7 @@ features.
 
 ### Server-side library extension: implemented
 
-This post-MVP extension supports server-hosted media through `--library`,
+This post-MVP extension supports server-hosted media through repeatable `--library`,
 including negotiated muxed original tracks, cached subtitle fonts, Range
 fallback for legacy clients, and the desktop Server tab. Only shared-mount
 path mapping remains planned; see

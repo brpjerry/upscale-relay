@@ -89,7 +89,7 @@ def settings():
     # Start every test from a known state regardless of prior runs.
     s.ep = "auto"
     s.port = 8590
-    s.library_dir = ""
+    s.library_dirs = []
     s.models_dir = "models"
     s.mdns = True
     s.file_logging = True
@@ -100,7 +100,7 @@ def test_settings_roundtrip(settings):
     provider = next((choice for choice in EP_CHOICES if choice != "auto"), "auto")
     settings.ep = provider
     settings.port = 9001
-    settings.library_dir = "D:/media"
+    settings.library_dirs = ["D:/media", "E:/shows"]
     settings.models_dir = "D:/models"
     settings.mdns = False
     settings.file_logging = False
@@ -108,10 +108,26 @@ def test_settings_roundtrip(settings):
     fresh = ServerSettings(scope="test-server-tray")
     assert fresh.ep == provider
     assert fresh.port == 9001
+    assert fresh.library_dirs == ["D:/media", "E:/shows"]
     assert fresh.library_dir == "D:/media"
     assert fresh.models_dir == "D:/models"
     assert fresh.mdns is False
     assert fresh.file_logging is False
+
+
+def test_settings_migrates_legacy_single_library_value():
+    settings = ServerSettings(scope="test-server-tray-legacy-library")
+    settings._qs.remove("server/library_dirs")
+    settings._qs.setValue("server/library_dir", "D:/legacy-media")
+
+    fresh = ServerSettings(scope="test-server-tray-legacy-library")
+    assert fresh.library_dirs == ["D:/legacy-media"]
+
+    fresh.library_dirs = ["D:/movies", "E:/shows"]
+    assert fresh._qs.value("server/library_dir", None) is None
+    assert ServerSettings(scope="test-server-tray-legacy-library").library_dirs == [
+        "D:/movies", "E:/shows",
+    ]
 
 
 def test_settings_reject_unknown_ep(settings):
@@ -229,13 +245,16 @@ def test_config_dialog_load_and_apply_persists(app, settings):
     provider = next((choice for choice in EP_CHOICES if choice != "auto"), "auto")
     settings.ep = provider
     settings.port = 8600
-    settings.library_dir = "C:/lib"
+    settings.library_dirs = ["C:/lib", "D:/shows"]
 
     dialog = ConfigDialog(settings)
     try:
         assert dialog.ep_combo.currentText() == provider
         assert dialog.port_spin.value() == 8600
-        assert dialog.library_edit.text() == "C:/lib"
+        assert [
+            dialog.library_list.item(index).text()
+            for index in range(dialog.library_list.count())
+        ] == ["C:/lib", "D:/shows"]
         assert dialog.logging_check.isChecked()
 
         applied = []
@@ -246,7 +265,8 @@ def test_config_dialog_load_and_apply_persists(app, settings):
         )
         dialog.ep_combo.setCurrentText(applied_provider)
         dialog.port_spin.setValue(8700)
-        dialog.library_edit.setText("C:/other")
+        dialog.library_list.clear()
+        dialog.library_list.addItems(["C:/other", "E:/movies"])
         dialog.models_edit.setText("C:/models")
         dialog.logging_check.setChecked(False)
         dialog._on_apply()
@@ -255,9 +275,33 @@ def test_config_dialog_load_and_apply_persists(app, settings):
         fresh = ServerSettings(scope="test-server-tray")
         assert fresh.ep == applied_provider
         assert fresh.port == 8700
-        assert fresh.library_dir == "C:/other"
+        assert fresh.library_dirs == ["C:/other", "E:/movies"]
         assert fresh.models_dir == "C:/models"
         assert fresh.file_logging is False
+    finally:
+        dialog.deleteLater()
+
+
+def test_config_dialog_adds_and_removes_library_folders(app, settings, monkeypatch):
+    dialog = ConfigDialog(settings)
+    try:
+        choices = iter(["C:/movies", "D:/shows", "C:/movies"])
+        monkeypatch.setattr(
+            "relay_server.tray.QFileDialog.getExistingDirectory",
+            lambda *_args: next(choices),
+        )
+        dialog._add_library_folder()
+        dialog._add_library_folder()
+        dialog._add_library_folder()  # duplicate is ignored
+        assert [
+            dialog.library_list.item(index).text()
+            for index in range(dialog.library_list.count())
+        ] == ["C:/movies", "D:/shows"]
+
+        dialog.library_list.item(0).setSelected(True)
+        dialog._remove_library_folders()
+        assert dialog.library_list.count() == 1
+        assert dialog.library_list.item(0).text() == "D:/shows"
     finally:
         dialog.deleteLater()
 
@@ -265,6 +309,12 @@ def test_config_dialog_load_and_apply_persists(app, settings):
 def test_controller_start_stop_binds_and_releases_port(app, settings, tmp_path):
     settings.models_dir = str(tmp_path)  # empty models dir is fine
     settings.port = free_port_pair()
+    settings.mdns = False  # Keep this listener/config test independent of LAN name collisions.
+    first_library = tmp_path / "movies"
+    second_library = tmp_path / "shows"
+    first_library.mkdir()
+    second_library.mkdir()
+    settings.library_dirs = [str(first_library), str(second_library)]
     controller = ServerController(settings)
     events = []
     callback = events.append
@@ -274,6 +324,9 @@ def test_controller_start_stop_binds_and_releases_port(app, settings, tmp_path):
         await controller.start()
         assert controller.running
         assert controller.server.stats_interval == 2.0
+        assert controller.server.library.roots == (
+            first_library.resolve(), second_library.resolve(),
+        )
         # Connection/playback events must reach the tray callback on every
         # (re)started instance.
         assert controller.server.event_callback is callback

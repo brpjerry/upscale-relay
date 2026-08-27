@@ -17,7 +17,7 @@ import pytest
 from relay_client_core import RelayClient, SessionConfig
 from relay_media import AuxiliaryTrack
 from relay_server.library import LibraryPathError, MediaLibrary
-from relay_server.server import RelayServer
+from relay_server.server import RelayServer, build_arg_parser
 import relay_server.session as session_module
 from upscale_cli.encode import DEFAULT_LOSSLESS_HEVC_PROFILE
 
@@ -193,6 +193,61 @@ def test_library_pages_and_path_sandbox(library_file, tmp_path):
         library.resolve_file("ignore.txt")
 
 
+def test_multiple_library_roots_are_virtual_top_level_directories(tmp_path):
+    movies = tmp_path / "Movies"
+    shows = tmp_path / "Shows"
+    movies.mkdir()
+    shows.mkdir()
+    movie = movies / "Movie.mkv"
+    episode = shows / "Episode.mkv"
+    movie.write_bytes(b"movie")
+    episode.write_bytes(b"episode")
+
+    library = MediaLibrary([movies, shows])
+    root_page, cursor = library.page()
+    assert cursor is None
+    assert root_page == {
+        "type": "directory", "name": "Libraries", "path": "",
+        "children": [
+            {"type": "directory", "name": "Movies", "path": "Movies", "children": []},
+            {"type": "directory", "name": "Shows", "path": "Shows", "children": []},
+        ],
+    }
+    movies_page, cursor = library.page("Movies")
+    assert cursor is None
+    assert movies_page["children"] == [
+        {"type": "file", "name": "Movie.mkv", "path": "Movies/Movie.mkv"}
+    ]
+    assert library.resolve_file("Movies/Movie.mkv") == movie.resolve()
+    assert library.resolve_file("Shows/Episode.mkv") == episode.resolve()
+    with pytest.raises(LibraryPathError):
+        library.resolve_file("Movie.mkv")
+    with pytest.raises(LibraryPathError):
+        library.resolve_file("Movies/../Shows/Episode.mkv")
+
+
+def test_multiple_library_roots_disambiguate_duplicate_folder_names(tmp_path):
+    first = tmp_path / "one" / "Videos"
+    second = tmp_path / "two" / "Videos"
+    first.mkdir(parents=True)
+    second.mkdir(parents=True)
+    (first / "First.mkv").write_bytes(b"first")
+    second_file = second / "Second.mkv"
+    second_file.write_bytes(b"second")
+
+    library = MediaLibrary([first, second])
+    root_page, _ = library.page()
+    assert [child["name"] for child in root_page["children"]] == ["Videos", "Videos (2)"]
+    assert library.resolve_file("Videos (2)/Second.mkv") == second_file.resolve()
+
+
+def test_server_cli_accepts_repeated_library_flags():
+    args = build_arg_parser().parse_args([
+        "--library", "D:/Movies", "--library", r"\\nas\media\Shows",
+    ])
+    assert args.library == ["D:/Movies", r"\\nas\media\Shows"]
+
+
 def test_library_pages_are_shallow_sorted_and_sandboxed(tmp_path):
     root = tmp_path / "library"
     root.mkdir()
@@ -276,6 +331,44 @@ def test_capabilities_without_library_advertise_no_sort_keys():
             assert caps["muxed_aux_tracks"] is False
             assert caps["attachment_cache"] == 0
             assert caps.get("library_sort", []) == []
+        finally:
+            await client.teardown()
+            await server.stop()
+
+    asyncio.run(scenario())
+
+
+def test_multiple_library_roots_work_through_existing_client_api(library_file, tmp_path):
+    first, target = library_file
+    second = tmp_path / "Movies"
+    second.mkdir()
+    (second / "Other.mkv").write_bytes(b"other")
+
+    async def scenario():
+        server = RelayServer(
+            str(ROOT / "models"), free_port_pair(),
+            library_roots=[str(first), str(second)],
+        )
+        await server.start()
+        client = RelayClient("127.0.0.1", server.port)
+        try:
+            caps = await client.connect()
+            assert caps["library"] is True
+            page = await client.fetch_library_page()
+            assert [child["name"] for child in page["tree"]["children"]] == [
+                first.name, second.name,
+            ]
+            nested = await client.fetch_library_page(f"{first.name}/Shows")
+            assert nested["tree"]["children"] == [{
+                "type": "file", "name": "Sample.MKV",
+                "path": f"{first.name}/Shows/Sample.MKV",
+            }]
+            async with client._http.get(
+                client.media_url(f"{first.name}/Shows/Sample.MKV"),
+                headers={"Range": "bytes=0-15"},
+            ) as response:
+                assert response.status == 206
+                assert await response.read() == target.read_bytes()[:16]
         finally:
             await client.teardown()
             await server.stop()
