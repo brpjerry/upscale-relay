@@ -52,13 +52,30 @@ class ServerSettings:
         self._qs.setValue("server/models_dir", str(v))
 
     @property
+    def library_dirs(self) -> list[str]:
+        """Configured media roots, migrating the former single-root setting."""
+        value = self._qs.value("server/library_dirs", None)
+        if value is None:
+            legacy = str(self._qs.value("server/library_dir", "")).strip()
+            return [legacy] if legacy else []
+        values = [value] if isinstance(value, str) else list(value)
+        return [str(item).strip() for item in values if str(item).strip()]
+
+    @library_dirs.setter
+    def library_dirs(self, values: list[str]) -> None:
+        cleaned = [str(value).strip() for value in values if str(value).strip()]
+        self._qs.setValue("server/library_dirs", cleaned)
+        self._qs.remove("server/library_dir")
+
+    @property
     def library_dir(self) -> str:
-        # Empty string => no media library exposed (server --library omitted).
-        return str(self._qs.value("server/library_dir", ""))
+        """Compatibility view of the first configured media root."""
+        return self.library_dirs[0] if self.library_dirs else ""
 
     @library_dir.setter
     def library_dir(self, v: str) -> None:
-        self._qs.setValue("server/library_dir", str(v))
+        value = str(v).strip()
+        self.library_dirs = [value] if value else []
 
     @property
     def port(self) -> int:

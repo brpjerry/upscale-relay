@@ -2,11 +2,11 @@
 
 Status: **implemented**, except for shared-mount path mapping.
 
-The server can expose a local folder, mounted share, or Windows UNC path as a
-media library. Clients browse the server tree and ask the server to demux and
-upscale a selected file. Capable clients negotiate original audio/subtitles in
-the epoch downlink; the Range-capable HTTP endpoint remains the compatibility
-path for older/external-mode clients.
+The server can expose one or more local folders, mounted shares, or Windows UNC
+paths as a media library. Clients browse the server tree and ask the server to
+demux and upscale a selected file. Capable clients negotiate original
+audio/subtitles in the epoch downlink; the Range-capable HTTP endpoint remains
+the compatibility path for older/external-mode clients.
 
 ## Run it
 
@@ -14,20 +14,37 @@ path for older/external-mode clients.
 relay-server --models-dir models --ep tensorrt --library \\nas\media\Videos
 ```
 
+Repeat `--library` to expose multiple folders:
+
+```powershell
+relay-server --models-dir models --ep tensorrt `
+  --library D:\Movies `
+  --library \\nas\media\Shows
+```
+
+The tray GUI provides an ordered folder list with **Add folder** and
+**Remove selected** controls. Existing GUI settings containing one library
+folder migrate automatically.
+
 The post-ONNX resize uses Lanczos by default. Add, for example,
 `--resize-algorithm area` to change the server default; desktop, headless, and
 Android clients can select any algorithm advertised by the server per session.
 
-Local Windows/Linux paths and OS-mounted network shares work the same way. If
-`--library` is omitted, no library capability or routes are advertised and the
-desktop retains its local-only browser appearance.
+Local Windows/Linux paths and OS-mounted network shares work the same way. A
+single configured folder retains the original listing layout. With two or more
+folders, the library root contains one virtual directory per configured folder;
+the virtual directory uses the folder's name, with ` (2)`, ` (3)`, and so on
+added when names collide. If `--library` is omitted, no library capability or
+routes are advertised and the desktop retains its local-only browser appearance.
 
 ## Implemented behavior
 
 ### Server
 
-- `relay_server.library.MediaLibrary` resolves every request beneath the
-  configured root and rejects traversal and non-playable files.
+- `relay_server.library.MediaLibrary` resolves every request beneath its
+  configured roots and rejects traversal and non-playable files. In multi-root
+  mode it first resolves the virtual top-level directory and then applies the
+  same sandbox independently within that root.
 - `GET /library?path=<relative-directory>&limit=100&cursor=<offset>&sort=<key>`
   returns one sorted page of that directory's immediate children. The response
   carries an opaque `next_cursor` (or `null`); `path` is empty for the root.

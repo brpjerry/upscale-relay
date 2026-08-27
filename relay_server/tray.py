@@ -3,7 +3,7 @@
 Double-clicking the frozen ``upscale-relay-server-gui.exe`` starts the server
 with the last-saved configuration and drops an icon in the notification area.
 The tray menu opens a configuration pane (execution provider, control port,
-media library folder, models folder, mDNS) that restarts the listeners in place
+media library folders, models folder, mDNS) that restarts the listeners in place
 when applied.
 
 The asyncio ``RelayServer`` and the Qt event loop are married with qasync, the
@@ -32,6 +32,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QListWidget,
     QMenu,
     QMessageBox,
     QPushButton,
@@ -279,7 +280,7 @@ class ServerController:
             s.port,
             ep=s.ep,
             stats_interval=2.0 if s.file_logging else None,
-            library_root=s.library_dir or None,
+            library_roots=s.library_dirs or None,
             mdns=s.mdns,
         )
         server.event_callback = self.event_callback
@@ -330,8 +331,21 @@ class ConfigDialog(QDialog):
         self.ep_combo.addItems(available_ep_choices())
         self.port_spin = QSpinBox()
         self.port_spin.setRange(1, 65535)
-        self.library_edit = QLineEdit()
-        self.library_edit.setPlaceholderText("(none — no media library exposed)")
+        self.library_list = QListWidget()
+        self.library_list.setMinimumHeight(90)
+        self.library_add_button = QPushButton("Add folder…")
+        self.library_remove_button = QPushButton("Remove selected")
+        self.library_add_button.clicked.connect(self._add_library_folder)
+        self.library_remove_button.clicked.connect(self._remove_library_folders)
+        library_widget = QWidget()
+        library_layout = QVBoxLayout(library_widget)
+        library_layout.setContentsMargins(0, 0, 0, 0)
+        library_layout.addWidget(self.library_list)
+        library_buttons = QHBoxLayout()
+        library_buttons.addWidget(self.library_add_button)
+        library_buttons.addWidget(self.library_remove_button)
+        library_buttons.addStretch(1)
+        library_layout.addLayout(library_buttons)
         self.models_edit = QLineEdit()
         self.mdns_check = QCheckBox("Advertise on the LAN via mDNS/DNS-SD")
         self.logging_check = QCheckBox(
@@ -342,7 +356,7 @@ class ConfigDialog(QDialog):
         form = QFormLayout(self)
         form.addRow("Execution provider:", self.ep_combo)
         form.addRow("Control port:", self.port_spin)
-        form.addRow("Media library folder:", _folder_row(self.library_edit, self))
+        form.addRow("Media library folders:", library_widget)
         form.addRow("Models folder:", _folder_row(self.models_edit, self))
         form.addRow("", self.mdns_check)
         form.addRow("", self.logging_check)
@@ -365,17 +379,40 @@ class ConfigDialog(QDialog):
         s = self._settings
         self.ep_combo.setCurrentText(s.ep)
         self.port_spin.setValue(s.port)
-        self.library_edit.setText(s.library_dir)
+        self.library_list.clear()
+        self.library_list.addItems(s.library_dirs)
         self.models_edit.setText(s.models_dir)
         self.mdns_check.setChecked(s.mdns)
         self.logging_check.setChecked(s.file_logging)
         self.autostart_check.setChecked(autostart.is_enabled())
 
+    def _add_library_folder(self) -> None:
+        selected = self.library_list.currentItem()
+        initial = selected.text() if selected is not None else ""
+        chosen = QFileDialog.getExistingDirectory(self, "Select media library folder", initial)
+        if not chosen:
+            return
+        identity = os.path.normcase(os.path.abspath(chosen))
+        existing = {
+            os.path.normcase(os.path.abspath(self.library_list.item(index).text()))
+            for index in range(self.library_list.count())
+        }
+        if identity not in existing:
+            self.library_list.addItem(chosen)
+
+    def _remove_library_folders(self) -> None:
+        for item in self.library_list.selectedItems():
+            self.library_list.takeItem(self.library_list.row(item))
+
     def _on_apply(self) -> None:
         s = self._settings
         s.ep = self.ep_combo.currentText()
         s.port = self.port_spin.value()
-        s.library_dir = self.library_edit.text().strip()
+        s.library_dirs = [
+            self.library_list.item(index).text().strip()
+            for index in range(self.library_list.count())
+            if self.library_list.item(index).text().strip()
+        ]
         s.models_dir = self.models_edit.text().strip()
         s.mdns = self.mdns_check.isChecked()
         s.file_logging = self.logging_check.isChecked()

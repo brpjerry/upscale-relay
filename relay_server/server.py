@@ -17,6 +17,7 @@ import re
 import sys
 from collections.abc import Callable
 from pathlib import Path
+from typing import Iterable
 
 from aiohttp import WSMsgType, web, web_fileresponse
 
@@ -80,7 +81,8 @@ class RelayServer:
                  resize_algorithm: str = DEFAULT_RESIZE_ALGORITHM,
                  lossless_hevc_profile: str = DEFAULT_LOSSLESS_HEVC_PROFILE,
                  mdns: bool = False,
-                 seek_discard_max_s: float | None = None):
+                 seek_discard_max_s: float | None = None,
+                 library_roots: Iterable[str | Path] | None = None):
         self.port = port
         self.media_port = port + 1
         self.ep = ep
@@ -90,7 +92,10 @@ class RelayServer:
         self.seek_discard_max_s = seek_discard_max_s
         self.models_info = discover_models(models_dir)
         self.models = {name: info["path"] for name, info in self.models_info.items()}
-        self.library = MediaLibrary(library_root) if library_root else None
+        if library_root and library_roots is not None:
+            raise ValueError("specify library_root or library_roots, not both")
+        configured_roots = library_roots if library_roots is not None else library_root
+        self.library = MediaLibrary(configured_roots) if configured_roots else None
         self.sessions: dict[str, Session] = {}  # keyed by media tokens AND id
         self.native_teardown_error: dict | None = None
         # Optional GUI hook (kept Qt-free): called with a short human-readable
@@ -481,7 +486,7 @@ async def main_async(args) -> None:
     server = RelayServer(
         args.models_dir, args.port, ep=args.ep,
         stats_interval=2.0 if args.verbose else None,
-        library_root=args.library,
+        library_roots=args.library,
         resize_algorithm=args.resize_algorithm,
         lossless_hevc_profile=args.lossless_hevc_profile,
         mdns=not args.no_mdns,
@@ -491,24 +496,15 @@ async def main_async(args) -> None:
     await asyncio.Event().wait()  # run forever
 
 
-def main() -> None:
-    # Native faults (libav/ORT/TRT) kill the process silently otherwise —
-    # print the Python-level stack of the faulting thread instead.
-    import faulthandler
-
-    faulthandler.enable()
-    try:
-        from .crashinfo import install as _install_crashinfo
-
-        _install_crashinfo()
-    except Exception:
-        pass
-
+def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="relay-server")
     parser.add_argument("--models-dir", default="models")
     parser.add_argument("--port", type=int, default=8590)
     parser.add_argument("--ep", default="auto", choices=["auto", "tensorrt", "cuda", "dml", "cpu"])
-    parser.add_argument("--library", help="folder (local, UNC, or mounted share) to expose")
+    parser.add_argument(
+        "--library", action="append", metavar="FOLDER",
+        help="folder (local, UNC, or mounted share) to expose; repeat for multiple folders",
+    )
     parser.add_argument(
         "--resize-algorithm", choices=RESIZE_ALGORITHMS,
         default=DEFAULT_RESIZE_ALGORITHM,
@@ -531,7 +527,23 @@ def main() -> None:
         help="do not advertise _upscalerelay._tcp over mDNS/DNS-SD",
     )
     parser.add_argument("-v", "--verbose", action="store_true")
-    args = parser.parse_args()
+    return parser
+
+
+def main() -> None:
+    # Native faults (libav/ORT/TRT) kill the process silently otherwise —
+    # print the Python-level stack of the faulting thread instead.
+    import faulthandler
+
+    faulthandler.enable()
+    try:
+        from .crashinfo import install as _install_crashinfo
+
+        _install_crashinfo()
+    except Exception:
+        pass
+
+    args = build_arg_parser().parse_args()
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
                         format="%(asctime)s %(name)s %(levelname)s %(message)s")
     try:
