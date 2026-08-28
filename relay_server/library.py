@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from pathlib import Path, PurePosixPath
+from pathlib import Path, PurePath, PurePosixPath
 from typing import Iterable
 
 
@@ -28,6 +28,18 @@ class LibraryPathError(ValueError):
 class _Root:
     name: str
     path: Path
+
+
+def _root_name(root: PurePath) -> str:
+    """Return a client-safe label for a local directory or filesystem root."""
+    if root.name:
+        return root.name
+    # A resolved UNC share root is all anchor: ``name`` is empty and ``drive``
+    # is ``\\server\share``.  Exposing that drive verbatim puts backslashes in
+    # an API path that deliberately accepts POSIX separators only, so use just
+    # the final share component.  Drive roots similarly become ``C``.
+    drive = root.drive.rstrip(":\\/").replace("\\", "/")
+    return drive.rsplit("/", 1)[-1] if drive else "Library"
 
 
 class MediaLibrary:
@@ -66,7 +78,7 @@ class MediaLibrary:
         entries: list[_Root] = []
         used: set[str] = set()
         for root in roots:
-            base = root.name or root.drive.rstrip(":\\/") or "Library"
+            base = _root_name(root)
             name = base
             suffix = 2
             while name.casefold() in used:

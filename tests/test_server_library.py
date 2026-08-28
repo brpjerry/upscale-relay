@@ -7,7 +7,7 @@ import socket
 import subprocess
 import sys
 from fractions import Fraction
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 import aiohttp
 import av
@@ -16,7 +16,7 @@ import pytest
 
 from relay_client_core import RelayClient, SessionConfig
 from relay_media import AuxiliaryTrack
-from relay_server.library import LibraryPathError, MediaLibrary
+from relay_server.library import LibraryPathError, MediaLibrary, _root_name
 from relay_server.server import RelayServer, build_arg_parser
 import relay_server.session as session_module
 from upscale_cli.encode import DEFAULT_LOSSLESS_HEVC_PROFILE
@@ -239,6 +239,12 @@ def test_multiple_library_roots_disambiguate_duplicate_folder_names(tmp_path):
     root_page, _ = library.page()
     assert [child["name"] for child in root_page["children"]] == ["Videos", "Videos (2)"]
     assert library.resolve_file("Videos (2)/Second.mkv") == second_file.resolve()
+
+
+def test_unc_share_root_uses_client_safe_virtual_name():
+    root = PureWindowsPath(r"\\192.168.0.74\data4")
+    assert root.name == ""  # UNC share roots are entirely represented by drive/anchor.
+    assert _root_name(root) == "data4"
 
 
 def test_server_cli_accepts_repeated_library_flags():
