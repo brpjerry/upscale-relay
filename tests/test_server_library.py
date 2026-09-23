@@ -648,17 +648,21 @@ def test_qt_headless_mpv_reads_muxed_audio_without_external_file(
     pytest.importorskip("qasync")
     root, _target = multitrack_library_file
 
+    from PySide6.QtWidgets import QApplication
+    from qasync import QEventLoop
+
+    from desktop_client.mpv_view import MpvPlayerView
+    from desktop_client.options import DesktopOptions
+
+    # Keep the application alive until both the loop and native player close.
+    app = QApplication.instance() or QApplication([])
+    player = None
+
     async def scenario():
-        from PySide6.QtWidgets import QApplication
-
-        from desktop_client.mpv_view import MpvPlayerView
-        from desktop_client.options import DesktopOptions
-
-        app = QApplication.instance() or QApplication([])
+        nonlocal player
         server = RelayServer(str(ROOT / "models"), free_port_pair(), library_root=str(root))
         await server.start()
         client = RelayClient("127.0.0.1", server.port)
-        player = None
         try:
             await client.connect()
             session = await client.open_session(SessionConfig(
@@ -689,14 +693,14 @@ def test_qt_headless_mpv_reads_muxed_audio_without_external_file(
                     audio_seen = False
                 if audio_seen:
                     break
-                app.processEvents()
                 await asyncio.sleep(0.05)
             assert audio_seen
             assert player._source_path is None
         finally:
             if player is not None:
+                tasks = [task for task in (player._task, player._stats_task) if task is not None]
                 player.stop()
-                player.mpv.terminate()
+                await asyncio.gather(*tasks, return_exceptions=True)
             await client.teardown()
             await server.stop()
 
@@ -705,11 +709,18 @@ def test_qt_headless_mpv_reads_muxed_audio_without_external_file(
     # normally (the repository hard rules document code 0xe24c4a02 as noise).
     import faulthandler
 
-    restore_faulthandler = faulthandler.is_enabled()
-    faulthandler.disable()
+    restore_faulthandler = sys.platform == "win32" and faulthandler.is_enabled()
+    if restore_faulthandler:
+        faulthandler.disable()
     try:
-        asyncio.run(scenario())
+        # Enter Qt once from synchronous code; processEvents inside a coroutine
+        # can re-enter queued asyncio timers and corrupt native event ownership.
+        with QEventLoop(app) as loop:
+            loop.run_until_complete(scenario())
     finally:
+        if player is not None:
+            player.mpv.terminate()
+            player.close()
         if restore_faulthandler:
             faulthandler.enable()
 
