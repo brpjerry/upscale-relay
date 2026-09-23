@@ -49,7 +49,15 @@ jobs:
         with:
           python-version: "3.14"
       - name: Install lightweight server build dependencies
-        run: python -m pip install ".[server-gui]" pyinstaller
+        run: python -m pip install ".[server-gui]" pyinstaller pytest
+      - name: Test Windows tray and runtime lifecycle
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: >
+          python -m pytest -q
+          tests/test_server_tray.py
+          tests/test_runtime_bootstrap.py
+          tests/test_infer_worker_dispatch.py
       - name: Build console server binary
         run: >
           pyinstaller --noconfirm --onedir --console
