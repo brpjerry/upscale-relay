@@ -13,14 +13,16 @@ Upscale Relay Server - Windows GUI
 
    New-NetFirewallRule -DisplayName "Upscale Relay" -Direction Inbound -Protocol TCP -LocalPort 8590,8591 -Action Allow -Profile Private
 
-5. Find the desktop's LAN IPv4 address with ipconfig. On the client, connect
-   to ADDRESS:8590. Check http://ADDRESS:8590/status from the client machine.
+5. Use the address shown beside Connect to in Configure. If needed, find the
+   desktop's LAN IPv4 address with ipconfig. On the client, connect to
+   ADDRESS:8590. Check http://ADDRESS:8590/status from the client machine.
 6. Start with the passthrough model. Choose a quality tier the network can
    sustain, then test playback, audio/subtitles, pause, seeks, and Stop.
    Once that works, select an actual ONNX model with the GPU otherwise idle.
 
 The runtime is stored under %LOCALAPPDATA%\upscale-relay\runtimes.
 The optional default-on server log is Documents\upscale-relay-server.log.
+It retains an 8 MiB current log and three rotated snapshots.
 BUILD.txt identifies the exact source commit and build run.
 No Python, CUDA Toolkit, TensorRT, or libmpv installation is needed manually.
 This server currently assumes a trusted LAN. Pairing/TLS are not implemented.
