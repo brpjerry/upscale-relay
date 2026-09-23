@@ -1070,11 +1070,18 @@ class MainWindow(QMainWindow):
 
     async def _seek_to_seconds(self, target_s: float, announce: bool = True) -> None:
         """Shared relay-protocol seek: slider, arrow keys, chapters, resume."""
-        if self.client is None or self.client.session is None:
-            return
         target_s = max(0.0, target_s)
         if self._duration_s:
             target_s = min(target_s, max(0.0, self._duration_s - 1.0))
+        if self._session_source == "local":
+            try:
+                self.player.seek_local(target_s)
+                self._arm_pending_seek(target_s)
+            except Exception as err:
+                self._error("Seek failed", str(err))
+            return
+        if self.client is None or self.client.session is None:
+            return
         tb = self._session_time_base
         if tb is None:
             return
@@ -1142,16 +1149,19 @@ class MainWindow(QMainWindow):
 
     @asyncSlot()
     async def on_play_pause(self) -> None:
-        if self.client is None:
+        local = self._session_source == "local"
+        if self.client is None and not local:
             return
         self._paused = not self._paused
         self.player.set_paused(self._paused)
         if self._paused:
-            await self.client.pause()
+            if not local:
+                await self.client.pause()
             self.play_btn.setIcon(self._icon_play)
             self.play_btn.setToolTip("Play (Space)")
         else:
-            await self.client.play()
+            if not local:
+                await self.client.play()
             self.play_btn.setIcon(self._icon_pause)
             self.play_btn.setToolTip("Pause (Space)")
 
@@ -1190,18 +1200,37 @@ class MainWindow(QMainWindow):
         if self._session_source != "uplink":
             return
         pos = self._position_s
-        path = self.client.track.path if self.client and self.client.track else None
+        path = self._session_path
         if path is None:
             return
-        self.player._source_path = path  # ensure set even if session died early
-        if self.client is not None and self.client.session is not None:
-            host, port = self.client.host, self.client.port
-            await self.client.teardown()
+        # The control teardown closes the old downlink. Stop its consumer first
+        # so that normal closure cannot enqueue a stale playback failure while
+        # the local file is being loaded.
+        self.player.stop()
+        if self.client is not None:
+            try:
+                await self.client.teardown()
+            except TeardownNotConfirmedError as err:
+                # Local playback allocates no replacement GPU session. It can
+                # proceed while the failed server cleanup remains visible.
+                self._error("Server cleanup not confirmed", str(err))
             self.client = None
             self._remove_server_tab()
             self.conn_label.setText("disconnected")
             self.connect_btn.setText("Connect")
-        self.player.play_local_fallback(pos)
+        self._session_source = "local"
+        self._session_time_base = None
+        self._pending_seek_s = None
+        self.fallback_btn.setEnabled(False)
+        self.player.client = None
+        try:
+            await self.player.play_local(path, pos, paused=self._paused)
+        except Exception as err:
+            self._error("Local playback failed", str(err))
+            await self._teardown_session()
+            return
+        if self._session_source != "local":
+            return
         self.statusBar().showMessage(f"playing locally from {pos:.1f}s (upscaler off)")
 
     def on_sub_selected(self, index: int) -> None:

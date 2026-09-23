@@ -431,6 +431,7 @@ class MpvPlayerView(QOpenGLWidget):
         self._task: asyncio.Task | None = None
         self._stats_task: asyncio.Task | None = None
         self._source_path: str | None = None
+        self._local_playback = False
         self._fps = 30.0
         self._fed = 0
         self._pending_start: float | None = None  # seek target for next reload
@@ -665,6 +666,7 @@ class MpvPlayerView(QOpenGLWidget):
         self.mpv.pause = self._caller_paused
 
     def stop(self) -> None:
+        self._reloading = True  # suppress EOF caused by retiring our own pipe
         for task in (self._task, self._stats_task):
             if task is not None:
                 task.cancel()
@@ -678,9 +680,9 @@ class MpvPlayerView(QOpenGLWidget):
             self.mpv.command("stop")
         except Exception:
             pass
-        self._reloading = False
         self._epoch_released = False
         self._caller_paused = False
+        self._local_playback = False
 
     def set_paused(self, paused: bool) -> None:
         self._caller_paused = paused
@@ -791,16 +793,35 @@ class MpvPlayerView(QOpenGLWidget):
     def set_audio_delay(self, seconds: float) -> None:
         self.mpv.audio_delay = seconds
 
-    def play_local_fallback(self, position_s: float) -> None:
-        """Direct playback of the original file (server lost)."""
-        for task in (self._task, self._stats_task):
-            if task is not None:
-                task.cancel()
-        self._task = None
-        if self._buffer is not None:
-            self._buffer.close()
-        self.mpv.pause = False
-        self.mpv.loadfile(self._source_path, start=str(position_s))
+    async def play_local(
+        self, path: str, position_s: float = 0.0, *, paused: bool = False,
+    ) -> None:
+        """Play an original file with the same transport and track reporting."""
+        self.stop()
+        generation = self._load_generation
+        self._reloading = True
+        # The native stop/load settle interval also applies when leaving a
+        # relay stream for its original file.
+        await asyncio.sleep(0.15)
+        if generation != self._load_generation:
+            return  # a newer stop/start superseded this transition
+        self.client = None
+        self._source_path = str(path)
+        self._local_playback = True
+        self._tracks_reported = False
+        self._caller_paused = paused
+        self._epoch_released = True  # local files need no external-media hold
+        self.mpv.loadfile(
+            self._source_path, start=str(max(0.0, position_s)),
+            pause="yes" if paused else "no",
+        )
+        self._reloading = False
+        self._stats_task = asyncio.create_task(self._stats_loop())
+
+    def seek_local(self, target_s: float) -> None:
+        """Seek the original file directly, retaining its absolute timeline."""
+        if self._local_playback:
+            self.mpv.command("seek", max(0.0, target_s), "absolute+exact")
 
     # -- internals ---------------------------------------------------------------
 
@@ -907,12 +928,15 @@ class MpvPlayerView(QOpenGLWidget):
             # makes the UI show stale ids while the new file independently
             # auto-selects another track. The path changes to the per-epoch
             # loopback URI only once mpv has adopted the fresh Matroska file.
-            current_uri = self._buffer.uri if self._buffer is not None else None
+            current_uri = (
+                self._source_path if self._local_playback
+                else self._buffer.uri if self._buffer is not None else None
+            )
             tracks_belong_to_current_epoch = (
                 current_uri is not None
                 and not self._reloading
                 and _prop("path") == current_uri
-                and (self._source_path is None or self._external_ready)
+                and (self._local_playback or self._source_path is None or self._external_ready)
             )
             if not self._tracks_reported and tracks_belong_to_current_epoch:
                 tracks = self.mpv.track_list or []

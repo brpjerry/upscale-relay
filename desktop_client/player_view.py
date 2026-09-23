@@ -72,8 +72,13 @@ class VideoPreviewView(QWidget):
     def set_audio_delay(self, seconds: float) -> None:
         pass
 
-    def play_local_fallback(self, position_s: float) -> None:
+    async def play_local(
+        self, path: str, position_s: float = 0.0, *, paused: bool = False,
+    ) -> None:
         self.failed.emit("local fallback requires the mpv backend")
+
+    def seek_local(self, target_s: float) -> None:
+        pass
 
     def stop(self) -> None:
         if self._task is not None:

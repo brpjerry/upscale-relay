@@ -69,8 +69,11 @@ class FakePlayer(QWidget):
     def select_audio(self, aid):
         pass
 
-    def play_local_fallback(self, position_s):
-        pass
+    async def play_local(self, path, position_s=0.0, *, paused=False):
+        self.local_playback = (path, position_s, paused)
+
+    def seek_local(self, target_s):
+        self.local_seek = target_s
 
 
 class FakeLibraryClient:
@@ -469,3 +472,47 @@ def test_loopback_stream_abort_unblocks_a_stalled_reader():
     finally:
         receiver.close()
         stream.abort()
+
+
+def test_local_fallback_keeps_transport_timeline_and_chapters(window):
+    class FallbackClient(FakeSessionClient):
+        released = False
+
+        async def teardown(self):
+            self.released = True
+
+    async def scenario():
+        client = FallbackClient()
+        window.client = client
+        window._session_source = "uplink"
+        window._session_path = "/tmp/original.mkv"
+        window._duration_s = 120.0
+        window._position_s = 20.0
+        window._paused = True
+        window._set_chapters([
+            main_window.Chapter(0.0, "Opening"),
+            main_window.Chapter(60.0, "Second half"),
+        ])
+        window.play_btn.setEnabled(True)
+        window.seek_slider.setEnabled(True)
+        await window.on_fallback()
+        assert client.released
+        assert window.client is None
+        assert window._session_source == "local"
+        assert window.player.local_playback == ("/tmp/original.mkv", 20.0, True)
+
+        await window.on_play_pause()
+        assert not window.player.paused
+        await window.on_seek_relative(5.0)
+        assert window.player.local_seek == 25.0
+        await window.on_chapter_step(1)
+        assert window.player.local_seek == 60.0
+        window.player.position_changed.emit(60.5)
+        assert window._position_s == 60.5
+        assert window.pos_label.text() == "01:00 / 02:00"
+
+        await window.on_stop()
+        assert window._session_source is None
+        assert not window.play_btn.isEnabled()
+
+    asyncio.run(scenario())
