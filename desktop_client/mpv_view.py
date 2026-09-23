@@ -848,17 +848,24 @@ class MpvPlayerView(QOpenGLWidget):
                 if pkt is None:
                     self.failed.emit("downlink closed")
                     return
+                # A receiver batch can have been waiting to publish while a
+                # seek drained its queue. Recheck at the final consumer so an
+                # old header, payload, or EOF cannot affect the current load.
+                if self.client is not None and pkt.epoch != self.client.epoch:
+                    continue
                 if pkt.eos:
                     if self._buffer is not None:
                         self._buffer.finish()  # mpv plays out and emits eof
                     self._prebuffer_ready = True
                     self._maybe_release_epoch()
                     return
-                if pkt.discontinuity and not first:
+                if pkt.discontinuity and (not first or self._buffer is None):
                     if trace:
                         print("[trace] discontinuity -> reload", flush=True, file=_sys.stderr)
                     # Seek: fresh container stream -> reload mpv on a new buffer.
                     await self._load_stream()
+                    if self.client is not None and pkt.epoch != self.client.epoch:
+                        continue  # another seek arrived during the native settle interval
                     if trace:
                         print("[trace] reload done", flush=True, file=_sys.stderr)
                 first = False

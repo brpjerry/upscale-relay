@@ -2,6 +2,7 @@
 
 import os
 import asyncio
+from types import SimpleNamespace
 
 import pytest
 
@@ -15,6 +16,7 @@ from PySide6.QtWidgets import QApplication
 
 from desktop_client.mpv_view import MpvPlayerView
 from desktop_client.options import DesktopOptions
+from relay_protocol import FLAG_DISCONTINUITY, FLAG_EOS, MediaPacket
 
 
 def test_keyboard_pause_intent_survives_epoch_release():
@@ -88,3 +90,88 @@ def test_local_playback_reports_tracks_position_and_accepts_transport(tmp_path):
     finally:
         player.mpv.terminate()
         player.close()
+
+
+class ConsumerProbe:
+    STARTUP_PACKETS = 1
+
+    def __init__(self, epoch, on_load=None):
+        self.options = SimpleNamespace(trace=False)
+        self.client = SimpleNamespace(epoch=epoch)
+        self.errors = []
+        self.failed = SimpleNamespace(emit=self.errors.append)
+        self.buffers = []
+        self.on_load = on_load
+
+    async def _load_stream(self):
+        chunks = []
+        completed = []
+        self._buffer = SimpleNamespace(feed=chunks.append, finish=lambda: completed.append(True))
+        self.buffers.append((chunks, completed))
+        self._fed = 0
+        self._prebuffer_ready = False
+        if self.on_load is not None:
+            await self.on_load(self)
+
+    def _maybe_release_epoch(self):
+        pass
+
+
+def test_stale_downlink_payload_and_eof_cannot_touch_current_stream():
+    async def scenario():
+        player = ConsumerProbe(epoch=2)
+        queue = asyncio.Queue()
+        for packet in (
+            MediaPacket(b"", flags=FLAG_EOS, epoch=1),
+            MediaPacket(b"old-header", flags=FLAG_DISCONTINUITY, epoch=1),
+            MediaPacket(b"old-body", epoch=1),
+            MediaPacket(b"current-header", flags=FLAG_DISCONTINUITY, epoch=2),
+            MediaPacket(b"current-body", epoch=2),
+            MediaPacket(b"", flags=FLAG_EOS, epoch=2),
+        ):
+            queue.put_nowait(packet)
+        await MpvPlayerView._consume(player, queue)
+        assert player.buffers == [([b"current-header", b"current-body"], [True])]
+        assert player.errors == []
+
+    asyncio.run(scenario())
+
+
+def test_seek_during_reload_drops_the_superseded_header():
+    async def newer_seek_during_load(player):
+        if len(player.buffers) == 2:
+            await asyncio.sleep(0)
+            player.client.epoch = 2
+
+    async def scenario():
+        player = ConsumerProbe(epoch=1, on_load=newer_seek_during_load)
+        queue = asyncio.Queue()
+        for packet in (
+            MediaPacket(b"first-header", flags=FLAG_DISCONTINUITY, epoch=1),
+            MediaPacket(b"superseded-header", flags=FLAG_DISCONTINUITY, epoch=1),
+            MediaPacket(b"", flags=FLAG_EOS, epoch=1),
+            MediaPacket(b"latest-header", flags=FLAG_DISCONTINUITY, epoch=2),
+            MediaPacket(b"", flags=FLAG_EOS, epoch=2),
+        ):
+            queue.put_nowait(packet)
+        await MpvPlayerView._consume(player, queue)
+        assert player.buffers == [([b"first-header"], []), ([], []), ([b"latest-header"], [True])]
+        assert player.errors == []
+
+    asyncio.run(scenario())
+
+
+def test_seek_before_first_header_reopens_the_retired_pipe():
+    async def seek_before_header(player):
+        if len(player.buffers) == 1:
+            player._buffer = None
+
+    async def scenario():
+        player = ConsumerProbe(epoch=2, on_load=seek_before_header)
+        queue = asyncio.Queue()
+        queue.put_nowait(MediaPacket(b"latest-header", flags=FLAG_DISCONTINUITY, epoch=2))
+        queue.put_nowait(MediaPacket(b"", flags=FLAG_EOS, epoch=2))
+        await MpvPlayerView._consume(player, queue)
+        assert player.buffers == [([], []), ([b"latest-header"], [True])]
+
+    asyncio.run(scenario())
