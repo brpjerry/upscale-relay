@@ -162,8 +162,11 @@ def _fmt(v: float | str) -> str:
 
 
 def _bench_end_to_end(up: OnnxUpscaler, frames: Sequence[np.ndarray], workdir: Path,
-                     fit: tuple[int, int] | None = None) -> float:
-    codec, pix_fmt, options = select_encoder("hevc-qp18")
+                     fit: tuple[int, int] | None = None) -> float | str:
+    try:
+        codec, pix_fmt, options = select_encoder("hevc-qp18")
+    except RuntimeError:
+        return "unavailable"
     with av.open(str(workdir / "e2e.mkv"), mode="w") as out:
         stream = out.add_stream(codec, rate=Fraction(30, 1), options=options)
         elapsed = 0.0
@@ -230,7 +233,7 @@ def _run_bench(models: list[Path], out_path: str, frames: int, ep: str,
         lines += [f"## Model: {model_path.name}", ""]
         header = "| input | untiled fps | tiled-512 fps | " + " | ".join(
             f"{t} enc fps" for t in TIERS
-        ) + " | e2e fps (vl) | GPU util peak | VRAM peak MB |"
+        ) + " | e2e fps (hevc-qp18) | GPU util peak | VRAM peak MB |"
         sep = "|" + "---|" * (len(TIERS) + 6)
         lines += [header, sep]
 

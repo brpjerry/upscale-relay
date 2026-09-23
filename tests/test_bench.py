@@ -1,5 +1,6 @@
 from types import SimpleNamespace
 import tracemalloc
+import sys
 
 import av
 import numpy as np
@@ -58,3 +59,25 @@ def test_synthetic_frames_are_repeatable_with_bounded_retained_memory():
     assert len(frames) == 1000
     assert np.array_equal(frames[3], np.roll(frames[0], shift=12, axis=1))
     assert np.array_equal(frames[2:5][1], frames[3])
+
+
+def test_benchmark_still_writes_report_without_nvenc(tmp_path, monkeypatch):
+    (tmp_path / "model.onnx").touch()
+    up = SimpleNamespace(scale_factor=1, infer_array=lambda frame: frame,
+                         infer_array_tiled=lambda frame, tile: frame)
+    monkeypatch.setitem(sys.modules, "upscale_cli.infer", SimpleNamespace(OnnxUpscaler=lambda *a, **kw: up))
+    monkeypatch.setattr(bench, "SIZES", {"small": (64, 64)})
+    monkeypatch.setattr(bench, "_bench_decode", lambda *args: 100.0)
+
+    def select(tier):
+        if tier == "lossless-ffv1":
+            return "libx264", "yuv420p", {"preset": "ultrafast"}
+        raise RuntimeError("NVENC unavailable")
+
+    monkeypatch.setattr(bench, "select_encoder", select)
+    report = tmp_path / "report.md"
+    bench.run_bench(str(tmp_path), str(report), frames=3, ep="cpu")
+    text = report.read_text()
+    assert "e2e fps (hevc-qp18)" in text
+    assert "| small |" in text
+    assert text.count("unavailable") == len(bench.TIERS)
