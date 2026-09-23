@@ -106,3 +106,74 @@ def test_thread_start_failure_releases_constructor_owned_mux(monkeypatch):
     assert mux.closed == 1
     assert auxiliary.closed == 1
     assert not any(t.name.startswith("pl-") for t in threading.enumerate())
+
+
+def test_failed_construction_cleanup_preserves_owner_and_failed_barrier(monkeypatch):
+    from relay_server.pipeline import PipelineConstructionError
+
+    class Unreleased(_Owner):
+        def close(self):
+            self.closed += 1
+            raise RuntimeError("worker still alive")
+
+    owner = Unreleased()
+    owner.scale_factor = None
+    monkeypatch.setitem(sys.modules, "onnxruntime", SimpleNamespace(
+        get_available_providers=lambda: ["TensorrtExecutionProvider"],
+    ))
+    monkeypatch.setattr(worker_mod, "SubprocessUpscaler", lambda *_a, **_k: owner)
+    with pytest.raises(PipelineConstructionError, match="worker still alive") as caught:
+        Pipeline(
+            VideoConfig("h264", None, 32, 32, Fraction(1, 1000)), "model.onnx",
+            "lossless-ffv1", (64, 64), lambda _: None, lambda _: None,
+        )
+    pipeline = caught.value.pipeline
+    assert pipeline.upscaler is owner
+    with pytest.raises(PipelineConstructionError):
+        pipeline.close()
+    assert owner.closed == 1
+
+
+def test_failed_constructor_rollback_latches_server_restart(monkeypatch):
+    import asyncio
+    from relay_server.pipeline import PipelineConstructionError
+    from relay_server.server import RelayServer
+    from relay_server.session import Session
+    import relay_server.session as session_mod
+
+    async def scenario():
+        class Ws:
+            closed = False
+
+            async def send_str(self, _value):
+                pass
+
+            async def close(self, **_kwargs):
+                self.closed = True
+
+        class Owner:
+            construction_failed = True
+            playing = False
+
+            def close(self):
+                raise failure
+
+        owner = Owner()
+        failure = PipelineConstructionError("rollback timed out", owner)
+
+        def construct(*_args, **_kwargs):
+            raise failure
+
+        monkeypatch.setattr(session_mod, "Pipeline", construct)
+        ws = Ws()
+        server = RelayServer("missing-models", 0)
+        session = Session(ws, {})
+        server.sessions[session.id] = session
+        await session.handle_open({"video": {
+            "codec": "h264", "width": 32, "height": 32, "time_base": [1, 1000],
+        }})
+        assert not await server._close_control_session(session, ws, acknowledge=True)
+        assert server.native_teardown_error["restart_required"] is True
+        assert ws.closed
+
+    asyncio.run(scenario())

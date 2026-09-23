@@ -19,7 +19,7 @@ from upscale_cli.encode import DEFAULT_LOSSLESS_HEVC_PROFILE
 from upscale_cli.fit import DEFAULT_RESIZE_ALGORITHM, RESIZE_ALGORITHMS
 
 from .library import MediaLibrary
-from .pipeline import Pipeline, VideoConfig
+from .pipeline import Pipeline, PipelineConstructionError, VideoConfig
 
 log = logging.getLogger("relay.session")
 
@@ -445,6 +445,8 @@ class Session:
                 embed_aux_attachments=self.aux_attachment_mode == "embedded",
             )
         except Exception as err:
+            if isinstance(err, PipelineConstructionError):
+                self.pipeline = err.pipeline
             await self.send("error", code="pipeline_error", message=str(err), fatal=True)
             # Do not await close from the open task: close must wait for this
             # task before acknowledging teardown, and the two would deadlock.
@@ -686,7 +688,7 @@ class Session:
 
         pipeline, self.pipeline = self.pipeline, None
         if pipeline is not None:
-            if hasattr(pipeline, "stats"):
+            if hasattr(pipeline, "stats") and not getattr(pipeline, "construction_failed", False):
                 self._final_pipeline_status = self._pipeline_status(pipeline)
             try:
                 await asyncio.to_thread(pipeline.close)
@@ -695,7 +697,7 @@ class Session:
             finally:
                 # Keep the completed run's diagnostics available to callers
                 # holding a Session reference after the teardown barrier.
-                if hasattr(pipeline, "stats"):
+                if hasattr(pipeline, "stats") and not getattr(pipeline, "construction_failed", False):
                     final_status = self._pipeline_status(pipeline)
                     if self._final_pipeline_status is not None:
                         final_status["provider"] = (
@@ -751,6 +753,8 @@ class Session:
 
     def status(self) -> dict:
         p = self.pipeline
+        if p is not None and getattr(p, "construction_failed", False):
+            p = None
         return {
             "id": self.id,
             "state": self.state.value,

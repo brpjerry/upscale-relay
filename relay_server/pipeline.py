@@ -60,6 +60,14 @@ class PipelineCloseError(RuntimeError):
     """A pipeline worker failed to release its native owner before timeout."""
 
 
+class PipelineConstructionError(PipelineCloseError):
+    """Construction failed and rollback could not confirm native release."""
+
+    def __init__(self, message: str, pipeline):
+        super().__init__(message)
+        self.pipeline = pipeline  # retain ownership until the server restarts
+
+
 def _should_use_tensorrt(ep: str, available_providers: set[str]) -> bool:
     provider = "TensorrtExecutionProvider"
     if ep == "tensorrt" and provider not in available_providers:
@@ -381,8 +389,22 @@ class Pipeline:
             ]
             for t in self._threads:
                 t.start()
-        except BaseException:
-            self._rollback_construction()
+        except BaseException as construction_error:
+            try:
+                self._rollback_construction()
+            except BaseException as cleanup_error:
+                self.construction_failed = True
+                failure = PipelineConstructionError(
+                    f"pipeline initialization failed: {construction_error!r}; "
+                    f"native rollback failed: {cleanup_error!r}", self,
+                )
+                # A partially initialized object cannot run the ordinary
+                # shutdown path. Subsequent close calls observe this failed
+                # barrier, allowing the server to latch restart_required.
+                self._close_error = failure
+                self._close_started = True
+                self._close_complete.set()
+                raise failure from construction_error
             raise
 
     def _rollback_construction(self) -> None:
@@ -394,22 +416,22 @@ class Pipeline:
         """
         self._threads = [thread for thread in self._threads if thread.ident is not None]
         if self._threads:
-            try:
-                self.close()
-            except BaseException:
-                log.exception("pipeline construction rollback could not stop its workers")
-                return  # live native owners must not be touched concurrently
+            self.close()  # failure must retain live native owners, not touch them
+        errors = []
         for name in ("_mux", "_aux_template_container", "upscaler"):
             owner = getattr(self, name, None)
             try:
                 if owner is not None and hasattr(owner, "close"):
                     owner.close()
-            except BaseException:
-                # An independent owner must still be released if another
-                # cleanup fails. Preserve the original construction error.
+            except BaseException as error:
+                # Continue releasing independent owners while retaining the
+                # failed owner and making the failure observable to Session.
+                errors.append(error)
                 log.exception("pipeline construction rollback failed for %s", name)
-            finally:
+            else:
                 setattr(self, name, None)
+        if errors:
+            raise PipelineCloseError(f"construction cleanup failed: {errors[0]!r}") from errors[0]
         self._enc_stream = None
         self._aux_streams = {}
         self._decoder = None
