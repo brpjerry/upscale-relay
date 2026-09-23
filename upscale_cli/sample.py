@@ -16,6 +16,7 @@ def make_sample(path: str, frames: int = 240, width: int = 640, height: int = 36
     stream.height = height
     stream.pix_fmt = "yuv420p"
     time_base = Fraction(1, fps)
+    reformatter = av.video.reformatter.VideoReformatter()
 
     yy, xx = np.mgrid[0:height, 0:width].astype(np.float32)
     box = max(16, height // 8)
@@ -28,7 +29,7 @@ def make_sample(path: str, frames: int = 240, width: int = 640, height: int = 36
         by = int((np.cos(i / 15) * 0.5 + 0.5) * (height - box))
         img[by : by + box, bx : bx + box] = (255, 255, 255)
 
-        frame = av.VideoFrame.from_ndarray(img, format="rgb24").reformat(format="yuv420p")
+        frame = reformatter.reformat(av.VideoFrame.from_ndarray(img, format="rgb24"), format="yuv420p")
         frame.pts = i
         frame.time_base = time_base
         for packet in stream.encode(frame):

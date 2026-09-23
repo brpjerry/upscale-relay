@@ -129,6 +129,7 @@ class FitStage:
         self.align = align
         self.interpolation = interpolation_for_algorithm(resize_algorithm)
         self._out_dims: tuple[int, int] | None = None
+        self._reformatter = av.video.reformatter.VideoReformatter()
 
     def process(self, frame: av.VideoFrame) -> Iterable[av.VideoFrame]:
         if self._out_dims is None:
@@ -147,7 +148,7 @@ class FitStage:
         if (frame.width, frame.height) == (ow, oh):
             yield frame
             return
-        scaled = frame.reformat(width=ow, height=oh, interpolation=self.interpolation)
+        scaled = self._reformatter.reformat(frame, width=ow, height=oh, interpolation=self.interpolation)
         scaled.pts = frame.pts
         scaled.time_base = frame.time_base
         yield scaled

@@ -100,8 +100,9 @@ def _bench_decode(width: int, height: int, frames: int, workdir: Path) -> float:
         stream = container.add_stream("libx264", rate=Fraction(30, 1),
                                       options={"crf": "18", "preset": "fast"})
         stream.width, stream.height, stream.pix_fmt = width, height, "yuv420p"
+        reformatter = av.video.reformatter.VideoReformatter()
         for i, rgb in enumerate(_synthetic_frames(width, height, frames)):
-            f = av.VideoFrame.from_ndarray(rgb, format="rgb24").reformat(format="yuv420p")
+            f = reformatter.reformat(av.VideoFrame.from_ndarray(rgb, format="rgb24"), format="yuv420p")
             f.pts, f.time_base = i, Fraction(1, 30)
             for pkt in stream.encode(f):
                 container.mux(pkt)
@@ -141,10 +142,11 @@ def _bench_encode(width: int, height: int, frames: Sequence[np.ndarray], tier: s
     out = av.open(str(workdir / f"enc_{tier}.mkv"), mode="w")
     stream = out.add_stream(codec, rate=Fraction(30, 1), options=options)
     stream.width, stream.height, stream.pix_fmt = width, height, pix_fmt
+    reformatter = av.video.reformatter.VideoReformatter()
     elapsed = 0.0
     for i, rgb in enumerate(frames):
         start = time.perf_counter()
-        f = av.VideoFrame.from_ndarray(rgb, format="rgb24").reformat(format=pix_fmt)
+        f = reformatter.reformat(av.VideoFrame.from_ndarray(rgb, format="rgb24"), format=pix_fmt)
         f.pts, f.time_base = i, Fraction(1, 30)
         for pkt in stream.encode(f):
             out.mux(pkt)
@@ -169,18 +171,20 @@ def _bench_end_to_end(up: OnnxUpscaler, frames: Sequence[np.ndarray], workdir: P
         return "unavailable"
     with av.open(str(workdir / "e2e.mkv"), mode="w") as out:
         stream = out.add_stream(codec, rate=Fraction(30, 1), options=options)
+        reformatter = av.video.reformatter.VideoReformatter()
         elapsed = 0.0
         count = 0
         for i, rgb in enumerate(frames[:24]):
             start = time.perf_counter()
             upres = up.infer_array(rgb)
             frame = av.VideoFrame.from_ndarray(upres, format="rgb24")
+            fw, fh = frame.width, frame.height
             if fit:
                 fw, fh = fit_dimensions(frame.width, frame.height, *fit)
-                frame = frame.reformat(width=fw, height=fh, interpolation="LANCZOS")
+            frame = reformatter.reformat(frame, width=fw, height=fh, format=pix_fmt,
+                                         interpolation="LANCZOS")
             if i == 0:
                 stream.width, stream.height, stream.pix_fmt = frame.width, frame.height, pix_fmt
-            frame = frame.reformat(format=pix_fmt)
             frame.pts, frame.time_base = i, Fraction(1, 30)
             for packet in stream.encode(frame):
                 out.mux(packet)

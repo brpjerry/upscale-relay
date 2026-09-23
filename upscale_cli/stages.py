@@ -131,6 +131,7 @@ class FrameSink:
         self._pix_fmt = pix_fmt
         self._options = options if options is not None else {"crf": "12", "preset": "medium"}
         self._container = av.open(path, mode="w")
+        self._reformatter = av.video.reformatter.VideoReformatter()
         self._stream: av.VideoStream | None = None
         self.frames_written = 0
         self.pts_written: list[float] = []  # seconds, for verification
@@ -148,7 +149,7 @@ class FrameSink:
         if self._stream is None:
             self._stream = self._init_stream(frame)
         if frame.format.name != self._pix_fmt:
-            converted = frame.reformat(format=self._pix_fmt)
+            converted = self._reformatter.reformat(frame, format=self._pix_fmt)
             converted.pts = frame.pts
             converted.time_base = frame.time_base
             frame = converted
