@@ -22,6 +22,7 @@ import struct
 import subprocess
 import sys
 import threading
+from contextlib import suppress
 from multiprocessing import shared_memory
 
 import numpy as np
@@ -174,12 +175,39 @@ class SubprocessUpscaler:
         if self.scale_factor is None:
             raise ValueError(f"model {model_path} needs a manifest with scale_factor")
         self._lock = threading.Lock()
-        self._shm_in = shared_memory.SharedMemory(create=True, size=_MAX_IN_BYTES)
-        self._shm_out = shared_memory.SharedMemory(create=True, size=_MAX_OUT_BYTES)
+        self._shm_in: shared_memory.SharedMemory | None = None
+        self._shm_out: shared_memory.SharedMemory | None = None
         self._proc: subprocess.Popen | None = None
         self._first_frame_done = False
         self.active_provider: str | None = None
-        self._start_worker()
+        try:
+            self._shm_in = shared_memory.SharedMemory(create=True, size=_MAX_IN_BYTES)
+            self._shm_out = shared_memory.SharedMemory(create=True, size=_MAX_OUT_BYTES)
+            self._start_worker()
+        except BaseException:
+            with suppress(Exception):
+                self._kill()
+            with suppress(Exception):
+                self._release_shared_memory()
+            raise
+
+    def _release_shared_memory(self) -> None:
+        error = None
+        for attribute in ("_shm_in", "_shm_out"):
+            block = getattr(self, attribute)
+            setattr(self, attribute, None)
+            if block is None:
+                continue
+            try:
+                try:
+                    block.close()
+                finally:
+                    with suppress(FileNotFoundError):
+                        block.unlink()
+            except Exception as exc:
+                error = error or exc
+        if error is not None:
+            raise error
 
     def _start_worker(self) -> None:
         tile = "none" if self.tile_size is None else str(self.tile_size)
@@ -287,10 +315,7 @@ class SubprocessUpscaler:
                 except Exception:
                     self._kill()
                 self._proc = None
-            self._shm_in.close()
-            self._shm_in.unlink()
-            self._shm_out.close()
-            self._shm_out.unlink()
+            self._release_shared_memory()
 
 
 def build_worker_command(model: str, ep: str, tile: str,
