@@ -46,7 +46,8 @@ class VideoPreviewView(QWidget):
     # -- public API --------------------------------------------------------
 
     def start(self, session, downlink_q: asyncio.Queue, time_base: Fraction,
-              source_path: str | None = None, avg_rate: Fraction | None = None) -> None:
+              source_path: str | None = None, avg_rate: Fraction | None = None,
+              source_has_audio: bool = True) -> None:
         self.stop()
         if session.downlink_container is not None:
             # The downlink became a container stream (docs/PROTOCOL.md §3.2); this
@@ -72,8 +73,22 @@ class VideoPreviewView(QWidget):
     def set_audio_delay(self, seconds: float) -> None:
         pass
 
-    def play_local_fallback(self, position_s: float) -> None:
+    def audio_output_state(self) -> tuple[int, bool]:
+        return 100, False
+
+    def set_volume(self, percent: int) -> None:
+        pass
+
+    def set_muted(self, muted: bool) -> None:
+        pass
+
+    async def play_local(
+        self, path: str, position_s: float = 0.0, *, paused: bool = False,
+    ) -> None:
         self.failed.emit("local fallback requires the mpv backend")
+
+    def seek_local(self, target_s: float) -> None:
+        pass
 
     def stop(self) -> None:
         if self._task is not None:

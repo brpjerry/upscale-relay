@@ -66,9 +66,9 @@ $env:RELAY_LOSSLESS_HEVC_PROFILE = "x265-ultrafast"
 python -m pytest tests -q
 ```
 
-CI installs only the base dependencies in its core test job, so optional GUI
-tests are skipped there. A developer environment with `.[gui]` installed will
-collect those tests and therefore must also have `mpv-dev\libmpv-2.dll`.
+CI's Windows core job skips optional GUI tests; its Linux job exercises the
+offscreen GUI and CPU inference tests. A Windows developer environment with
+`.[gui]` installed collects GUI tests and must also have `mpv-dev\libmpv-2.dll`.
 
 ## 4. Server-only Windows use
 

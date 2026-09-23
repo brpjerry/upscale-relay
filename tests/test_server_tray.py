@@ -213,6 +213,7 @@ def test_runtime_setup_failure_coroutine_returns_after_close(app, monkeypatch):
     from relay_server import runtime_bootstrap
 
     monkeypatch.setattr(runtime_bootstrap, "activate_runtime", lambda: False)
+    monkeypatch.setattr(runtime_bootstrap, "source_runtime_ready", lambda ep: False)
 
     def fail_installer(on_line, _on_process):
         on_line("Unable to locate finder for 'pip._vendor.distlib'")
@@ -239,6 +240,24 @@ def test_runtime_setup_failure_coroutine_returns_after_close(app, monkeypatch):
         assert returned_dialog is dialog
 
     asyncio.run(scenario())
+
+
+def test_usable_source_runtime_skips_managed_installation(app, monkeypatch):
+    from relay_server import runtime_bootstrap
+    monkeypatch.delattr(sys, "frozen", raising=False)
+    checked = []
+    monkeypatch.setattr(runtime_bootstrap, "source_runtime_ready", lambda ep: checked.append(ep) or True)
+    monkeypatch.setattr(runtime_bootstrap, "activate_runtime", lambda: pytest.fail("must retain source runtime"))
+    assert asyncio.run(ensure_runtime_gui("cuda")) == (True, None)
+    assert checked == ["cuda"]
+
+
+def test_frozen_gui_always_uses_managed_runtime(app, monkeypatch):
+    from relay_server import runtime_bootstrap
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(runtime_bootstrap, "source_runtime_ready", lambda ep: pytest.fail("source check in frozen app"))
+    monkeypatch.setattr(runtime_bootstrap, "activate_runtime", lambda: True)
+    assert asyncio.run(ensure_runtime_gui("auto")) == (True, None)
 
 
 def test_config_dialog_load_and_apply_persists(app, settings):
@@ -357,6 +376,127 @@ def test_controller_start_raises_on_bad_library(app, settings, tmp_path):
     asyncio.run(scenario())
 
 
+def test_controller_serializes_overlapping_restarts(settings, monkeypatch):
+    instances = []
+
+    async def scenario():
+        started, finish_start = asyncio.Event(), asyncio.Event()
+
+        class Server:
+            def __init__(self, models, port, **kwargs):
+                self.port, self.running = port, False
+                instances.append(self)
+
+            async def start(self):
+                started.set()
+                await finish_start.wait()
+                self.running = True
+
+            async def stop(self):
+                self.running = False
+
+        monkeypatch.setattr("relay_server.tray.RelayServer", Server)
+        controller = ServerController(settings)
+        first = asyncio.create_task(controller.start())
+        await started.wait()
+        settings.port = 8690
+        second = asyncio.create_task(controller.start())
+        await asyncio.sleep(0)
+        assert len(instances) == 1
+        finish_start.set()
+        await asyncio.gather(first, second)
+        assert [server.port for server in instances if server.running] == [8690]
+        await controller.stop()
+        assert not any(server.running for server in instances)
+
+    asyncio.run(scenario())
+
+
+def test_config_port_reserves_media_port_and_explains_restart(app, settings):
+    dialog = ConfigDialog(settings)
+    try:
+        dialog.port_spin.setValue(65535)
+        assert dialog.port_spin.value() == 65534
+        assert dialog.apply_button.text() == "Apply and restart"
+        dialog.set_server_status("Restarting server…", "Control localhost:8590 · Media localhost:8591", True)
+        assert not dialog.apply_button.isEnabled()
+        assert "8591" in dialog.address_label.text()
+    finally:
+        dialog.deleteLater()
+
+
+def test_tray_persists_failure_and_disables_restart_while_busy(app, settings, monkeypatch):
+    tray = TrayApp(settings)
+    tray.open_config()
+
+    async def scenario():
+        entered, finish = asyncio.Event(), asyncio.Event()
+        attempts = []
+
+        async def fail_start():
+            attempts.append(True)
+            entered.set()
+            await finish.wait()
+            raise OSError("port unavailable")
+
+        monkeypatch.setattr(tray.controller, "start", fail_start)
+        task = asyncio.create_task(tray.restart())
+        await entered.wait()
+        assert "Restarting" in tray.dialog.status_label.text()
+        assert not tray.dialog.apply_button.isEnabled()
+        assert not tray._restart_action.isEnabled()
+        await tray.restart()
+        assert len(attempts) == 1
+        finish.set()
+        await task
+        assert "port unavailable" in tray.dialog.status_label.text()
+        assert "port unavailable" in tray.tray.toolTip()
+        assert tray.dialog.apply_button.isEnabled()
+        assert tray._restart_action.isEnabled()
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        tray.dialog.close()
+        tray.tray.hide()
+
+
+@pytest.mark.parametrize("cancel", [False, True])
+def test_controller_cleans_up_unpublished_startup(settings, monkeypatch, cancel):
+    instances = []
+
+    async def scenario():
+        started = asyncio.Event()
+
+        class Server:
+            def __init__(self, *args, **kwargs):
+                self.running = False
+                instances.append(self)
+
+            async def start(self):
+                self.running = True
+                started.set()
+                if cancel:
+                    await asyncio.Event().wait()
+                raise OSError("control port unavailable")
+
+            async def stop(self):
+                self.running = False
+
+        monkeypatch.setattr("relay_server.tray.RelayServer", Server)
+        controller = ServerController(settings)
+        task = asyncio.create_task(controller.start())
+        await started.wait()
+        if cancel:
+            task.cancel()
+        with pytest.raises(asyncio.CancelledError if cancel else OSError):
+            await task
+        assert not controller.running
+        assert not any(server.running for server in instances)
+
+    asyncio.run(scenario())
+
+
 def test_tray_app_start_failure_opens_config(app, settings, tmp_path, monkeypatch):
     settings.models_dir = str(tmp_path)
     settings.port = free_port_pair()
@@ -400,6 +540,40 @@ def test_setup_diagnostics_writes_documents_log_without_stderr(tmp_path, monkeyp
         tray.configure_file_logging(False)
         # Restore faulthandler against the real stderr (still blanked here —
         # monkeypatch only undoes at teardown, after this finally runs).
+        faulthandler.disable()
+        if was_enabled and real_stderr is not None:
+            faulthandler.enable(file=real_stderr)
+
+
+def test_diagnostic_rotation_bounds_backups_and_preserves_native_writer_fd(tmp_path, monkeypatch):
+    import faulthandler
+    from relay_server import tray
+
+    real_stderr = sys.stderr
+    was_enabled = faulthandler.is_enabled()
+    monkeypatch.setattr(sys, "stderr", None)
+    monkeypatch.setenv("RELAY_GUI_LOG_DIR", str(tmp_path))
+    monkeypatch.setattr(tray, "_LOG_MAX_BYTES", 512)
+    try:
+        tray.setup_diagnostics(True)
+        stream = tray._diagnostics_log
+        descriptor = stream.fileno()
+        logger = logging.getLogger("relay.rotation-test")
+        for index in range(20):
+            logger.info("sample %d %s", index, "x" * 256)
+        backups = list(tmp_path.glob("upscale-relay-server.log.*"))
+        assert len(backups) == 3
+        assert all(path.stat().st_size <= 512 for path in backups)
+        assert stream.fileno() == descriptor
+        assert sys.stderr is stream
+        assert faulthandler.is_enabled()
+        os.write(descriptor, b"native crash writer after rotation\n")
+        faulthandler.dump_traceback(file=stream)
+        contents = tray.diagnostics_log_path().read_text()
+        assert "native crash writer after rotation" in contents
+        assert "test_diagnostic_rotation" in contents
+    finally:
+        tray.configure_file_logging(False)
         faulthandler.disable()
         if was_enabled and real_stderr is not None:
             faulthandler.enable(file=real_stderr)

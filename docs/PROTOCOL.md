@@ -77,14 +77,22 @@ notifications remain backward compatible.
 | type | fields | notes |
 |---|---|---|
 | `capabilities` | `protocol_version:int`, `server_name:str`, `models:[{name, scale_factor}]`, `quality_tiers:[str]`, `quality_options:[{id,label,codec,lossless,android_supported,p95_mbps}]`, `resize_algorithms:[str]`, `default_resize_algorithm:str`, `library:bool`, `library_sort:[str]`, `muxed_aux_tracks:bool`, `attachment_cache:int` | `quality_tiers` remains the authoritative ID list; `quality_options` supplies presentation metadata. `library` means the library HTTP API is available. `muxed_aux_tracks` permits the opt-in mode. `attachment_cache >= 1` permits authenticated content-addressed attachment manifests; absent/zero means embedded attachments only |
-| `session_opened` | `session_id:str`, `media_port:int`, `uplink_token:str?`, `downlink_token:str`, `epoch:int(=0)`, `source:str`, `time_base:[num,den]`, `duration_s:float?`, `avg_rate:[num,den]?`, `chapters:[...]?`, `downlink_container:"matroska"`, `downlink_codec:str`, `downlink_extradata_b64:str?`, `downlink_width:int`, `downlink_height:int`, `fit_mode:str`, `resize_algorithm:str`, `aux_tracks:"external"\|"muxed"`, `aux_attachments:"embedded"\|"cached"`, `attachment_manifest:[{name,mimetype,size,sha256}]?`, `attachment_token:str?` | Effective choices are authoritative. A client omits its external original-media source only after muxed confirmation. `cached` means attachment bodies are omitted from every epoch and both manifest and token are required; `embedded` means any accepted attachments remain in each Matroska header. Absent auxiliary fields mean `external` and `embedded` |
+| `session_opened` | `session_id:str`, `media_port:int`, `uplink_token:str?`, `downlink_token:str`, `epoch:int(=0)`, `source:str`, `time_base:[num,den]`, `duration_s:float?`, `avg_rate:[num,den]?`, `chapters:[...]?`, `downlink_container:"matroska"`, `downlink_codec:str`, `downlink_extradata_b64:str?`, `downlink_width:int`, `downlink_height:int`, `fit_mode:str`, `resize_algorithm:str`, `aux_tracks:"external"\|"muxed"`, `aux_attachments:"embedded"\|"cached"`, `attachment_manifest:[{name,mimetype,size,sha256}]?`, `attachment_token:str?`, `source_has_audio:bool?`, `source_has_auxiliary:bool?` | Effective choices are authoritative. A client omits its external original-media source after muxed confirmation or confirmed absence of source audio/subtitle tracks. `cached` means attachment bodies are omitted from every epoch and both manifest and token are required; `embedded` means any accepted attachments remain in each Matroska header. Absent auxiliary mode fields mean `external` and `embedded` |
 | `state` | `state:"open"\|"playing"\|"paused"\|"closed"` | emitted on every transition |
 | `session_progress` | `stage:str`, `message:str`, `elapsed_s:float` | ticked ~every 2 s while a slow `open_session` is being processed (today: `stage:"pipeline_init"`, e.g. a first-use TensorRT engine build, which can run for minutes). Clients must treat it as a keepalive for the pending open — refresh the open_session timeout on every tick — and should surface `message` as a loading indicator. Quick opens send none |
 | `seek_ready` | `epoch:int` | server has flushed; an uplink client may start sending the new epoch. A server-file source is restarted by the server. **Not a readiness signal for media** — it is dispatched within milliseconds, before any frame of the new epoch exists (§4) |
-| `seek_progress` | `epoch:int`, `target_pts:int`, `keyframe_pts:int?`, `frames_discarded:int`, `elapsed_s:float` | ticked ~every 500 ms while a seek has produced no downlink bytes yet, starting ~750 ms after the `seek`. Purely informational: the client renders it as seek progress so a long discard window (§4 step 4) is distinguishable from a wedged pipeline. `keyframe_pts` is null until the server's demuxer reports where the seek landed. A seek that produces media promptly sends none, and the server stops ticking after 60 s. Additive and safe to ignore — clients that do not know the type must skip it, so it carries no protocol-version change |
+| `seek_progress` | `epoch:int`, `target_pts:int`, `keyframe_pts:int?`, `frames_discarded:int`, `elapsed_s:float` | ticked ~every 500 ms while a seek has produced no downlink bytes yet, starting ~750 ms after the `seek`. Purely informational: the client renders it as seek progress so a long discard window (§4 step 4) is distinguishable from a wedged pipeline. `keyframe_pts` is null until the server's demuxer reports where the seek landed. A seek that produces media promptly sends none, and the server stops ticking after 60 s without downlink bytes or advancing subtitle-index progress. Additive and safe to ignore — clients that do not know the type must skip it, so it carries no protocol-version change |
 | `stats` | `pipeline_fps:float`, `queue_depths:{...}`, `buffered_ahead_ms:int` | periodic, informational |
 | `error` | `code:str`, `message:str`, `fatal:bool` | non-fatal errors leave the session usable |
 | `closed` | | resource-release barrier acknowledging successful teardown; no acknowledgement is sent if a native owner times out |
+
+For `server_file`, the optional `source_has_audio` and `source_has_auxiliary`
+booleans describe the original file, independently of the negotiated auxiliary
+mode. `source_has_auxiliary` covers audio or subtitle tracks. In external mode,
+a confirmed `false` omits the original-media attachment; otherwise a confirmed
+`source_has_audio:false` selects one delayed `sub-add` instead of `audio-add`.
+Absent source metadata preserves the older external `audio-add` behavior.
+Uplink clients use their own cached source metadata.
 
 `fit_mode` (default `"fit"`) chooses how the output frame relates to `display`.
 `"fit"` preserves the full image and returns the largest same-aspect frame that
@@ -150,6 +158,9 @@ offset size  field
   and the client replaces its demuxer/player input.
 - `end_of_stream`: payload_len = 0; uplink: file fully sent; downlink: pipeline
   fully drained after its source iterator(s) end (never during a seek flush).
+- A payload is limited to 64 MiB. Senders enforce the limit and receivers
+  reject an oversized length immediately after reading the header, before
+  allocating or reading its body. File size is independent of packet size.
 - Uplink payloads are in the source codec's storage format (e.g. length-
   prefixed AVCC for H.264, as extracted; codec-specific detail is carried by
   `open_session.video.codec` + `extradata_b64`).
@@ -203,6 +214,17 @@ anchor can force a long linear scan. Original auxiliary PTS and codec packets
 are preserved. A small audio preroll and subtitle events overlapping the seek
 target may precede the first video PTS; the player performs normal timestamp
 synchronization.
+
+The current server preserves overlapping ASS/SSA, SubRip, WebVTT, and plain-text
+subtitle events with a temporary per-session packet index. Normal demux fills
+it progressively; an unseen forward seek scans only the missing source prefix
+without decoding video, and reports `seek_progress.stage:"subtitle_index"`,
+`message`, and `subtitle_indexed_s` while doing so. Repeated/backward seeks reuse
+the index and retain the video-keyframe seek anchor. The index has a 256 MiB
+disk limit and a 2 MiB SQLite page cache, is removed at session teardown, and
+reports an explicit session error if exhausted. Stateful bitmap subtitles
+(such as PGS/VobSub) currently confirm `aux_tracks:"external"` so their full
+display/clear state survives seeks; clients must honor that confirmation.
 
 ### 3.4 Cached attachment objects
 

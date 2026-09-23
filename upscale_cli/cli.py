@@ -12,12 +12,23 @@ from __future__ import annotations
 
 import argparse
 import sys
+from pathlib import Path
 
 from .info import print_info, verify_passthrough, verify_pts
 from .sample import make_sample
 from .stages import FrameSink, FrameSource, run_pipeline
 
 _SUBCOMMANDS = {"run", "info", "sample", "bench"}
+
+
+def _same_file(input_path: str, output_path: str) -> bool:
+    source, target = Path(input_path), Path(output_path)
+    if source.resolve() == target.resolve():
+        return True
+    try:
+        return source.samefile(target)
+    except FileNotFoundError:
+        return False
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -72,7 +83,8 @@ def main(argv: list[str] | None = None) -> int:
     elif argv and argv[0] not in _SUBCOMMANDS and not argv[0].startswith("-"):
         argv = ["run"] + argv
 
-    args = _build_parser().parse_args(argv)
+    parser = _build_parser()
+    args = parser.parse_args(argv)
 
     if args.command == "info":
         print_info(args.input)
@@ -94,6 +106,8 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     # run
+    if _same_file(args.input, args.output):
+        parser.error("input and output must be different files")
     stages = []
     if args.model:
         from .infer import OnnxUpscaler

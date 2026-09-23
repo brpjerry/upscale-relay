@@ -45,6 +45,52 @@ from .attachments import materialize_attachment_cache, remove_attachment_view
 
 log = logging.getLogger("relay.client")
 
+
+def _open_local_source(path: str):
+    """Open and inspect a potentially remote mounted file on one worker."""
+    track = VideoTrack(path)
+    try:
+        return track, track.open_session_video_dict(), track.duration_seconds(), track.chapters()
+    except BaseException:
+        track.close()
+        raise
+
+
+class _SourceOpening:
+    """Keep native ownership on the worker until the loop accepts the source."""
+
+    def __init__(self, path: str):
+        self.path = path
+        self._lock = threading.Lock()
+        self._abandoned = False
+        self._result = None
+
+    def run(self) -> None:
+        opened = _open_local_source(self.path)
+        with self._lock:
+            if not self._abandoned:
+                self._result = opened
+                return
+        # Cancellation can return to the GUI immediately; the still-running
+        # native opener releases its own eventual result on this worker.
+        opened[0].close()
+
+    def take(self):
+        with self._lock:
+            result, self._result = self._result, None
+        return result
+
+    def abandon(self):
+        with self._lock:
+            self._abandoned = True
+            result, self._result = self._result, None
+        return result[0] if result is not None else None
+
+
+def _observe_source_cleanup(future: asyncio.Future) -> None:
+    if not future.cancelled() and (error := future.exception()) is not None:
+        log.warning("abandoned source cleanup failed: %r", error)
+
 # Media pumping is sized for a slow event loop, not a fast one: under qasync
 # the loop shares the GUI thread with mpv rendering and turns come roughly
 # once per painted frame (~25/s at 24 fps). Anything that needs a loop turn
@@ -52,6 +98,7 @@ log = logging.getLogger("relay.client")
 # starving the server below realtime while playback was smooth.
 _UPLINK_BATCH = 16  # packets demuxed+sent per loop-turn pair
 _DOWNLINK_BATCH = 8  # one Qt-loop wakeup per batch, not per lossless frame
+_DOWNLINK_BATCH_BYTES = 16 * 1024 * 1024
 _DOWNLINK_SOCKET_BUFFER = 4 * 1024 * 1024
 
 # open_session inactivity window: each server session_progress keepalive
@@ -81,7 +128,8 @@ def _take_downlink_batch(
         batch.clear()
         return [pkt]
     batch.append(pkt)
-    if len(batch) >= _DOWNLINK_BATCH or pkt.eos:
+    if (len(batch) >= _DOWNLINK_BATCH or pkt.eos
+            or sum(len(item.payload) for item in batch if item is not None) >= _DOWNLINK_BATCH_BYTES):
         ready = list(batch)
         batch.clear()
         return ready
@@ -96,24 +144,46 @@ class _ThreadBridgeQueue:
     calls asyncio.Queue methods from outside the event-loop thread.
     """
 
-    def __init__(self, loop: asyncio.AbstractEventLoop, maxsize: int):
+    def __init__(self, loop: asyncio.AbstractEventLoop, maxsize: int,
+                 max_bytes: int = 128 * 1024 * 1024):
+        if maxsize < 1 or max_bytes < 1:
+            raise ValueError("queue limits must be positive")
         self._loop = loop
         self._maxsize = maxsize
+        self._max_bytes = max_bytes
+        self._queued_bytes = 0
         self._items = collections.deque()
         self._condition = threading.Condition()
         self._available = asyncio.Event()
         self._closed = False
 
     def put_batch_from_thread(self, items: list[MediaPacket | None]) -> bool:
-        if not items:
-            return True
-        with self._condition:
-            while not self._closed and len(self._items) + len(items) > self._maxsize:
-                self._condition.wait(timeout=0.25)
-            if self._closed:
-                return False
-            self._items.extend(items)
-        self._wake()
+        if any(item is not None and len(item.payload) > self._max_bytes for item in items):
+            raise ValueError("packet exceeds downlink queue byte budget")
+        index = 0
+        while index < len(items):
+            with self._condition:
+                item = items[index]
+                size = len(item.payload) if item is not None else 0
+                while not self._closed and (
+                    len(self._items) >= self._maxsize
+                    or self._queued_bytes + size > self._max_bytes
+                ):
+                    self._condition.wait(timeout=0.25)
+                if self._closed:
+                    return False
+                # Publish the largest prefix that fits, waking the consumer
+                # before waiting for space for the remainder of a large batch.
+                while index < len(items):
+                    item = items[index]
+                    size = len(item.payload) if item is not None else 0
+                    if (len(self._items) >= self._maxsize
+                            or self._queued_bytes + size > self._max_bytes):
+                        break
+                    self._items.append(item)
+                    self._queued_bytes += size
+                    index += 1
+            self._wake()
         return True
 
     def _wake(self) -> None:
@@ -127,6 +197,7 @@ class _ThreadBridgeQueue:
             with self._condition:
                 if self._items:
                     item = self._items.popleft()
+                    self._queued_bytes -= len(item.payload) if item is not None else 0
                     if not self._items:
                         self._available.clear()
                     self._condition.notify_all()
@@ -144,6 +215,7 @@ class _ThreadBridgeQueue:
             if not self._items:
                 raise asyncio.QueueEmpty
             item = self._items.popleft()
+            self._queued_bytes -= len(item.payload) if item is not None else 0
             if not self._items:
                 self._available.clear()
             self._condition.notify_all()
@@ -157,6 +229,7 @@ class _ThreadBridgeQueue:
         with self._condition:
             self._closed = True
             self._items.clear()
+            self._queued_bytes = 0
             self._condition.notify_all()
         self._wake()
 
@@ -210,6 +283,9 @@ class SessionInfo:
     aux_attachments: str = "embedded"
     attachment_manifest: list[dict] | None = None
     attachment_token: str | None = None
+    # Server-file metadata; None preserves attachment behavior with old peers.
+    source_has_audio: bool | None = None
+    source_has_auxiliary: bool | None = None
 
 
 class RelayClient:
@@ -222,10 +298,12 @@ class RelayClient:
         self.capabilities: dict | None = None
         self.session: SessionInfo | None = None
         self._has_server_session = False
+        self._closing = False
+        self._close_task: asyncio.Task | None = None
         self.track: VideoTrack | None = None
         self.epoch = 0
         self.state = "idle"
-        self._pending: dict[str, asyncio.Future] = {}
+        self._pending: dict[str | tuple[str, int], asyncio.Future] = {}
         self._down_q = _ThreadBridgeQueue(self._loop, maxsize=1024)
         self._uplink_writer: asyncio.StreamWriter | None = None
         self._uplink_task: asyncio.Task | None = None
@@ -251,8 +329,20 @@ class RelayClient:
 
     # -- control channel -------------------------------------------------------
 
+    @property
+    def has_server_session(self) -> bool:
+        """Also true during an open whose server allocation is not yet known."""
+        return self._has_server_session
+
+    @property
+    def base_url(self) -> str:
+        host = self.host.strip("[]")
+        if ":" in host:
+            host = f"[{host}]"
+        return f"http://{host}:{self.port}"
+
     async def connect(self) -> dict:
-        self._ws = await self._http.ws_connect(f"http://{self.host}:{self.port}/control")
+        self._ws = await self._http.ws_connect(f"{self.base_url}/control")
         self._reader_task = asyncio.create_task(self._control_reader())
         self.capabilities = await self._request(
             "capabilities", "hello",
@@ -268,21 +358,17 @@ class RelayClient:
     async def _request(self, expect: str, type_: str, timeout: float = 30,
                        keepalive: bool = False, **fields) -> dict:
         fut: asyncio.Future = asyncio.get_running_loop().create_future()
-        self._pending[expect] = fut
+        key = (expect, fields["epoch"]) if expect == "seek_ready" else expect
+        if key in self._pending:
+            raise RuntimeError(f"a {expect} request is already pending")
+        self._pending[key] = fut
         self._last_activity = time.monotonic()
-        await self._send(type_, **fields)
-        if not keepalive:
-            try:
-                return await asyncio.wait_for(fut, timeout=timeout)
-            except BaseException:
-                if self._pending.get(expect) is fut:
-                    del self._pending[expect]
-                fut.cancel()
-                raise
-        # Inactivity deadline: session_progress keepalives push it out, so a
-        # server that is visibly working (TensorRT engine build) never times
-        # out while a silent one still fails within ``timeout``.
         try:
+            await self._send(type_, **fields)
+            if not keepalive:
+                return await asyncio.wait_for(fut, timeout=timeout)
+            # Inactivity deadline: progress keepalives push it out, so a
+            # building server remains alive while a silent one still fails.
             while True:
                 remaining = self._last_activity + timeout - time.monotonic()
                 if remaining <= 0:
@@ -294,8 +380,8 @@ class RelayClient:
                 except asyncio.TimeoutError:
                     continue
         except BaseException:
-            if self._pending.get(expect) is fut:
-                del self._pending[expect]
+            if self._pending.get(key) is fut:
+                del self._pending[key]
             fut.cancel()
             raise
 
@@ -337,7 +423,8 @@ class RelayClient:
                                 RuntimeError(f"{msg.get('code')}: {msg.get('message', '')}")
                             )
                     self._pending.clear()
-                fut = self._pending.pop(mtype, None)
+                key = (mtype, msg.get("epoch")) if mtype == "seek_ready" else mtype
+                fut = self._pending.pop(key, None)
                 if fut is not None and not fut.done():
                     fut.set_result(msg)
         finally:
@@ -359,9 +446,31 @@ class RelayClient:
             raise ValueError(f"unknown auxiliary attachment mode: {cfg.aux_attachments}")
         if cfg.aux_attachments == "cached" and cfg.aux_tracks != "muxed":
             raise ValueError("cached attachments require muxed auxiliary tracks")
-        self.track = VideoTrack(cfg.path) if cfg.source == "uplink" else None
-        video = self.track.open_session_video_dict() if self.track else None
-        duration_s = self.track.duration_seconds() if self.track else None
+        if self._closing:
+            raise ConnectionError("client is closing")
+        video, duration_s, chapters = None, None, []
+        if cfg.source == "uplink":
+            owner = _SourceOpening(cfg.path)
+            # Use an executor Future, not another asyncio Task: cancellation
+            # of all loop tasks must not discard a native worker's result.
+            opening = self._loop.run_in_executor(None, owner.run)
+            try:
+                await asyncio.shield(opening)
+            except asyncio.CancelledError:
+                track = owner.abandon()
+                opening.add_done_callback(_observe_source_cleanup)
+                if track is not None:
+                    cleanup = self._loop.run_in_executor(None, track.close)
+                    cleanup.add_done_callback(_observe_source_cleanup)
+                raise
+            if self._closing:
+                track = owner.abandon()
+                if track is not None:
+                    cleanup = self._loop.run_in_executor(None, track.close)
+                    cleanup.add_done_callback(_observe_source_cleanup)
+                raise ConnectionError("client closed while opening source")
+            track, video, duration_s, chapters = owner.take()
+            self.track = track
         source = ("uplink" if cfg.source == "uplink" else
                   {"type": "server_file", "path": cfg.path})
         # keepalive=True: a cold TensorRT engine build at session open can run
@@ -369,10 +478,8 @@ class RelayClient:
         # alive (OPEN_SESSION_TIMEOUT_S is a window of *inactivity*, not a cap
         # on total build time).
         file_info = {"name": cfg.path, "duration_s": duration_s}
-        if self.track is not None:
-            chapters = self.track.chapters()
-            if chapters:
-                file_info["chapters"] = chapters
+        if chapters:
+            file_info["chapters"] = chapters
         fields = {
             "source": source,
             "file": file_info,
@@ -395,8 +502,9 @@ class RelayClient:
             )
         except BaseException:
             if self.track is not None:
-                self.track.close()
+                track = self.track
                 self.track = None
+                await asyncio.to_thread(track.close)
             raise
         self.session = SessionInfo(
             session_id=msg["session_id"],
@@ -421,26 +529,46 @@ class RelayClient:
             aux_attachments=msg.get("aux_attachments", "embedded"),
             attachment_manifest=msg.get("attachment_manifest") or None,
             attachment_token=msg.get("attachment_token"),
+            source_has_audio=(
+                msg["source_has_audio"] if type(msg.get("source_has_audio")) is bool else None
+            ),
+            source_has_auxiliary=(
+                msg["source_has_auxiliary"]
+                if type(msg.get("source_has_auxiliary")) is bool else None
+            ),
         )
         return self.session
 
     async def prepare_attachments(self, cache_root: Path) -> Path | None:
         """Materialize negotiated cached fonts before mpv loads the epoch."""
+        if self._closing:
+            raise ConnectionError("client is closing")
         session = self.session
         if session is None or session.aux_attachments != "cached":
             return None
         token = session.attachment_token
         if not token:
             raise RuntimeError("cached attachment session omitted its token")
-        await remove_attachment_view(self._attachment_view_dir)
-        self._attachment_view_dir = await materialize_attachment_cache(
+        previous_view = self._attachment_view_dir
+        self._attachment_view_dir = None
+        await remove_attachment_view(previous_view)
+        if self._closing or self.session is not session:
+            raise ConnectionError("client closed while preparing attachments")
+        view = await materialize_attachment_cache(
             self._http,
-            f"http://{self.host}:{self.port}",
+            self.base_url,
             session.session_id,
             session.attachment_manifest or [],
             token,
             Path(cache_root),
         )
+        if self._closing or self.session is not session:
+            # close() may have finished while a disk worker created this view.
+            # It never owned that unpublished lease, so the opening operation
+            # must release it rather than assigning it to an already closed client.
+            await remove_attachment_view(view)
+            raise ConnectionError("client closed while preparing attachments")
+        self._attachment_view_dir = view
         return self._attachment_view_dir
 
     async def fetch_library_page(
@@ -451,7 +579,7 @@ class RelayClient:
         if cursor is not None:
             params["cursor"] = cursor
         async with self._http.get(
-            f"http://{self.host}:{self.port}/library", params=params,
+            f"{self.base_url}/library", params=params,
         ) as response:
             response.raise_for_status()
             payload = await response.json()
@@ -462,7 +590,7 @@ class RelayClient:
 
     def media_url(self, relative_path: str) -> str:
         path = quote(relative_path, safe="/")
-        return f"http://{self.host}:{self.port}/media/{path}"
+        return f"{self.base_url}/media/{path}"
 
     # -- media ------------------------------------------------------------------
 
@@ -497,6 +625,8 @@ class RelayClient:
                            epoch: int | None = None) -> None:
         if self.track is None:
             return
+        if epoch is None:
+            epoch = self.epoch
         # The demuxer is single-threaded state: the old task must be fully done
         # before we seek it and start a new epoch's iteration.
         if self._uplink_task is not None:
@@ -509,15 +639,15 @@ class RelayClient:
         # seek can bump self.epoch before the task is scheduled, and a stale
         # task stamping the new epoch interleaves two streams of one epoch
         # (docs/PROTOCOL.md §4 forbids exactly this).
-        if epoch is None:
-            epoch = self.epoch
+        if epoch != self.epoch:
+            return
         self._uplink_task = asyncio.create_task(self._uplink_loop(from_pts, discontinuity, epoch))
 
     async def _uplink_loop(self, from_pts: int | None, discontinuity: bool, epoch: int) -> None:
         assert self.track is not None and self._uplink_writer is not None
         first = True
         try:
-            iterator = self.track.packets(from_pts)
+            iterator = await asyncio.to_thread(self.track.packets, from_pts)
 
             def next_batch() -> list:
                 batch = []
@@ -598,7 +728,7 @@ class RelayClient:
                 if ready_batch is not None:
                     if not self._down_q.put_batch_from_thread(ready_batch):
                         return
-        except (EOFError, OSError, ConnectionError, RuntimeError) as err:
+        except (EOFError, OSError, ConnectionError, RuntimeError, ValueError) as err:
             if not ready:
                 try:
                     self._loop.call_soon_threadsafe(self._finish_downlink_setup, err)
@@ -681,6 +811,15 @@ class RelayClient:
         """Full docs/PROTOCOL.md §4 seek dance."""
         self.epoch += 1
         epoch = self.epoch
+        # The server may acknowledge only the newest seek. Retire old waiters
+        # immediately; an old acknowledgement must never resolve the new one.
+        for key, future in list(self._pending.items()):
+            if isinstance(key, tuple) and key[0] == "seek_ready":
+                self._pending.pop(key)
+                if not future.done():
+                    future.set_result({"type": "seek_ready", "epoch": key[1]})
+        if self._uplink_task is not None:
+            self._uplink_task.cancel()
         # Drop already-received downlink data.
         try:
             while True:
@@ -704,6 +843,12 @@ class RelayClient:
                 await self._request(
                     "closed", "teardown", timeout=TEARDOWN_TIMEOUT_S,
                 )
+            except asyncio.CancelledError:
+                # Cancelling the acknowledgement wait must still release local
+                # sockets, demux and fonts. Start the shared cleanup owner now;
+                # a slow mounted-file close need not hold the cancelled caller.
+                self._begin_close()
+                raise
             except (asyncio.TimeoutError, ConnectionError, ConnectionResetError,
                     RuntimeError) as err:
                 barrier_error = err
@@ -720,7 +865,16 @@ class RelayClient:
                     "do not open a replacement session until the server is checked"
                 ) from barrier_error
 
+    def _begin_close(self) -> asyncio.Task:
+        self._closing = True
+        if self._close_task is None:
+            self._close_task = asyncio.create_task(self._close())
+        return self._close_task
+
     async def close(self) -> None:
+        await asyncio.shield(self._begin_close())
+
+    async def _close(self) -> None:
         tasks = [t for t in (self._uplink_task, self._reader_task,
                              getattr(self, "_report_task", None)) if t is not None]
         for task in tasks:
@@ -736,9 +890,13 @@ class RelayClient:
         if self._uplink_writer is not None:
             self._uplink_writer.close()
         if self.track is not None:
-            self.track.close()
+            track = self.track
+            self.track = None
+            await asyncio.to_thread(track.close)
         if self._ws is not None:
             await self._ws.close()
         await remove_attachment_view(self._attachment_view_dir)
         self._attachment_view_dir = None
         await self._http.close()
+        self.session = None
+        self._has_server_session = False

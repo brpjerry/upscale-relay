@@ -316,6 +316,8 @@ def test_cached_attachment_negotiation_omits_epoch_attachment_bodies(monkeypatch
                 return Path("fake.mkv")
 
         class Video:
+            has_audio_tracks = True
+            has_auxiliary_tracks = True
             average_rate = Fraction(24, 1)
 
             def __init__(self, _path):

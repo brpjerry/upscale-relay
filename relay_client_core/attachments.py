@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import contextmanager
 import hashlib
+import logging
 import os
 from pathlib import Path
 import re
 import shutil
 import tempfile
+import threading
 
 import aiohttp
 
@@ -18,6 +21,95 @@ _SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
 MAX_ATTACHMENT_BYTES = 64 * 1024 * 1024
 MAX_MANIFEST_BYTES = 256 * 1024 * 1024
 MAX_CACHE_BYTES = 512 * 1024 * 1024
+_VIEW_LEASES: dict[Path, object] = {}
+_CACHE_MUTEX = threading.RLock()
+log = logging.getLogger("relay.attachments")
+
+
+class _ViewPublication:
+    """Keep an unpublished lease on its worker through caller cancellation."""
+
+    def __init__(self, root: Path, session_id: str, entries: list[dict]):
+        self.args = root, session_id, entries
+        self.lock = threading.Lock()
+        self.abandoned = False
+        self.view = None
+
+    def run(self) -> None:
+        view = _materialize_view(*self.args)
+        with self.lock:
+            if not self.abandoned:
+                self.view = view
+                return
+        _remove_view(view)
+
+    def take(self, *, abandon: bool = False):
+        with self.lock:
+            self.abandoned |= abandon
+            view, self.view = self.view, None
+        return view
+
+
+def _observe_cleanup(future: asyncio.Future) -> None:
+    if not future.cancelled() and (error := future.exception()) is not None:
+        log.warning("abandoned attachment cleanup failed: %r", error)
+
+
+def _lock_file(handle, *, blocking: bool) -> None:
+    handle.seek(0)
+    if os.name == "nt":
+        import msvcrt
+        msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK if blocking else msvcrt.LK_NBLCK, 1)
+    else:
+        import fcntl
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
+
+
+def _unlock_file(handle) -> None:
+    handle.seek(0)
+    if os.name == "nt":
+        import msvcrt
+        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+    else:
+        import fcntl
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def _lease_file(path: Path):
+    handle = path.open("a+b")
+    if path.stat().st_size == 0:
+        handle.write(b"\0")
+        handle.flush()
+    return handle
+
+
+@contextmanager
+def _cache_guard(root: Path):
+    root.mkdir(parents=True, exist_ok=True)
+    with _CACHE_MUTEX, _lease_file(root / ".views.lock") as handle:
+        _lock_file(handle, blocking=True)
+        try:
+            yield
+        finally:
+            _unlock_file(handle)
+
+
+def _prune_abandoned_views(root: Path) -> None:
+    sessions = root / "sessions"
+    sessions.mkdir(exist_ok=True)
+    for view in sessions.iterdir():
+        if not view.is_dir() or view in _VIEW_LEASES:
+            continue
+        # New clients hold the lease throughout playback. OS locks disappear
+        # on crash, unlike timestamps or PID files; another live player keeps
+        # its font view even if this process evicts the original object name.
+        with _lease_file(view / ".lease") as handle:
+            try:
+                _lock_file(handle, blocking=False)
+            except OSError:
+                continue
+            _unlock_file(handle)
+        shutil.rmtree(view)
 
 
 def _safe_name(value: object, digest: str) -> str:
@@ -91,25 +183,44 @@ def _publish_object(path: Path, data: bytes, digest: str) -> None:
 
 
 def _materialize_view(root: Path, session_id: str, entries: list[dict]) -> Path:
+    with _cache_guard(root):
+        _prune_abandoned_views(root)
+        return _create_view(root, session_id, entries)
+
+
+def _create_view(root: Path, session_id: str, entries: list[dict]) -> Path:
     safe_session = re.sub(r"[^A-Za-z0-9_-]", "_", session_id)[:64] or "session"
-    view = root / "sessions" / safe_session
-    if view.exists():
-        shutil.rmtree(view)
-    view.mkdir(parents=True, exist_ok=True)
+    view = Path(tempfile.mkdtemp(prefix=f"{safe_session}-", dir=root / "sessions"))
+    lease = _lease_file(view / ".lease")
+    try:
+        _lock_file(lease, blocking=False)
+        _VIEW_LEASES[view] = lease
+        _populate_view(root, view, entries)
+    except BaseException:
+        _VIEW_LEASES.pop(view, None)
+        lease.close()
+        shutil.rmtree(view, ignore_errors=True)
+        raise
+    return view
+
+
+def _populate_view(root: Path, view: Path, entries: list[dict]) -> None:
     used: set[str] = set()
     for entry in entries:
         name = entry["name"]
-        if name in used:
+        if name.casefold() in used:
             stem, suffix = os.path.splitext(name)
-            name = f"{stem}-{entry['sha256'][:8]}{suffix}"
-        used.add(name)
+            index = 1
+            while name.casefold() in used:
+                name = f"{stem}-{entry['sha256'][:8]}-{index}{suffix}"
+                index += 1
+        used.add(name.casefold())
         source = root / "objects" / entry["sha256"]
         target = view / name
         try:
             os.link(source, target)
         except OSError:
             shutil.copyfile(source, target)
-    return view
 
 
 def _evict(root: Path, protected: set[str]) -> None:
@@ -172,11 +283,35 @@ async def materialize_attachment_cache(
         if len(data) != entry["size"] or hashlib.sha256(data).hexdigest() != digest:
             raise ValueError("attachment size/hash mismatch")
         await asyncio.to_thread(_publish_object, target, data, digest)
-    view = await asyncio.to_thread(_materialize_view, cache_root, session_id, entries)
-    await asyncio.to_thread(_evict, cache_root, {entry["sha256"] for entry in entries})
+    loop = asyncio.get_running_loop()
+    owner = _ViewPublication(cache_root, session_id, entries)
+    publishing = loop.run_in_executor(None, owner.run)
+    try:
+        await asyncio.shield(publishing)
+    except asyncio.CancelledError:
+        view = owner.take(abandon=True)
+        publishing.add_done_callback(_observe_cleanup)
+        if view is not None:
+            cleanup = loop.run_in_executor(None, _remove_view, view)
+            cleanup.add_done_callback(_observe_cleanup)
+        raise
+    view = owner.take()
+    try:
+        await asyncio.to_thread(_evict, cache_root, {entry["sha256"] for entry in entries})
+    except BaseException:
+        await remove_attachment_view(view)
+        raise
     return view
 
 
 async def remove_attachment_view(path: Path | None) -> None:
     if path is not None:
-        await asyncio.to_thread(shutil.rmtree, path, True)
+        await asyncio.to_thread(_remove_view, path)
+
+
+def _remove_view(path: Path) -> None:
+    with _cache_guard(path.parent.parent):
+        lease = _VIEW_LEASES.pop(path, None)
+        if lease is not None:
+            lease.close()
+        shutil.rmtree(path, ignore_errors=True)

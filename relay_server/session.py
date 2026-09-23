@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import concurrent.futures
 import json
 import logging
 import time
@@ -12,13 +13,13 @@ from enum import Enum
 from fractions import Fraction
 from typing import Any
 
-from relay_protocol import FLAG_EOS, NO_TS, MediaPacket, new_token
+from relay_protocol import DIR_DOWNLINK, DIR_UPLINK, FLAG_EOS, NO_TS, MediaPacket, new_token
 from relay_media import AuxiliaryTrack, VideoTrack
 from upscale_cli.encode import DEFAULT_LOSSLESS_HEVC_PROFILE
 from upscale_cli.fit import DEFAULT_RESIZE_ALGORITHM, RESIZE_ALGORITHMS
 
 from .library import MediaLibrary
-from .pipeline import Pipeline, VideoConfig
+from .pipeline import Pipeline, PipelineConstructionError, VideoConfig
 
 log = logging.getLogger("relay.session")
 
@@ -77,6 +78,55 @@ class State(str, Enum):
     CLOSED = "closed"
 
 
+class _DownlinkQueue(asyncio.Queue):
+    """Bound both packet count and payload bytes on the owning event loop."""
+
+    def __init__(self, maxsize: int = 256, max_bytes: int = 128 * 1024 * 1024):
+        super().__init__(maxsize=maxsize)
+        self.max_bytes = max_bytes
+        self.payload_bytes = 0
+        self._capacity = asyncio.Event()
+        self._retired = False
+
+    def retire(self) -> None:
+        self._retired = True
+        self._capacity.set()
+
+    def _check_live(self, item: MediaPacket | None) -> None:
+        if item is not None and self._retired:
+            raise asyncio.CancelledError
+
+    @staticmethod
+    def _size(item: MediaPacket | None) -> int:
+        return len(item.payload) if item is not None else 0
+
+    def _fits(self, item: MediaPacket | None) -> bool:
+        return not self.full() and self.payload_bytes + self._size(item) <= self.max_bytes
+
+    async def put(self, item: MediaPacket | None) -> None:
+        self._check_live(item)
+        if self._size(item) > self.max_bytes:
+            raise ValueError("downlink packet exceeds queue byte budget")
+        while not self._fits(item):
+            self._capacity.clear()
+            await self._capacity.wait()
+            self._check_live(item)
+        self.put_nowait(item)
+
+    def put_nowait(self, item: MediaPacket | None) -> None:
+        self._check_live(item)
+        if not self._fits(item):
+            raise asyncio.QueueFull
+        super().put_nowait(item)
+        self.payload_bytes += self._size(item)
+
+    def get_nowait(self) -> MediaPacket | None:
+        item = super().get_nowait()
+        self.payload_bytes -= self._size(item)
+        self._capacity.set()
+        return item
+
+
 class Session:
     def __init__(self, ws, models: dict[str, str], ep: str = "auto",
                  library: MediaLibrary | None = None,
@@ -108,7 +158,8 @@ class Session:
         self.uplink_token = new_token()
         self.downlink_token = new_token()
         self.pipeline: Pipeline | None = None
-        self.down_q: asyncio.Queue[MediaPacket | None] = asyncio.Queue(maxsize=512)
+        self.down_q: asyncio.Queue[MediaPacket | None] = _DownlinkQueue()
+        self._media_connections: dict[int, tuple[asyncio.StreamWriter, asyncio.Task]] = {}
         self.uplink_attached = False
         self.downlink_attached = False
         self.last_buffer_report = time.monotonic()
@@ -117,6 +168,45 @@ class Session:
         self._final_pipeline_status: dict | None = None
 
     # -- helpers ---------------------------------------------------------------
+
+    def register_media(self, direction: int, writer: asyncio.StreamWriter) -> bool:
+        """Reserve exactly one live attachment per direction before accepting it."""
+        if self.state == State.CLOSED or self._close_task is not None:
+            return False
+        if direction in self._media_connections:
+            return False
+        self._media_connections[direction] = (writer, asyncio.current_task())
+        self.uplink_attached = DIR_UPLINK in self._media_connections
+        self.downlink_attached = DIR_DOWNLINK in self._media_connections
+        return True
+
+    def unregister_media(self, direction: int, writer: asyncio.StreamWriter) -> None:
+        current = self._media_connections.get(direction)
+        if current is not None and current[0] is writer:
+            self._media_connections.pop(direction)
+        self.uplink_attached = DIR_UPLINK in self._media_connections
+        self.downlink_attached = DIR_DOWNLINK in self._media_connections
+
+    async def _close_media(self, initiator: asyncio.Task | None) -> None:
+        connections = list(self._media_connections.values())
+        tasks = []
+        for writer, task in connections:
+            # Teardown abandons pending epoch data. Graceful close alone can
+            # wait forever for a peer which has stopped reading a full socket.
+            writer.close()
+            writer.transport.abort()
+            if task is not initiator and task is not asyncio.current_task():
+                task.cancel()
+                tasks.append(task)
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        for writer, _task in connections:
+            try:
+                await writer.wait_closed()
+            except (OSError, RuntimeError):
+                pass
+        self._media_connections.clear()
+        self.uplink_attached = self.downlink_attached = False
 
     async def send(self, type_: str, **fields: Any) -> None:
         try:
@@ -136,29 +226,38 @@ class Session:
         await self.send("state", state=state.value)
 
     def _emit_downlink(self, pkt: MediaPacket) -> None:
-        """Called from the pipeline worker thread. Blocks that thread while
-        the downlink writer is behind (real backpressure — the old queue
-        expansion ballooned memory when the client drained slowly)."""
-        import time as _time
+        """Apply backpressure to the complete worker-to-event-loop handoff.
 
-        waited = 0.0
-        while self.down_q.qsize() >= 256 and self.state != State.CLOSED:
-            _time.sleep(0.05)
-            waited += 0.05
-            if waited >= 30.0:
-                log.warning("session %s: downlink stalled >30s, dropping session", self.id)
-                asyncio.run_coroutine_threadsafe(self.close(), self._loop)
-                return
-
-        def _put() -> None:
-            if pkt.epoch < self.epoch:
-                return  # a seek happened while this was in flight
-            try:
-                self.down_q.put_nowait(pkt)
-            except asyncio.QueueFull:
-                pass  # bounded by the gate above; only a burst race lands here
-
-        self._loop.call_soon_threadsafe(_put)
+        Waiting for Queue.put also bounds callbacks waiting for the event loop.
+        A qsize check followed by call_soon could queue unbounded callbacks and
+        then silently lose Matroska bytes when those callbacks filled the queue.
+        """
+        if self.state == State.CLOSED or pkt.epoch < self.epoch:
+            return
+        pending = self.down_q.put(pkt)
+        try:
+            delivery = asyncio.run_coroutine_threadsafe(pending, self._loop)
+        except RuntimeError:
+            pending.close()
+            return  # the owning event loop has already shut down
+        deadline = time.monotonic() + 30.0
+        try:
+            while self.state != State.CLOSED and pkt.epoch >= self.epoch:
+                try:
+                    delivery.result(timeout=0.1)
+                    return
+                except concurrent.futures.TimeoutError:
+                    if time.monotonic() >= deadline:
+                        log.warning("session %s: downlink stalled >30s, dropping session", self.id)
+                        asyncio.run_coroutine_threadsafe(self.close(), self._loop)
+                        return
+                except concurrent.futures.CancelledError:
+                    return
+        finally:
+            # In particular, do not leave a stale seek or closed-session put
+            # waiting behind the current epoch's media.
+            if not delivery.done():
+                delivery.cancel()
 
     async def _progress_keepalive(self, stage: str, message: str,
                                   done: asyncio.Event) -> None:
@@ -245,7 +344,7 @@ class Session:
                 return
             relative = source.get("path") if isinstance(source, dict) else None
             try:
-                resolved = self.library.resolve_file(relative or "")
+                resolved = await asyncio.to_thread(self.library.resolve_file, relative or "")
                 resolved_path = str(resolved)
                 self.source_track = await asyncio.to_thread(VideoTrack, resolved_path)
                 if requested_aux == "muxed":
@@ -346,6 +445,8 @@ class Session:
                 embed_aux_attachments=self.aux_attachment_mode == "embedded",
             )
         except Exception as err:
+            if isinstance(err, PipelineConstructionError):
+                self.pipeline = err.pipeline
             await self.send("error", code="pipeline_error", message=str(err), fatal=True)
             # Do not await close from the open task: close must wait for this
             # task before acknowledging teardown, and the two would deadlock.
@@ -364,6 +465,13 @@ class Session:
         # session_opened.chapters is the one place clients read them from.
         chapters = (self.source_track.chapters() if self.source_track else
                     _sanitize_chapters((msg.get("file") or {}).get("chapters")))
+        source_metadata = (
+            {
+                "source_has_audio": self.source_track.has_audio_tracks,
+                "source_has_auxiliary": self.source_track.has_auxiliary_tracks,
+            }
+            if self.source_track is not None else {}
+        )
         await self.send(
             "session_opened",
             session_id=self.id,
@@ -391,6 +499,7 @@ class Session:
             attachment_token=(
                 self.attachment_token if self.aux_attachment_mode == "cached" else None
             ),
+            **source_metadata,
         )
 
     media_port: int = 0  # set by server at construction
@@ -430,18 +539,32 @@ class Session:
     async def _seek_progress_loop(self, trace, epoch: int) -> None:
         """Narrate a slow seek until its first downlink bytes are queued."""
         await asyncio.sleep(SEEK_PROGRESS_INITIAL_DELAY_S)
+        last_progress_at = trace.requested_at
+        last_indexed_s = None
         while (trace.first_packet_ms is None and epoch == self.epoch
                and self.state != State.CLOSED):
-            elapsed = time.perf_counter() - trace.requested_at
-            if elapsed > SEEK_PROGRESS_MAX_S:
+            now = time.perf_counter()
+            elapsed = now - trace.requested_at
+            index_progress = getattr(self.aux_track, "subtitle_index_progress", None)
+            if index_progress is not None and (
+                last_indexed_s is None or index_progress[1] > last_indexed_s
+            ):
+                last_indexed_s = index_progress[1]
+                last_progress_at = now
+            idle_s = now - last_progress_at
+            if idle_s > SEEK_PROGRESS_MAX_S:
                 log.warning(
-                    "session %s: seek to %d produced no downlink bytes in %.0fs "
-                    "(discarded %d frames) — giving up on progress ticks",
-                    self.id, trace.target_pts, elapsed, trace.frames_discarded,
+                    "session %s: seek to %d produced no downlink bytes or "
+                    "subtitle indexing progress for %.0fs (discarded %d frames) "
+                    "— giving up on progress ticks",
+                    self.id, trace.target_pts, idle_s, trace.frames_discarded,
                 )
                 return
             await self.send(
                 "seek_progress",
+                stage="subtitle_index" if index_progress is not None else "video_decode",
+                message=("Indexing subtitles for this seek" if index_progress is not None else None),
+                subtitle_indexed_s=(index_progress[1] if index_progress is not None else None),
                 epoch=epoch,
                 target_pts=trace.target_pts,
                 keyframe_pts=trace.keyframe_pts,
@@ -563,13 +686,15 @@ class Session:
     async def close(self) -> None:
         """Idempotent resource-release barrier for the control connection."""
         if self._close_task is None:
-            self._close_task = asyncio.create_task(self._close_impl())
+            self._close_task = asyncio.create_task(self._close_impl(asyncio.current_task()))
         await asyncio.shield(self._close_task)
 
-    async def _close_impl(self) -> None:
+    async def _close_impl(self, initiator: asyncio.Task | None = None) -> None:
         errors: list[BaseException] = []
         if self.state != State.CLOSED:
             await self.set_state(State.CLOSED)
+        self.down_q.retire()
+        await self._close_media(initiator)
         await self._stop_seek_progress()
         await self._stop_server_source()
 
@@ -585,7 +710,7 @@ class Session:
 
         pipeline, self.pipeline = self.pipeline, None
         if pipeline is not None:
-            if hasattr(pipeline, "stats"):
+            if hasattr(pipeline, "stats") and not getattr(pipeline, "construction_failed", False):
                 self._final_pipeline_status = self._pipeline_status(pipeline)
             try:
                 await asyncio.to_thread(pipeline.close)
@@ -594,7 +719,7 @@ class Session:
             finally:
                 # Keep the completed run's diagnostics available to callers
                 # holding a Session reference after the teardown barrier.
-                if hasattr(pipeline, "stats"):
+                if hasattr(pipeline, "stats") and not getattr(pipeline, "construction_failed", False):
                     final_status = self._pipeline_status(pipeline)
                     if self._final_pipeline_status is not None:
                         final_status["provider"] = (
@@ -616,12 +741,11 @@ class Session:
             except BaseException as err:
                 errors.append(err)
 
-        # Wake the downlink writer even when a native owner timed out; the
-        # control socket will close without a successful acknowledgement.
-        try:
-            self.down_q.put_nowait(None)
-        except asyncio.QueueFull:
-            pass
+        # Release queued payloads even if the peer vanished before consuming
+        # them. Wake any internal consumer which was not a media attachment.
+        while not self.down_q.empty():
+            self.down_q.get_nowait()
+        self.down_q.put_nowait(None)
         if errors:
             raise errors[0]
 
@@ -651,6 +775,8 @@ class Session:
 
     def status(self) -> dict:
         p = self.pipeline
+        if p is not None and getattr(p, "construction_failed", False):
+            p = None
         return {
             "id": self.id,
             "state": self.state.value,

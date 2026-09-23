@@ -7,6 +7,25 @@ on:
   workflow_dispatch:
 
 jobs:
+  linux-gui:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+      - name: Install native client libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libmpv2 libegl1 libopengl0
+      - name: Install client and CPU inference tests
+        run: python -m pip install -e ".[gui]" pytest onnx onnxruntime
+      - name: Run client, server, GUI, and CPU inference tests
+        env:
+          QT_QPA_PLATFORM: offscreen
+          RELAY_LOSSLESS_HEVC_PROFILE: x265-ultrafast
+        run: python -m pytest tests -q
+
   test:
     runs-on: windows-latest
     steps:
@@ -30,11 +49,20 @@ jobs:
         with:
           python-version: "3.14"
       - name: Install lightweight server build dependencies
-        run: python -m pip install ".[server-gui]" pyinstaller
+        run: python -m pip install ".[server-gui]" pyinstaller pytest
+      - name: Test Windows tray and runtime lifecycle
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: >
+          python -m pytest -q
+          tests/test_server_tray.py
+          tests/test_runtime_bootstrap.py
+          tests/test_infer_worker_dispatch.py
       - name: Build console server binary
         run: >
           pyinstaller --noconfirm --onedir --console
           --name upscale-relay-server
+          --icon packaging/icon.ico
           --collect-all pip
           --collect-submodules zeroconf
           packaging/server_entry.py
@@ -42,6 +70,7 @@ jobs:
         run: >
           pyinstaller --noconfirm --onedir --windowed
           --name upscale-relay-server-gui
+          --icon packaging/icon.ico
           --collect-all pip
           --collect-submodules zeroconf
           --collect-submodules relay_server
@@ -51,6 +80,7 @@ jobs:
         run: |
           $exe = "dist/upscale-relay-server/upscale-relay-server.exe"
           & $exe --help
+          if ($LASTEXITCODE -ne 0) { throw "console help check failed" }
           & $exe --upscale-infer-worker --check
           if ($LASTEXITCODE -ne 0) { throw "console worker dispatch check failed" }
           & $exe --upscale-infer-worker --onnx-check
@@ -88,6 +118,39 @@ jobs:
             throw "GUI frozen pip smoke failed with exit $($p.ExitCode)"
           }
           "GUI import check OK"
+      - name: Package standalone GUI ZIP
+        shell: pwsh
+        run: |
+          $bundle = "dist/upscale-relay-server-gui"
+          Copy-Item packaging/SERVER_GUI_README.txt "$bundle/README.txt"
+          "Commit: ${{ github.sha }}`nBranch: ${{ github.ref_name }}`nBuild: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" |
+            Set-Content "$bundle/BUILD.txt"
+          $short = "${{ github.sha }}".Substring(0, 8)
+          $zip = "dist/upscale-relay-server-gui-$short-windows-x64.zip"
+          Compress-Archive -Path "$bundle/*" -DestinationPath $zip
+          (Get-FileHash -Algorithm SHA256 $zip).Hash.ToLower() |
+            Set-Content "$zip.sha256"
+      - name: Verify extracted GUI ZIP
+        shell: pwsh
+        timeout-minutes: 3
+        run: |
+          $zip = Get-Item "dist/upscale-relay-server-gui-*-windows-x64.zip"
+          $expected = (Get-Content "$($zip.FullName).sha256").Trim()
+          if ((Get-FileHash -Algorithm SHA256 $zip.FullName).Hash.ToLower() -ne $expected) {
+            throw "GUI ZIP checksum mismatch"
+          }
+          $unpacked = Join-Path $env:RUNNER_TEMP "extracted gui"
+          Expand-Archive -LiteralPath $zip.FullName -DestinationPath $unpacked
+          if (-not (Test-Path "$unpacked/_internal") -or
+              -not (Test-Path "$unpacked/README.txt") -or
+              -not (Select-String -Path "$unpacked/BUILD.txt" -SimpleMatch "${{ github.sha }}" -Quiet)) {
+            throw "GUI ZIP is missing bundle content or source provenance"
+          }
+          $exe = Join-Path $unpacked "upscale-relay-server-gui.exe"
+          foreach ($arguments in @(@("--check"), @("--upscale-infer-worker", "--onnx-check"))) {
+            $p = Start-Process -FilePath $exe -ArgumentList $arguments -WorkingDirectory $unpacked -Wait -PassThru
+            if ($p.ExitCode -ne 0) { throw "Extracted GUI smoke failed: $arguments ($($p.ExitCode))" }
+          }
       - uses: actions/upload-artifact@v7
         with:
           name: upscale-relay-server-windows
@@ -95,4 +158,6 @@ jobs:
       - uses: actions/upload-artifact@v7
         with:
           name: upscale-relay-server-gui-windows
-          path: dist/upscale-relay-server-gui/
+          path: |
+            dist/upscale-relay-server-gui-*-windows-x64.zip
+            dist/upscale-relay-server-gui-*-windows-x64.zip.sha256

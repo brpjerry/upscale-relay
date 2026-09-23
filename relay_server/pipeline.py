@@ -30,6 +30,7 @@ from relay_protocol import (
     FLAG_DISCONTINUITY,
     FLAG_EOS,
     FLAG_KEYFRAME,
+    MAX_PAYLOAD_BYTES,
     NO_TS,
     MediaPacket,
 )
@@ -58,6 +59,14 @@ MUX_MAX_INTERLEAVE_DELTA_US = 100_000
 
 class PipelineCloseError(RuntimeError):
     """A pipeline worker failed to release its native owner before timeout."""
+
+
+class PipelineConstructionError(PipelineCloseError):
+    """Construction failed and rollback could not confirm native release."""
+
+    def __init__(self, message: str, pipeline):
+        super().__init__(message)
+        self.pipeline = pipeline  # retain ownership until the server restarts
 
 
 def _should_use_tensorrt(ep: str, available_providers: set[str]) -> bool:
@@ -262,111 +271,171 @@ class Pipeline:
         self._close_started = False
         self._close_error: BaseException | None = None
         self._finish_cleanup_error: BaseException | None = None
-        self.video = video
-        self.emit = emit
-        self.on_error = on_error
-        self.stats = PipelineStats()
-        self.in_q: queue.Queue = queue.Queue(maxsize=256)
-        self._q_dec: queue.Queue = queue.Queue(maxsize=_QUEUE_DEPTH)
-        self._q_up: queue.Queue = queue.Queue(maxsize=_QUEUE_DEPTH)
-
+        self._threads = []
         self.upscaler = None
-        scale = 1
-        if model_path:
-            # Fixed tiling decision from known input dims: no "auto" probing
-            # (which shells out to nvidia-smi) in the streaming hot path.
-            tile = None if (video.height <= 1440 and video.width <= 2560) else 1024
-            import onnxruntime as _ort
-
-            use_trt = _should_use_tensorrt(ep, set(_ort.get_available_providers()))
-            if use_trt:
-                # The ORT TensorRT EP corrupts the process heap on this stack
-                # (see upscale_cli/infer_worker.py) — run it out-of-process.
-                from upscale_cli.infer_worker import SubprocessUpscaler
-
-                self.upscaler = SubprocessUpscaler(model_path, ep="tensorrt", tile_size=tile)
-            else:
-                from upscale_cli.infer import OnnxUpscaler
-
-                self.upscaler = OnnxUpscaler(model_path, ep=ep, tile_size=tile)
-            if self.upscaler.scale_factor is None:
-                raise ValueError(f"model {model_path} needs a manifest with scale_factor")
-            _require_gpu_session(self.upscaler, ep)
-            scale = self.upscaler.scale_factor
-
-        # "fit" preserves the full image inside the display. "cover" crops the
-        # post-ONNX frame centrally before resizing to the display dimensions.
-        if fit_mode not in ("fit", "cover"):
-            raise ValueError(f"unknown fit mode {fit_mode!r}")
-        self.fit_mode = fit_mode
-        self.resize_algorithm = resize_algorithm
-        self._interpolation = interpolation_for_algorithm(resize_algorithm)
-        processed_w, processed_h = video.width * scale, video.height * scale
-        if fit_mode == "cover":
-            self.out_w, self.out_h = aligned_target_dimensions(*display)
-            self._crop_box = cover_crop_box(
-                processed_w, processed_h, self.out_w, self.out_h,
-            )
-        else:
-            self.out_w, self.out_h = fit_dimensions(
-                processed_w, processed_h, display[0], display[1]
-            )
-            self._crop_box = None
-
-        self.lossless_hevc_profile = lossless_hevc_profile
-        self.quality_tier = quality_tier
-        self._enc_codec, self._enc_pix_fmt, self._enc_options = select_encoder(
-            quality_tier, lossless_hevc_profile=lossless_hevc_profile,
-        )
-        self.encoder_name = self._enc_codec
         self._mux = None
         self._enc_stream = None
-        self._aux_template_container = (
-            av.open(aux_source_path) if aux_source_path is not None else None
-        )
-        self._embed_aux_attachments = embed_aux_attachments
-        self._aux_streams: dict[int, av.stream.Stream] = {}
-        self._sink_buf = _SinkBuffer()
-        self._open_mux()
-        self.downlink_container = "matroska"
-        self.downlink_codec = {
-            "hevc_nvenc": "hevc", "libx265": "hevc", "libx264": "h264",
-        }.get(self._enc_codec, self._enc_codec)
-        self.downlink_extradata_b64 = None  # container is self-describing
+        self._aux_template_container = None
+        self._aux_streams = {}
+        self._decoder = None
+        try:
+            if video.width <= 0 or video.height <= 0 or video.time_base <= 0:
+                raise ValueError("source dimensions and time base must be positive")
+            aligned_target_dimensions(*display)
+            interpolation_for_algorithm(resize_algorithm)
+            if fit_mode not in ("fit", "cover"):
+                raise ValueError(f"unknown fit mode {fit_mode!r}")
+            self.video = video
+            self.emit = emit
+            self.on_error = on_error
+            self.stats = PipelineStats()
+            self.in_q: queue.Queue = queue.Queue(maxsize=256)
+            self._q_dec: queue.Queue = queue.Queue(maxsize=_QUEUE_DEPTH)
+            self._q_up: queue.Queue = queue.Queue(maxsize=_QUEUE_DEPTH)
 
-        # Persistent reformatters: swscale context setup (filter tables) is
-        # expensive at multi-megapixel sizes; rebuild-per-frame costs ~5x more
-        # than the conversion itself (worst with 10-bit sources). One instance
-        # per stage thread -- they are not thread-safe.
-        self._reformatter = av.video.reformatter.VideoReformatter()  # finish thread
-        self._crop_reformatter = av.video.reformatter.VideoReformatter()  # finish thread
-        self._in_reformatter = av.video.reformatter.VideoReformatter()  # infer thread
-        self._decoder = self._open_decoder()
-        self._epoch = 0  # decode-stage epoch (authoritative for stale drops)
-        self._discard_until: int | None = None
-        # Post-seek accuracy knob (docs/SEEK_LATENCY_PLAN.md step 2). None keeps
-        # seeks frame-accurate: every frame between the source keyframe and the
-        # target is decoded and dropped, which costs one GOP of decode time. A
-        # number caps that — when the keyframe lands further than this many
-        # seconds before the target the stream is emitted from the keyframe
-        # instead, so the client lands early rather than waiting.
-        self.seek_discard_max_s = seek_discard_max_s
-        self._seek_trace: SeekTrace | None = None  # decode thread
-        self._finish_trace: SeekTrace | None = None  # finish thread
-        self._seek_keyframe_seen = False  # decode thread
-        self._need_discontinuity = True
-        self.client_buffered_ms = 0  # last buffer_report value (raw)
-        self._client_buffered_at = time.monotonic()
-        self.playing = False  # session mirrors PLAYING state here
-        self._flush_pending = threading.Event()
-        self._closed = threading.Event()
-        self._threads = [
-            threading.Thread(target=self._guard(self._decode_work), daemon=True, name="pl-decode"),
-            threading.Thread(target=self._guard(self._infer_work), daemon=True, name="pl-infer"),
-            threading.Thread(target=self._guard(self._finish_work), daemon=True, name="pl-finish"),
-        ]
-        for t in self._threads:
-            t.start()
+            self.upscaler = None
+            scale = 1
+            if model_path:
+                # Fixed tiling decision from known input dims: no "auto" probing
+                # (which shells out to nvidia-smi) in the streaming hot path.
+                tile = None if (video.height <= 1440 and video.width <= 2560) else 1024
+                import onnxruntime as _ort
+
+                use_trt = _should_use_tensorrt(ep, set(_ort.get_available_providers()))
+                if use_trt:
+                    # The ORT TensorRT EP corrupts the process heap on this stack
+                    # (see upscale_cli/infer_worker.py) — run it out-of-process.
+                    from upscale_cli.infer_worker import SubprocessUpscaler
+
+                    self.upscaler = SubprocessUpscaler(model_path, ep="tensorrt", tile_size=tile)
+                else:
+                    from upscale_cli.infer import OnnxUpscaler
+
+                    self.upscaler = OnnxUpscaler(model_path, ep=ep, tile_size=tile)
+                if self.upscaler.scale_factor is None:
+                    raise ValueError(f"model {model_path} needs a manifest with scale_factor")
+                _require_gpu_session(self.upscaler, ep)
+                scale = self.upscaler.scale_factor
+
+            # "fit" preserves the full image inside the display. "cover" crops the
+            # post-ONNX frame centrally before resizing to the display dimensions.
+            if fit_mode not in ("fit", "cover"):
+                raise ValueError(f"unknown fit mode {fit_mode!r}")
+            self.fit_mode = fit_mode
+            self.resize_algorithm = resize_algorithm
+            self._interpolation = interpolation_for_algorithm(resize_algorithm)
+            processed_w, processed_h = video.width * scale, video.height * scale
+            if fit_mode == "cover":
+                self.out_w, self.out_h = aligned_target_dimensions(*display)
+                self._crop_box = cover_crop_box(
+                    processed_w, processed_h, self.out_w, self.out_h,
+                )
+            else:
+                self.out_w, self.out_h = fit_dimensions(
+                    processed_w, processed_h, display[0], display[1]
+                )
+                self._crop_box = None
+
+            self.lossless_hevc_profile = lossless_hevc_profile
+            self.quality_tier = quality_tier
+            self._enc_codec, self._enc_pix_fmt, self._enc_options = select_encoder(
+                quality_tier, lossless_hevc_profile=lossless_hevc_profile,
+            )
+            self.encoder_name = self._enc_codec
+            self._mux = None
+            self._enc_stream = None
+            self._aux_template_container = (
+                av.open(aux_source_path) if aux_source_path is not None else None
+            )
+            self._embed_aux_attachments = embed_aux_attachments
+            self._aux_streams: dict[int, av.stream.Stream] = {}
+            self._sink_buf = _SinkBuffer()
+            self._open_mux()
+            self.downlink_container = "matroska"
+            self.downlink_codec = {
+                "hevc_nvenc": "hevc", "libx265": "hevc", "libx264": "h264",
+            }.get(self._enc_codec, self._enc_codec)
+            self.downlink_extradata_b64 = None  # container is self-describing
+
+            # Persistent reformatters: swscale context setup (filter tables) is
+            # expensive at multi-megapixel sizes; rebuild-per-frame costs ~5x more
+            # than the conversion itself (worst with 10-bit sources). One instance
+            # per stage thread -- they are not thread-safe.
+            self._reformatter = av.video.reformatter.VideoReformatter()  # finish thread
+            self._crop_reformatter = av.video.reformatter.VideoReformatter()  # finish thread
+            self._in_reformatter = av.video.reformatter.VideoReformatter()  # infer thread
+            self._decoder = self._open_decoder()
+            self._epoch = 0  # decode-stage epoch (authoritative for stale drops)
+            self._discard_until: int | None = None
+            # Post-seek accuracy knob (docs/SEEK_LATENCY_PLAN.md step 2). None keeps
+            # seeks frame-accurate: every frame between the source keyframe and the
+            # target is decoded and dropped, which costs one GOP of decode time. A
+            # number caps that — when the keyframe lands further than this many
+            # seconds before the target the stream is emitted from the keyframe
+            # instead, so the client lands early rather than waiting.
+            self.seek_discard_max_s = seek_discard_max_s
+            self._seek_trace: SeekTrace | None = None  # decode thread
+            self._finish_trace: SeekTrace | None = None  # finish thread
+            self._seek_keyframe_seen = False  # decode thread
+            self._need_discontinuity = True
+            self.client_buffered_ms = 0  # last buffer_report value (raw)
+            self._client_buffered_at = time.monotonic()
+            self.playing = False  # session mirrors PLAYING state here
+            self._flush_pending = threading.Event()
+            self._closed = threading.Event()
+            self._threads = [
+                threading.Thread(target=self._guard(self._decode_work), daemon=True, name="pl-decode"),
+                threading.Thread(target=self._guard(self._infer_work), daemon=True, name="pl-infer"),
+                threading.Thread(target=self._guard(self._finish_work), daemon=True, name="pl-finish"),
+            ]
+            for t in self._threads:
+                t.start()
+        except BaseException as construction_error:
+            try:
+                self._rollback_construction()
+            except BaseException as cleanup_error:
+                self.construction_failed = True
+                failure = PipelineConstructionError(
+                    f"pipeline initialization failed: {construction_error!r}; "
+                    f"native rollback failed: {cleanup_error!r}", self,
+                )
+                # A partially initialized object cannot run the ordinary
+                # shutdown path. Subsequent close calls observe this failed
+                # barrier, allowing the server to latch restart_required.
+                self._close_error = failure
+                self._close_started = True
+                self._close_complete.set()
+                raise failure from construction_error
+            raise
+
+    def _rollback_construction(self) -> None:
+        """Unwind owners even when __init__ never publishes a Pipeline.
+
+        Until stage threads start, native state belongs to this constructor.
+        If starting a later thread fails, use the normal shutdown barrier for
+        the threads which did start before releasing their state.
+        """
+        self._threads = [thread for thread in self._threads if thread.ident is not None]
+        if self._threads:
+            self.close()  # failure must retain live native owners, not touch them
+        errors = []
+        for name in ("_mux", "_aux_template_container", "upscaler"):
+            owner = getattr(self, name, None)
+            try:
+                if owner is not None and hasattr(owner, "close"):
+                    owner.close()
+            except BaseException as error:
+                # Continue releasing independent owners while retaining the
+                # failed owner and making the failure observable to Session.
+                errors.append(error)
+                log.exception("pipeline construction rollback failed for %s", name)
+            else:
+                setattr(self, name, None)
+        if errors:
+            raise PipelineCloseError(f"construction cleanup failed: {errors[0]!r}") from errors[0]
+        self._enc_stream = None
+        self._aux_streams = {}
+        self._decoder = None
 
     # -- codec management ----------------------------------------------------
 
@@ -918,10 +987,15 @@ class Pipeline:
         if self._need_discontinuity:
             flags |= FLAG_DISCONTINUITY
             self._need_discontinuity = False
-        self.emit(MediaPacket(
-            payload=data,
-            flags=flags,
-            epoch=epoch,
-            pts=pts if pts is not None else NO_TS,
-            dts=NO_TS,
-        ))
+        # Mux flushes can include a large audio tail or many subtitle events.
+        # Container chunk boundaries are arbitrary: split without changing any
+        # bytes, and mark only the first fragment as the epoch discontinuity.
+        for offset in range(0, len(data), MAX_PAYLOAD_BYTES):
+            self.emit(MediaPacket(
+                payload=data[offset:offset + MAX_PAYLOAD_BYTES],
+                flags=flags,
+                epoch=epoch,
+                pts=pts if pts is not None else NO_TS,
+                dts=NO_TS,
+            ))
+            flags = 0

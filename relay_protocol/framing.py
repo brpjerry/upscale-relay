@@ -25,6 +25,14 @@ NO_TS = -(2**63)  # INT64_MIN
 # payload_len, flags, epoch, pts, dts
 _HEADER = struct.Struct("<IBIqq")
 HEADER_LEN = _HEADER.size  # 25
+# Bounds both the wire allocation and a single queued item. Large files are
+# streamed as many packets; no individual access unit/header needs GiB of RAM.
+MAX_PAYLOAD_BYTES = 64 * 1024 * 1024
+
+
+def _validate_payload_size(size: int) -> None:
+    if size > MAX_PAYLOAD_BYTES:
+        raise ValueError(f"media payload exceeds {MAX_PAYLOAD_BYTES} byte limit")
 
 
 @dataclass(slots=True)
@@ -49,6 +57,7 @@ class MediaPacket:
 
 
 def encode_packet(pkt: MediaPacket) -> bytes:
+    _validate_payload_size(len(pkt.payload))
     return _HEADER.pack(len(pkt.payload), pkt.flags, pkt.epoch, pkt.pts, pkt.dts) + pkt.payload
 
 
@@ -61,6 +70,7 @@ async def read_packet(reader: asyncio.StreamReader) -> MediaPacket:
     """Read one framed packet; raises asyncio.IncompleteReadError on EOF."""
     header = await reader.readexactly(HEADER_LEN)
     payload_len, flags, epoch, pts, dts = _HEADER.unpack(header)
+    _validate_payload_size(payload_len)
     payload = await reader.readexactly(payload_len) if payload_len else b""
     return MediaPacket(payload=payload, flags=flags, epoch=epoch, pts=pts, dts=dts)
 
@@ -86,6 +96,7 @@ def read_packet_sync(sock) -> MediaPacket:
     """
     header = _recv_exact(sock, HEADER_LEN)
     payload_len, flags, epoch, pts, dts = _HEADER.unpack(header)
+    _validate_payload_size(payload_len)
     payload = _recv_exact(sock, payload_len) if payload_len else b""
     return MediaPacket(payload=payload, flags=flags, epoch=epoch, pts=pts, dts=dts)
 

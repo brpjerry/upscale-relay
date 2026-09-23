@@ -9,6 +9,27 @@ from pathlib import Path
 from relay_server import runtime_bootstrap as runtime
 
 
+def test_source_runtime_validation_runs_in_an_isolated_process(monkeypatch):
+    from types import SimpleNamespace
+    commands = []
+    monkeypatch.delattr(runtime.sys, "frozen", raising=False)
+    monkeypatch.setattr(runtime.subprocess, "run", lambda command, **kwargs: (
+        commands.append(command) or SimpleNamespace(returncode=0)
+    ))
+    assert runtime.source_runtime_ready("cuda")
+    assert commands[0][-2:] == [runtime.SOURCE_VALIDATE_ARG, "cuda"]
+    monkeypatch.setattr(runtime.sys, "frozen", True, raising=False)
+    assert not runtime.source_runtime_ready("cuda")
+    assert len(commands) == 1
+
+
+def test_source_runtime_dispatch_does_not_run_installer(monkeypatch):
+    checked = []
+    monkeypatch.setattr(runtime, "_validate_source_runtime", checked.append)
+    assert runtime.maybe_run_runtime_installer([runtime.SOURCE_VALIDATE_ARG, "cpu"]) == 0
+    assert checked == ["cpu"]
+
+
 def _use_temp_runtime(monkeypatch, tmp_path: Path) -> Path:
     monkeypatch.setenv("UPSCALE_RELAY_RUNTIME_DIR", str(tmp_path))
     return tmp_path / runtime.RUNTIME_STACK_ID

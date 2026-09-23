@@ -22,6 +22,7 @@ import struct
 import subprocess
 import sys
 import threading
+from contextlib import suppress
 from multiprocessing import shared_memory
 
 import numpy as np
@@ -174,12 +175,40 @@ class SubprocessUpscaler:
         if self.scale_factor is None:
             raise ValueError(f"model {model_path} needs a manifest with scale_factor")
         self._lock = threading.Lock()
-        self._shm_in = shared_memory.SharedMemory(create=True, size=_MAX_IN_BYTES)
-        self._shm_out = shared_memory.SharedMemory(create=True, size=_MAX_OUT_BYTES)
+        self._shm_in: shared_memory.SharedMemory | None = None
+        self._shm_out: shared_memory.SharedMemory | None = None
         self._proc: subprocess.Popen | None = None
+        self._reader: threading.Thread | None = None
         self._first_frame_done = False
         self.active_provider: str | None = None
-        self._start_worker()
+        try:
+            self._shm_in = shared_memory.SharedMemory(create=True, size=_MAX_IN_BYTES)
+            self._shm_out = shared_memory.SharedMemory(create=True, size=_MAX_OUT_BYTES)
+            self._start_worker()
+        except BaseException:
+            with suppress(Exception):
+                self._kill()
+            with suppress(Exception):
+                self._release_shared_memory()
+            raise
+
+    def _release_shared_memory(self) -> None:
+        error = None
+        for attribute in ("_shm_in", "_shm_out"):
+            block = getattr(self, attribute)
+            setattr(self, attribute, None)
+            if block is None:
+                continue
+            try:
+                try:
+                    block.close()
+                finally:
+                    with suppress(FileNotFoundError):
+                        block.unlink()
+            except Exception as exc:
+                error = error or exc
+        if error is not None:
+            raise error
 
     def _start_worker(self) -> None:
         tile = "none" if self.tile_size is None else str(self.tile_size)
@@ -191,19 +220,19 @@ class SubprocessUpscaler:
         )
         # ONE persistent reader thread per worker: a thread-per-frame read
         # pattern churned ~30 threads/s at streaming rate.
-        self._reply_q: queue.Queue = queue.Queue()
+        self._reply_q = reply_q = queue.Queue()
         proc = self._proc
 
         def _reader():
             stdout = proc.stdout
             line = stdout.readline()  # READY line
-            self._reply_q.put(line if line else None)
+            reply_q.put(line if line else None)
             while True:
                 hdr = stdout.read(_HDR.size)
                 if not hdr or len(hdr) < _HDR.size:
-                    self._reply_q.put(None)  # worker died / EOF
+                    reply_q.put(None)  # worker died / EOF
                     return
-                self._reply_q.put(hdr)
+                reply_q.put(hdr)
 
         self._reader = threading.Thread(target=_reader, daemon=True,
                                         name="infer-worker-reader")
@@ -231,11 +260,25 @@ class SubprocessUpscaler:
 
     def _kill(self) -> None:
         if self._proc is not None:
-            try:
+            if self._proc.poll() is None:
                 self._proc.kill()
-            except Exception:
-                pass
-            self._proc = None
+            self._reap_worker()
+
+    def _reap_worker(self) -> None:
+        """Finish the old generation before pipes or shared buffers are reused."""
+        proc = self._proc
+        if proc is None:
+            return
+        proc.wait(timeout=5)
+        if self._reader is not None:
+            self._reader.join(timeout=5)
+            if self._reader.is_alive():
+                raise RuntimeError("inference worker reader did not stop")
+        for pipe in (proc.stdin, proc.stdout):
+            if pipe is not None:
+                pipe.close()
+        self._proc = None
+        self._reader = None
 
     def _roundtrip(self, rgb: np.ndarray, timeout: float) -> np.ndarray | None:
         h, w = rgb.shape[:2]
@@ -283,14 +326,10 @@ class SubprocessUpscaler:
                 try:
                     self._proc.stdin.write(_HDR.pack(0, 0))
                     self._proc.stdin.flush()
-                    self._proc.wait(timeout=5)
+                    self._reap_worker()
                 except Exception:
                     self._kill()
-                self._proc = None
-            self._shm_in.close()
-            self._shm_in.unlink()
-            self._shm_out.close()
-            self._shm_out.unlink()
+            self._release_shared_memory()
 
 
 def build_worker_command(model: str, ep: str, tile: str,

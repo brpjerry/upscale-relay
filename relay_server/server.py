@@ -110,6 +110,10 @@ class RelayServer:
             self.app.router.add_get("/media/{path:.*}", self.handle_media_file)
             self.app.router.add_get("/attachments/{digest}", self.handle_attachment)
         self._stats_task = None
+        self._media_server = None
+        self._runner = None
+        self._stop_task = None
+        self._media_handlers: dict[asyncio.Task, asyncio.StreamWriter] = {}
         self._mdns = MdnsAdvertiser(
             port=self.port,
             media_port=self.media_port,
@@ -330,7 +334,11 @@ class RelayServer:
     # -- media sockets -----------------------------------------------------------
 
     async def handle_media(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        task = asyncio.current_task()
+        self._media_handlers[task] = writer
         peer = writer.get_extra_info("peername")
+        attached_session = None
+        direction = None
         try:
             direction, token = parse_handshake(await reader.readexactly(HANDSHAKE_LEN))
             session = self.sessions.get(token)
@@ -339,10 +347,11 @@ class RelayServer:
                  and session.source_kind == "uplink")
                 or (direction == DIR_DOWNLINK and token == session.downlink_token)
             )
-            if not valid:
+            if not valid or not session.register_media(direction, writer):
                 writer.write(b"\x01")
                 await writer.drain()
                 return
+            attached_session = session
             writer.write(b"\x00")
             await writer.drain()
             if direction == DIR_UPLINK:
@@ -352,36 +361,36 @@ class RelayServer:
         except (asyncio.IncompleteReadError, ConnectionResetError, ValueError) as err:
             log.info("media conn %s closed: %r", peer, err)
         finally:
+            if attached_session is not None:
+                attached_session.unregister_media(direction, writer)
             writer.close()
+            try:
+                await writer.wait_closed()
+            except (OSError, RuntimeError):
+                pass
+            finally:
+                self._media_handlers.pop(task, None)
 
     async def _run_uplink(self, session: Session, reader: asyncio.StreamReader) -> None:
-        session.uplink_attached = True
-        try:
-            while session.state != State.CLOSED:
-                pkt = await read_packet(reader)
-                if pkt.epoch < session.epoch:
-                    continue  # stale, drop before any processing
-                if session.pipeline is None:
-                    continue
-                # Blocking put in executor -> natural TCP backpressure.
-                await asyncio.to_thread(session.pipeline.feed, pkt)
-        finally:
-            session.uplink_attached = False
+        while session.state != State.CLOSED:
+            pkt = await read_packet(reader)
+            if pkt.epoch < session.epoch:
+                continue  # stale, drop before any processing
+            if session.pipeline is None:
+                continue
+            # Blocking put in executor -> natural TCP backpressure.
+            await asyncio.to_thread(session.pipeline.feed, pkt)
 
     async def _run_downlink(self, session: Session, writer: asyncio.StreamWriter) -> None:
-        session.downlink_attached = True
-        try:
-            await session.start_server_source()
-            while True:
-                pkt = await session.down_q.get()
-                if pkt is None or session.state == State.CLOSED:
-                    break
-                if pkt.epoch < session.epoch:
-                    continue
-                writer.write(encode_packet(pkt))
-                await writer.drain()
-        finally:
-            session.downlink_attached = False
+        await session.start_server_source()
+        while True:
+            pkt = await session.down_q.get()
+            if pkt is None or session.state == State.CLOSED:
+                break
+            if pkt.epoch < session.epoch:
+                continue
+            writer.write(encode_packet(pkt))
+            await writer.drain()
 
     # -- status -------------------------------------------------------------------
 
@@ -417,7 +426,9 @@ class RelayServer:
     async def handle_media_file(self, request: web.Request) -> web.StreamResponse:
         assert self.library is not None
         try:
-            path = self.library.resolve_file(request.match_info["path"])
+            path = await asyncio.to_thread(
+                self.library.resolve_file, request.match_info["path"],
+            )
         except LibraryPathError:
             raise web.HTTPNotFound()
         # aiohttp FileResponse implements byte ranges, conditional requests,
@@ -459,27 +470,80 @@ class RelayServer:
     # -- lifecycle ------------------------------------------------------------------
 
     async def start(self) -> None:
-        self._media_server = await asyncio.start_server(self.handle_media, port=self.media_port)
-        self._runner = web.AppRunner(self.app)
-        await self._runner.setup()
-        site = web.TCPSite(self._runner, port=self.port)
-        await site.start()
-        if self.stats_interval:
-            self._stats_task = asyncio.create_task(self._stats_loop())
-        if self._mdns is not None:
-            await self._mdns.start()
-        log.info("control/status on :%d, media on :%d", self.port, self.media_port)
+        if self._media_server is not None or self._runner is not None:
+            raise RuntimeError("relay server already started")
+        self._stop_task = None
+        try:
+            self._media_server = await asyncio.start_server(self.handle_media, port=self.media_port)
+            self._runner = web.AppRunner(self.app)
+            await self._runner.setup()
+            site = web.TCPSite(self._runner, port=self.port)
+            await site.start()
+            if self.stats_interval:
+                self._stats_task = asyncio.create_task(self._stats_loop())
+            if self._mdns is not None:
+                await self._mdns.start()
+            log.info("control/status on :%d, media on :%d", self.port, self.media_port)
+        except BaseException:
+            # A failed control bind or canceled advertisement must not leave
+            # the earlier media listener alive in an unpublished server.
+            try:
+                await self.stop()
+            except BaseException:
+                log.exception("server startup rollback failed")
+            raise
 
     async def stop(self) -> None:
-        if self._mdns is not None:
-            await self._mdns.stop()
+        if self._stop_task is None:
+            self._stop_task = asyncio.create_task(self._stop_impl())
+        await asyncio.shield(self._stop_task)
+
+    async def _stop_impl(self) -> None:
+        errors = []
+        media, self._media_server = self._media_server, None
+        runner, self._runner = self._runner, None
+        if media is not None:
+            media.close()  # stop accepting; await only after active sockets close
         if self._stats_task is not None:
             self._stats_task.cancel()
-        for s in {s.id: s for s in self.sessions.values()}.values():
-            await s.close()
-        self._media_server.close()
-        await self._media_server.wait_closed()
-        await self._runner.cleanup()
+            await asyncio.gather(self._stats_task, return_exceptions=True)
+            self._stats_task = None
+        if self._mdns is not None:
+            try:
+                await self._mdns.stop()
+            except Exception as error:
+                errors.append(error)
+        for session in {s.id: s for s in self.sessions.values()}.values():
+            try:
+                await session.close()
+            except Exception as error:
+                errors.append(error)
+            finally:
+                try:
+                    await session.ws.close()
+                except Exception as error:
+                    errors.append(error)
+        # Include peers still waiting for a handshake, which have no Session
+        # owner yet. Python 3.13+ wait_closed also waits for these transports.
+        handlers = list(self._media_handlers.items())
+        for task, writer in handlers:
+            writer.close()
+            writer.transport.abort()
+            if task is not asyncio.current_task():
+                task.cancel()
+        await asyncio.gather(
+            *(task for task, _writer in handlers if task is not asyncio.current_task()),
+            return_exceptions=True,
+        )
+        if media is not None:
+            await media.wait_closed()
+        if runner is not None:
+            try:
+                await runner.cleanup()
+            except Exception as error:
+                errors.append(error)
+        if errors:
+            raise errors[0]
 
 
 async def main_async(args) -> None:

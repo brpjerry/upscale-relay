@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import time
 from pathlib import Path
 
@@ -19,7 +20,9 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QDoubleSpinBox,
+    QDockWidget,
     QFileSystemModel,
+    QFormLayout,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -69,6 +72,47 @@ _SERVER_PAGE_SIZE = 100
 
 def _format_time(seconds: float) -> str:
     return f"{int(seconds // 60):02d}:{int(seconds % 60):02d}"
+
+
+def _server_address(host: str, port: int) -> str:
+    return f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
+
+
+def _parse_server_address(address: str) -> tuple[str, int]:
+    text = address.strip()
+    if not text or any(char.isspace() for char in text) or any(c in text for c in "/?#"):
+        raise ValueError("Enter a hostname or IP address, such as server.local:8590.")
+    port_text = None
+    if text.startswith("["):
+        end = text.find("]")
+        if end < 0:
+            raise ValueError("Close the IPv6 address with ], for example [::1]:8590.")
+        host = text[1:end]
+        try:
+            ipaddress.IPv6Address(host)
+        except ValueError as err:
+            raise ValueError("Enter a valid IPv6 address inside the brackets.") from err
+        suffix = text[end + 1:]
+        if suffix and not suffix.startswith(":"):
+            raise ValueError("Use [IPv6]:port, for example [::1]:8590.")
+        port_text = suffix[1:] if suffix else None
+    elif text.count(":") > 1:
+        try:
+            ipaddress.IPv6Address(text)
+        except ValueError as err:
+            raise ValueError("Use [IPv6]:port, for example [::1]:8590.") from err
+        host = text  # an unbracketed IPv6 address uses the default port
+    else:
+        host, separator, port = text.partition(":")
+        port_text = port if separator else None
+        if not host or "[" in host or "]" in host:
+            raise ValueError("Enter a server hostname or IP address before the port.")
+    if port_text is not None and (not port_text.isascii() or not port_text.isdecimal()):
+        raise ValueError("The control port must be a number from 1 to 65534.")
+    port = int(port_text) if port_text is not None else 8590
+    if not 1 <= port <= 65534:
+        raise ValueError("The control port must be from 1 to 65534; media uses the next port.")
+    return host, port
 
 
 class SeekSlider(QSlider):
@@ -139,11 +183,14 @@ class MainWindow(QMainWindow):
         self.browser_toggle.setChecked(self.settings.browser_visible)
         self.browser_toggle.setIcon(self._icon("folder", QStyle.SP_DirIcon))
         self.browser_toggle.setToolTip("Show/hide the file browser")
-        self.host_edit = QLineEdit(f"{self.settings.server_host}:{self.settings.server_port}")
-        self.host_edit.setFixedWidth(160)
+        self.host_edit = QLineEdit(_server_address(
+            self.settings.server_host, self.settings.server_port,
+        ))
+        self.host_edit.setMinimumWidth(180)
+        self.host_edit.setMaximumWidth(320)
         self.host_edit.setPlaceholderText("host:port")
         self.connect_btn = QPushButton("Connect")
-        self.autoconnect_check = QCheckBox("auto")
+        self.autoconnect_check = QCheckBox("Auto connect")
         self.autoconnect_check.setToolTip("Connect to this server automatically on launch")
         self.autoconnect_check.setChecked(self.settings.auto_connect)
         self.model_combo = QComboBox()
@@ -163,29 +210,63 @@ class MainWindow(QMainWindow):
         if self.settings.resize_algorithm:
             self.resize_combo.addItem(self.settings.resize_algorithm, self.settings.resize_algorithm)
             self.resize_combo.setCurrentIndex(1)
-        self.deband_check = QCheckBox("deband")
+        self.deband_check = QCheckBox("Reduce color banding")
         self.deband_check.setToolTip(
-            "Apply mpv's GPU debanding after decode (does not alter the ONNX input)"
+            "Smooth visible color steps in gradients during playback."
         )
         self.deband_check.setChecked(self.settings.deband_enabled)
         self.conn_label = QLabel("disconnected")
+        self.conn_label.setMinimumWidth(120)
+        self.conn_label.setMaximumWidth(300)
+        self.conn_label.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred)
+        self.playback_settings_toggle = QToolButton()
+        self.playback_settings_toggle.setText("Playback settings")
+        self.playback_settings_toggle.setCheckable(True)
+        self.playback_settings_toggle.setToolButtonStyle(Qt.ToolButtonTextOnly)
+        self.playback_settings_toggle.setToolTip("Show playback settings")
         bar.addWidget(self.browser_toggle)
-        bar.addWidget(QLabel(" server "))
+        bar.addWidget(QLabel(" Server "))
         bar.addWidget(self.host_edit)
         bar.addWidget(self.connect_btn)
         bar.addWidget(self.autoconnect_check)
-        bar.addWidget(QLabel("  model "))
-        bar.addWidget(self.model_combo)
-        bar.addWidget(QLabel("  quality "))
-        bar.addWidget(self.tier_combo)
-        bar.addWidget(QLabel("  display "))
-        bar.addWidget(self.fit_combo)
-        bar.addWidget(QLabel("  resize "))
-        bar.addWidget(self.resize_combo)
-        bar.addWidget(QLabel("  "))
-        bar.addWidget(self.deband_check)
-        bar.addWidget(QLabel("  "))
-        bar.addWidget(self.conn_label)
+        spacer = QWidget()
+        spacer.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        bar.addWidget(spacer)
+        bar.addWidget(self.playback_settings_toggle)
+
+        self.playback_settings = QDockWidget("Playback settings", self)
+        self.playback_settings.setObjectName("playbackSettings")
+        self.playback_settings.setFeatures(QDockWidget.DockWidgetClosable)
+        settings_page = QWidget()
+        settings_layout = QVBoxLayout(settings_page)
+        explanation = QLabel(
+            "Streaming settings apply at the current playback position. "
+            "Changing them restarts an active stream."
+        )
+        explanation.setWordWrap(True)
+        settings_layout.addWidget(explanation)
+        form = QFormLayout()
+        form.setRowWrapPolicy(QFormLayout.WrapAllRows)
+        for label, combo, help_text in (
+            ("Upscale model", self.model_combo, "Choose a model available on the server."),
+            ("Stream quality", self.tier_combo, "Higher quality can require more network bandwidth."),
+            ("Framing", self.fit_combo, "Fit keeps the whole image; Crop fills the display."),
+            ("Resize filter", self.resize_combo, "Choose how the upscaled image is fitted to the display."),
+        ):
+            combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+            combo.setMinimumContentsLength(24)
+            combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+            combo.setToolTip(help_text)
+            form.addRow(label, combo)
+        settings_layout.addLayout(form)
+        settings_layout.addWidget(self.deband_check)
+        settings_layout.addStretch(1)
+        self.playback_settings.setWidget(settings_page)
+        self.addDockWidget(Qt.RightDockWidgetArea, self.playback_settings)
+        self.playback_settings.hide()
+        self.playback_settings_toggle.toggled.connect(self.playback_settings.setVisible)
+        self.playback_settings.visibilityChanged.connect(self.playback_settings_toggle.setChecked)
+        self._settings_visible_before_fullscreen = False
 
         # -- file browser ------------------------------------------------------
         self.fs_model = QFileSystemModel()
@@ -233,6 +314,16 @@ class MainWindow(QMainWindow):
 
         # -- player -------------------------------------------------------------
         self.player = PlayerView(options=self.options)
+        self.idle_hint = QLabel(self.player)
+        self.idle_hint.setObjectName("idleGuidance")
+        self.idle_hint.setTextFormat(Qt.PlainText)
+        self.idle_hint.setAlignment(Qt.AlignCenter)
+        self.idle_hint.setWordWrap(True)
+        self.idle_hint.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self.idle_hint.setStyleSheet("color: #dddddd; background: transparent;")
+        hint_font = self.idle_hint.font()
+        hint_font.setPointSizeF(max(12.0, hint_font.pointSizeF()))
+        self.idle_hint.setFont(hint_font)
         if hasattr(self.player, "set_deband"):
             self.player.set_deband(self.settings.deband_enabled)
         self._icon_play = self._icon("media-playback-start", QStyle.SP_MediaPlay)
@@ -295,6 +386,10 @@ class MainWindow(QMainWindow):
         self.sub_delay.setSingleStep(0.1)
         self.sub_delay.setSuffix(" s")
         self.sub_delay.setEnabled(False)
+        self.sub_delay.setToolTip(
+            "Subtitle delay: positive values show subtitles later; negative values show them earlier."
+        )
+        self.sub_delay.setAccessibleName("Subtitle delay")
 
         self.audio_combo = QComboBox()
         self.audio_combo.addItem("no audio", None)
@@ -305,6 +400,24 @@ class MainWindow(QMainWindow):
         self.audio_delay.setSingleStep(0.1)
         self.audio_delay.setSuffix(" s")
         self.audio_delay.setEnabled(False)
+        self.audio_delay.setToolTip(
+            "Audio delay: positive values play audio later; negative values play it earlier."
+        )
+        self.audio_delay.setAccessibleName("Audio delay")
+
+        volume, muted = (
+            self.player.audio_output_state()
+            if hasattr(self.player, "audio_output_state") else (100, False)
+        )
+        self.mute_btn = QToolButton()
+        self.mute_btn.setCheckable(True)
+        self._icon_volume = self._icon("audio-volume-high", QStyle.SP_MediaVolume)
+        self._icon_muted = self._icon("audio-volume-muted", QStyle.SP_MediaVolumeMuted)
+        self.volume_slider = QSlider(Qt.Horizontal)
+        self.volume_slider.setRange(0, max(100, volume))
+        self.volume_slider.setFixedWidth(90)
+        self.volume_slider.setAccessibleName("Volume")
+        self._show_audio_output(volume, muted)
 
         transport = QHBoxLayout()
         transport.addWidget(self.play_btn)
@@ -315,6 +428,8 @@ class MainWindow(QMainWindow):
         transport.addWidget(self.fullscreen_btn)
         transport.addWidget(self.fallback_btn)
         transport.addWidget(self.player_status, stretch=1)
+        transport.addWidget(self.mute_btn)
+        transport.addWidget(self.volume_slider)
         # Track selectors used to share the transport row with chapters and
         # telemetry.  Once a video populated all of them, that single row had
         # an ~900 px minimum and Qt enlarged the window (or stole width from
@@ -373,7 +488,8 @@ class MainWindow(QMainWindow):
         self.open_progress.setFixedWidth(140)
         self.open_progress.setVisible(False)
         self.statusBar().addPermanentWidget(self.open_progress)
-        self.statusBar().showMessage(f"player backend: {PLAYER_BACKEND}")
+        self.statusBar().addPermanentWidget(self.conn_label)
+        self.statusBar().showMessage("Connect to a server to start streaming.")
 
         # -- signals ---------------------------------------------------------------
         self.connect_btn.clicked.connect(self.on_connect)
@@ -397,6 +513,8 @@ class MainWindow(QMainWindow):
         if hasattr(self.player, "fullscreen_toggled"):
             self.player.fullscreen_toggled.connect(self.toggle_fullscreen)
         self.play_btn.clicked.connect(self.on_play_pause)
+        if hasattr(self.player, "pause_requested"):
+            self.player.pause_requested.connect(self.on_play_pause)
         self.stop_btn.clicked.connect(self.on_stop)
         self.fallback_btn.clicked.connect(self.on_fallback)
         self.seek_slider.sliderReleased.connect(self.on_seek)
@@ -411,6 +529,10 @@ class MainWindow(QMainWindow):
         self.sub_delay.valueChanged.connect(lambda v: self.player.set_sub_delay(v))
         self.audio_combo.currentIndexChanged.connect(self.on_audio_selected)
         self.audio_delay.valueChanged.connect(lambda v: self.player.set_audio_delay(v))
+        self.volume_slider.valueChanged.connect(self._on_volume_requested)
+        self.mute_btn.toggled.connect(self._on_mute_requested)
+        if hasattr(self.player, "volume_changed"):
+            self.player.volume_changed.connect(self._show_audio_output)
         self.player.stats_changed.connect(self.player_status.setText)
         self.player.position_changed.connect(self._on_position)
         self.player.track_list_changed.connect(self._on_tracks)
@@ -438,6 +560,7 @@ class MainWindow(QMainWindow):
         self.seek_slider.sliderPressed.connect(lambda: setattr(self, "_slider_down", True))
 
         self._apply_browser_visible(self.settings.browser_visible)
+        self._update_idle_guidance()
         if self.settings.auto_connect:
             # Fire once the qasync loop starts (on_connect is a coroutine slot).
             QTimer.singleShot(0, self.on_connect)
@@ -494,6 +617,10 @@ class MainWindow(QMainWindow):
         if hasattr(self, "play_btn"):
             self.play_btn.setIcon(
                 self._icon_play if getattr(self, "_paused", False) else self._icon_pause)
+        if hasattr(self, "volume_slider"):
+            self._icon_volume = self._icon("audio-volume-high", QStyle.SP_MediaVolume)
+            self._icon_muted = self._icon("audio-volume-muted", QStyle.SP_MediaVolumeMuted)
+            self._show_audio_output(self.volume_slider.value(), self.mute_btn.isChecked())
 
     def changeEvent(self, event) -> None:
         super().changeEvent(event)
@@ -503,6 +630,8 @@ class MainWindow(QMainWindow):
             QEvent.StyleChange,
         ):
             self._refresh_action_icons()
+            if getattr(self, "_controls_overlay", False):
+                self._apply_overlay_palette()
 
     @staticmethod
     def _bound_track_combo(combo: QComboBox) -> None:
@@ -549,12 +678,15 @@ class MainWindow(QMainWindow):
         for w in (self._toolbar, self.statusBar()):
             w.setVisible(not entering)
         if entering:
+            self._settings_visible_before_fullscreen = self.playback_settings.isVisible()
+            self.playback_settings.hide()
             self._apply_browser_visible(False)
             self._enter_overlay_controls()
             self._was_maximized = self.isMaximized()
             self.showFullScreen()
             self.player.setFocus()  # keys (Space/F/arrows) go to the video
         else:
+            self.playback_settings.setVisible(self._settings_visible_before_fullscreen)
             self._apply_browser_visible(self.browser_toggle.isChecked())
             self._exit_overlay_controls()
             if self._was_maximized:
@@ -580,14 +712,25 @@ class MainWindow(QMainWindow):
         self._controls_layout.removeWidget(self.controls_panel)
         self.controls_panel.setParent(self.player)
         self.controls_panel.setAttribute(Qt.WA_StyledBackground, True)
+        self._apply_overlay_palette()
         self.controls_panel.setStyleSheet(
-            "#overlayControls { background-color: rgba(18, 18, 18, 210); "
-            "border-top: 1px solid rgba(255, 255, 255, 28); }"
+            "#overlayControls { background-color: palette(window); "
+            "border-top: 1px solid palette(mid); }"
         )
         self.controls_panel.layout().setContentsMargins(16, 8, 16, 12)
         self.controls_panel.hide()
         self._position_overlay()
         self.controls_panel.raise_()
+
+    def _apply_overlay_palette(self) -> None:
+        # Keep foreground, disabled text, control surfaces and focus colors in
+        # the same palette. A fixed dark background made a light theme's black
+        # labels disappear in fullscreen.
+        palette = QPalette(self.palette())
+        backdrop = palette.color(QPalette.Window)
+        backdrop.setAlpha(240)
+        palette.setColor(QPalette.Window, backdrop)
+        self.controls_panel.setPalette(palette)
 
     def _exit_overlay_controls(self) -> None:
         if not self._controls_overlay:
@@ -595,6 +738,7 @@ class MainWindow(QMainWindow):
         self._controls_overlay = False
         self._controls_timer.stop()
         self.controls_panel.setStyleSheet("")
+        self.controls_panel.setPalette(QPalette())
         self.controls_panel.setAttribute(Qt.WA_StyledBackground, False)
         self.controls_panel.layout().setContentsMargins(0, 0, 0, 0)
         self._controls_layout.addWidget(self.controls_panel)  # re-dock below the video
@@ -632,21 +776,63 @@ class MainWindow(QMainWindow):
         self.controls_panel.hide()
 
     def eventFilter(self, obj, event) -> bool:
-        if (obj is self.player and event.type() == QEvent.Resize
-                and self._controls_overlay):
-            self._position_overlay()
+        if obj is self.player and event.type() == QEvent.Resize:
+            self._position_idle_guidance()
+            if self._controls_overlay:
+                self._position_overlay()
         return super().eventFilter(obj, event)
 
+    def _position_idle_guidance(self) -> None:
+        height = min(180, max(0, self.player.height() - 48))
+        self.idle_hint.setGeometry(
+            24, (self.player.height() - height) // 2,
+            max(0, self.player.width() - 48), height,
+        )
+
+    def _update_idle_guidance(self) -> None:
+        if self._session_source is not None:
+            self.idle_hint.hide()
+            return
+        if self.client is None:
+            text = "Connect to your server\n\nEnter its address above, then choose a video from the file browser."
+        else:
+            location = "Local or Server" if self._server_caps.get("library") else "the file browser"
+            text = f"Choose a video\n\nDouble-click a file in {location} to start streaming."
+        self.idle_hint.setText(text)
+        self._position_idle_guidance()
+        self.idle_hint.show()
+
+    def _show_audio_output(self, volume: int, muted: bool) -> None:
+        self.volume_slider.blockSignals(True)
+        self.volume_slider.setMaximum(max(self.volume_slider.maximum(), volume))
+        self.volume_slider.setValue(volume)
+        self.volume_slider.blockSignals(False)
+        self.volume_slider.setToolTip(f"Volume: {volume}%")
+        self.mute_btn.blockSignals(True)
+        self.mute_btn.setChecked(muted)
+        self.mute_btn.blockSignals(False)
+        self.mute_btn.setIcon(self._icon_muted if muted else self._icon_volume)
+        self.mute_btn.setToolTip("Unmute (M)" if muted else "Mute (M)")
+        self.mute_btn.setAccessibleName("Unmute" if muted else "Mute")
+
+    def _on_volume_requested(self, volume: int) -> None:
+        self.player.set_volume(volume)
+        self._show_audio_output(volume, self.mute_btn.isChecked())
+
+    def _on_mute_requested(self, muted: bool) -> None:
+        self.player.set_muted(muted)
+        self._show_audio_output(self.volume_slider.value(), muted)
+
     def _host_port(self) -> tuple[str, int]:
-        text = self.host_edit.text().strip()
-        host, _, port = text.partition(":")
-        return host or "127.0.0.1", int(port or 8590)
+        return _parse_server_address(self.host_edit.text())
 
     def _set_opening(self, active: bool, text: str = "") -> None:
         """Show/hide the indeterminate busy bar while a session opens."""
         self.open_progress.setVisible(active)
         if active and text:
             self.statusBar().showMessage(text)
+            self.idle_hint.setText(f"Preparing playback…\n\n{text}")
+            self.idle_hint.show()
 
     def _on_open_progress(self, msg: dict) -> None:
         """session_progress from the server (e.g. TensorRT engine build)."""
@@ -663,7 +849,12 @@ class MainWindow(QMainWindow):
         elapsed = msg.get("elapsed_s")
         discarded = msg.get("frames_discarded")
         text = "seeking…"
-        if isinstance(discarded, int) and discarded:
+        if msg.get("stage") == "subtitle_index":
+            text = "Indexing subtitles for this seek…"
+            indexed_s = msg.get("subtitle_indexed_s")
+            if isinstance(indexed_s, (int, float)):
+                text += f" read through {_format_time(indexed_s)}"
+        elif isinstance(discarded, int) and discarded:
             text = f"seeking… (server decoded past {discarded} frames)"
         if isinstance(elapsed, (int, float)):
             text = f"{text} {elapsed:.1f} s"
@@ -716,6 +907,9 @@ class MainWindow(QMainWindow):
         self.resize_combo.blockSignals(False)
         self.conn_label.setText(f"connected: {caps['server_name']}")
         self.connect_btn.setText("Disconnect")
+        self._update_idle_guidance()
+        if self._session_source is None:
+            self.statusBar().showMessage("Choose a video from the file browser.")
         if caps.get("library"):
             self._ensure_server_tab()
             await self.on_refresh_server_library()
@@ -882,8 +1076,15 @@ class MainWindow(QMainWindow):
             self._remove_server_tab()
             self.conn_label.setText("disconnected")
             self.connect_btn.setText("Connect")
+            self._update_idle_guidance()
             return
-        host, port = self._host_port()
+        try:
+            host, port = self._host_port()
+        except ValueError as err:
+            self.host_edit.setFocus()
+            self.host_edit.selectAll()
+            self._error("Invalid server address", str(err))
+            return
         client = RelayClient(host, port)
         try:
             caps = await client.connect()
@@ -987,7 +1188,14 @@ class MainWindow(QMainWindow):
             await self.client.start_uplink()
         except Exception as err:
             self._error("Session failed", str(err))
+            # open_session may already have allocated a GPU pipeline before
+            # fonts, media sockets, or the source pump fail. Retire that owner
+            # through the same confirmed teardown barrier as an ordinary stop.
+            await self._teardown_session()
             return
+        except asyncio.CancelledError:
+            await self._teardown_session()
+            raise
         finally:
             self._set_opening(False)
         track = self.client.track
@@ -998,9 +1206,20 @@ class MainWindow(QMainWindow):
             self._error("Session failed", "Server did not provide the source time base.")
             await self._teardown_session()
             return
+        source_has_auxiliary = (
+            getattr(track, "has_auxiliary_tracks", None) if track is not None
+            else getattr(session, "source_has_auxiliary", None)
+        )
+        source_has_audio = (
+            getattr(track, "has_audio_tracks", None) if track is not None
+            else getattr(session, "source_has_audio", None)
+        )
         original_media = (
             None
-            if getattr(session, "aux_tracks", "external") == "muxed"
+            if (
+                getattr(session, "aux_tracks", "external") == "muxed"
+                or source_has_auxiliary is False
+            )
             else (path if source == "uplink" else self.client.media_url(path))
         )
         self._session_source = source
@@ -1013,7 +1232,9 @@ class MainWindow(QMainWindow):
             time_base,
             source_path=original_media,
             avg_rate=avg_rate,
+            source_has_audio=source_has_audio is not False,
         )
+        self.idle_hint.hide()
         # Match Android's ordering: give mpv its per-load loopback first, then
         # release the server pipeline. Previously the server could produce into
         # the bridge while the player had not even begun opening its socket.
@@ -1061,11 +1282,18 @@ class MainWindow(QMainWindow):
 
     async def _seek_to_seconds(self, target_s: float, announce: bool = True) -> None:
         """Shared relay-protocol seek: slider, arrow keys, chapters, resume."""
-        if self.client is None or self.client.session is None:
-            return
         target_s = max(0.0, target_s)
         if self._duration_s:
             target_s = min(target_s, max(0.0, self._duration_s - 1.0))
+        if self._session_source == "local":
+            try:
+                self.player.seek_local(target_s)
+                self._arm_pending_seek(target_s)
+            except Exception as err:
+                self._error("Seek failed", str(err))
+            return
+        if self.client is None or self.client.session is None:
+            return
         tb = self._session_time_base
         if tb is None:
             return
@@ -1133,16 +1361,19 @@ class MainWindow(QMainWindow):
 
     @asyncSlot()
     async def on_play_pause(self) -> None:
-        if self.client is None:
+        local = self._session_source == "local"
+        if not local and (self.client is None or self.client.session is None):
             return
         self._paused = not self._paused
         self.player.set_paused(self._paused)
         if self._paused:
-            await self.client.pause()
+            if not local:
+                await self.client.pause()
             self.play_btn.setIcon(self._icon_play)
             self.play_btn.setToolTip("Play (Space)")
         else:
-            await self.client.play()
+            if not local:
+                await self.client.play()
             self.play_btn.setIcon(self._icon_pause)
             self.play_btn.setToolTip("Pause (Space)")
 
@@ -1181,18 +1412,37 @@ class MainWindow(QMainWindow):
         if self._session_source != "uplink":
             return
         pos = self._position_s
-        path = self.client.track.path if self.client and self.client.track else None
+        path = self._session_path
         if path is None:
             return
-        self.player._source_path = path  # ensure set even if session died early
-        if self.client is not None and self.client.session is not None:
-            host, port = self.client.host, self.client.port
-            await self.client.teardown()
+        # The control teardown closes the old downlink. Stop its consumer first
+        # so that normal closure cannot enqueue a stale playback failure while
+        # the local file is being loaded.
+        self.player.stop()
+        if self.client is not None:
+            try:
+                await self.client.teardown()
+            except TeardownNotConfirmedError as err:
+                # Local playback allocates no replacement GPU session. It can
+                # proceed while the failed server cleanup remains visible.
+                self._error("Server cleanup not confirmed", str(err))
             self.client = None
             self._remove_server_tab()
             self.conn_label.setText("disconnected")
             self.connect_btn.setText("Connect")
-        self.player.play_local_fallback(pos)
+        self._session_source = "local"
+        self._session_time_base = None
+        self._pending_seek_s = None
+        self.fallback_btn.setEnabled(False)
+        self.player.client = None
+        try:
+            await self.player.play_local(path, pos, paused=self._paused)
+        except Exception as err:
+            self._error("Local playback failed", str(err))
+            await self._teardown_session()
+            return
+        if self._session_source != "local":
+            return
         self.statusBar().showMessage(f"playing locally from {pos:.1f}s (upscaler off)")
 
     def on_sub_selected(self, index: int) -> None:
@@ -1283,7 +1533,10 @@ class MainWindow(QMainWindow):
 
     def _on_rebuffering(self, buffering: bool) -> None:
         if buffering:
-            self.statusBar().showMessage("buffering… (server behind real-time)")
+            self.statusBar().showMessage(
+                "Buffering local playback…" if self._session_source == "local"
+                else "Buffering… waiting for the stream."
+            )
         else:
             self.statusBar().clearMessage()
 
@@ -1311,7 +1564,15 @@ class MainWindow(QMainWindow):
         self._session_source = None
         self._session_path = None
         self._session_time_base = None
-        if self.client is not None and self.client.session is not None:
+        self._duration_s = None
+        self._position_s = 0.0
+        self.pos_label.setText("--:-- / --:--")
+        self.player_status.clear()
+        self._update_idle_guidance()
+        if self.client is not None and (
+            self.client.session is not None
+            or getattr(self.client, "has_server_session", False)
+        ):
             # Close the whole client (server tears the session down with the
             # WS) and reconnect fresh: one session per connection in v1.
             host, port = self.client.host, self.client.port

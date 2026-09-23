@@ -11,8 +11,10 @@ q = quit.
 from __future__ import annotations
 
 import argparse
+from contextlib import ExitStack
 import asyncio
 import sys
+import tempfile
 import time
 from fractions import Fraction
 
@@ -30,7 +32,7 @@ class PlaybackSim:
 
     def __init__(self, time_base: Fraction):
         self.time_base = time_base
-        self.received_pts: list[int] = []
+        self.received_packets = 0
         self.newest_pts_s = 0.0
         self.start_wall: float | None = None
         self.start_pts_s: float | None = None
@@ -40,7 +42,7 @@ class PlaybackSim:
     def on_packet(self, pts: int) -> None:
         if pts == NO_TS:
             return
-        self.received_pts.append(pts)
+        self.received_packets += 1
         self.newest_pts_s = max(self.newest_pts_s, float(pts * self.time_base))
         if self.start_pts_s is None:
             self.start_pts_s = float(pts * self.time_base)
@@ -78,6 +80,14 @@ class PlaybackSim:
 
 async def run(args) -> int:
     client = RelayClient(args.host, args.port)
+    try:
+        with ExitStack() as resources:
+            return await _run_session(args, client, resources)
+    finally:
+        await client.teardown()
+
+
+async def _run_session(args, client, resources: ExitStack) -> int:
     caps = await client.connect()
     print(f"server: {caps['server_name']} | models: {[m['name'] for m in caps['models']]}")
 
@@ -94,8 +104,9 @@ async def run(args) -> int:
     sim = PlaybackSim(client.track.time_base)
 
     # Downlink is a self-describing container stream (docs/PROTOCOL.md §3.2);
-    # collect the current epoch's bytes and demux after EOS for verification.
-    epoch_bytes = bytearray()
+    # Optional verification spools to disk: normal playback retains no payload,
+    # and even a multi-hour --decode run has bounded Python memory.
+    epoch_file = resources.enter_context(tempfile.TemporaryFile()) if args.decode else None
 
     mpv_proc = None
     if args.mpv:
@@ -104,7 +115,7 @@ async def run(args) -> int:
             stdin=asyncio.subprocess.PIPE,
         )
 
-    out_file = open(args.save, "wb") if args.save else None
+    out_file = resources.enter_context(open(args.save, "wb")) if args.save else None
 
     await client.start_uplink()
     await client.play()
@@ -116,14 +127,18 @@ async def run(args) -> int:
             pkt = await q.get()
             if pkt is None:
                 break
+            if pkt.epoch < client.epoch:
+                continue
             if pkt.eos:
                 sim.eos = True
                 break
             sim.on_packet(pkt.pts)
             client.buffered_ms = sim.buffered_ms
-            if pkt.discontinuity:
-                epoch_bytes.clear()  # fresh container stream after a seek
-            epoch_bytes.extend(pkt.payload)
+            if epoch_file is not None:
+                if pkt.discontinuity:
+                    epoch_file.seek(0)
+                    epoch_file.truncate()
+                epoch_file.write(pkt.payload)
             if mpv_proc is not None:
                 mpv_proc.stdin.write(pkt.payload)
                 await mpv_proc.stdin.drain()
@@ -144,7 +159,7 @@ async def run(args) -> int:
     report_live_task = asyncio.create_task(report_live())
 
     async def keyboard() -> None:
-        if not sys.stdin.isatty():
+        if sys.platform != "win32" or not sys.stdin.isatty():
             await asyncio.Event().wait()
         import msvcrt
 
@@ -183,26 +198,25 @@ async def run(args) -> int:
             await asyncio.wait([consume_task], timeout=status_interval)
             if not consume_task.done():
                 print(f"pos {sim.position_s:6.1f}s | buffered {sim.buffered_ms:5d} ms | "
-                      f"pkts {len(sim.received_pts)}", file=sys.stderr)
+                      f"pkts {sim.received_packets}", file=sys.stderr)
+        if not consume_task.cancelled():
+            await consume_task  # propagate read/write failures, rather than report success
     finally:
-        kb_task.cancel()
-        report_live_task.cancel()
-        if out_file:
-            out_file.close()
+        for task in (kb_task, report_live_task, consume_task):
+            task.cancel()
+        await asyncio.gather(kb_task, report_live_task, consume_task, return_exceptions=True)
         if mpv_proc is not None:
             mpv_proc.stdin.close()
             await mpv_proc.wait()
 
-    print(f"downlink packets: {len(sim.received_pts)}, eos: {sim.eos}")
-    if args.decode and epoch_bytes:
-        import io
-
+    print(f"downlink packets: {sim.received_packets}, eos: {sim.eos}")
+    if epoch_file is not None and epoch_file.tell():
+        epoch_file.seek(0)
         decoded_frames = 0
-        with av.open(io.BytesIO(bytes(epoch_bytes))) as container:
+        with av.open(epoch_file) as container:
             for _ in container.decode(container.streams.video[0]):
                 decoded_frames += 1
         print(f"decoded frames: {decoded_frames}")
-    await client.teardown()
     return 0
 
 

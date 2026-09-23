@@ -11,6 +11,7 @@ from .framing import (  # noqa: F401
     FLAG_KEYFRAME,
     HANDSHAKE_LEN,
     MAGIC,
+    MAX_PAYLOAD_BYTES,
     NO_TS,
     PROTOCOL_VERSION,
     MediaPacket,

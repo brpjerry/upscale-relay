@@ -155,6 +155,7 @@ class OnnxUpscaler:
         if overlap % 2:
             raise ValueError("overlap must be even")
         self.tile_size = tile_size
+        self._reformatter = av.video.reformatter.VideoReformatter()
         self.overlap = overlap
         self.model_path = model_path
         self.manifest = ModelManifest.load(model_path)
@@ -332,7 +333,7 @@ class OnnxUpscaler:
     # -- FrameStage API ------------------------------------------------------
 
     def process(self, frame: av.VideoFrame) -> Iterable[av.VideoFrame]:
-        rgb = frame.to_ndarray(format="rgb24")
+        rgb = self._reformatter.reformat(frame, format="rgb24").to_ndarray()
         up = self._infer_with_fallback(rgb)
         if self.scale_factor is None:
             self.scale_factor = round(up.shape[0] / rgb.shape[0])
