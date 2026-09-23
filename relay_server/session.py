@@ -531,19 +531,27 @@ class Session:
     async def _seek_progress_loop(self, trace, epoch: int) -> None:
         """Narrate a slow seek until its first downlink bytes are queued."""
         await asyncio.sleep(SEEK_PROGRESS_INITIAL_DELAY_S)
+        last_progress_at = trace.requested_at
+        last_indexed_s = None
         while (trace.first_packet_ms is None and epoch == self.epoch
                and self.state != State.CLOSED):
-            elapsed = time.perf_counter() - trace.requested_at
-            if elapsed > SEEK_PROGRESS_MAX_S:
+            now = time.perf_counter()
+            elapsed = now - trace.requested_at
+            index_progress = getattr(self.aux_track, "subtitle_index_progress", None)
+            if index_progress is not None and (
+                last_indexed_s is None or index_progress[1] > last_indexed_s
+            ):
+                last_indexed_s = index_progress[1]
+                last_progress_at = now
+            idle_s = now - last_progress_at
+            if idle_s > SEEK_PROGRESS_MAX_S:
                 log.warning(
-                    "session %s: seek to %d produced no downlink bytes in %.0fs "
-                    "(discarded %d frames) — giving up on progress ticks",
-                    self.id, trace.target_pts, elapsed, trace.frames_discarded,
+                    "session %s: seek to %d produced no downlink bytes or "
+                    "subtitle indexing progress for %.0fs (discarded %d frames) "
+                    "— giving up on progress ticks",
+                    self.id, trace.target_pts, idle_s, trace.frames_discarded,
                 )
                 return
-            index_progress = (
-                getattr(self.aux_track, "subtitle_index_progress", None)
-            )
             await self.send(
                 "seek_progress",
                 stage="subtitle_index" if index_progress is not None else "video_decode",
