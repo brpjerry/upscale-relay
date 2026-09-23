@@ -57,6 +57,8 @@ _APP_NAME = "Upscale Relay Server"
 _diagnostics_log = None
 _diagnostics_handler = None
 _console_stderr = None
+_LOG_MAX_BYTES = 8 * 1024 * 1024
+_LOG_BACKUPS = 3
 
 
 class RuntimeSetupDialog(QDialog):
@@ -197,6 +199,44 @@ def _open_diagnostics_log():
         return None
 
 
+class _DiagnosticsHandler(logging.StreamHandler):
+    """Rotate snapshots without replacing the fd held by native crash writers.
+
+    faulthandler and already-running inference children retain the open file
+    descriptor. Copy/truncate keeps those writers attached to the current log.
+    Snapshots retain at most the final limit bytes, even after native log bursts.
+    """
+
+    def emit(self, record) -> None:
+        try:
+            if os.fstat(self.stream.fileno()).st_size >= _LOG_MAX_BYTES:
+                self._rotate()
+        except OSError:
+            # A failed backup must not suppress current diagnostic output.
+            pass
+        super().emit(record)
+
+    def _rotate(self) -> None:
+        self.stream.flush()
+        path = Path(self.stream.name)
+        for index in range(_LOG_BACKUPS - 1, 0, -1):
+            previous = path.with_name(f"{path.name}.{index}")
+            if previous.exists():
+                previous.replace(path.with_name(f"{path.name}.{index + 1}"))
+        with path.open("rb") as source, path.with_name(f"{path.name}.1").open("wb") as backup:
+            size = os.fstat(source.fileno()).st_size
+            source.seek(max(0, size - _LOG_MAX_BYTES))
+            remaining = min(size, _LOG_MAX_BYTES)
+            while remaining:
+                chunk = source.read(min(65536, remaining))
+                if not chunk:
+                    break
+                backup.write(chunk)
+                remaining -= len(chunk)
+        self.stream.seek(0)
+        self.stream.truncate()
+
+
 def configure_file_logging(enabled: bool) -> Path | None:
     """Apply the GUI file-logging preference immediately."""
     import faulthandler
@@ -231,7 +271,7 @@ def configure_file_logging(enabled: bool) -> Path | None:
         return None
 
     _diagnostics_log = stream
-    handler = logging.StreamHandler(stream)
+    handler = _DiagnosticsHandler(stream)
     handler.setLevel(logging.INFO)
     handler.setFormatter(logging.Formatter(
         "%(asctime)s %(name)s %(levelname)s %(message)s"

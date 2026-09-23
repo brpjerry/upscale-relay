@@ -494,3 +494,37 @@ def test_setup_diagnostics_writes_documents_log_without_stderr(tmp_path, monkeyp
         faulthandler.disable()
         if was_enabled and real_stderr is not None:
             faulthandler.enable(file=real_stderr)
+
+
+def test_diagnostic_rotation_bounds_backups_and_preserves_native_writer_fd(tmp_path, monkeypatch):
+    import faulthandler
+    from relay_server import tray
+
+    real_stderr = sys.stderr
+    was_enabled = faulthandler.is_enabled()
+    monkeypatch.setattr(sys, "stderr", None)
+    monkeypatch.setenv("RELAY_GUI_LOG_DIR", str(tmp_path))
+    monkeypatch.setattr(tray, "_LOG_MAX_BYTES", 512)
+    try:
+        tray.setup_diagnostics(True)
+        stream = tray._diagnostics_log
+        descriptor = stream.fileno()
+        logger = logging.getLogger("relay.rotation-test")
+        for index in range(20):
+            logger.info("sample %d %s", index, "x" * 256)
+        backups = list(tmp_path.glob("upscale-relay-server.log.*"))
+        assert len(backups) == 3
+        assert all(path.stat().st_size <= 512 for path in backups)
+        assert stream.fileno() == descriptor
+        assert sys.stderr is stream
+        assert faulthandler.is_enabled()
+        os.write(descriptor, b"native crash writer after rotation\n")
+        faulthandler.dump_traceback(file=stream)
+        contents = tray.diagnostics_log_path().read_text()
+        assert "native crash writer after rotation" in contents
+        assert "test_diagnostic_rotation" in contents
+    finally:
+        tray.configure_file_logging(False)
+        faulthandler.disable()
+        if was_enabled and real_stderr is not None:
+            faulthandler.enable(file=real_stderr)
