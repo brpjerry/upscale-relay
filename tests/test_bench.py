@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+import tracemalloc
 
 import av
 import numpy as np
@@ -40,3 +41,20 @@ def test_benchmark_removes_temporary_media_on_success_and_failure(tmp_path, monk
         bench.run_bench(str(tmp_path), str(tmp_path / "report.md"))
     assert len(directories) == 1
     assert not directories[0].exists()
+
+
+def test_synthetic_frames_are_repeatable_with_bounded_retained_memory():
+    tracemalloc.start()
+    try:
+        frames = bench._synthetic_frames(160, 90, 1000)
+        baseline, _ = tracemalloc.get_traced_memory()
+        for frame in frames:
+            assert frame.shape == (90, 160, 3)
+        retained, peak = tracemalloc.get_traced_memory()
+        assert retained - baseline < 500_000
+        assert peak < 1_000_000  # 1000 retained images would exceed 40 MB.
+    finally:
+        tracemalloc.stop()
+    assert len(frames) == 1000
+    assert np.array_equal(frames[3], np.roll(frames[0], shift=12, axis=1))
+    assert np.array_equal(frames[2:5][1], frames[3])

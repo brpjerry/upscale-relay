@@ -11,6 +11,7 @@ from __future__ import annotations
 import subprocess
 import threading
 import time
+from collections.abc import Sequence
 from fractions import Fraction
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -67,14 +68,28 @@ class GpuSampler:
             self._thread.join(timeout=2)
 
 
-def _synthetic_frames(width: int, height: int, count: int) -> list[np.ndarray]:
-    """Deterministic textured frames (in RAM) for feeding stages directly."""
+class _SyntheticFrames(Sequence[np.ndarray]):
+    """Repeatable input with one retained image, independent of frame count."""
+
+    def __init__(self, base: np.ndarray, indices: range):
+        self._base = base
+        self._indices = indices
+
+    def __len__(self) -> int:
+        return len(self._indices)
+
+    def __getitem__(self, index):
+        position = self._indices[index]
+        if isinstance(position, range):
+            return _SyntheticFrames(self._base, position)
+        return np.roll(self._base, shift=position * 4, axis=1)
+
+
+def _synthetic_frames(width: int, height: int, count: int) -> Sequence[np.ndarray]:
+    """Generate deterministic textured frames on demand, without retaining them."""
     rng = np.random.default_rng(7)
     base = rng.integers(0, 256, size=(height, width, 3), dtype=np.uint8)
-    frames = []
-    for i in range(count):
-        frames.append(np.roll(base, shift=i * 4, axis=1))
-    return frames
+    return _SyntheticFrames(base, range(count))
 
 
 def _bench_decode(width: int, height: int, frames: int, workdir: Path) -> float:
@@ -104,19 +119,21 @@ def _bench_decode(width: int, height: int, frames: int, workdir: Path) -> float:
     return n / (time.perf_counter() - start)
 
 
-def _bench_inference(up: OnnxUpscaler, frames: list[np.ndarray], tile: int | None) -> float | str:
+def _bench_inference(up: OnnxUpscaler, frames: Sequence[np.ndarray], tile: int | None) -> float | str:
     try:
         run = (lambda f: up.infer_array_tiled(f, tile)) if tile else up.infer_array
         run(frames[0])  # warmup / shape lock-in
-        start = time.perf_counter()
+        elapsed = 0.0
         for f in frames:
+            start = time.perf_counter()
             run(f)
-        return len(frames) / (time.perf_counter() - start)
+            elapsed += time.perf_counter() - start
+        return len(frames) / elapsed
     except Exception as err:
         return f"error: {str(err).splitlines()[0][:60]}"
 
 
-def _bench_encode(width: int, height: int, frames: list[np.ndarray], tier: str, workdir: Path) -> float | str:
+def _bench_encode(width: int, height: int, frames: Sequence[np.ndarray], tier: str, workdir: Path) -> float | str:
     try:
         codec, pix_fmt, options = select_encoder(tier)
     except RuntimeError:
@@ -124,30 +141,35 @@ def _bench_encode(width: int, height: int, frames: list[np.ndarray], tier: str, 
     out = av.open(str(workdir / f"enc_{tier}.mkv"), mode="w")
     stream = out.add_stream(codec, rate=Fraction(30, 1), options=options)
     stream.width, stream.height, stream.pix_fmt = width, height, pix_fmt
-    start = time.perf_counter()
+    elapsed = 0.0
     for i, rgb in enumerate(frames):
+        start = time.perf_counter()
         f = av.VideoFrame.from_ndarray(rgb, format="rgb24").reformat(format=pix_fmt)
         f.pts, f.time_base = i, Fraction(1, 30)
         for pkt in stream.encode(f):
             out.mux(pkt)
+        elapsed += time.perf_counter() - start
+    start = time.perf_counter()
     for pkt in stream.encode(None):
         out.mux(pkt)
     out.close()
-    return len(frames) / (time.perf_counter() - start)
+    elapsed += time.perf_counter() - start
+    return len(frames) / elapsed
 
 
 def _fmt(v: float | str) -> str:
     return f"{v:.1f}" if isinstance(v, float) else str(v)
 
 
-def _bench_end_to_end(up: OnnxUpscaler, frames: list[np.ndarray], workdir: Path,
+def _bench_end_to_end(up: OnnxUpscaler, frames: Sequence[np.ndarray], workdir: Path,
                      fit: tuple[int, int] | None = None) -> float:
     codec, pix_fmt, options = select_encoder("hevc-qp18")
     with av.open(str(workdir / "e2e.mkv"), mode="w") as out:
         stream = out.add_stream(codec, rate=Fraction(30, 1), options=options)
-        start = time.perf_counter()
+        elapsed = 0.0
         count = 0
         for i, rgb in enumerate(frames[:24]):
+            start = time.perf_counter()
             upres = up.infer_array(rgb)
             frame = av.VideoFrame.from_ndarray(upres, format="rgb24")
             if fit:
@@ -160,14 +182,20 @@ def _bench_end_to_end(up: OnnxUpscaler, frames: list[np.ndarray], workdir: Path,
             for packet in stream.encode(frame):
                 out.mux(packet)
             count += 1
+            elapsed += time.perf_counter() - start
+        start = time.perf_counter()
         for packet in stream.encode(None):
             out.mux(packet)
-    return count / (time.perf_counter() - start)
+    elapsed += time.perf_counter() - start
+    return count / elapsed
 
 
 def run_bench(models_dir: str, out_path: str, frames: int = 48, ep: str = "auto",
               fit: tuple[int, int] | None = None) -> None:
     import tempfile
+
+    if frames <= 0:
+        raise ValueError("benchmark frame count must be positive")
 
     models = sorted(Path(models_dir).glob("*.onnx"))
     if not models:
