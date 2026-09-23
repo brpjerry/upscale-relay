@@ -107,6 +107,11 @@ one downlink attachment. Server-library sessions omit the uplink attachment.
   sessions, preventing an unconfirmed NVENC owner from overlapping a reopen.
 - A 100 ms mux interleave bound prevents sparse subtitles from withholding the
   first playable cluster.
+- Overlapping text subtitle events survive seeks through a lazy, temporary
+  per-session packet index (256 MiB disk cap, removed at teardown). Ordinary
+  demux populates it; only unseen forward seeks need prefix catchup, narrated
+  by seek progress. Stateful bitmap subtitles use confirmed external tracks
+  until complete display-state reconstruction is supported.
 - Model discovery from `--models-dir` and execution-provider selection.
 - Configurable post-ONNX resize filters (`fast-bilinear`, `bilinear`, `bicubic`,
   `area`, `bicublin`, `gaussian`, `sinc`, `lanczos`, and `spline`), advertised

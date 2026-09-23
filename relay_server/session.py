@@ -541,8 +541,14 @@ class Session:
                     self.id, trace.target_pts, elapsed, trace.frames_discarded,
                 )
                 return
+            index_progress = (
+                getattr(self.aux_track, "subtitle_index_progress", None)
+            )
             await self.send(
                 "seek_progress",
+                stage="subtitle_index" if index_progress is not None else "video_decode",
+                message=("Indexing subtitles for this seek" if index_progress is not None else None),
+                subtitle_indexed_s=(index_progress[1] if index_progress is not None else None),
                 epoch=epoch,
                 target_pts=trace.target_pts,
                 keyframe_pts=trace.keyframe_pts,

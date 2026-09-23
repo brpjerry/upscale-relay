@@ -6,6 +6,7 @@ import base64
 from collections import OrderedDict
 import hashlib
 import io
+import logging
 import os
 import re
 import threading
@@ -16,6 +17,9 @@ from typing import Iterator
 import av
 
 from relay_protocol import FLAG_KEYFRAME, NO_TS, MediaPacket
+from .subtitles import INDEXABLE_SUBTITLE_CODECS, SubtitleIndex
+
+log = logging.getLogger("relay.media")
 
 
 _AUDIO_PREROLL_S = 0.25
@@ -243,6 +247,18 @@ class AuxiliaryTrack:
             iter(self._container.streams.video),
             next((stream for stream in self._streams if stream.type == "audio"), None),
         )
+        self._subtitle_streams = [stream for stream in self._streams if stream.type == "subtitle"]
+        if self._subtitle_streams and (
+            not hasattr(av.Packet, "iter_sidedata")
+            or any(stream.codec_context.name not in INDEXABLE_SUBTITLE_CODECS
+                   for stream in self._subtitle_streams)
+        ):
+            self._container.close()
+            raise ValueError("subtitle codec needs external media for complete post-seek display state")
+        self._subtitle_index: SubtitleIndex | None = None
+        self._index_covered_s = float("-inf")
+        self._index_eof = False
+        self.subtitle_index_progress: tuple[float, float] | None = None
         raw_attachments = list(self._container.streams.attachments)
         self.attachments = self._cached_attachment_info(path, raw_attachments)
         self.attachment_bytes = sum(attachment.size for attachment in self.attachments)
@@ -345,6 +361,59 @@ class AuxiliaryTrack:
     def attachment_by_hash(self, digest: str) -> AttachmentInfo | None:
         return next((item for item in self.attachments if item.sha256 == digest), None)
 
+    def _remember_subtitle_progress(self, packet, *, contiguous: bool) -> None:
+        if not self._subtitle_streams:
+            return
+        if packet.stream.type == "subtitle" and packet.size:
+            if self._subtitle_index is None:
+                self._subtitle_index = SubtitleIndex()
+            self._subtitle_index.remember(packet)
+        if (contiguous and self._seek_stream is not None
+                and packet.stream.index == self._seek_stream.index):
+            stamp = packet.dts if packet.dts is not None else packet.pts
+            if stamp is not None and packet.time_base is not None:
+                self._index_covered_s = max(self._index_covered_s, float(stamp * packet.time_base))
+
+    def _catch_up_subtitles(self, target_s: float, gen: int) -> bool:
+        """Only unseen forward seeks read extra source data; never decode it.
+
+        The caller holds _lock. Cancellation invalidates gen without acquiring
+        that native lock, so each completed read can end the old scan promptly.
+        """
+        if not self._subtitle_streams or self._index_eof or self._index_covered_s > target_s:
+            return True
+        log.info("indexing subtitles through %.2fs for seek", target_s)
+        self.subtitle_index_progress = (target_s, max(0.0, self._index_covered_s))
+        try:
+            # This epoch has invalidated the previous auxiliary iterator, so
+            # reuse its native owner for catchup. A fourth input container
+            # would duplicate large embedded font bundles in memory.
+            anchor = self._seek_stream
+            covered_s = max(0.0, self._index_covered_s)
+            if anchor is not None and anchor.time_base is not None:
+                self._container.seek(
+                    int(covered_s / float(anchor.time_base)),
+                    stream=anchor, backward=True, any_frame=False,
+                )
+            else:
+                self._container.seek(int(covered_s * av.time_base), backward=True, any_frame=False)
+            index_iterator = iter(self._container.demux([
+                *([anchor] if anchor is not None else []), *self._subtitle_streams,
+            ]))
+            while self._index_covered_s <= target_s and not self._index_eof:
+                if gen != self._iter_gen:
+                    return False
+                try:
+                    packet = next(index_iterator)
+                except StopIteration:
+                    self._index_eof = True
+                    break
+                self._remember_subtitle_progress(packet, contiguous=True)
+                self.subtitle_index_progress = (target_s, max(0.0, self._index_covered_s))
+            return gen == self._iter_gen
+        finally:
+            self.subtitle_index_progress = None
+
     def packets(self, target_s: float | None = None) -> Iterator[AuxiliaryPacketInfo]:
         """Iterate original auxiliary packets, optionally from ``target_s``.
 
@@ -365,7 +434,12 @@ class AuxiliaryTrack:
         with self._lock:
             if self._iter_gen != gen:
                 return
+            replay = None
             if target_s is not None:
+                if not self._catch_up_subtitles(target_s, gen):
+                    return
+                if self._subtitle_index is not None:
+                    replay = self._subtitle_index.overlapping(target_s)
                 # Always name an indexed anchor: omitting the stream lets
                 # libav choose a sparse subtitle index, while naming audio is
                 # also slow for Matroska files whose cues index video only.
@@ -383,7 +457,31 @@ class AuxiliaryTrack:
                         backward=True,
                         any_frame=False,
                     )
-            iterator = self._container.demux(self._streams)
+            # Seeing video timestamps lets normal playback progressively index
+            # the source prefix even with sparse subtitles or no audio track.
+            iterator = self._container.demux([
+                *self._streams,
+                *([self._seek_stream] if self._subtitle_streams
+                  and self._seek_stream is not None and self._seek_stream.type == "video" else []),
+            ])
+        replayed = set()
+        if replay is not None:
+            try:
+                while True:
+                    with self._lock:
+                        if self._iter_gen != gen:
+                            return
+                        row = replay.fetchone()
+                        if row is None:
+                            break
+                        identity, packet = SubtitleIndex.restore(row, self._container.streams)
+                        replayed.add(identity)
+                    stamp = packet.dts if packet.dts is not None else packet.pts
+                    yield AuxiliaryPacketInfo(packet, packet.stream.index, float(stamp * packet.time_base))
+            finally:
+                with self._lock:
+                    if self._subtitle_index is not None:
+                        self._subtitle_index.close_cursor(replay)
         while True:
             with self._lock:
                 if self._iter_gen != gen:
@@ -391,7 +489,15 @@ class AuxiliaryTrack:
                 try:
                     packet = next(iterator)
                 except StopIteration:
+                    if target_s is None:
+                        self._index_eof = True
                     return
+                self._remember_subtitle_progress(packet, contiguous=target_s is None)
+                if packet.stream.type == "video":
+                    continue
+                if (packet.stream.type == "subtitle" and replayed
+                        and SubtitleIndex.identity(packet) in replayed):
+                    continue
             if packet.pts is None and packet.dts is None and packet.size == 0:
                 continue
             time_base = packet.time_base or packet.stream.time_base
@@ -416,4 +522,9 @@ class AuxiliaryTrack:
         with self._generation_lock:
             self._iter_gen += 1
         with self._lock:
-            self._container.close()
+            try:
+                self._container.close()
+            finally:
+                if self._subtitle_index is not None:
+                    self._subtitle_index.close()
+                    self._subtitle_index = None

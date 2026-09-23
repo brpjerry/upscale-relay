@@ -207,6 +207,17 @@ are preserved. A small audio preroll and subtitle events overlapping the seek
 target may precede the first video PTS; the player performs normal timestamp
 synchronization.
 
+The current server preserves overlapping ASS/SSA, SubRip, WebVTT, and plain-text
+subtitle events with a temporary per-session packet index. Normal demux fills
+it progressively; an unseen forward seek scans only the missing source prefix
+without decoding video, and reports `seek_progress.stage:"subtitle_index"`,
+`message`, and `subtitle_indexed_s` while doing so. Repeated/backward seeks reuse
+the index and retain the video-keyframe seek anchor. The index has a 256 MiB
+disk limit and a 2 MiB SQLite page cache, is removed at session teardown, and
+reports an explicit session error if exhausted. Stateful bitmap subtitles
+(such as PGS/VobSub) currently confirm `aux_tracks:"external"` so their full
+display/clear state survives seeks; clients must honor that confirmation.
+
 ### 3.4 Cached attachment objects
 
 For a session confirming `aux_attachments:"cached"`, the client fetches each
