@@ -45,6 +45,16 @@ from .attachments import materialize_attachment_cache, remove_attachment_view
 
 log = logging.getLogger("relay.client")
 
+
+def _open_local_source(path: str):
+    """Open and inspect a potentially remote mounted file on one worker."""
+    track = VideoTrack(path)
+    try:
+        return track, track.open_session_video_dict(), track.duration_seconds(), track.chapters()
+    except BaseException:
+        track.close()
+        raise
+
 # Media pumping is sized for a slow event loop, not a fast one: under qasync
 # the loop shares the GUI thread with mpv rendering and turns come roughly
 # once per painted frame (~25/s at 24 fps). Anything that needs a loop turn
@@ -222,6 +232,8 @@ class RelayClient:
         self.capabilities: dict | None = None
         self.session: SessionInfo | None = None
         self._has_server_session = False
+        self._closing = False
+        self._close_task: asyncio.Task | None = None
         self.track: VideoTrack | None = None
         self.epoch = 0
         self.state = "idle"
@@ -251,6 +263,11 @@ class RelayClient:
 
     # -- control channel -------------------------------------------------------
 
+    @property
+    def has_server_session(self) -> bool:
+        """Also true during an open whose server allocation is not yet known."""
+        return self._has_server_session
+
     async def connect(self) -> dict:
         self._ws = await self._http.ws_connect(f"http://{self.host}:{self.port}/control")
         self._reader_task = asyncio.create_task(self._control_reader())
@@ -277,9 +294,8 @@ class RelayClient:
             await self._send(type_, **fields)
             if not keepalive:
                 return await asyncio.wait_for(fut, timeout=timeout)
-        # Inactivity deadline: session_progress keepalives push it out, so a
-        # server that is visibly working (TensorRT engine build) never times
-        # out while a silent one still fails within ``timeout``.
+            # Inactivity deadline: progress keepalives push it out, so a
+            # building server remains alive while a silent one still fails.
             while True:
                 remaining = self._last_activity + timeout - time.monotonic()
                 if remaining <= 0:
@@ -357,9 +373,27 @@ class RelayClient:
             raise ValueError(f"unknown auxiliary attachment mode: {cfg.aux_attachments}")
         if cfg.aux_attachments == "cached" and cfg.aux_tracks != "muxed":
             raise ValueError("cached attachments require muxed auxiliary tracks")
-        self.track = VideoTrack(cfg.path) if cfg.source == "uplink" else None
-        video = self.track.open_session_video_dict() if self.track else None
-        duration_s = self.track.duration_seconds() if self.track else None
+        if self._closing:
+            raise ConnectionError("client is closing")
+        video, duration_s, chapters = None, None, []
+        if cfg.source == "uplink":
+            opening = asyncio.create_task(asyncio.to_thread(_open_local_source, cfg.path))
+            try:
+                track, video, duration_s, chapters = await asyncio.shield(opening)
+            except asyncio.CancelledError:
+                # Cancellation does not stop libav. Retain ownership until its
+                # worker returns, then release the unpublished container.
+                try:
+                    opened = await opening
+                except Exception:
+                    pass
+                else:
+                    await asyncio.to_thread(opened[0].close)
+                raise
+            if self._closing:
+                await asyncio.to_thread(track.close)
+                raise ConnectionError("client closed while opening source")
+            self.track = track
         source = ("uplink" if cfg.source == "uplink" else
                   {"type": "server_file", "path": cfg.path})
         # keepalive=True: a cold TensorRT engine build at session open can run
@@ -367,10 +401,8 @@ class RelayClient:
         # alive (OPEN_SESSION_TIMEOUT_S is a window of *inactivity*, not a cap
         # on total build time).
         file_info = {"name": cfg.path, "duration_s": duration_s}
-        if self.track is not None:
-            chapters = self.track.chapters()
-            if chapters:
-                file_info["chapters"] = chapters
+        if chapters:
+            file_info["chapters"] = chapters
         fields = {
             "source": source,
             "file": file_info,
@@ -393,8 +425,9 @@ class RelayClient:
             )
         except BaseException:
             if self.track is not None:
-                self.track.close()
+                track = self.track
                 self.track = None
+                await asyncio.to_thread(track.close)
             raise
         self.session = SessionInfo(
             session_id=msg["session_id"],
@@ -517,7 +550,7 @@ class RelayClient:
         assert self.track is not None and self._uplink_writer is not None
         first = True
         try:
-            iterator = self.track.packets(from_pts)
+            iterator = await asyncio.to_thread(self.track.packets, from_pts)
 
             def next_batch() -> list:
                 batch = []
@@ -730,6 +763,12 @@ class RelayClient:
                 ) from barrier_error
 
     async def close(self) -> None:
+        self._closing = True
+        if self._close_task is None:
+            self._close_task = asyncio.create_task(self._close())
+        await asyncio.shield(self._close_task)
+
+    async def _close(self) -> None:
         tasks = [t for t in (self._uplink_task, self._reader_task,
                              getattr(self, "_report_task", None)) if t is not None]
         for task in tasks:
@@ -745,9 +784,13 @@ class RelayClient:
         if self._uplink_writer is not None:
             self._uplink_writer.close()
         if self.track is not None:
-            self.track.close()
+            track = self.track
+            self.track = None
+            await asyncio.to_thread(track.close)
         if self._ws is not None:
             await self._ws.close()
         await remove_attachment_view(self._attachment_view_dir)
         self._attachment_view_dir = None
         await self._http.close()
+        self.session = None
+        self._has_server_session = False
