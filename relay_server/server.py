@@ -113,6 +113,7 @@ class RelayServer:
         self._media_server = None
         self._runner = None
         self._stop_task = None
+        self._media_handlers: dict[asyncio.Task, asyncio.StreamWriter] = {}
         self._mdns = MdnsAdvertiser(
             port=self.port,
             media_port=self.media_port,
@@ -333,6 +334,8 @@ class RelayServer:
     # -- media sockets -----------------------------------------------------------
 
     async def handle_media(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        task = asyncio.current_task()
+        self._media_handlers[task] = writer
         peer = writer.get_extra_info("peername")
         attached_session = None
         direction = None
@@ -365,6 +368,8 @@ class RelayServer:
                 await writer.wait_closed()
             except (OSError, RuntimeError):
                 pass
+            finally:
+                self._media_handlers.pop(task, None)
 
     async def _run_uplink(self, session: Session, reader: asyncio.StreamReader) -> None:
         while session.state != State.CLOSED:
@@ -498,8 +503,7 @@ class RelayServer:
         media, self._media_server = self._media_server, None
         runner, self._runner = self._runner, None
         if media is not None:
-            media.close()
-            await media.wait_closed()
+            media.close()  # stop accepting; await only after active sockets close
         if self._stats_task is not None:
             self._stats_task.cancel()
             await asyncio.gather(self._stats_task, return_exceptions=True)
@@ -515,7 +519,24 @@ class RelayServer:
             except Exception as error:
                 errors.append(error)
             finally:
-                await session.ws.close()
+                try:
+                    await session.ws.close()
+                except Exception as error:
+                    errors.append(error)
+        # Include peers still waiting for a handshake, which have no Session
+        # owner yet. Python 3.13+ wait_closed also waits for these transports.
+        handlers = list(self._media_handlers.items())
+        for task, writer in handlers:
+            writer.close()
+            writer.transport.abort()
+            if task is not asyncio.current_task():
+                task.cancel()
+        await asyncio.gather(
+            *(task for task, _writer in handlers if task is not asyncio.current_task()),
+            return_exceptions=True,
+        )
+        if media is not None:
+            await media.wait_closed()
         if runner is not None:
             try:
                 await runner.cleanup()
