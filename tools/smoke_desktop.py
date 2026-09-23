@@ -49,6 +49,10 @@ async def exercise(window, args):
         window.host_edit.setText(args.server)
         await window.on_connect()
         assert window.client is not None, errors
+        if args.external_aux:
+            # Exercise the supported fallback path even when this server can
+            # mux the particular test fixture's auxiliary codecs.
+            window._server_caps["muxed_aux_tracks"] = False
         window.model_combo.setCurrentText(args.model)
         tier = window.tier_combo.findData(args.tier)
         assert tier >= 0, f"server does not advertise {args.tier}"
@@ -129,8 +133,12 @@ def main():
     parser.add_argument("--model", default="passthrough")
     parser.add_argument("--tier", default="lossless-hevc")
     parser.add_argument("--expect-subtitle", help="subtitle text expected at the 12-second seek")
+    parser.add_argument("--external-aux", action="store_true",
+                        help="exercise server-file external audio/subtitle attachment")
     parser.add_argument("--trace", action="store_true")
     args = parser.parse_args()
+    if args.external_aux and args.source != "server_file":
+        parser.error("--external-aux requires --source server_file")
     app = QApplication([])
     locale.setlocale(locale.LC_NUMERIC, "C")
     loop = QEventLoop(app)
