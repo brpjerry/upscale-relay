@@ -20,7 +20,9 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QDoubleSpinBox,
+    QDockWidget,
     QFileSystemModel,
+    QFormLayout,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -184,10 +186,11 @@ class MainWindow(QMainWindow):
         self.host_edit = QLineEdit(_server_address(
             self.settings.server_host, self.settings.server_port,
         ))
-        self.host_edit.setFixedWidth(160)
+        self.host_edit.setMinimumWidth(180)
+        self.host_edit.setMaximumWidth(320)
         self.host_edit.setPlaceholderText("host:port")
         self.connect_btn = QPushButton("Connect")
-        self.autoconnect_check = QCheckBox("auto")
+        self.autoconnect_check = QCheckBox("Auto connect")
         self.autoconnect_check.setToolTip("Connect to this server automatically on launch")
         self.autoconnect_check.setChecked(self.settings.auto_connect)
         self.model_combo = QComboBox()
@@ -207,29 +210,63 @@ class MainWindow(QMainWindow):
         if self.settings.resize_algorithm:
             self.resize_combo.addItem(self.settings.resize_algorithm, self.settings.resize_algorithm)
             self.resize_combo.setCurrentIndex(1)
-        self.deband_check = QCheckBox("deband")
+        self.deband_check = QCheckBox("Reduce color banding")
         self.deband_check.setToolTip(
-            "Apply mpv's GPU debanding after decode (does not alter the ONNX input)"
+            "Smooth visible color steps in gradients during playback."
         )
         self.deband_check.setChecked(self.settings.deband_enabled)
         self.conn_label = QLabel("disconnected")
+        self.conn_label.setMinimumWidth(120)
+        self.conn_label.setMaximumWidth(300)
+        self.conn_label.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred)
+        self.playback_settings_toggle = QToolButton()
+        self.playback_settings_toggle.setText("Playback settings")
+        self.playback_settings_toggle.setCheckable(True)
+        self.playback_settings_toggle.setToolButtonStyle(Qt.ToolButtonTextOnly)
+        self.playback_settings_toggle.setToolTip("Show playback settings")
         bar.addWidget(self.browser_toggle)
-        bar.addWidget(QLabel(" server "))
+        bar.addWidget(QLabel(" Server "))
         bar.addWidget(self.host_edit)
         bar.addWidget(self.connect_btn)
         bar.addWidget(self.autoconnect_check)
-        bar.addWidget(QLabel("  model "))
-        bar.addWidget(self.model_combo)
-        bar.addWidget(QLabel("  quality "))
-        bar.addWidget(self.tier_combo)
-        bar.addWidget(QLabel("  display "))
-        bar.addWidget(self.fit_combo)
-        bar.addWidget(QLabel("  resize "))
-        bar.addWidget(self.resize_combo)
-        bar.addWidget(QLabel("  "))
-        bar.addWidget(self.deband_check)
-        bar.addWidget(QLabel("  "))
-        bar.addWidget(self.conn_label)
+        spacer = QWidget()
+        spacer.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        bar.addWidget(spacer)
+        bar.addWidget(self.playback_settings_toggle)
+
+        self.playback_settings = QDockWidget("Playback settings", self)
+        self.playback_settings.setObjectName("playbackSettings")
+        self.playback_settings.setFeatures(QDockWidget.DockWidgetClosable)
+        settings_page = QWidget()
+        settings_layout = QVBoxLayout(settings_page)
+        explanation = QLabel(
+            "Streaming settings apply at the current playback position. "
+            "Changing them restarts an active stream."
+        )
+        explanation.setWordWrap(True)
+        settings_layout.addWidget(explanation)
+        form = QFormLayout()
+        form.setRowWrapPolicy(QFormLayout.WrapAllRows)
+        for label, combo, help_text in (
+            ("Upscale model", self.model_combo, "Choose a model available on the server."),
+            ("Stream quality", self.tier_combo, "Higher quality can require more network bandwidth."),
+            ("Framing", self.fit_combo, "Fit keeps the whole image; Crop fills the display."),
+            ("Resize filter", self.resize_combo, "Choose how the upscaled image is fitted to the display."),
+        ):
+            combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+            combo.setMinimumContentsLength(24)
+            combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+            combo.setToolTip(help_text)
+            form.addRow(label, combo)
+        settings_layout.addLayout(form)
+        settings_layout.addWidget(self.deband_check)
+        settings_layout.addStretch(1)
+        self.playback_settings.setWidget(settings_page)
+        self.addDockWidget(Qt.RightDockWidgetArea, self.playback_settings)
+        self.playback_settings.hide()
+        self.playback_settings_toggle.toggled.connect(self.playback_settings.setVisible)
+        self.playback_settings.visibilityChanged.connect(self.playback_settings_toggle.setChecked)
+        self._settings_visible_before_fullscreen = False
 
         # -- file browser ------------------------------------------------------
         self.fs_model = QFileSystemModel()
@@ -417,7 +454,8 @@ class MainWindow(QMainWindow):
         self.open_progress.setFixedWidth(140)
         self.open_progress.setVisible(False)
         self.statusBar().addPermanentWidget(self.open_progress)
-        self.statusBar().showMessage(f"player backend: {PLAYER_BACKEND}")
+        self.statusBar().addPermanentWidget(self.conn_label)
+        self.statusBar().showMessage("Connect to a server to start streaming.")
 
         # -- signals ---------------------------------------------------------------
         self.connect_btn.clicked.connect(self.on_connect)
@@ -597,12 +635,15 @@ class MainWindow(QMainWindow):
         for w in (self._toolbar, self.statusBar()):
             w.setVisible(not entering)
         if entering:
+            self._settings_visible_before_fullscreen = self.playback_settings.isVisible()
+            self.playback_settings.hide()
             self._apply_browser_visible(False)
             self._enter_overlay_controls()
             self._was_maximized = self.isMaximized()
             self.showFullScreen()
             self.player.setFocus()  # keys (Space/F/arrows) go to the video
         else:
+            self.playback_settings.setVisible(self._settings_visible_before_fullscreen)
             self._apply_browser_visible(self.browser_toggle.isChecked())
             self._exit_overlay_controls()
             if self._was_maximized:
