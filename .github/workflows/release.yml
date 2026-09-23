@@ -19,6 +19,8 @@ jobs:
       TAG: ${{ github.event.inputs.tag || github.ref_name }}
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: refs/tags/${{ github.event.inputs.tag || github.ref_name }}
       - uses: actions/setup-python@v7
         with:
           python-version: "3.14"
@@ -95,8 +97,13 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          $notesFile = "release-notes/$env:TAG.md"
+          if (-not (Test-Path $notesFile)) {
+            throw "Missing release notes: $notesFile"
+          }
           gh release create "$env:TAG" `
+            --verify-tag `
             --title "Upscale Relay Server $env:TAG" `
             --generate-notes `
-            --notes "Media files larger than 2 GiB now stream from /media. Windows serves them through TransmitFile, which accepts at most 2,147,483,646 bytes per call, but asyncio clamps its block to 0xffff_ffff — so any request whose remaining length passed that limit failed with WinError 87, and aiohttp falls back to its own read loop only on NotImplementedError. The error therefore landed after the response headers were already sent: clients saw a correct Content-Length followed by a closed connection and zero bytes. Small bounded ranges stayed under the limit and worked, which is what made this look like a client bug. mpv opens external audio and subtitle sources with 'Range: bytes=0-', so on the Android client every remux over 2 GiB played with no audio and no subtitles at all. The -gui ZIP is the tray app; the plain ZIP is the headless console server." `
+            --notes-file "$notesFile" `
             (Get-Item dist/*.zip).FullName
