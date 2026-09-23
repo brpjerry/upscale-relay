@@ -62,6 +62,7 @@ jobs:
         run: >
           pyinstaller --noconfirm --onedir --console
           --name upscale-relay-server
+          --icon packaging/icon.ico
           --collect-all pip
           --collect-submodules zeroconf
           packaging/server_entry.py
@@ -69,6 +70,7 @@ jobs:
         run: >
           pyinstaller --noconfirm --onedir --windowed
           --name upscale-relay-server-gui
+          --icon packaging/icon.ico
           --collect-all pip
           --collect-submodules zeroconf
           --collect-submodules relay_server
@@ -78,6 +80,7 @@ jobs:
         run: |
           $exe = "dist/upscale-relay-server/upscale-relay-server.exe"
           & $exe --help
+          if ($LASTEXITCODE -ne 0) { throw "console help check failed" }
           & $exe --upscale-infer-worker --check
           if ($LASTEXITCODE -ne 0) { throw "console worker dispatch check failed" }
           & $exe --upscale-infer-worker --onnx-check
@@ -127,6 +130,27 @@ jobs:
           Compress-Archive -Path "$bundle/*" -DestinationPath $zip
           (Get-FileHash -Algorithm SHA256 $zip).Hash.ToLower() |
             Set-Content "$zip.sha256"
+      - name: Verify extracted GUI ZIP
+        shell: pwsh
+        timeout-minutes: 3
+        run: |
+          $zip = Get-Item "dist/upscale-relay-server-gui-*-windows-x64.zip"
+          $expected = (Get-Content "$($zip.FullName).sha256").Trim()
+          if ((Get-FileHash -Algorithm SHA256 $zip.FullName).Hash.ToLower() -ne $expected) {
+            throw "GUI ZIP checksum mismatch"
+          }
+          $unpacked = Join-Path $env:RUNNER_TEMP "extracted gui"
+          Expand-Archive -LiteralPath $zip.FullName -DestinationPath $unpacked
+          if (-not (Test-Path "$unpacked/_internal") -or
+              -not (Test-Path "$unpacked/README.txt") -or
+              -not (Select-String -Path "$unpacked/BUILD.txt" -SimpleMatch "${{ github.sha }}" -Quiet)) {
+            throw "GUI ZIP is missing bundle content or source provenance"
+          }
+          $exe = Join-Path $unpacked "upscale-relay-server-gui.exe"
+          foreach ($arguments in @(@("--check"), @("--upscale-infer-worker", "--onnx-check"))) {
+            $p = Start-Process -FilePath $exe -ArgumentList $arguments -WorkingDirectory $unpacked -Wait -PassThru
+            if ($p.ExitCode -ne 0) { throw "Extracted GUI smoke failed: $arguments ($($p.ExitCode))" }
+          }
       - uses: actions/upload-artifact@v7
         with:
           name: upscale-relay-server-windows
