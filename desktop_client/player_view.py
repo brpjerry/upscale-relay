@@ -46,7 +46,8 @@ class VideoPreviewView(QWidget):
     # -- public API --------------------------------------------------------
 
     def start(self, session, downlink_q: asyncio.Queue, time_base: Fraction,
-              source_path: str | None = None, avg_rate: Fraction | None = None) -> None:
+              source_path: str | None = None, avg_rate: Fraction | None = None,
+              source_has_audio: bool = True) -> None:
         self.stop()
         if session.downlink_container is not None:
             # The downlink became a container stream (docs/PROTOCOL.md §3.2); this

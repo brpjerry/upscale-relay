@@ -44,8 +44,10 @@ class FakePlayer(QWidget):
         self.started = None
         self.font_dir = None
 
-    def start(self, session, queue, time_base, source_path=None, avg_rate=None):
+    def start(self, session, queue, time_base, source_path=None, avg_rate=None,
+              source_has_audio=True):
         self.started = (session, queue, time_base, source_path, avg_rate)
+        self.source_has_audio = source_has_audio
 
     def stop(self):
         pass
@@ -595,3 +597,24 @@ def test_volume_controls_follow_player_updates_without_feedback(window):
     assert window.player.volume == 75
     window.mute_btn.setChecked(False)
     assert not window.player.muted
+
+
+@pytest.mark.parametrize("has_subtitles", [False, True])
+def test_local_original_attachment_follows_cached_auxiliary_metadata(window, has_subtitles):
+    class LocalClient(FakeSessionClient):
+        async def open_session(self, config):
+            session = await super().open_session(config)
+            self.track = SimpleNamespace(
+                time_base=Fraction(1, 1000), average_rate=Fraction(24),
+                duration_seconds=lambda: 120.0, chapters=lambda: [],
+                has_audio_tracks=False, has_auxiliary_tracks=has_subtitles,
+            )
+            return session
+
+    async def scenario():
+        window.client = LocalClient()
+        await window._start_session("/tmp/original.mkv", source="uplink")
+        assert window.player.started[3] == ("/tmp/original.mkv" if has_subtitles else None)
+        assert not window.player.source_has_audio
+
+    asyncio.run(scenario())

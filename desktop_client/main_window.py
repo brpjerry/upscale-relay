@@ -1208,7 +1208,10 @@ class MainWindow(QMainWindow):
             return
         original_media = (
             None
-            if getattr(session, "aux_tracks", "external") == "muxed"
+            if (
+                getattr(session, "aux_tracks", "external") == "muxed"
+                or (track is not None and not getattr(track, "has_auxiliary_tracks", True))
+            )
             else (path if source == "uplink" else self.client.media_url(path))
         )
         self._session_source = source
@@ -1221,6 +1224,7 @@ class MainWindow(QMainWindow):
             time_base,
             source_path=original_media,
             avg_rate=avg_rate,
+            source_has_audio=getattr(track, "has_audio_tracks", True),
         )
         self.idle_hint.hide()
         # Match Android's ordering: give mpv its per-load loopback first, then

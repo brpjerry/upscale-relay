@@ -432,6 +432,7 @@ class MpvPlayerView(QOpenGLWidget):
         self._task: asyncio.Task | None = None
         self._stats_task: asyncio.Task | None = None
         self._source_path: str | None = None
+        self._source_has_audio = True
         self._local_playback = False
         self._local_load_ready: asyncio.Future | None = None
         self._pending_local_seek: float | None = None
@@ -519,13 +520,15 @@ class MpvPlayerView(QOpenGLWidget):
     # -- public API -----------------------------------------------------------
 
     def start(self, session, downlink_q: asyncio.Queue, time_base: Fraction,
-              source_path: str | None = None, avg_rate: Fraction | None = None) -> None:
+              source_path: str | None = None, avg_rate: Fraction | None = None,
+              source_has_audio: bool = True) -> None:
         self.stop()
         if session.downlink_container != "matroska":
             self.failed.emit(f"unsupported downlink container: {session.downlink_container}")
             return
         self._fps = float(avg_rate) if avg_rate else 30.0
         self._source_path = source_path
+        self._source_has_audio = source_has_audio
         self._tracks_reported = False
         self._chosen_subtitle_id = None
         self._subtitle_choice_made = False
@@ -614,6 +617,7 @@ class MpvPlayerView(QOpenGLWidget):
             return
         self._external_attach_started = True
         source = self._source_path
+        source_has_audio = self._source_has_audio
         chosen_audio = self._chosen_audio_id
         chosen_subtitle = self._chosen_subtitle_id
         subtitle_choice_made = self._subtitle_choice_made
@@ -625,11 +629,18 @@ class MpvPlayerView(QOpenGLWidget):
                 # its absolute PTS. mpv exposes all of that demuxer's audio and
                 # subtitle tracks; adding it twice needlessly opens/parses the
                 # same file twice and materially slows every load.
-                self.mpv.command(
-                    "audio-add", source,
-                    "select" if chosen_audio is None else "auto",
+                # mpv rejects audio-add when a file has only subtitles. Use
+                # the corresponding sub-add once for that metadata-confirmed
+                # case; it still opens one original demuxer after restart.
+                select = (
+                    chosen_audio is None if source_has_audio
+                    else chosen_subtitle is None and not subtitle_choice_made
                 )
-                if chosen_audio is not None:
+                self.mpv.command(
+                    "audio-add" if source_has_audio else "sub-add", source,
+                    "select" if select else "auto",
+                )
+                if source_has_audio and chosen_audio is not None:
                     self.mpv.aid = chosen_audio
                 if subtitle_choice_made:
                     self.mpv.sid = (
@@ -647,7 +658,7 @@ class MpvPlayerView(QOpenGLWidget):
                 error = err
             if generation == self._load_generation:
                 if error is not None:
-                    self.failed.emit(f"external audio attach: {error!r}")
+                    self.failed.emit(f"external media attach: {error!r}")
                 self._external_media_ready.emit(generation)
 
         threading.Thread(

@@ -115,10 +115,12 @@ constructor options).
   `hwdec=vaapi` exposed a retired zero-copy Intel surface. Copy-back retains
   hardware decode; never restore zero-copy VA-API as the default here.
 - For external auxiliary media, load the video-only epoch paused, then issue
-  exactly one raw-argument `audio-add` after mpv's `playback-restart`; that
+  exactly one raw-argument `audio-add` after mpv's `playback-restart`; use
+  `sub-add` instead only when source metadata confirms subtitles without audio.
+  Video-only originals need no external attachment. The single external
   demuxer contributes both audio and subtitle tracks. Attaching during
   `loadfile` positions the original demuxer at zero and makes far seeks decode
-  through old media. On desktop, release the load-time hold when `audio-add`
+  through old media. On desktop, release the load-time hold when the attachment command
   returns (`audio-pts` is not reliable while paused), and preserve the caller's
   pause intent across that hold.
 - For a server-file session confirmed as `aux_tracks:"muxed"`, never attach

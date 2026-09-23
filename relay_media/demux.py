@@ -109,6 +109,11 @@ class VideoTrack:
         self.path = path
         self._container = av.open(path)
         self._stream = self._container.streams.video[0]
+        # Snapshot auxiliary presence while this worker owns the open container;
+        # GUI startup decisions must not inspect native stream lists mid-demux.
+        self.has_audio_tracks = bool(self._container.streams.audio)
+        self.has_subtitle_tracks = bool(self._container.streams.subtitles)
+        self.has_auxiliary_tracks = self.has_audio_tracks or self.has_subtitle_tracks
         # Serializes native demux/seek calls: a cancelled asyncio task's
         # in-flight to_thread(next, ...) keeps running on its worker thread,
         # and concurrent libav access is a native crash, not an exception.
