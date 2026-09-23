@@ -260,6 +260,7 @@ class ServerController:
     def __init__(self, settings: ServerSettings):
         self.settings = settings
         self.server: RelayServer | None = None
+        self._lifecycle_lock = asyncio.Lock()
         # Set by TrayApp; wired onto every new RelayServer instance so
         # connection/playback events survive config-applied restarts.
         self.event_callback = None
@@ -275,21 +276,33 @@ class ServerController:
         invalid library folder, or a port already in use) after ensuring any
         previously running instance is stopped.
         """
-        await self.stop()
-        s = self.settings
-        server = RelayServer(
-            s.models_dir,
-            s.port,
-            ep=s.ep,
-            stats_interval=2.0 if s.file_logging else None,
-            library_roots=s.library_dirs or None,
-            mdns=s.mdns,
-        )
-        server.event_callback = self.event_callback
-        await server.start()
-        self.server = server
+        async with self._lifecycle_lock:
+            await self._stop_locked()
+            s = self.settings
+            server = RelayServer(
+                s.models_dir,
+                s.port,
+                ep=s.ep,
+                stats_interval=2.0 if s.file_logging else None,
+                library_roots=s.library_dirs or None,
+                mdns=s.mdns,
+            )
+            server.event_callback = self.event_callback
+            try:
+                await server.start()
+            except BaseException:
+                try:
+                    await server.stop()
+                except Exception:
+                    log.exception("could not finish cleanup after server startup failed")
+                raise
+            self.server = server
 
     async def stop(self) -> None:
+        async with self._lifecycle_lock:
+            await self._stop_locked()
+
+    async def _stop_locked(self) -> None:
         if self.server is not None:
             await self.server.stop()
             self.server = None
