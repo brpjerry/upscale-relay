@@ -295,8 +295,15 @@ class RelayClient:
         """Also true during an open whose server allocation is not yet known."""
         return self._has_server_session
 
+    @property
+    def base_url(self) -> str:
+        host = self.host.strip("[]")
+        if ":" in host:
+            host = f"[{host}]"
+        return f"http://{host}:{self.port}"
+
     async def connect(self) -> dict:
-        self._ws = await self._http.ws_connect(f"http://{self.host}:{self.port}/control")
+        self._ws = await self._http.ws_connect(f"{self.base_url}/control")
         self._reader_task = asyncio.create_task(self._control_reader())
         self.capabilities = await self._request(
             "capabilities", "hello",
@@ -493,7 +500,7 @@ class RelayClient:
         await remove_attachment_view(self._attachment_view_dir)
         self._attachment_view_dir = await materialize_attachment_cache(
             self._http,
-            f"http://{self.host}:{self.port}",
+            self.base_url,
             session.session_id,
             session.attachment_manifest or [],
             token,
@@ -509,7 +516,7 @@ class RelayClient:
         if cursor is not None:
             params["cursor"] = cursor
         async with self._http.get(
-            f"http://{self.host}:{self.port}/library", params=params,
+            f"{self.base_url}/library", params=params,
         ) as response:
             response.raise_for_status()
             payload = await response.json()
@@ -520,7 +527,7 @@ class RelayClient:
 
     def media_url(self, relative_path: str) -> str:
         path = quote(relative_path, safe="/")
-        return f"http://{self.host}:{self.port}/media/{path}"
+        return f"{self.base_url}/media/{path}"
 
     # -- media ------------------------------------------------------------------
 
