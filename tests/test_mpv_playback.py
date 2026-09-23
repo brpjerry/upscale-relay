@@ -64,10 +64,14 @@ def test_local_playback_reports_tracks_position_and_accepts_transport(tmp_path):
 
     async def scenario():
         try:
-            await player.play_local(str(path), 1.0, paused=True)
-            await wait_until(lambda: positions and track_reports)
+            await player.play_local(str(path), 1.0, paused=False)
+            # No settling or telemetry wait: fallback's caller can immediately
+            # pause and seek after play_local returns.
+            player.set_paused(True)
+            player.seek_local(2.0)
+            await wait_until(lambda: positions and track_reports and abs(positions[-1] - 2.0) < 0.1)
             assert player.mpv.pause
-            assert 0.9 <= positions[-1] <= 1.1
+            assert 1.9 <= positions[-1] <= 2.1
             # mpv key bindings/config can change output independently of Qt.
             player.mpv.volume = 37
             player.mpv.mute = True
@@ -75,11 +79,11 @@ def test_local_playback_reports_tracks_position_and_accepts_transport(tmp_path):
             player.set_volume(65)
             player.set_muted(False)
             assert player.audio_output_state() == (65, False)
-            player.seek_local(2.0)
-            await wait_until(lambda: positions[-1] >= 1.9)
+            player.seek_local(3.0)
+            await wait_until(lambda: positions[-1] >= 2.9)
             assert player.mpv.pause  # seeking preserves caller pause intent
             player.set_paused(False)
-            await wait_until(lambda: positions[-1] > 2.2)
+            await wait_until(lambda: positions[-1] > 3.2)
             assert player._stats_task is not None and not player._stats_task.done()
         finally:
             player.stop()
@@ -90,6 +94,98 @@ def test_local_playback_reports_tracks_position_and_accepts_transport(tmp_path):
     finally:
         player.mpv.terminate()
         player.close()
+
+
+@pytest.fixture
+def local_player():
+    app = QApplication.instance() or QApplication([])
+    player = MpvPlayerView(options=DesktopOptions(
+        headless=True, settings_scope="test-mpv-local-readiness",
+    ))
+    yield player
+    player.stop()
+    player.mpv.terminate()
+    player.close()
+
+
+@pytest.mark.parametrize("cancel_task", [False, True])
+def test_stop_or_cancel_pending_local_load_cleans_up(local_player, monkeypatch, cancel_task):
+    player = local_player
+
+    async def scenario():
+        loading = asyncio.Event()
+        monkeypatch.setattr(type(player.mpv), "loadfile", lambda *a, **kw: loading.set())
+        task = asyncio.create_task(player.play_local("pending.mkv"))
+        await asyncio.wait_for(loading.wait(), 2)
+        assert not task.done()
+        if cancel_task:
+            task.cancel()
+        else:
+            player.stop()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, 1)
+        assert not player._local_playback
+        assert player._local_load_ready is None
+        assert player._stats_task is None
+
+    asyncio.run(scenario())
+
+
+def test_stop_during_settle_prevents_late_local_load(local_player, monkeypatch):
+    player = local_player
+    loaded = []
+    monkeypatch.setattr(type(player.mpv), "loadfile", lambda *a, **kw: loaded.append(True))
+
+    async def scenario():
+        task = asyncio.create_task(player.play_local("superseded.mkv"))
+        await asyncio.sleep(0)
+        player.stop()
+        await asyncio.wait_for(task, 1)
+        assert loaded == []
+        assert player._stats_task is None
+
+    asyncio.run(scenario())
+
+
+def test_pause_and_seek_during_local_load_are_applied_when_ready(tmp_path, local_player, monkeypatch):
+    from upscale_cli.sample import make_sample
+    path = tmp_path / "original.mkv"
+    make_sample(str(path), frames=144, width=64, height=64, fps=24)
+    player = local_player
+    native_load = player.mpv.loadfile
+
+    async def scenario():
+        loading = asyncio.Event()
+        command = []
+
+        def delay_load(_self, *args, **kwargs):
+            command.append((args, kwargs))
+            loading.set()
+
+        monkeypatch.setattr(type(player.mpv), "loadfile", delay_load)
+        task = asyncio.create_task(player.play_local(str(path), paused=False))
+        await asyncio.wait_for(loading.wait(), 2)
+        player.set_paused(True)
+        player.seek_local(2.0)
+        native_load(*command[0][0], **command[0][1])
+        await asyncio.wait_for(task, 5)
+        assert player.mpv.pause
+        async with asyncio.timeout(5):
+            while abs((player.mpv.time_pos or 0) - 2.0) > 0.1:
+                await asyncio.sleep(0.02)
+        player.stop()
+
+    asyncio.run(scenario())
+
+
+def test_unreadable_local_file_fails_without_waiting_for_timeout(tmp_path, local_player):
+    async def scenario():
+        with pytest.raises(RuntimeError, match="Local media load ended"):
+            await asyncio.wait_for(local_player.play_local(str(tmp_path / "missing.mkv")), 5)
+        assert not local_player._local_playback
+        assert local_player._stats_task is None
+
+    asyncio.run(scenario())
 
 
 class ConsumerProbe:

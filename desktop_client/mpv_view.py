@@ -433,6 +433,8 @@ class MpvPlayerView(QOpenGLWidget):
         self._stats_task: asyncio.Task | None = None
         self._source_path: str | None = None
         self._local_playback = False
+        self._local_load_ready: asyncio.Future | None = None
+        self._pending_local_seek: float | None = None
         self._last_audio_output: tuple[int, bool] | None = None
         self._fps = 30.0
         self._fed = 0
@@ -669,6 +671,11 @@ class MpvPlayerView(QOpenGLWidget):
 
     def stop(self) -> None:
         self._reloading = True  # suppress EOF caused by retiring our own pipe
+        ready = self._local_load_ready
+        self._local_load_ready = None
+        self._pending_local_seek = None
+        if ready is not None and not ready.done():
+            ready.cancel()
         for task in (self._task, self._stats_task):
             if task is not None:
                 task.cancel()
@@ -807,32 +814,96 @@ class MpvPlayerView(QOpenGLWidget):
     async def play_local(
         self, path: str, position_s: float = 0.0, *, paused: bool = False,
     ) -> None:
-        """Play an original file with the same transport and track reporting."""
+        """Return once the original file accepts transport controls.
+
+        loadfile only queues a native load. Hold playback until its file-loaded
+        event arrives, preserving pause/seek requests made during the load.
+        """
         self.stop()
         generation = self._load_generation
+        loop = asyncio.get_running_loop()
+        self._local_load_ready = ready = loop.create_future()
         self._reloading = True
-        # The native stop/load settle interval also applies when leaving a
-        # relay stream for its original file.
-        await asyncio.sleep(0.15)
-        if generation != self._load_generation:
-            return  # a newer stop/start superseded this transition
         self.client = None
         self._source_path = str(path)
         self._local_playback = True
         self._tracks_reported = False
         self._caller_paused = paused
-        self._epoch_released = True  # local files need no external-media hold
-        self.mpv.loadfile(
-            self._source_path, start=str(max(0.0, position_s)),
-            pause="yes" if paused else "no",
-        )
-        self._reloading = False
-        self._stats_task = asyncio.create_task(self._stats_loop())
+        callback = None
+
+        def complete(error: str | None) -> None:
+            if generation != self._load_generation or ready.done():
+                return
+            if error is None:
+                ready.set_result(None)
+            else:
+                ready.set_exception(RuntimeError(error))
+
+        try:
+            # The native stop/load settle interval also applies when leaving
+            # a relay stream for its original file. No property reads here.
+            await asyncio.sleep(0.15)
+            if generation != self._load_generation:
+                return
+            entry_id = None
+
+            @self.mpv.event_callback("start-file", "file-loaded", "end-file")
+            def callback(event):
+                nonlocal entry_id
+                # Event data belongs to libmpv. Copy primitive fields before
+                # scheduling back onto asyncio; never block the event thread.
+                kind = event.event_id.value
+                if kind == mpv.MpvEventID.START_FILE:
+                    entry_id = event.data.playlist_entry_id
+                    return
+                if entry_id is None:
+                    return
+                if kind == mpv.MpvEventID.FILE_LOADED:
+                    error = None
+                elif (event.data.playlist_entry_id == entry_id
+                      and event.data.reason != mpv.MpvEventEndFile.REDIRECT):
+                    error = f"Local media load ended before it was ready (mpv error {event.data.error})"
+                else:
+                    return
+                try:
+                    loop.call_soon_threadsafe(complete, error)
+                except RuntimeError:
+                    pass  # the application loop was closed during shutdown
+
+            self.mpv.loadfile(
+                self._source_path, start=str(max(0.0, position_s)), pause="yes",
+            )
+            async with asyncio.timeout(30):
+                await ready
+            if generation != self._load_generation:
+                return
+            if self._pending_local_seek is not None:
+                self.mpv.command("seek", self._pending_local_seek, "absolute+exact")
+                self._pending_local_seek = None
+            self._epoch_released = True
+            self.mpv.pause = self._caller_paused
+            self._reloading = False
+            self._stats_task = asyncio.create_task(self._stats_loop())
+        except BaseException as error:
+            if generation == self._load_generation:
+                self.stop()
+            if isinstance(error, TimeoutError):
+                raise RuntimeError("Timed out waiting for local media to load") from error
+            raise
+        finally:
+            if callback is not None:
+                self.mpv.unregister_event_callback(callback)
+            if self._local_load_ready is ready:
+                self._local_load_ready = None
 
     def seek_local(self, target_s: float) -> None:
         """Seek the original file directly, retaining its absolute timeline."""
         if self._local_playback:
-            self.mpv.command("seek", max(0.0, target_s), "absolute+exact")
+            target_s = max(0.0, target_s)
+            if self._epoch_released:
+                self.mpv.command("seek", target_s, "absolute+exact")
+            else:
+                self._pending_local_seek = target_s
 
     # -- internals ---------------------------------------------------------------
 
