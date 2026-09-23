@@ -49,8 +49,9 @@ def test_failed_materialization_removes_partial_view_and_lease(tmp_path):
 
 
 def test_cancelled_materialization_releases_the_late_view(tmp_path, monkeypatch):
-    started, release = threading.Event(), threading.Event()
+    started, release, removed = threading.Event(), threading.Event(), threading.Event()
     original = cache._materialize_view
+    original_remove = cache._remove_view
 
     def slow(*args):
         started.set()
@@ -58,6 +59,10 @@ def test_cancelled_materialization_releases_the_late_view(tmp_path, monkeypatch)
         return original(*args)
 
     monkeypatch.setattr(cache, "_materialize_view", slow)
+    def remove(path):
+        original_remove(path)
+        removed.set()
+    monkeypatch.setattr(cache, "_remove_view", remove)
 
     async def scenario():
         task = asyncio.create_task(cache.materialize_attachment_cache(
@@ -65,9 +70,12 @@ def test_cancelled_materialization_releases_the_late_view(tmp_path, monkeypatch)
         try:
             assert await asyncio.to_thread(started.wait, 2)
             task.cancel()
-            release.set()
+            await asyncio.sleep(0)
+            task.cancel()  # repeated cancellation cannot steal the worker's lease
             with pytest.raises(asyncio.CancelledError):
-                await task
+                await asyncio.wait_for(task, 0.5)
+            release.set()
+            assert await asyncio.to_thread(removed.wait, 2)
         finally:
             release.set()
         assert list((tmp_path / "sessions").iterdir()) == []

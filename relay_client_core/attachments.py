@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from contextlib import contextmanager
 import hashlib
+import logging
 import os
 from pathlib import Path
 import re
@@ -22,6 +23,36 @@ MAX_MANIFEST_BYTES = 256 * 1024 * 1024
 MAX_CACHE_BYTES = 512 * 1024 * 1024
 _VIEW_LEASES: dict[Path, object] = {}
 _CACHE_MUTEX = threading.RLock()
+log = logging.getLogger("relay.attachments")
+
+
+class _ViewPublication:
+    """Keep an unpublished lease on its worker through caller cancellation."""
+
+    def __init__(self, root: Path, session_id: str, entries: list[dict]):
+        self.args = root, session_id, entries
+        self.lock = threading.Lock()
+        self.abandoned = False
+        self.view = None
+
+    def run(self) -> None:
+        view = _materialize_view(*self.args)
+        with self.lock:
+            if not self.abandoned:
+                self.view = view
+                return
+        _remove_view(view)
+
+    def take(self, *, abandon: bool = False):
+        with self.lock:
+            self.abandoned |= abandon
+            view, self.view = self.view, None
+        return view
+
+
+def _observe_cleanup(future: asyncio.Future) -> None:
+    if not future.cancelled() and (error := future.exception()) is not None:
+        log.warning("abandoned attachment cleanup failed: %r", error)
 
 
 def _lock_file(handle, *, blocking: bool) -> None:
@@ -252,18 +283,19 @@ async def materialize_attachment_cache(
         if len(data) != entry["size"] or hashlib.sha256(data).hexdigest() != digest:
             raise ValueError("attachment size/hash mismatch")
         await asyncio.to_thread(_publish_object, target, data, digest)
-    publishing = asyncio.create_task(asyncio.to_thread(
-        _materialize_view, cache_root, session_id, entries))
+    loop = asyncio.get_running_loop()
+    owner = _ViewPublication(cache_root, session_id, entries)
+    publishing = loop.run_in_executor(None, owner.run)
     try:
-        view = await asyncio.shield(publishing)
+        await asyncio.shield(publishing)
     except asyncio.CancelledError:
-        try:
-            view = await publishing
-        except Exception:
-            pass
-        else:
-            await remove_attachment_view(view)
+        view = owner.take(abandon=True)
+        publishing.add_done_callback(_observe_cleanup)
+        if view is not None:
+            cleanup = loop.run_in_executor(None, _remove_view, view)
+            cleanup.add_done_callback(_observe_cleanup)
         raise
+    view = owner.take()
     try:
         await asyncio.to_thread(_evict, cache_root, {entry["sha256"] for entry in entries})
     except BaseException:
