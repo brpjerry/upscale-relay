@@ -418,7 +418,9 @@ class RelayServer:
     async def handle_media_file(self, request: web.Request) -> web.StreamResponse:
         assert self.library is not None
         try:
-            path = self.library.resolve_file(request.match_info["path"])
+            path = await asyncio.to_thread(
+                self.library.resolve_file, request.match_info["path"],
+            )
         except LibraryPathError:
             raise web.HTTPNotFound()
         # aiohttp FileResponse implements byte ranges, conditional requests,

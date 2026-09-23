@@ -109,6 +109,10 @@ class VideoTrack:
         # in-flight to_thread(next, ...) keeps running on its worker thread,
         # and concurrent libav access is a native crash, not an exception.
         self._lock = threading.Lock()
+        # Iterator invalidation must never wait for a potentially slow native
+        # demux/seek holding _lock (e.g. an outstanding SMB read). Callers may
+        # create the replacement iterator on the asyncio/GUI thread.
+        self._generation_lock = threading.Lock()
         self._iter_gen = 0
 
     @property
@@ -139,7 +143,7 @@ class VideoTrack:
         cancelled ``asyncio.to_thread`` calls keep running and must not steal
         packets from a newer post-seek iterator that shares the container.
         """
-        with self._lock:
+        with self._generation_lock:
             self._iter_gen = gen = self._iter_gen + 1
         return self._packet_iter(gen, from_pts)
 
@@ -208,8 +212,9 @@ class VideoTrack:
         return None
 
     def close(self) -> None:
-        with self._lock:
+        with self._generation_lock:
             self._iter_gen += 1
+        with self._lock:
             self._container.close()
 
 
@@ -242,6 +247,10 @@ class AuxiliaryTrack:
         self.attachments = self._cached_attachment_info(path, raw_attachments)
         self.attachment_bytes = sum(attachment.size for attachment in self.attachments)
         self._lock = threading.Lock()
+        # Iterator invalidation must never wait for a potentially slow native
+        # demux/seek holding _lock (e.g. an outstanding SMB read). Callers may
+        # create the replacement iterator on the asyncio/GUI thread.
+        self._generation_lock = threading.Lock()
         self._iter_gen = 0
         try:
             self._validate_matroska_mux(self.attachments)
@@ -344,7 +353,7 @@ class AuxiliaryTrack:
         samples before the first video PTS; keeping them is safer than starting
         codecs such as Opus/AAC without decoder preroll.
         """
-        with self._lock:
+        with self._generation_lock:
             self._iter_gen = gen = self._iter_gen + 1
         return self._packet_iter(gen, target_s)
 
@@ -404,6 +413,7 @@ class AuxiliaryTrack:
             )
 
     def close(self) -> None:
-        with self._lock:
+        with self._generation_lock:
             self._iter_gen += 1
+        with self._lock:
             self._container.close()

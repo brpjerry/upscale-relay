@@ -344,7 +344,7 @@ class Session:
                 return
             relative = source.get("path") if isinstance(source, dict) else None
             try:
-                resolved = self.library.resolve_file(relative or "")
+                resolved = await asyncio.to_thread(self.library.resolve_file, relative or "")
                 resolved_path = str(resolved)
                 self.source_track = await asyncio.to_thread(VideoTrack, resolved_path)
                 if requested_aux == "muxed":
