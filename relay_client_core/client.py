@@ -491,14 +491,20 @@ class RelayClient:
 
     async def prepare_attachments(self, cache_root: Path) -> Path | None:
         """Materialize negotiated cached fonts before mpv loads the epoch."""
+        if self._closing:
+            raise ConnectionError("client is closing")
         session = self.session
         if session is None or session.aux_attachments != "cached":
             return None
         token = session.attachment_token
         if not token:
             raise RuntimeError("cached attachment session omitted its token")
-        await remove_attachment_view(self._attachment_view_dir)
-        self._attachment_view_dir = await materialize_attachment_cache(
+        previous_view = self._attachment_view_dir
+        self._attachment_view_dir = None
+        await remove_attachment_view(previous_view)
+        if self._closing or self.session is not session:
+            raise ConnectionError("client closed while preparing attachments")
+        view = await materialize_attachment_cache(
             self._http,
             self.base_url,
             session.session_id,
@@ -506,6 +512,13 @@ class RelayClient:
             token,
             Path(cache_root),
         )
+        if self._closing or self.session is not session:
+            # close() may have finished while a disk worker created this view.
+            # It never owned that unpublished lease, so the opening operation
+            # must release it rather than assigning it to an already closed client.
+            await remove_attachment_view(view)
+            raise ConnectionError("client closed while preparing attachments")
+        self._attachment_view_dir = view
         return self._attachment_view_dir
 
     async def fetch_library_page(

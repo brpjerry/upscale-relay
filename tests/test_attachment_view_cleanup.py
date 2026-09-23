@@ -5,6 +5,8 @@ import threading
 import pytest
 
 from relay_client_core import attachments as cache
+from relay_client_core import client as client_module
+from types import SimpleNamespace
 
 
 def test_abandoned_hardlinked_views_do_not_pin_evicted_objects(tmp_path):
@@ -68,6 +70,34 @@ def test_cancelled_materialization_releases_the_late_view(tmp_path, monkeypatch)
                 await task
         finally:
             release.set()
+        assert list((tmp_path / "sessions").iterdir()) == []
+        assert not any(path.is_relative_to(tmp_path) for path in cache._VIEW_LEASES)
+
+    asyncio.run(scenario())
+
+
+def test_client_close_reaps_a_font_view_that_finishes_later(tmp_path, monkeypatch):
+    async def scenario():
+        started, release = asyncio.Event(), asyncio.Event()
+
+        async def delayed_view(*args):
+            started.set()
+            await release.wait()
+            return cache._materialize_view(tmp_path, "late", [])
+
+        monkeypatch.setattr(client_module, "materialize_attachment_cache", delayed_view)
+        client = client_module.RelayClient("localhost", 1)
+        client.session = SimpleNamespace(
+            aux_attachments="cached", attachment_token="token",
+            session_id="late", attachment_manifest=[],
+        )
+        opening = asyncio.create_task(client.prepare_attachments(tmp_path))
+        await started.wait()
+        await client.close()
+        release.set()
+        with pytest.raises(ConnectionError, match="closed while preparing attachments"):
+            await opening
+        assert client._attachment_view_dir is None
         assert list((tmp_path / "sessions").iterdir()) == []
         assert not any(path.is_relative_to(tmp_path) for path in cache._VIEW_LEASES)
 
