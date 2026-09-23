@@ -107,6 +107,18 @@ jobs:
             throw "GUI frozen pip smoke failed with exit $($p.ExitCode)"
           }
           "GUI import check OK"
+      - name: Package standalone GUI ZIP
+        shell: pwsh
+        run: |
+          $bundle = "dist/upscale-relay-server-gui"
+          Copy-Item packaging/SERVER_GUI_README.txt "$bundle/README.txt"
+          "Commit: ${{ github.sha }}`nBranch: ${{ github.ref_name }}`nBuild: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" |
+            Set-Content "$bundle/BUILD.txt"
+          $short = "${{ github.sha }}".Substring(0, 8)
+          $zip = "dist/upscale-relay-server-gui-$short-windows-x64.zip"
+          Compress-Archive -Path "$bundle/*" -DestinationPath $zip
+          (Get-FileHash -Algorithm SHA256 $zip).Hash.ToLower() |
+            Set-Content "$zip.sha256"
       - uses: actions/upload-artifact@v7
         with:
           name: upscale-relay-server-windows
@@ -114,4 +126,6 @@ jobs:
       - uses: actions/upload-artifact@v7
         with:
           name: upscale-relay-server-gui-windows
-          path: dist/upscale-relay-server-gui/
+          path: |
+            dist/upscale-relay-server-gui-*-windows-x64.zip
+            dist/upscale-relay-server-gui-*-windows-x64.zip.sha256
