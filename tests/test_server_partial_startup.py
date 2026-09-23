@@ -2,6 +2,7 @@ import asyncio
 from types import SimpleNamespace
 
 import pytest
+from aiohttp import web
 
 from relay_server.server import RelayServer
 
@@ -17,30 +18,45 @@ def test_stop_is_safe_before_start_and_repeated():
 
 def test_failed_control_bind_closes_earlier_media_listener(monkeypatch):
     async def scenario():
-        occupied = await asyncio.start_server(lambda _r, w: w.close(), "127.0.0.1", 0)
         created = []
+        cleaned_runners = []
         original = asyncio.start_server
+        original_cleanup = web.AppRunner.cleanup
 
         async def record(*args, **kwargs):
             server = await original(*args, **kwargs)
             created.append(server)
             return server
 
+        async def fail_control_start(_site):
+            # Wildcard/loopback bind conflicts differ across operating systems.
+            # Fail this boundary explicitly while retaining real media sockets
+            # and AppRunner setup/cleanup below it.
+            assert len(created) == 1 and created[0].is_serving()
+            raise OSError("injected control bind failure")
+
+        async def record_cleanup(runner):
+            cleaned_runners.append(runner)
+            await original_cleanup(runner)
+
         monkeypatch.setattr(asyncio, "start_server", record)
-        server = RelayServer("missing-models", occupied.sockets[0].getsockname()[1])
+        monkeypatch.setattr(web.TCPSite, "start", fail_control_start)
+        monkeypatch.setattr(web.AppRunner, "cleanup", record_cleanup)
+        server = RelayServer("missing-models", 0)
         server.media_port = 0
         try:
-            with pytest.raises(OSError):
+            with pytest.raises(OSError, match="injected control bind failure"):
                 await server.start()
             assert len(created) == 1
             assert not created[0].is_serving()
             assert not created[0].sockets
+            assert len(cleaned_runners) == 1
+            assert cleaned_runners[0].server is None
             assert server._media_server is None
             assert server._runner is None
             await server.stop()
         finally:
-            occupied.close()
-            await occupied.wait_closed()
+            await server.stop()
 
     asyncio.run(scenario())
 
