@@ -331,6 +331,7 @@ def test_open_progress_indicator_toggles(window):
 
 def test_keyboard_pause_uses_the_toolbar_and_server_state(window):
     class PauseClient(FakeLibraryClient):
+        session = object()
         pauses = 0
         plays = 0
 
@@ -351,6 +352,17 @@ def test_keyboard_pause_uses_the_toolbar_and_server_state(window):
         await window.on_play_pause()
         assert not window._paused and not window.player.paused
         assert client.plays == 1
+
+    asyncio.run(scenario())
+
+
+def test_keyboard_pause_is_ignored_without_an_active_session(window):
+    async def scenario():
+        window.client = FakeLibraryClient()  # connected, but no file open
+        window.player.pause_requested.emit()
+        await asyncio.sleep(0)
+        assert not window._paused
+        assert not hasattr(window.player, "paused")
 
     asyncio.run(scenario())
 

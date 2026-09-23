@@ -796,7 +796,8 @@ class MainWindow(QMainWindow):
         if self.client is None:
             text = "Connect to your server\n\nEnter its address above, then choose a video from the file browser."
         else:
-            text = "Choose a video\n\nDouble-click a file in Local or Server to start streaming."
+            location = "Local or Server" if self._server_caps.get("library") else "the file browser"
+            text = f"Choose a video\n\nDouble-click a file in {location} to start streaming."
         self.idle_hint.setText(text)
         self._position_idle_guidance()
         self.idle_hint.show()
@@ -1344,7 +1345,7 @@ class MainWindow(QMainWindow):
     @asyncSlot()
     async def on_play_pause(self) -> None:
         local = self._session_source == "local"
-        if self.client is None and not local:
+        if not local and (self.client is None or self.client.session is None):
             return
         self._paused = not self._paused
         self.player.set_paused(self._paused)
