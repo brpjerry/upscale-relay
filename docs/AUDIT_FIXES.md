@@ -109,5 +109,58 @@ The real Windows relay's fast NVENC passthrough initially exposed a client seek
 failure after all epoch bytes had arrived. After the EOS consumer fix, the same
 Windows lossless-HEVC run passed playback, keyboard pause, active subtitle text,
 paused/overlapping seeks, resume, local fallback and Stop. This validates the new
-client against the existing Windows server. Re-run against the newly installed
-ZIP to exercise the updated server together with the client.
+client against the existing Windows server.
+
+### Updated Windows relay acceptance
+
+The installed GUI ZIP built from `0330667d` was subsequently exercised over the
+LAN with the desktop GPU confirmed idle. The updated server's source metadata
+was present, and all sessions ended with an empty `/status` session registry,
+`restart_required:false` and no native teardown error.
+
+- Native desktop uplink checks passed with passthrough and
+  `2x_AnimeJaNai_HD_V3Sharp1_Compact`: playback, keyboard pause, paused and
+  overlapping seeks, overlapping subtitle text, resume, local fallback and Stop.
+- Server-library playback confirmed muxed FLAC audio and ASS subtitles, cached
+  attachments, and both source audio/auxiliary metadata flags. The larger source
+  supplied 22 cached fonts. No external original-media attachment was needed.
+- A 40-second, 1,200-frame uplink fixture returned exactly the source's fractional
+  video packet timestamps. Complete post-EOS epochs after seeks to 12 and 4
+  seconds also matched exactly (840 and 1,080 frames). Each epoch had one initial
+  discontinuity and terminal EOS. Duplicate uplink and downlink attachments were
+  rejected, and the rejected sockets reached EOF.
+- The visible Wayland MainWindow passed playback, Playback Settings, fullscreen
+  overlay, pause, subtitle overlap, overlapping seeks, resume and Stop at
+  2880x1620. Native decoding used `vaapi-copy`. Window, settings, fullscreen and
+  paused-subtitle captures were inspected. Frame drops during window transitions
+  and capture are separate from the sustained playback measurements below.
+
+The sustained runs used a 1920x1080, 23.976 fps server-library source with a
+3840x2160 downlink. Measurements began after startup and a seek to 60 seconds.
+The named 2x model confirmed `TensorrtExecutionProvider`; encoding confirmed
+`hevc_nvenc`. The following headless libmpv runs sampled state every two seconds:
+
+| Model | Tier | Measured wall time | Playback advance | Buffering samples | Frame drops | Minimum cache |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| passthrough | hevc-qp18 | 62.00 s | 61.98 s | 0 | 0 | 3.21 s |
+| 2x AnimeJaNai HD V3Sharp1 Compact | hevc-qp18 | 91.95 s | 91.97 s | 0 | 0 | 2.00 s |
+| 2x AnimeJaNai HD V3Sharp1 Compact | lossless-hevc | 120.05 s | 120.04 s | 0 | 0 | 2.46 s |
+
+The lossless run confirmed `nvenc-p4-low-delay`. Model inference averaged about
+23.4 ms/frame in that run; the observed playback clock, cache and buffering
+state establish real-time delivery for this source. The periodically sampled
+pipeline FPS also includes watermark pauses and is not a standalone capacity
+benchmark.
+
+A separate visible Wayland run rendered the same 4K lossless model stream through
+`vaapi-copy` for 60.13 seconds, advancing 60.10 seconds with no sampled buffering
+and at least 3.30 seconds of cache. Its frame-drop counter remained at one from
+the beginning to the end of the measurement: no additional drops occurred during
+steady playback. No window changes or screenshots occurred during that interval.
+
+These bounded tests did not reproduce the previously reported intermittent
+native GPU crash. They do not establish a fix for it or certify other models,
+source complexity, network conditions, or full-length playback. Headless audio
+used a null sink; visible checks were muted. Audible synchronization and remote
+subtitle-spool deletion were not inspected directly; the latter retains local
+regression coverage and the server's confirmed teardown contract.
