@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import concurrent.futures
 import json
 import logging
 import time
@@ -77,6 +78,43 @@ class State(str, Enum):
     CLOSED = "closed"
 
 
+class _DownlinkQueue(asyncio.Queue):
+    """Bound both packet count and payload bytes on the owning event loop."""
+
+    def __init__(self, maxsize: int = 256, max_bytes: int = 128 * 1024 * 1024):
+        super().__init__(maxsize=maxsize)
+        self.max_bytes = max_bytes
+        self.payload_bytes = 0
+        self._capacity = asyncio.Event()
+
+    @staticmethod
+    def _size(item: MediaPacket | None) -> int:
+        return len(item.payload) if item is not None else 0
+
+    def _fits(self, item: MediaPacket | None) -> bool:
+        return not self.full() and self.payload_bytes + self._size(item) <= self.max_bytes
+
+    async def put(self, item: MediaPacket | None) -> None:
+        if self._size(item) > self.max_bytes:
+            raise ValueError("downlink packet exceeds queue byte budget")
+        while not self._fits(item):
+            self._capacity.clear()
+            await self._capacity.wait()
+        self.put_nowait(item)
+
+    def put_nowait(self, item: MediaPacket | None) -> None:
+        if not self._fits(item):
+            raise asyncio.QueueFull
+        super().put_nowait(item)
+        self.payload_bytes += self._size(item)
+
+    def get_nowait(self) -> MediaPacket | None:
+        item = super().get_nowait()
+        self.payload_bytes -= self._size(item)
+        self._capacity.set()
+        return item
+
+
 class Session:
     def __init__(self, ws, models: dict[str, str], ep: str = "auto",
                  library: MediaLibrary | None = None,
@@ -108,7 +146,7 @@ class Session:
         self.uplink_token = new_token()
         self.downlink_token = new_token()
         self.pipeline: Pipeline | None = None
-        self.down_q: asyncio.Queue[MediaPacket | None] = asyncio.Queue(maxsize=512)
+        self.down_q: asyncio.Queue[MediaPacket | None] = _DownlinkQueue()
         self.uplink_attached = False
         self.downlink_attached = False
         self.last_buffer_report = time.monotonic()
@@ -136,29 +174,38 @@ class Session:
         await self.send("state", state=state.value)
 
     def _emit_downlink(self, pkt: MediaPacket) -> None:
-        """Called from the pipeline worker thread. Blocks that thread while
-        the downlink writer is behind (real backpressure — the old queue
-        expansion ballooned memory when the client drained slowly)."""
-        import time as _time
+        """Apply backpressure to the complete worker-to-event-loop handoff.
 
-        waited = 0.0
-        while self.down_q.qsize() >= 256 and self.state != State.CLOSED:
-            _time.sleep(0.05)
-            waited += 0.05
-            if waited >= 30.0:
-                log.warning("session %s: downlink stalled >30s, dropping session", self.id)
-                asyncio.run_coroutine_threadsafe(self.close(), self._loop)
-                return
-
-        def _put() -> None:
-            if pkt.epoch < self.epoch:
-                return  # a seek happened while this was in flight
-            try:
-                self.down_q.put_nowait(pkt)
-            except asyncio.QueueFull:
-                pass  # bounded by the gate above; only a burst race lands here
-
-        self._loop.call_soon_threadsafe(_put)
+        Waiting for Queue.put also bounds callbacks waiting for the event loop.
+        A qsize check followed by call_soon could queue unbounded callbacks and
+        then silently lose Matroska bytes when those callbacks filled the queue.
+        """
+        if self.state == State.CLOSED or pkt.epoch < self.epoch:
+            return
+        pending = self.down_q.put(pkt)
+        try:
+            delivery = asyncio.run_coroutine_threadsafe(pending, self._loop)
+        except RuntimeError:
+            pending.close()
+            return  # the owning event loop has already shut down
+        deadline = time.monotonic() + 30.0
+        try:
+            while self.state != State.CLOSED and pkt.epoch >= self.epoch:
+                try:
+                    delivery.result(timeout=0.1)
+                    return
+                except concurrent.futures.TimeoutError:
+                    if time.monotonic() >= deadline:
+                        log.warning("session %s: downlink stalled >30s, dropping session", self.id)
+                        asyncio.run_coroutine_threadsafe(self.close(), self._loop)
+                        return
+                except concurrent.futures.CancelledError:
+                    return
+        finally:
+            # In particular, do not leave a stale seek or closed-session put
+            # waiting behind the current epoch's media.
+            if not delivery.done():
+                delivery.cancel()
 
     async def _progress_keepalive(self, stage: str, message: str,
                                   done: asyncio.Event) -> None:
