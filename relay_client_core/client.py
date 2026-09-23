@@ -55,6 +55,42 @@ def _open_local_source(path: str):
         track.close()
         raise
 
+
+class _SourceOpening:
+    """Keep native ownership on the worker until the loop accepts the source."""
+
+    def __init__(self, path: str):
+        self.path = path
+        self._lock = threading.Lock()
+        self._abandoned = False
+        self._result = None
+
+    def run(self) -> None:
+        opened = _open_local_source(self.path)
+        with self._lock:
+            if not self._abandoned:
+                self._result = opened
+                return
+        # Cancellation can return to the GUI immediately; the still-running
+        # native opener releases its own eventual result on this worker.
+        opened[0].close()
+
+    def take(self):
+        with self._lock:
+            result, self._result = self._result, None
+        return result
+
+    def abandon(self):
+        with self._lock:
+            self._abandoned = True
+            result, self._result = self._result, None
+        return result[0] if result is not None else None
+
+
+def _observe_source_cleanup(future: asyncio.Future) -> None:
+    if not future.cancelled() and (error := future.exception()) is not None:
+        log.warning("abandoned source cleanup failed: %r", error)
+
 # Media pumping is sized for a slow event loop, not a fast one: under qasync
 # the loop shares the GUI thread with mpv rendering and turns come roughly
 # once per painted frame (~25/s at 24 fps). Anything that needs a loop turn
@@ -411,22 +447,26 @@ class RelayClient:
             raise ConnectionError("client is closing")
         video, duration_s, chapters = None, None, []
         if cfg.source == "uplink":
-            opening = asyncio.create_task(asyncio.to_thread(_open_local_source, cfg.path))
+            owner = _SourceOpening(cfg.path)
+            # Use an executor Future, not another asyncio Task: cancellation
+            # of all loop tasks must not discard a native worker's result.
+            opening = self._loop.run_in_executor(None, owner.run)
             try:
-                track, video, duration_s, chapters = await asyncio.shield(opening)
+                await asyncio.shield(opening)
             except asyncio.CancelledError:
-                # Cancellation does not stop libav. Retain ownership until its
-                # worker returns, then release the unpublished container.
-                try:
-                    opened = await opening
-                except Exception:
-                    pass
-                else:
-                    await asyncio.to_thread(opened[0].close)
+                track = owner.abandon()
+                opening.add_done_callback(_observe_source_cleanup)
+                if track is not None:
+                    cleanup = self._loop.run_in_executor(None, track.close)
+                    cleanup.add_done_callback(_observe_source_cleanup)
                 raise
             if self._closing:
-                await asyncio.to_thread(track.close)
+                track = owner.abandon()
+                if track is not None:
+                    cleanup = self._loop.run_in_executor(None, track.close)
+                    cleanup.add_done_callback(_observe_source_cleanup)
                 raise ConnectionError("client closed while opening source")
+            track, video, duration_s, chapters = owner.take()
             self.track = track
         source = ("uplink" if cfg.source == "uplink" else
                   {"type": "server_file", "path": cfg.path})
