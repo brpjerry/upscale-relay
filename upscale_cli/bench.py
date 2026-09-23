@@ -167,15 +167,21 @@ def _bench_end_to_end(up: OnnxUpscaler, frames: list[np.ndarray], workdir: Path,
 
 def run_bench(models_dir: str, out_path: str, frames: int = 48, ep: str = "auto",
               fit: tuple[int, int] | None = None) -> None:
-    import sys
     import tempfile
-    from .infer import OnnxUpscaler
 
     models = sorted(Path(models_dir).glob("*.onnx"))
     if not models:
         raise SystemExit(f"no .onnx models in {models_dir}")
 
-    workdir = Path(tempfile.mkdtemp(prefix="upscale-bench-"))
+    with tempfile.TemporaryDirectory(prefix="upscale-bench-") as directory:
+        _run_bench(models, out_path, frames, ep, fit, Path(directory))
+
+
+def _run_bench(models: list[Path], out_path: str, frames: int, ep: str,
+               fit: tuple[int, int] | None, workdir: Path) -> None:
+    import sys
+    from .infer import OnnxUpscaler
+
     lines = [
         "# upscale-cli benchmark",
         "",

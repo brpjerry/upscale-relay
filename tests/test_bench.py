@@ -19,3 +19,24 @@ def test_end_to_end_encodes_actual_upscaled_and_fitted_geometry(tmp_path, monkey
         decoded = list(output.decode(video=0))
     assert len(decoded) == 3
     assert {(frame.width, frame.height) for frame in decoded} == {expected}
+
+
+@pytest.mark.parametrize("fails", [False, True])
+def test_benchmark_removes_temporary_media_on_success_and_failure(tmp_path, monkeypatch, fails):
+    (tmp_path / "model.onnx").touch()
+    directories = []
+
+    def run(models, output, frames, ep, fit, workdir):
+        directories.append(workdir)
+        (workdir / "large-lossless.mkv").write_bytes(b"temporary media")
+        if fails:
+            raise RuntimeError("model failed")
+
+    monkeypatch.setattr(bench, "_run_bench", run)
+    if fails:
+        with pytest.raises(RuntimeError, match="model failed"):
+            bench.run_bench(str(tmp_path), str(tmp_path / "report.md"))
+    else:
+        bench.run_bench(str(tmp_path), str(tmp_path / "report.md"))
+    assert len(directories) == 1
+    assert not directories[0].exists()
