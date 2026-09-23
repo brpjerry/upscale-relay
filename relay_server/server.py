@@ -110,6 +110,9 @@ class RelayServer:
             self.app.router.add_get("/media/{path:.*}", self.handle_media_file)
             self.app.router.add_get("/attachments/{digest}", self.handle_attachment)
         self._stats_task = None
+        self._media_server = None
+        self._runner = None
+        self._stop_task = None
         self._mdns = MdnsAdvertiser(
             port=self.port,
             media_port=self.media_port,
@@ -462,27 +465,64 @@ class RelayServer:
     # -- lifecycle ------------------------------------------------------------------
 
     async def start(self) -> None:
-        self._media_server = await asyncio.start_server(self.handle_media, port=self.media_port)
-        self._runner = web.AppRunner(self.app)
-        await self._runner.setup()
-        site = web.TCPSite(self._runner, port=self.port)
-        await site.start()
-        if self.stats_interval:
-            self._stats_task = asyncio.create_task(self._stats_loop())
-        if self._mdns is not None:
-            await self._mdns.start()
-        log.info("control/status on :%d, media on :%d", self.port, self.media_port)
+        if self._media_server is not None or self._runner is not None:
+            raise RuntimeError("relay server already started")
+        self._stop_task = None
+        try:
+            self._media_server = await asyncio.start_server(self.handle_media, port=self.media_port)
+            self._runner = web.AppRunner(self.app)
+            await self._runner.setup()
+            site = web.TCPSite(self._runner, port=self.port)
+            await site.start()
+            if self.stats_interval:
+                self._stats_task = asyncio.create_task(self._stats_loop())
+            if self._mdns is not None:
+                await self._mdns.start()
+            log.info("control/status on :%d, media on :%d", self.port, self.media_port)
+        except BaseException:
+            # A failed control bind or canceled advertisement must not leave
+            # the earlier media listener alive in an unpublished server.
+            try:
+                await self.stop()
+            except BaseException:
+                log.exception("server startup rollback failed")
+            raise
 
     async def stop(self) -> None:
-        if self._mdns is not None:
-            await self._mdns.stop()
+        if self._stop_task is None:
+            self._stop_task = asyncio.create_task(self._stop_impl())
+        await asyncio.shield(self._stop_task)
+
+    async def _stop_impl(self) -> None:
+        errors = []
+        media, self._media_server = self._media_server, None
+        runner, self._runner = self._runner, None
+        if media is not None:
+            media.close()
+            await media.wait_closed()
         if self._stats_task is not None:
             self._stats_task.cancel()
-        for s in {s.id: s for s in self.sessions.values()}.values():
-            await s.close()
-        self._media_server.close()
-        await self._media_server.wait_closed()
-        await self._runner.cleanup()
+            await asyncio.gather(self._stats_task, return_exceptions=True)
+            self._stats_task = None
+        if self._mdns is not None:
+            try:
+                await self._mdns.stop()
+            except Exception as error:
+                errors.append(error)
+        for session in {s.id: s for s in self.sessions.values()}.values():
+            try:
+                await session.close()
+            except Exception as error:
+                errors.append(error)
+            finally:
+                await session.ws.close()
+        if runner is not None:
+            try:
+                await runner.cleanup()
+            except Exception as error:
+                errors.append(error)
+        if errors:
+            raise errors[0]
 
 
 async def main_async(args) -> None:
