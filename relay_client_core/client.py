@@ -225,7 +225,7 @@ class RelayClient:
         self.track: VideoTrack | None = None
         self.epoch = 0
         self.state = "idle"
-        self._pending: dict[str, asyncio.Future] = {}
+        self._pending: dict[str | tuple[str, int], asyncio.Future] = {}
         self._down_q = _ThreadBridgeQueue(self._loop, maxsize=1024)
         self._uplink_writer: asyncio.StreamWriter | None = None
         self._uplink_task: asyncio.Task | None = None
@@ -268,21 +268,18 @@ class RelayClient:
     async def _request(self, expect: str, type_: str, timeout: float = 30,
                        keepalive: bool = False, **fields) -> dict:
         fut: asyncio.Future = asyncio.get_running_loop().create_future()
-        self._pending[expect] = fut
+        key = (expect, fields["epoch"]) if expect == "seek_ready" else expect
+        if key in self._pending:
+            raise RuntimeError(f"a {expect} request is already pending")
+        self._pending[key] = fut
         self._last_activity = time.monotonic()
-        await self._send(type_, **fields)
-        if not keepalive:
-            try:
+        try:
+            await self._send(type_, **fields)
+            if not keepalive:
                 return await asyncio.wait_for(fut, timeout=timeout)
-            except BaseException:
-                if self._pending.get(expect) is fut:
-                    del self._pending[expect]
-                fut.cancel()
-                raise
         # Inactivity deadline: session_progress keepalives push it out, so a
         # server that is visibly working (TensorRT engine build) never times
         # out while a silent one still fails within ``timeout``.
-        try:
             while True:
                 remaining = self._last_activity + timeout - time.monotonic()
                 if remaining <= 0:
@@ -294,8 +291,8 @@ class RelayClient:
                 except asyncio.TimeoutError:
                     continue
         except BaseException:
-            if self._pending.get(expect) is fut:
-                del self._pending[expect]
+            if self._pending.get(key) is fut:
+                del self._pending[key]
             fut.cancel()
             raise
 
@@ -337,7 +334,8 @@ class RelayClient:
                                 RuntimeError(f"{msg.get('code')}: {msg.get('message', '')}")
                             )
                     self._pending.clear()
-                fut = self._pending.pop(mtype, None)
+                key = (mtype, msg.get("epoch")) if mtype == "seek_ready" else mtype
+                fut = self._pending.pop(key, None)
                 if fut is not None and not fut.done():
                     fut.set_result(msg)
         finally:
@@ -497,6 +495,8 @@ class RelayClient:
                            epoch: int | None = None) -> None:
         if self.track is None:
             return
+        if epoch is None:
+            epoch = self.epoch
         # The demuxer is single-threaded state: the old task must be fully done
         # before we seek it and start a new epoch's iteration.
         if self._uplink_task is not None:
@@ -509,8 +509,8 @@ class RelayClient:
         # seek can bump self.epoch before the task is scheduled, and a stale
         # task stamping the new epoch interleaves two streams of one epoch
         # (docs/PROTOCOL.md §4 forbids exactly this).
-        if epoch is None:
-            epoch = self.epoch
+        if epoch != self.epoch:
+            return
         self._uplink_task = asyncio.create_task(self._uplink_loop(from_pts, discontinuity, epoch))
 
     async def _uplink_loop(self, from_pts: int | None, discontinuity: bool, epoch: int) -> None:
@@ -681,6 +681,15 @@ class RelayClient:
         """Full docs/PROTOCOL.md §4 seek dance."""
         self.epoch += 1
         epoch = self.epoch
+        # The server may acknowledge only the newest seek. Retire old waiters
+        # immediately; an old acknowledgement must never resolve the new one.
+        for key, future in list(self._pending.items()):
+            if isinstance(key, tuple) and key[0] == "seek_ready":
+                self._pending.pop(key)
+                if not future.done():
+                    future.set_result({"type": "seek_ready", "epoch": key[1]})
+        if self._uplink_task is not None:
+            self._uplink_task.cancel()
         # Drop already-received downlink data.
         try:
             while True:
