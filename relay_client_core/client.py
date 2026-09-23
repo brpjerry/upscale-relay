@@ -62,6 +62,7 @@ def _open_local_source(path: str):
 # starving the server below realtime while playback was smooth.
 _UPLINK_BATCH = 16  # packets demuxed+sent per loop-turn pair
 _DOWNLINK_BATCH = 8  # one Qt-loop wakeup per batch, not per lossless frame
+_DOWNLINK_BATCH_BYTES = 16 * 1024 * 1024
 _DOWNLINK_SOCKET_BUFFER = 4 * 1024 * 1024
 
 # open_session inactivity window: each server session_progress keepalive
@@ -91,7 +92,8 @@ def _take_downlink_batch(
         batch.clear()
         return [pkt]
     batch.append(pkt)
-    if len(batch) >= _DOWNLINK_BATCH or pkt.eos:
+    if (len(batch) >= _DOWNLINK_BATCH or pkt.eos
+            or sum(len(item.payload) for item in batch if item is not None) >= _DOWNLINK_BATCH_BYTES):
         ready = list(batch)
         batch.clear()
         return ready
@@ -106,24 +108,46 @@ class _ThreadBridgeQueue:
     calls asyncio.Queue methods from outside the event-loop thread.
     """
 
-    def __init__(self, loop: asyncio.AbstractEventLoop, maxsize: int):
+    def __init__(self, loop: asyncio.AbstractEventLoop, maxsize: int,
+                 max_bytes: int = 128 * 1024 * 1024):
+        if maxsize < 1 or max_bytes < 1:
+            raise ValueError("queue limits must be positive")
         self._loop = loop
         self._maxsize = maxsize
+        self._max_bytes = max_bytes
+        self._queued_bytes = 0
         self._items = collections.deque()
         self._condition = threading.Condition()
         self._available = asyncio.Event()
         self._closed = False
 
     def put_batch_from_thread(self, items: list[MediaPacket | None]) -> bool:
-        if not items:
-            return True
-        with self._condition:
-            while not self._closed and len(self._items) + len(items) > self._maxsize:
-                self._condition.wait(timeout=0.25)
-            if self._closed:
-                return False
-            self._items.extend(items)
-        self._wake()
+        if any(item is not None and len(item.payload) > self._max_bytes for item in items):
+            raise ValueError("packet exceeds downlink queue byte budget")
+        index = 0
+        while index < len(items):
+            with self._condition:
+                item = items[index]
+                size = len(item.payload) if item is not None else 0
+                while not self._closed and (
+                    len(self._items) >= self._maxsize
+                    or self._queued_bytes + size > self._max_bytes
+                ):
+                    self._condition.wait(timeout=0.25)
+                if self._closed:
+                    return False
+                # Publish the largest prefix that fits, waking the consumer
+                # before waiting for space for the remainder of a large batch.
+                while index < len(items):
+                    item = items[index]
+                    size = len(item.payload) if item is not None else 0
+                    if (len(self._items) >= self._maxsize
+                            or self._queued_bytes + size > self._max_bytes):
+                        break
+                    self._items.append(item)
+                    self._queued_bytes += size
+                    index += 1
+            self._wake()
         return True
 
     def _wake(self) -> None:
@@ -137,6 +161,7 @@ class _ThreadBridgeQueue:
             with self._condition:
                 if self._items:
                     item = self._items.popleft()
+                    self._queued_bytes -= len(item.payload) if item is not None else 0
                     if not self._items:
                         self._available.clear()
                     self._condition.notify_all()
@@ -154,6 +179,7 @@ class _ThreadBridgeQueue:
             if not self._items:
                 raise asyncio.QueueEmpty
             item = self._items.popleft()
+            self._queued_bytes -= len(item.payload) if item is not None else 0
             if not self._items:
                 self._available.clear()
             self._condition.notify_all()
@@ -167,6 +193,7 @@ class _ThreadBridgeQueue:
         with self._condition:
             self._closed = True
             self._items.clear()
+            self._queued_bytes = 0
             self._condition.notify_all()
         self._wake()
 
