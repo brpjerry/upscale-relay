@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import time
 from pathlib import Path
 
@@ -69,6 +70,47 @@ _SERVER_PAGE_SIZE = 100
 
 def _format_time(seconds: float) -> str:
     return f"{int(seconds // 60):02d}:{int(seconds % 60):02d}"
+
+
+def _server_address(host: str, port: int) -> str:
+    return f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
+
+
+def _parse_server_address(address: str) -> tuple[str, int]:
+    text = address.strip()
+    if not text or any(char.isspace() for char in text) or any(c in text for c in "/?#"):
+        raise ValueError("Enter a hostname or IP address, such as server.local:8590.")
+    port_text = None
+    if text.startswith("["):
+        end = text.find("]")
+        if end < 0:
+            raise ValueError("Close the IPv6 address with ], for example [::1]:8590.")
+        host = text[1:end]
+        try:
+            ipaddress.IPv6Address(host)
+        except ValueError as err:
+            raise ValueError("Enter a valid IPv6 address inside the brackets.") from err
+        suffix = text[end + 1:]
+        if suffix and not suffix.startswith(":"):
+            raise ValueError("Use [IPv6]:port, for example [::1]:8590.")
+        port_text = suffix[1:] if suffix else None
+    elif text.count(":") > 1:
+        try:
+            ipaddress.IPv6Address(text)
+        except ValueError as err:
+            raise ValueError("Use [IPv6]:port, for example [::1]:8590.") from err
+        host = text  # an unbracketed IPv6 address uses the default port
+    else:
+        host, separator, port = text.partition(":")
+        port_text = port if separator else None
+        if not host or "[" in host or "]" in host:
+            raise ValueError("Enter a server hostname or IP address before the port.")
+    if port_text is not None and (not port_text.isascii() or not port_text.isdecimal()):
+        raise ValueError("The control port must be a number from 1 to 65534.")
+    port = int(port_text) if port_text is not None else 8590
+    if not 1 <= port <= 65534:
+        raise ValueError("The control port must be from 1 to 65534; media uses the next port.")
+    return host, port
 
 
 class SeekSlider(QSlider):
@@ -139,7 +181,9 @@ class MainWindow(QMainWindow):
         self.browser_toggle.setChecked(self.settings.browser_visible)
         self.browser_toggle.setIcon(self._icon("folder", QStyle.SP_DirIcon))
         self.browser_toggle.setToolTip("Show/hide the file browser")
-        self.host_edit = QLineEdit(f"{self.settings.server_host}:{self.settings.server_port}")
+        self.host_edit = QLineEdit(_server_address(
+            self.settings.server_host, self.settings.server_port,
+        ))
         self.host_edit.setFixedWidth(160)
         self.host_edit.setPlaceholderText("host:port")
         self.connect_btn = QPushButton("Connect")
@@ -654,9 +698,7 @@ class MainWindow(QMainWindow):
         return super().eventFilter(obj, event)
 
     def _host_port(self) -> tuple[str, int]:
-        text = self.host_edit.text().strip()
-        host, _, port = text.partition(":")
-        return host or "127.0.0.1", int(port or 8590)
+        return _parse_server_address(self.host_edit.text())
 
     def _set_opening(self, active: bool, text: str = "") -> None:
         """Show/hide the indeterminate busy bar while a session opens."""
@@ -899,7 +941,13 @@ class MainWindow(QMainWindow):
             self.conn_label.setText("disconnected")
             self.connect_btn.setText("Connect")
             return
-        host, port = self._host_port()
+        try:
+            host, port = self._host_port()
+        except ValueError as err:
+            self.host_edit.setFocus()
+            self.host_edit.selectAll()
+            self._error("Invalid server address", str(err))
+            return
         client = RelayClient(host, port)
         try:
             caps = await client.connect()

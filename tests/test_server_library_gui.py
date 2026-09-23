@@ -534,3 +534,34 @@ def test_fullscreen_labels_follow_a_readable_theme(window, background, foregroun
     assert surface.alpha() >= 230
     window._exit_overlay_controls()
     assert window.pos_label.palette().color(QPalette.WindowText) == QColor(foreground)
+
+
+@pytest.mark.parametrize("address,expected", [
+    ("server.local", ("server.local", 8590)),
+    (" 127.0.0.1:8590 ", ("127.0.0.1", 8590)),
+    ("[::1]:8590", ("::1", 8590)),
+    ("[2001:db8::1]", ("2001:db8::1", 8590)),
+    ("2001:db8::1", ("2001:db8::1", 8590)),
+    ("[fe80::1%eth0]:1234", ("fe80::1%eth0", 1234)),
+])
+def test_server_address_accepts_hostname_and_ipv6(address, expected):
+    assert main_window._parse_server_address(address) == expected
+    assert main_window._parse_server_address(main_window._server_address(*expected)) == expected
+
+
+@pytest.mark.parametrize("address", [
+    "", "server:not-a-port", "server:0", "server:65535", "server:-1",
+    "server:", ":8590", "http://server:8590", "server name:8590",
+    "[::1", "[example]:8590", "[::1]garbage", "[::1]:8590:8591",
+])
+def test_invalid_server_address_is_handled_before_connection(window, monkeypatch, address):
+    errors = []
+    monkeypatch.setattr(window, "_error", lambda *args: errors.append(args))
+    window.host_edit.setText(address)
+
+    async def scenario():
+        await window.on_connect()
+        assert window.client is None
+        assert errors and errors[0][0] == "Invalid server address"
+
+    asyncio.run(scenario())
