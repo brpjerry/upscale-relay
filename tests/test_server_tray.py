@@ -213,6 +213,7 @@ def test_runtime_setup_failure_coroutine_returns_after_close(app, monkeypatch):
     from relay_server import runtime_bootstrap
 
     monkeypatch.setattr(runtime_bootstrap, "activate_runtime", lambda: False)
+    monkeypatch.setattr(runtime_bootstrap, "source_runtime_ready", lambda ep: False)
 
     def fail_installer(on_line, _on_process):
         on_line("Unable to locate finder for 'pip._vendor.distlib'")
@@ -239,6 +240,24 @@ def test_runtime_setup_failure_coroutine_returns_after_close(app, monkeypatch):
         assert returned_dialog is dialog
 
     asyncio.run(scenario())
+
+
+def test_usable_source_runtime_skips_managed_installation(app, monkeypatch):
+    from relay_server import runtime_bootstrap
+    monkeypatch.delattr(sys, "frozen", raising=False)
+    checked = []
+    monkeypatch.setattr(runtime_bootstrap, "source_runtime_ready", lambda ep: checked.append(ep) or True)
+    monkeypatch.setattr(runtime_bootstrap, "activate_runtime", lambda: pytest.fail("must retain source runtime"))
+    assert asyncio.run(ensure_runtime_gui("cuda")) == (True, None)
+    assert checked == ["cuda"]
+
+
+def test_frozen_gui_always_uses_managed_runtime(app, monkeypatch):
+    from relay_server import runtime_bootstrap
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(runtime_bootstrap, "source_runtime_ready", lambda ep: pytest.fail("source check in frozen app"))
+    monkeypatch.setattr(runtime_bootstrap, "activate_runtime", lambda: True)
+    assert asyncio.run(ensure_runtime_gui("auto")) == (True, None)
 
 
 def test_config_dialog_load_and_apply_persists(app, settings):

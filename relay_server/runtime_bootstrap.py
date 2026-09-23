@@ -27,6 +27,7 @@ RUNTIME_INSTALL_ARG = "--install-nvidia-runtime"
 RUNTIME_INSTALL_CHECK_ARG = "--check-nvidia-runtime-installer"
 RUNTIME_INSTALL_SMOKE_ARG = "--smoke-nvidia-runtime-installer"
 RUNTIME_VALIDATE_ARG = "--validate-nvidia-runtime"
+SOURCE_VALIDATE_ARG = "--validate-source-runtime"
 RUNTIME_STACK_ID = (
     f"ort1.28.0-trt10.16.1-cuda13.3-"
     f"py{sys.version_info.major}{sys.version_info.minor}-v1"
@@ -284,6 +285,44 @@ def _run_validation_process(target: Path) -> int:
     return subprocess.run(_validation_command(target), check=False).returncode
 
 
+def _validate_source_runtime(ep: str) -> None:
+    """Exercise the source environment in a disposable process, including DLLs."""
+    import numpy as np
+    import onnx
+    from upscale_cli.infer import ort, _EP_ORDER
+
+    available = set(ort.get_available_providers())
+    providers = [name for alias, name in _EP_ORDER
+                 if name in available and (ep == "auto" or alias == ep)]
+    if not providers:
+        raise RuntimeError(f"execution provider {ep!r} is unavailable")
+    graph = onnx.helper.make_graph(
+        [onnx.helper.make_node("Identity", ["input"], ["output"])],
+        "source-runtime-check",
+        [onnx.helper.make_tensor_value_info("input", onnx.TensorProto.FLOAT, [1, 3, 8, 8])],
+        [onnx.helper.make_tensor_value_info("output", onnx.TensorProto.FLOAT, [1, 3, 8, 8])],
+    )
+    model = onnx.helper.make_model(graph, opset_imports=[onnx.helper.make_opsetid("", 13)], ir_version=10)
+    session = ort.InferenceSession(model.SerializeToString(), providers=providers)
+    if session.get_providers()[0] != providers[0]:
+        raise RuntimeError(f"execution provider {providers[0]} failed to initialize")
+    session.run(None, {"input": np.zeros((1, 3, 8, 8), dtype=np.float32)})
+
+
+def source_runtime_ready(ep: str = "auto") -> bool:
+    """Keep native provider validation out of the long-running tray process."""
+    if getattr(sys, "frozen", False):
+        return False
+    try:
+        result = subprocess.run(
+            [sys.executable, "-m", "relay_server.runtime_bootstrap", SOURCE_VALIDATE_ARG, ep],
+            capture_output=True, timeout=60, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0
+
+
 def install_runtime() -> int:
     """Install and verify the pinned stack, publishing it atomically."""
     final = runtime_dir()
@@ -332,6 +371,13 @@ def install_runtime() -> int:
 
 def maybe_run_runtime_installer(argv: list[str] | None = None) -> int | None:
     args = sys.argv[1:] if argv is None else argv
+    if len(args) == 2 and args[0] == SOURCE_VALIDATE_ARG:
+        try:
+            _validate_source_runtime(args[1])
+        except Exception as err:
+            print(f"Source runtime validation failed: {err}", file=sys.stderr, flush=True)
+            return 1
+        return 0
     if args == [RUNTIME_INSTALL_CHECK_ARG]:
         # Frozen-build smoke test: prove pip's internal CLI was collected
         # without starting the multi-gigabyte network installation in CI.

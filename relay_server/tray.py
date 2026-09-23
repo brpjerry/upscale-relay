@@ -131,10 +131,12 @@ class RuntimeSetupDialog(QDialog):
         self.closed.emit()
 
 
-async def ensure_runtime_gui() -> tuple[bool, RuntimeSetupDialog | None]:
+async def ensure_runtime_gui(ep: str = "auto") -> tuple[bool, RuntimeSetupDialog | None]:
     """Install the external runtime without blocking Qt's event loop."""
-    from .runtime_bootstrap import activate_runtime, run_installer_process
+    from .runtime_bootstrap import activate_runtime, run_installer_process, source_runtime_ready
 
+    if not getattr(sys, "frozen", False) and await asyncio.to_thread(source_runtime_ready, ep):
+        return True, None
     if activate_runtime():
         return True, None
 
@@ -582,7 +584,7 @@ def main() -> None:
     asyncio.set_event_loop(loop)
 
     with loop:
-        runtime_ok, setup_dialog = loop.run_until_complete(ensure_runtime_gui())
+        runtime_ok, setup_dialog = loop.run_until_complete(ensure_runtime_gui(settings.ep))
         if not runtime_ok:
             return
 
