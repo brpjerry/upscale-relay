@@ -110,3 +110,49 @@ def test_repeated_cancellation_cannot_abandon_a_native_source(monkeypatch):
             await client.close()
 
     asyncio.run(scenario())
+
+
+def test_cancelled_teardown_still_owns_local_cleanup():
+    release, source_closed = threading.Event(), threading.Event()
+
+    def close_source():
+        assert release.wait(5)
+        source_closed.set()
+
+    async def scenario():
+        request_sent = asyncio.Event()
+
+        class Socket:
+            closed = False
+
+            async def send_str(self, message):
+                request_sent.set()
+
+            async def close(self):
+                self.closed = True
+
+        client = module.RelayClient("localhost", 1)
+        client._ws = Socket()
+        client._has_server_session = True
+        client.track = SimpleNamespace(close=close_source)
+        task = asyncio.create_task(client.teardown())
+        try:
+            await request_sent.wait()
+            task.cancel()
+            await asyncio.sleep(0)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(task, 1)
+            assert client._closing
+            assert client._close_task is not None and not client._close_task.cancelled()
+            assert not source_closed.is_set()
+            release.set()
+            await client.close()
+            assert source_closed.is_set()
+            assert client._ws.closed and client._http.closed
+            assert client._pending == {}
+        finally:
+            release.set()
+            await client.close()
+
+    asyncio.run(scenario())

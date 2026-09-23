@@ -833,6 +833,12 @@ class RelayClient:
                 await self._request(
                     "closed", "teardown", timeout=TEARDOWN_TIMEOUT_S,
                 )
+            except asyncio.CancelledError:
+                # Cancelling the acknowledgement wait must still release local
+                # sockets, demux and fonts. Start the shared cleanup owner now;
+                # a slow mounted-file close need not hold the cancelled caller.
+                self._begin_close()
+                raise
             except (asyncio.TimeoutError, ConnectionError, ConnectionResetError,
                     RuntimeError) as err:
                 barrier_error = err
@@ -849,11 +855,14 @@ class RelayClient:
                     "do not open a replacement session until the server is checked"
                 ) from barrier_error
 
-    async def close(self) -> None:
+    def _begin_close(self) -> asyncio.Task:
         self._closing = True
         if self._close_task is None:
             self._close_task = asyncio.create_task(self._close())
-        await asyncio.shield(self._close_task)
+        return self._close_task
+
+    async def close(self) -> None:
+        await asyncio.shield(self._begin_close())
 
     async def _close(self) -> None:
         tasks = [t for t in (self._uplink_task, self._reader_task,
