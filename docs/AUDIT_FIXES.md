@@ -52,6 +52,9 @@ core and desktop, server pipeline and GUI, offline CLI, tests, and packaging.
 - Video-only originals require no external media attachment. Subtitle-only
   originals use one delayed `sub-add`; audio-bearing sources retain one delayed
   `audio-add`. Both paths preserve the caller's track and pause choices.
+- Receiving an epoch's end marker keeps the desktop consumer alive for later
+  seeks. Fast servers can finish transmitting a short clip well before playback
+  ends; this case is covered by a new regression and a real Windows relay test.
 
 The selected subtitle cache is temporary, per session, and deleted on Stop. It
 stores original packet bodies, timestamps and codec side data in SQLite, with
@@ -82,7 +85,7 @@ the existing intermittent NVIDIA crash without its native fault evidence.
 
 ### Local validation results
 
-The complete local suite finished with **281 passed, 4 skipped** using offscreen Qt and
+The complete local suite finished with **282 passed, 4 skipped** using offscreen Qt and
 `RELAY_LOSSLESS_HEVC_PROFILE=x265-ultrafast`; the shipped default encoder-profile
 test also passed separately without that override. Local skips cover unavailable
 ONNX Runtime, Windows registry behavior and the intentionally overridden default.
@@ -102,7 +105,9 @@ These include native paused positions, overlapping seeks and subtitle text activ
 across the seek. The old subtitle implementation failed that text assertion;
 the temporary index passed with the same fixture.
 
-The pre-existing Windows relay on the local network was reachable and began
-lossless-HEVC passthrough playback, but its paused-seek check timed out. It does
-not contain this branch's server fixes. Re-run `tools/smoke_desktop.py` against
-the newly installed ZIP before drawing conclusions about that failure.
+The real Windows relay's fast NVENC passthrough initially exposed a client seek
+failure after all epoch bytes had arrived. After the EOS consumer fix, the same
+Windows lossless-HEVC run passed playback, keyboard pause, active subtitle text,
+paused/overlapping seeks, resume, local fallback and Stop. This validates the new
+client against the existing Windows server. Re-run against the newly installed
+ZIP to exercise the updated server together with the client.
