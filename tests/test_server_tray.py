@@ -412,6 +412,55 @@ def test_controller_serializes_overlapping_restarts(settings, monkeypatch):
     asyncio.run(scenario())
 
 
+def test_config_port_reserves_media_port_and_explains_restart(app, settings):
+    dialog = ConfigDialog(settings)
+    try:
+        dialog.port_spin.setValue(65535)
+        assert dialog.port_spin.value() == 65534
+        assert dialog.apply_button.text() == "Apply and restart"
+        dialog.set_server_status("Restarting server…", "Control localhost:8590 · Media localhost:8591", True)
+        assert not dialog.apply_button.isEnabled()
+        assert "8591" in dialog.address_label.text()
+    finally:
+        dialog.deleteLater()
+
+
+def test_tray_persists_failure_and_disables_restart_while_busy(app, settings, monkeypatch):
+    tray = TrayApp(settings)
+    tray.open_config()
+
+    async def scenario():
+        entered, finish = asyncio.Event(), asyncio.Event()
+        attempts = []
+
+        async def fail_start():
+            attempts.append(True)
+            entered.set()
+            await finish.wait()
+            raise OSError("port unavailable")
+
+        monkeypatch.setattr(tray.controller, "start", fail_start)
+        task = asyncio.create_task(tray.restart())
+        await entered.wait()
+        assert "Restarting" in tray.dialog.status_label.text()
+        assert not tray.dialog.apply_button.isEnabled()
+        assert not tray._restart_action.isEnabled()
+        await tray.restart()
+        assert len(attempts) == 1
+        finish.set()
+        await task
+        assert "port unavailable" in tray.dialog.status_label.text()
+        assert "port unavailable" in tray.tray.toolTip()
+        assert tray.dialog.apply_button.isEnabled()
+        assert tray._restart_action.isEnabled()
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        tray.dialog.close()
+        tray.tray.hide()
+
+
 @pytest.mark.parametrize("cancel", [False, True])
 def test_controller_cleans_up_unpublished_startup(settings, monkeypatch, cancel):
     instances = []

@@ -381,11 +381,18 @@ class ConfigDialog(QDialog):
         super().__init__(parent)
         self._settings = settings
         self.setWindowTitle(f"{_APP_NAME} — Configuration")
+        self.status_label = QLabel("Stopped")
+        self.status_label.setTextFormat(Qt.PlainText)
+        self.status_label.setWordWrap(True)
+        self.address_label = QLabel()
+        self.address_label.setTextFormat(Qt.PlainText)
+        self.address_label.setWordWrap(True)
 
         self.ep_combo = QComboBox()
         self.ep_combo.addItems(available_ep_choices())
         self.port_spin = QSpinBox()
-        self.port_spin.setRange(1, 65535)
+        self.port_spin.setRange(1, 65534)
+        self.port_spin.setToolTip("The media listener uses the next port (control + 1).")
         self.library_list = QListWidget()
         self.library_list.setMinimumHeight(90)
         self.library_add_button = QPushButton("Add folder…")
@@ -409,6 +416,8 @@ class ConfigDialog(QDialog):
         self.autostart_check = QCheckBox("Start automatically when I sign in to Windows")
 
         form = QFormLayout(self)
+        form.addRow("Server status:", self.status_label)
+        form.addRow("Connect to:", self.address_label)
         form.addRow("Execution provider:", self.ep_combo)
         form.addRow("Control port:", self.port_spin)
         form.addRow("Media library folders:", library_widget)
@@ -423,11 +432,21 @@ class ConfigDialog(QDialog):
         buttons = QDialogButtonBox(
             QDialogButtonBox.Apply | QDialogButtonBox.Close
         )
-        buttons.button(QDialogButtonBox.Apply).clicked.connect(self._on_apply)
+        self.apply_button = buttons.button(QDialogButtonBox.Apply)
+        self.apply_button.setText("Apply and restart")
+        self.apply_button.clicked.connect(self._on_apply)
         buttons.button(QDialogButtonBox.Close).clicked.connect(self.hide)
+        consequence = QLabel("Applying settings restarts the server and disconnects active playback.")
+        consequence.setWordWrap(True)
+        form.addRow(consequence)
         form.addRow(buttons)
 
         self.load()
+
+    def set_server_status(self, status: str, address: str, busy: bool = False) -> None:
+        self.status_label.setText(status)
+        self.address_label.setText(address)
+        self.apply_button.setEnabled(not busy)
 
     def load(self) -> None:
         """Populate the fields from the persisted settings."""
@@ -460,6 +479,8 @@ class ConfigDialog(QDialog):
             self.library_list.takeItem(self.library_list.row(item))
 
     def _on_apply(self) -> None:
+        if not self.apply_button.isEnabled():
+            return
         s = self._settings
         s.ep = self.ep_combo.currentText()
         s.port = self.port_spin.value()
@@ -487,6 +508,8 @@ class TrayApp:
         self.controller = ServerController(settings)
         self.controller.event_callback = self._server_event
         self.dialog: ConfigDialog | None = None
+        self._busy = False
+        self._status = "Stopped"
 
         self.tray = QSystemTrayIcon(make_icon())
         self.tray.setToolTip(_APP_NAME)
@@ -497,41 +520,78 @@ class TrayApp:
         self._configure_action.triggered.connect(self.open_config)
         self._restart_action = QAction("Restart server", menu)
         self._restart_action.triggered.connect(lambda: asyncio.ensure_future(self.restart()))
-        quit_action = QAction("Quit", menu)
-        quit_action.triggered.connect(lambda: asyncio.ensure_future(self.quit()))
+        self._quit_action = QAction("Quit", menu)
+        self._quit_action.triggered.connect(lambda: asyncio.ensure_future(self.quit()))
+        self._status_action = QAction(self._status, menu)
+        self._status_action.setEnabled(False)
+        self._address_action = QAction("", menu)
+        self._address_action.setEnabled(False)
+        menu.addAction(self._status_action)
+        menu.addAction(self._address_action)
+        menu.addSeparator()
         menu.addAction(self._configure_action)
         menu.addAction(self._restart_action)
         menu.addSeparator()
-        menu.addAction(quit_action)
+        menu.addAction(self._quit_action)
         self.tray.setContextMenu(menu)
         self.tray.activated.connect(self._on_activated)
         self.tray.show()
+        self._set_status("Stopped")
 
     # -- lifecycle ------------------------------------------------------------
 
     async def start(self) -> None:
         """Start the server; on failure notify and open the config pane."""
+        self._set_status("Starting server…", busy=True)
         try:
             await self.controller.start()
         except Exception as err:  # bad folder, port in use, EP unavailable…
             log.warning("server start failed: %r", err)
+            self._set_status(f"Could not start: {err}")
             self._notify(f"Could not start: {err}", error=True)
             self.open_config()
             return
+        self._set_status("Running")
         self._notify(f"Listening on port {self.settings.port}")
 
     async def restart(self) -> None:
+        if self._busy:
+            return
+        self._set_status("Restarting server…", busy=True)
         try:
             await self.controller.start()
         except Exception as err:
             log.warning("server restart failed: %r", err)
+            self._set_status(f"Could not start: {err}")
             self._notify(f"Could not start: {err}", error=True)
             return
+        self._set_status("Running")
         self._notify(f"Restarted on port {self.settings.port}")
 
     async def quit(self) -> None:
+        if self._busy:
+            return
+        self._set_status("Stopping server…", busy=True)
         await self.controller.stop()
         QApplication.quit()
+
+    def _connection_address(self) -> str:
+        from .mdns import primary_ipv4
+        address = primary_ipv4() or "localhost"
+        server = self.controller.server
+        port = server.port if server is not None else self.settings.port
+        return f"Control {address}:{port} · Media {address}:{port + 1}"
+
+    def _set_status(self, status: str, *, busy: bool = False) -> None:
+        self._status, self._busy = status, busy
+        address = self._connection_address()
+        self._status_action.setText(status)
+        self._address_action.setText(address)
+        self.tray.setToolTip(f"{_APP_NAME}\n{status}\n{address}")
+        self._restart_action.setEnabled(not busy)
+        self._quit_action.setEnabled(not busy)
+        if self.dialog is not None:
+            self.dialog.set_server_status(status, address, busy)
 
     # -- ui slots -------------------------------------------------------------
 
@@ -540,6 +600,7 @@ class TrayApp:
             self.dialog = ConfigDialog(self.settings)
             self.dialog.applied.connect(self._settings_applied)
         self.dialog.load()
+        self.dialog.set_server_status(self._status, self._connection_address(), self._busy)
         self.dialog.show()
         self.dialog.raise_()
         self.dialog.activateWindow()
