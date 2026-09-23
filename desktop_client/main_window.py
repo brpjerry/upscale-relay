@@ -1206,11 +1206,19 @@ class MainWindow(QMainWindow):
             self._error("Session failed", "Server did not provide the source time base.")
             await self._teardown_session()
             return
+        source_has_auxiliary = (
+            getattr(track, "has_auxiliary_tracks", None) if track is not None
+            else getattr(session, "source_has_auxiliary", None)
+        )
+        source_has_audio = (
+            getattr(track, "has_audio_tracks", None) if track is not None
+            else getattr(session, "source_has_audio", None)
+        )
         original_media = (
             None
             if (
                 getattr(session, "aux_tracks", "external") == "muxed"
-                or (track is not None and not getattr(track, "has_auxiliary_tracks", True))
+                or source_has_auxiliary is False
             )
             else (path if source == "uplink" else self.client.media_url(path))
         )
@@ -1224,7 +1232,7 @@ class MainWindow(QMainWindow):
             time_base,
             source_path=original_media,
             avg_rate=avg_rate,
-            source_has_audio=getattr(track, "has_audio_tracks", True),
+            source_has_audio=source_has_audio is not False,
         )
         self.idle_hint.hide()
         # Match Android's ordering: give mpv its per-load loopback first, then

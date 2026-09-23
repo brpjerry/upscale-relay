@@ -1,6 +1,7 @@
 """Server-hosted library discovery, media serving, and streaming tests."""
 
 import asyncio
+import io
 import os
 import shutil
 import socket
@@ -499,8 +500,30 @@ def test_server_source_muxes_original_audio_into_each_epoch(multitrack_library_f
     asyncio.run(scenario())
 
 
-def test_unmuxable_auxiliary_codec_confirms_external_fallback(library_file, monkeypatch):
-    root, _target = library_file
+@pytest.mark.parametrize("with_subtitles", [False, True])
+def test_unmuxable_auxiliary_codec_confirms_external_fallback(
+    library_file, monkeypatch, with_subtitles,
+):
+    root, target = library_file
+    if with_subtitles:
+        source = target
+        target = source.with_name("WithSubtitles.mkv")
+        srt = b"1\n00:00:00,000 --> 00:00:03,000\nSubtitle-only original\n"
+        with (
+            av.open(str(source)) as video_input,
+            av.open(io.BytesIO(srt), format="srt") as subtitle_input,
+            av.open(str(target), "w") as output,
+        ):
+            video = output.add_stream_from_template(video_input.streams.video[0])
+            subtitle = output.add_stream_from_template(subtitle_input.streams.subtitles[0])
+            for container, stream, destination in (
+                (video_input, video_input.streams.video[0], video),
+                (subtitle_input, subtitle_input.streams.subtitles[0], subtitle),
+            ):
+                for packet in container.demux(stream):
+                    if packet.dts is not None:
+                        packet.stream = destination
+                        output.mux(packet)
 
     def unsupported(_path):
         raise ValueError("matroska does not support this subtitle codec")
@@ -514,10 +537,14 @@ def test_unmuxable_auxiliary_codec_confirms_external_fallback(library_file, monk
         try:
             await client.connect()
             session = await client.open_session(SessionConfig(
-                path="Shows/Sample.MKV", source="server_file", model="passthrough",
+                path=target.relative_to(root).as_posix(), source="server_file",
+                model="passthrough", quality_tier="lossless-ffv1",
                 display_w=320, display_h=180, aux_tracks="muxed",
             ))
             assert session.aux_tracks == "external"
+            assert client.track is None
+            assert session.source_has_audio is False
+            assert session.source_has_auxiliary is with_subtitles
             await client.attach_media()
             await client.play()
             assert (await collect(client))[-1].eos

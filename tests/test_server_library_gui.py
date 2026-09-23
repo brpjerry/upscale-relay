@@ -618,3 +618,38 @@ def test_local_original_attachment_follows_cached_auxiliary_metadata(window, has
         assert not window.player.source_has_audio
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "has_audio,has_auxiliary,attach,attach_as_audio",
+    [
+        (False, False, False, False),
+        (False, True, True, False),
+        (True, True, True, True),
+        (None, None, True, True),  # old servers omit the optional metadata
+    ],
+)
+def test_server_original_attachment_follows_confirmed_source_metadata(
+    window, has_audio, has_auxiliary, attach, attach_as_audio,
+):
+    class ExternalClient(FakeSessionClient):
+        async def open_session(self, config):
+            session = await super().open_session(config)
+            # The server may fall back despite the requested muxed mode.
+            session.aux_tracks = "external"
+            if has_audio is not None:
+                session.source_has_audio = has_audio
+            if has_auxiliary is not None:
+                session.source_has_auxiliary = has_auxiliary
+            return session
+
+    async def scenario():
+        window.client = ExternalClient()
+        window._server_caps = {"muxed_aux_tracks": True}
+        await window._start_session("Shows/original.mkv", source="server_file")
+        assert window.client.opened_config.aux_tracks == "muxed"
+        expected = window.client.media_url("Shows/original.mkv") if attach else None
+        assert window.player.started[3] == expected
+        assert window.player.source_has_audio is attach_as_audio
+
+    asyncio.run(scenario())

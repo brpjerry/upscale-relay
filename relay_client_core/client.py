@@ -283,6 +283,9 @@ class SessionInfo:
     aux_attachments: str = "embedded"
     attachment_manifest: list[dict] | None = None
     attachment_token: str | None = None
+    # Server-file metadata; None preserves attachment behavior with old peers.
+    source_has_audio: bool | None = None
+    source_has_auxiliary: bool | None = None
 
 
 class RelayClient:
@@ -526,6 +529,13 @@ class RelayClient:
             aux_attachments=msg.get("aux_attachments", "embedded"),
             attachment_manifest=msg.get("attachment_manifest") or None,
             attachment_token=msg.get("attachment_token"),
+            source_has_audio=(
+                msg["source_has_audio"] if type(msg.get("source_has_audio")) is bool else None
+            ),
+            source_has_auxiliary=(
+                msg["source_has_auxiliary"]
+                if type(msg.get("source_has_auxiliary")) is bool else None
+            ),
         )
         return self.session
 

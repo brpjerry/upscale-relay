@@ -465,6 +465,13 @@ class Session:
         # session_opened.chapters is the one place clients read them from.
         chapters = (self.source_track.chapters() if self.source_track else
                     _sanitize_chapters((msg.get("file") or {}).get("chapters")))
+        source_metadata = (
+            {
+                "source_has_audio": self.source_track.has_audio_tracks,
+                "source_has_auxiliary": self.source_track.has_auxiliary_tracks,
+            }
+            if self.source_track is not None else {}
+        )
         await self.send(
             "session_opened",
             session_id=self.id,
@@ -492,6 +499,7 @@ class Session:
             attachment_token=(
                 self.attachment_token if self.aux_attachment_mode == "cached" else None
             ),
+            **source_metadata,
         )
 
     media_port: int = 0  # set by server at construction
