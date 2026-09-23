@@ -505,6 +505,8 @@ class MainWindow(QMainWindow):
             QEvent.StyleChange,
         ):
             self._refresh_action_icons()
+            if getattr(self, "_controls_overlay", False):
+                self._apply_overlay_palette()
 
     @staticmethod
     def _bound_track_combo(combo: QComboBox) -> None:
@@ -582,14 +584,25 @@ class MainWindow(QMainWindow):
         self._controls_layout.removeWidget(self.controls_panel)
         self.controls_panel.setParent(self.player)
         self.controls_panel.setAttribute(Qt.WA_StyledBackground, True)
+        self._apply_overlay_palette()
         self.controls_panel.setStyleSheet(
-            "#overlayControls { background-color: rgba(18, 18, 18, 210); "
-            "border-top: 1px solid rgba(255, 255, 255, 28); }"
+            "#overlayControls { background-color: palette(window); "
+            "border-top: 1px solid palette(mid); }"
         )
         self.controls_panel.layout().setContentsMargins(16, 8, 16, 12)
         self.controls_panel.hide()
         self._position_overlay()
         self.controls_panel.raise_()
+
+    def _apply_overlay_palette(self) -> None:
+        # Keep foreground, disabled text, control surfaces and focus colors in
+        # the same palette. A fixed dark background made a light theme's black
+        # labels disappear in fullscreen.
+        palette = QPalette(self.palette())
+        backdrop = palette.color(QPalette.Window)
+        backdrop.setAlpha(240)
+        palette.setColor(QPalette.Window, backdrop)
+        self.controls_panel.setPalette(palette)
 
     def _exit_overlay_controls(self) -> None:
         if not self._controls_overlay:
@@ -597,6 +610,7 @@ class MainWindow(QMainWindow):
         self._controls_overlay = False
         self._controls_timer.stop()
         self.controls_panel.setStyleSheet("")
+        self.controls_panel.setPalette(QPalette())
         self.controls_panel.setAttribute(Qt.WA_StyledBackground, False)
         self.controls_panel.layout().setContentsMargins(0, 0, 0, 0)
         self._controls_layout.addWidget(self.controls_panel)  # re-dock below the video

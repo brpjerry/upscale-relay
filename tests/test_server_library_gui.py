@@ -17,6 +17,7 @@ pytest.importorskip("qasync")
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import QApplication, QWidget
+from PySide6.QtGui import QColor, QPalette
 
 import desktop_client.main_window as main_window
 from desktop_client.options import DesktopOptions
@@ -516,3 +517,20 @@ def test_local_fallback_keeps_transport_timeline_and_chapters(window):
         assert not window.play_btn.isEnabled()
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("background,foreground", [
+    ("#f0f0f0", "#101010"), ("#202020", "#f0f0f0"),
+])
+def test_fullscreen_labels_follow_a_readable_theme(window, background, foreground):
+    palette = QPalette(window.palette())
+    palette.setColor(QPalette.Window, QColor(background))
+    palette.setColor(QPalette.WindowText, QColor(foreground))
+    window.setPalette(palette)
+    window._enter_overlay_controls()
+    text = window.pos_label.palette().color(QPalette.WindowText)
+    surface = window.controls_panel.palette().color(QPalette.Window)
+    assert abs(text.lightness() - surface.lightness()) >= 190
+    assert surface.alpha() >= 230
+    window._exit_overlay_controls()
+    assert window.pos_label.palette().color(QPalette.WindowText) == QColor(foreground)
