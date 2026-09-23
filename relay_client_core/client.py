@@ -598,7 +598,7 @@ class RelayClient:
                 if ready_batch is not None:
                     if not self._down_q.put_batch_from_thread(ready_batch):
                         return
-        except (EOFError, OSError, ConnectionError, RuntimeError) as err:
+        except (EOFError, OSError, ConnectionError, RuntimeError, ValueError) as err:
             if not ready:
                 try:
                     self._loop.call_soon_threadsafe(self._finish_downlink_setup, err)

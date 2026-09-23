@@ -150,6 +150,9 @@ offset size  field
   and the client replaces its demuxer/player input.
 - `end_of_stream`: payload_len = 0; uplink: file fully sent; downlink: pipeline
   fully drained after its source iterator(s) end (never during a seek flush).
+- A payload is limited to 64 MiB. Senders enforce the limit and receivers
+  reject an oversized length immediately after reading the header, before
+  allocating or reading its body. File size is independent of packet size.
 - Uplink payloads are in the source codec's storage format (e.g. length-
   prefixed AVCC for H.264, as extracted; codec-specific detail is carried by
   `open_session.video.codec` + `extradata_b64`).
