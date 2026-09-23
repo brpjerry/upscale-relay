@@ -940,7 +940,10 @@ class MpvPlayerView(QOpenGLWidget):
                         self._buffer.finish()  # mpv plays out and emits eof
                     self._prebuffer_ready = True
                     self._maybe_release_epoch()
-                    return
+                    # EOS closes this epoch's bytes, which can arrive well
+                    # before mpv finishes playing (or while it is paused).
+                    # Keep consuming so a later seek can load a fresh epoch.
+                    continue
                 if pkt.discontinuity and (not first or self._buffer is None):
                     if trace:
                         print("[trace] discontinuity -> reload", flush=True, file=_sys.stderr)

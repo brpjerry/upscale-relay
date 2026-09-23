@@ -198,11 +198,17 @@ class ConsumerProbe:
         self.failed = SimpleNamespace(emit=self.errors.append)
         self.buffers = []
         self.on_load = on_load
+        self.finished_buffers = asyncio.Queue()
 
     async def _load_stream(self):
         chunks = []
         completed = []
-        self._buffer = SimpleNamespace(feed=chunks.append, finish=lambda: completed.append(True))
+
+        def finish():
+            completed.append(True)
+            self.finished_buffers.put_nowait(len(self.buffers))
+
+        self._buffer = SimpleNamespace(feed=chunks.append, finish=finish)
         self.buffers.append((chunks, completed))
         self._fed = 0
         self._prebuffer_ready = False
@@ -211,6 +217,15 @@ class ConsumerProbe:
 
     def _maybe_release_epoch(self):
         pass
+
+
+async def consume_through_epoch_eos(player, queue):
+    task = asyncio.create_task(MpvPlayerView._consume(player, queue))
+    try:
+        await asyncio.wait_for(player.finished_buffers.get(), 1)
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
 
 
 def test_stale_downlink_payload_and_eof_cannot_touch_current_stream():
@@ -226,7 +241,7 @@ def test_stale_downlink_payload_and_eof_cannot_touch_current_stream():
             MediaPacket(b"", flags=FLAG_EOS, epoch=2),
         ):
             queue.put_nowait(packet)
-        await MpvPlayerView._consume(player, queue)
+        await consume_through_epoch_eos(player, queue)
         assert player.buffers == [([b"current-header", b"current-body"], [True])]
         assert player.errors == []
 
@@ -250,7 +265,7 @@ def test_seek_during_reload_drops_the_superseded_header():
             MediaPacket(b"", flags=FLAG_EOS, epoch=2),
         ):
             queue.put_nowait(packet)
-        await MpvPlayerView._consume(player, queue)
+        await consume_through_epoch_eos(player, queue)
         assert player.buffers == [([b"first-header"], []), ([], []), ([b"latest-header"], [True])]
         assert player.errors == []
 
@@ -267,7 +282,41 @@ def test_seek_before_first_header_reopens_the_retired_pipe():
         queue = asyncio.Queue()
         queue.put_nowait(MediaPacket(b"latest-header", flags=FLAG_DISCONTINUITY, epoch=2))
         queue.put_nowait(MediaPacket(b"", flags=FLAG_EOS, epoch=2))
-        await MpvPlayerView._consume(player, queue)
+        await consume_through_epoch_eos(player, queue)
         assert player.buffers == [([], []), ([b"latest-header"], [True])]
+
+    asyncio.run(scenario())
+
+
+def test_seek_after_network_eos_reloads_the_next_epoch():
+    async def scenario():
+        player = ConsumerProbe(epoch=0)
+        queue = asyncio.Queue()
+        queue.put_nowait(MediaPacket(b"first-epoch", flags=FLAG_DISCONTINUITY, epoch=0))
+        queue.put_nowait(MediaPacket(b"", flags=FLAG_EOS, epoch=0))
+        task = asyncio.create_task(MpvPlayerView._consume(player, queue))
+        try:
+            assert await asyncio.wait_for(player.finished_buffers.get(), 1) == 1
+            assert not task.done()  # the network finished before playback did
+            assert player.buffers == [([b"first-epoch"], [True])]
+
+            player.client.epoch = 1
+            queue.put_nowait(MediaPacket(b"seek-header", flags=FLAG_DISCONTINUITY, epoch=1))
+            queue.put_nowait(MediaPacket(b"seek-body", epoch=1))
+            queue.put_nowait(MediaPacket(b"", flags=FLAG_EOS, epoch=1))
+            assert await asyncio.wait_for(player.finished_buffers.get(), 1) == 2
+            assert not task.done()
+            assert player.buffers == [
+                ([b"first-epoch"], [True]),
+                ([b"seek-header", b"seek-body"], [True]),
+            ]
+            assert player.errors == []
+
+            queue.put_nowait(None)  # transport closure still ends the consumer
+            await asyncio.wait_for(task, 1)
+            assert player.errors == ["downlink closed"]
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
 
     asyncio.run(scenario())
