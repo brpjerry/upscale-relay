@@ -55,7 +55,8 @@ def test_close_releases_worker_waiting_for_downlink_capacity():
         await asyncio.to_thread(producer.join, 1)
         assert not producer.is_alive()
         await asyncio.sleep(0)
-        assert all(packet.payload != b"pending" for packet in session.down_q._queue)
+        assert session.down_q.get_nowait() is None
+        assert session.down_q.empty()
 
     asyncio.run(scenario())
 

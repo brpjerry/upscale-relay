@@ -13,7 +13,7 @@ from enum import Enum
 from fractions import Fraction
 from typing import Any
 
-from relay_protocol import FLAG_EOS, NO_TS, MediaPacket, new_token
+from relay_protocol import DIR_DOWNLINK, DIR_UPLINK, FLAG_EOS, NO_TS, MediaPacket, new_token
 from relay_media import AuxiliaryTrack, VideoTrack
 from upscale_cli.encode import DEFAULT_LOSSLESS_HEVC_PROFILE
 from upscale_cli.fit import DEFAULT_RESIZE_ALGORITHM, RESIZE_ALGORITHMS
@@ -86,6 +86,15 @@ class _DownlinkQueue(asyncio.Queue):
         self.max_bytes = max_bytes
         self.payload_bytes = 0
         self._capacity = asyncio.Event()
+        self._retired = False
+
+    def retire(self) -> None:
+        self._retired = True
+        self._capacity.set()
+
+    def _check_live(self, item: MediaPacket | None) -> None:
+        if item is not None and self._retired:
+            raise asyncio.CancelledError
 
     @staticmethod
     def _size(item: MediaPacket | None) -> int:
@@ -95,14 +104,17 @@ class _DownlinkQueue(asyncio.Queue):
         return not self.full() and self.payload_bytes + self._size(item) <= self.max_bytes
 
     async def put(self, item: MediaPacket | None) -> None:
+        self._check_live(item)
         if self._size(item) > self.max_bytes:
             raise ValueError("downlink packet exceeds queue byte budget")
         while not self._fits(item):
             self._capacity.clear()
             await self._capacity.wait()
+            self._check_live(item)
         self.put_nowait(item)
 
     def put_nowait(self, item: MediaPacket | None) -> None:
+        self._check_live(item)
         if not self._fits(item):
             raise asyncio.QueueFull
         super().put_nowait(item)
@@ -147,6 +159,7 @@ class Session:
         self.downlink_token = new_token()
         self.pipeline: Pipeline | None = None
         self.down_q: asyncio.Queue[MediaPacket | None] = _DownlinkQueue()
+        self._media_connections: dict[int, tuple[asyncio.StreamWriter, asyncio.Task]] = {}
         self.uplink_attached = False
         self.downlink_attached = False
         self.last_buffer_report = time.monotonic()
@@ -155,6 +168,45 @@ class Session:
         self._final_pipeline_status: dict | None = None
 
     # -- helpers ---------------------------------------------------------------
+
+    def register_media(self, direction: int, writer: asyncio.StreamWriter) -> bool:
+        """Reserve exactly one live attachment per direction before accepting it."""
+        if self.state == State.CLOSED or self._close_task is not None:
+            return False
+        if direction in self._media_connections:
+            return False
+        self._media_connections[direction] = (writer, asyncio.current_task())
+        self.uplink_attached = DIR_UPLINK in self._media_connections
+        self.downlink_attached = DIR_DOWNLINK in self._media_connections
+        return True
+
+    def unregister_media(self, direction: int, writer: asyncio.StreamWriter) -> None:
+        current = self._media_connections.get(direction)
+        if current is not None and current[0] is writer:
+            self._media_connections.pop(direction)
+        self.uplink_attached = DIR_UPLINK in self._media_connections
+        self.downlink_attached = DIR_DOWNLINK in self._media_connections
+
+    async def _close_media(self, initiator: asyncio.Task | None) -> None:
+        connections = list(self._media_connections.values())
+        tasks = []
+        for writer, task in connections:
+            # Teardown abandons pending epoch data. Graceful close alone can
+            # wait forever for a peer which has stopped reading a full socket.
+            writer.close()
+            writer.transport.abort()
+            if task is not initiator and task is not asyncio.current_task():
+                task.cancel()
+                tasks.append(task)
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        for writer, _task in connections:
+            try:
+                await writer.wait_closed()
+            except (OSError, RuntimeError):
+                pass
+        self._media_connections.clear()
+        self.uplink_attached = self.downlink_attached = False
 
     async def send(self, type_: str, **fields: Any) -> None:
         try:
@@ -610,13 +662,15 @@ class Session:
     async def close(self) -> None:
         """Idempotent resource-release barrier for the control connection."""
         if self._close_task is None:
-            self._close_task = asyncio.create_task(self._close_impl())
+            self._close_task = asyncio.create_task(self._close_impl(asyncio.current_task()))
         await asyncio.shield(self._close_task)
 
-    async def _close_impl(self) -> None:
+    async def _close_impl(self, initiator: asyncio.Task | None = None) -> None:
         errors: list[BaseException] = []
         if self.state != State.CLOSED:
             await self.set_state(State.CLOSED)
+        self.down_q.retire()
+        await self._close_media(initiator)
         await self._stop_seek_progress()
         await self._stop_server_source()
 
@@ -663,12 +717,11 @@ class Session:
             except BaseException as err:
                 errors.append(err)
 
-        # Wake the downlink writer even when a native owner timed out; the
-        # control socket will close without a successful acknowledgement.
-        try:
-            self.down_q.put_nowait(None)
-        except asyncio.QueueFull:
-            pass
+        # Release queued payloads even if the peer vanished before consuming
+        # them. Wake any internal consumer which was not a media attachment.
+        while not self.down_q.empty():
+            self.down_q.get_nowait()
+        self.down_q.put_nowait(None)
         if errors:
             raise errors[0]
 

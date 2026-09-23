@@ -331,6 +331,8 @@ class RelayServer:
 
     async def handle_media(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         peer = writer.get_extra_info("peername")
+        attached_session = None
+        direction = None
         try:
             direction, token = parse_handshake(await reader.readexactly(HANDSHAKE_LEN))
             session = self.sessions.get(token)
@@ -339,10 +341,11 @@ class RelayServer:
                  and session.source_kind == "uplink")
                 or (direction == DIR_DOWNLINK and token == session.downlink_token)
             )
-            if not valid:
+            if not valid or not session.register_media(direction, writer):
                 writer.write(b"\x01")
                 await writer.drain()
                 return
+            attached_session = session
             writer.write(b"\x00")
             await writer.drain()
             if direction == DIR_UPLINK:
@@ -352,36 +355,34 @@ class RelayServer:
         except (asyncio.IncompleteReadError, ConnectionResetError, ValueError) as err:
             log.info("media conn %s closed: %r", peer, err)
         finally:
+            if attached_session is not None:
+                attached_session.unregister_media(direction, writer)
             writer.close()
+            try:
+                await writer.wait_closed()
+            except (OSError, RuntimeError):
+                pass
 
     async def _run_uplink(self, session: Session, reader: asyncio.StreamReader) -> None:
-        session.uplink_attached = True
-        try:
-            while session.state != State.CLOSED:
-                pkt = await read_packet(reader)
-                if pkt.epoch < session.epoch:
-                    continue  # stale, drop before any processing
-                if session.pipeline is None:
-                    continue
-                # Blocking put in executor -> natural TCP backpressure.
-                await asyncio.to_thread(session.pipeline.feed, pkt)
-        finally:
-            session.uplink_attached = False
+        while session.state != State.CLOSED:
+            pkt = await read_packet(reader)
+            if pkt.epoch < session.epoch:
+                continue  # stale, drop before any processing
+            if session.pipeline is None:
+                continue
+            # Blocking put in executor -> natural TCP backpressure.
+            await asyncio.to_thread(session.pipeline.feed, pkt)
 
     async def _run_downlink(self, session: Session, writer: asyncio.StreamWriter) -> None:
-        session.downlink_attached = True
-        try:
-            await session.start_server_source()
-            while True:
-                pkt = await session.down_q.get()
-                if pkt is None or session.state == State.CLOSED:
-                    break
-                if pkt.epoch < session.epoch:
-                    continue
-                writer.write(encode_packet(pkt))
-                await writer.drain()
-        finally:
-            session.downlink_attached = False
+        await session.start_server_source()
+        while True:
+            pkt = await session.down_q.get()
+            if pkt is None or session.state == State.CLOSED:
+                break
+            if pkt.epoch < session.epoch:
+                continue
+            writer.write(encode_packet(pkt))
+            await writer.drain()
 
     # -- status -------------------------------------------------------------------
 
