@@ -397,6 +397,8 @@ class MainWindow(QMainWindow):
         if hasattr(self.player, "fullscreen_toggled"):
             self.player.fullscreen_toggled.connect(self.toggle_fullscreen)
         self.play_btn.clicked.connect(self.on_play_pause)
+        if hasattr(self.player, "pause_requested"):
+            self.player.pause_requested.connect(self.on_play_pause)
         self.stop_btn.clicked.connect(self.on_stop)
         self.fallback_btn.clicked.connect(self.on_fallback)
         self.seek_slider.sliderReleased.connect(self.on_seek)

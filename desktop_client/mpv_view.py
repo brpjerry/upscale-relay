@@ -286,6 +286,7 @@ class MpvPlayerView(QOpenGLWidget):
     track_list_changed = Signal(list, object)  # [(sid, title)] subs, selected sid
     audio_track_list_changed = Signal(list, object)  # [(aid, title)] audio, selected aid
     rebuffering = Signal(bool)
+    pause_requested = Signal()  # keyboard and toolbar share application intent
     seek_requested = Signal(float)  # relative seconds (arrow keys)
     chapter_step_requested = Signal(int)  # +1 next / -1 previous (PgUp/PgDn)
     finished = Signal()
@@ -716,6 +717,9 @@ class MpvPlayerView(QOpenGLWidget):
     def keyPressEvent(self, event) -> None:
         key = event.key()
         if not event.modifiers():
+            if key == Qt.Key_Space:
+                self.pause_requested.emit()
+                return
             if key == Qt.Key_F:
                 self.fullscreen_toggled.emit()
                 return

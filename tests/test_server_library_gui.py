@@ -29,6 +29,7 @@ class FakePlayer(QWidget):
     track_list_changed = Signal(list, object)
     audio_track_list_changed = Signal(list, object)
     rebuffering = Signal(bool)
+    pause_requested = Signal()
     seek_requested = Signal(float)
     finished = Signal()
     failed = Signal(str)
@@ -51,7 +52,7 @@ class FakePlayer(QWidget):
         pass
 
     def set_paused(self, value):
-        pass
+        self.paused = value
 
     def set_subtitle_fonts_dir(self, path):
         self.font_dir = path
@@ -315,6 +316,32 @@ def test_open_progress_indicator_toggles(window):
     assert window.statusBar().currentMessage() == "Preparing anime — TensorRT engine (12 s)"
     window._set_opening(False)
     assert window.open_progress.isHidden()
+
+
+def test_keyboard_pause_uses_the_toolbar_and_server_state(window):
+    class PauseClient(FakeLibraryClient):
+        pauses = 0
+        plays = 0
+
+        async def pause(self):
+            self.pauses += 1
+
+        async def play(self):
+            self.plays += 1
+
+    async def scenario():
+        client = PauseClient()
+        window.client = client
+        window.player.pause_requested.emit()
+        await asyncio.sleep(0)
+        assert window._paused and window.player.paused
+        assert client.pauses == 1
+        assert window.play_btn.toolTip() == "Play (Space)"
+        await window.on_play_pause()
+        assert not window._paused and not window.player.paused
+        assert client.plays == 1
+
+    asyncio.run(scenario())
 
 
 @pytest.mark.parametrize("stage", ["open", "attachments", "media", "uplink"])
