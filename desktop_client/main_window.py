@@ -849,7 +849,12 @@ class MainWindow(QMainWindow):
         elapsed = msg.get("elapsed_s")
         discarded = msg.get("frames_discarded")
         text = "seeking…"
-        if isinstance(discarded, int) and discarded:
+        if msg.get("stage") == "subtitle_index":
+            text = "Indexing subtitles for this seek…"
+            indexed_s = msg.get("subtitle_indexed_s")
+            if isinstance(indexed_s, (int, float)):
+                text += f" read through {_format_time(indexed_s)}"
+        elif isinstance(discarded, int) and discarded:
             text = f"seeking… (server decoded past {discarded} frames)"
         if isinstance(elapsed, (int, float)):
             text = f"{text} {elapsed:.1f} s"
