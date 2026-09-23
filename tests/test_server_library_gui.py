@@ -29,6 +29,7 @@ class FakePlayer(QWidget):
     position_changed = Signal(float)
     track_list_changed = Signal(list, object)
     audio_track_list_changed = Signal(list, object)
+    volume_changed = Signal(int, bool)
     rebuffering = Signal(bool)
     pause_requested = Signal()
     seek_requested = Signal(float)
@@ -75,6 +76,12 @@ class FakePlayer(QWidget):
 
     def seek_local(self, target_s):
         self.local_seek = target_s
+
+    def set_volume(self, percent):
+        self.volume = percent
+
+    def set_muted(self, muted):
+        self.muted = muted
 
 
 class FakeLibraryClient:
@@ -565,3 +572,14 @@ def test_invalid_server_address_is_handled_before_connection(window, monkeypatch
         assert errors and errors[0][0] == "Invalid server address"
 
     asyncio.run(scenario())
+
+
+def test_volume_controls_follow_player_updates_without_feedback(window):
+    window.player.volume_changed.emit(125, True)
+    assert window.volume_slider.value() == 125
+    assert window.mute_btn.isChecked()
+    assert not hasattr(window.player, "volume")
+    window.volume_slider.setValue(75)
+    assert window.player.volume == 75
+    window.mute_btn.setChecked(False)
+    assert not window.player.muted

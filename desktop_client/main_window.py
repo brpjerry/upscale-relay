@@ -314,6 +314,16 @@ class MainWindow(QMainWindow):
 
         # -- player -------------------------------------------------------------
         self.player = PlayerView(options=self.options)
+        self.idle_hint = QLabel(self.player)
+        self.idle_hint.setObjectName("idleGuidance")
+        self.idle_hint.setTextFormat(Qt.PlainText)
+        self.idle_hint.setAlignment(Qt.AlignCenter)
+        self.idle_hint.setWordWrap(True)
+        self.idle_hint.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self.idle_hint.setStyleSheet("color: #dddddd; background: transparent;")
+        hint_font = self.idle_hint.font()
+        hint_font.setPointSizeF(max(12.0, hint_font.pointSizeF()))
+        self.idle_hint.setFont(hint_font)
         if hasattr(self.player, "set_deband"):
             self.player.set_deband(self.settings.deband_enabled)
         self._icon_play = self._icon("media-playback-start", QStyle.SP_MediaPlay)
@@ -376,6 +386,10 @@ class MainWindow(QMainWindow):
         self.sub_delay.setSingleStep(0.1)
         self.sub_delay.setSuffix(" s")
         self.sub_delay.setEnabled(False)
+        self.sub_delay.setToolTip(
+            "Subtitle delay: positive values show subtitles later; negative values show them earlier."
+        )
+        self.sub_delay.setAccessibleName("Subtitle delay")
 
         self.audio_combo = QComboBox()
         self.audio_combo.addItem("no audio", None)
@@ -386,6 +400,24 @@ class MainWindow(QMainWindow):
         self.audio_delay.setSingleStep(0.1)
         self.audio_delay.setSuffix(" s")
         self.audio_delay.setEnabled(False)
+        self.audio_delay.setToolTip(
+            "Audio delay: positive values play audio later; negative values play it earlier."
+        )
+        self.audio_delay.setAccessibleName("Audio delay")
+
+        volume, muted = (
+            self.player.audio_output_state()
+            if hasattr(self.player, "audio_output_state") else (100, False)
+        )
+        self.mute_btn = QToolButton()
+        self.mute_btn.setCheckable(True)
+        self._icon_volume = self._icon("audio-volume-high", QStyle.SP_MediaVolume)
+        self._icon_muted = self._icon("audio-volume-muted", QStyle.SP_MediaVolumeMuted)
+        self.volume_slider = QSlider(Qt.Horizontal)
+        self.volume_slider.setRange(0, max(100, volume))
+        self.volume_slider.setFixedWidth(90)
+        self.volume_slider.setAccessibleName("Volume")
+        self._show_audio_output(volume, muted)
 
         transport = QHBoxLayout()
         transport.addWidget(self.play_btn)
@@ -396,6 +428,8 @@ class MainWindow(QMainWindow):
         transport.addWidget(self.fullscreen_btn)
         transport.addWidget(self.fallback_btn)
         transport.addWidget(self.player_status, stretch=1)
+        transport.addWidget(self.mute_btn)
+        transport.addWidget(self.volume_slider)
         # Track selectors used to share the transport row with chapters and
         # telemetry.  Once a video populated all of them, that single row had
         # an ~900 px minimum and Qt enlarged the window (or stole width from
@@ -495,6 +529,10 @@ class MainWindow(QMainWindow):
         self.sub_delay.valueChanged.connect(lambda v: self.player.set_sub_delay(v))
         self.audio_combo.currentIndexChanged.connect(self.on_audio_selected)
         self.audio_delay.valueChanged.connect(lambda v: self.player.set_audio_delay(v))
+        self.volume_slider.valueChanged.connect(self._on_volume_requested)
+        self.mute_btn.toggled.connect(self._on_mute_requested)
+        if hasattr(self.player, "volume_changed"):
+            self.player.volume_changed.connect(self._show_audio_output)
         self.player.stats_changed.connect(self.player_status.setText)
         self.player.position_changed.connect(self._on_position)
         self.player.track_list_changed.connect(self._on_tracks)
@@ -522,6 +560,7 @@ class MainWindow(QMainWindow):
         self.seek_slider.sliderPressed.connect(lambda: setattr(self, "_slider_down", True))
 
         self._apply_browser_visible(self.settings.browser_visible)
+        self._update_idle_guidance()
         if self.settings.auto_connect:
             # Fire once the qasync loop starts (on_connect is a coroutine slot).
             QTimer.singleShot(0, self.on_connect)
@@ -578,6 +617,10 @@ class MainWindow(QMainWindow):
         if hasattr(self, "play_btn"):
             self.play_btn.setIcon(
                 self._icon_play if getattr(self, "_paused", False) else self._icon_pause)
+        if hasattr(self, "volume_slider"):
+            self._icon_volume = self._icon("audio-volume-high", QStyle.SP_MediaVolume)
+            self._icon_muted = self._icon("audio-volume-muted", QStyle.SP_MediaVolumeMuted)
+            self._show_audio_output(self.volume_slider.value(), self.mute_btn.isChecked())
 
     def changeEvent(self, event) -> None:
         super().changeEvent(event)
@@ -733,10 +776,51 @@ class MainWindow(QMainWindow):
         self.controls_panel.hide()
 
     def eventFilter(self, obj, event) -> bool:
-        if (obj is self.player and event.type() == QEvent.Resize
-                and self._controls_overlay):
-            self._position_overlay()
+        if obj is self.player and event.type() == QEvent.Resize:
+            self._position_idle_guidance()
+            if self._controls_overlay:
+                self._position_overlay()
         return super().eventFilter(obj, event)
+
+    def _position_idle_guidance(self) -> None:
+        height = min(180, max(0, self.player.height() - 48))
+        self.idle_hint.setGeometry(
+            24, (self.player.height() - height) // 2,
+            max(0, self.player.width() - 48), height,
+        )
+
+    def _update_idle_guidance(self) -> None:
+        if self._session_source is not None:
+            self.idle_hint.hide()
+            return
+        if self.client is None:
+            text = "Connect to your server\n\nEnter its address above, then choose a video from the file browser."
+        else:
+            text = "Choose a video\n\nDouble-click a file in Local or Server to start streaming."
+        self.idle_hint.setText(text)
+        self._position_idle_guidance()
+        self.idle_hint.show()
+
+    def _show_audio_output(self, volume: int, muted: bool) -> None:
+        self.volume_slider.blockSignals(True)
+        self.volume_slider.setMaximum(max(self.volume_slider.maximum(), volume))
+        self.volume_slider.setValue(volume)
+        self.volume_slider.blockSignals(False)
+        self.volume_slider.setToolTip(f"Volume: {volume}%")
+        self.mute_btn.blockSignals(True)
+        self.mute_btn.setChecked(muted)
+        self.mute_btn.blockSignals(False)
+        self.mute_btn.setIcon(self._icon_muted if muted else self._icon_volume)
+        self.mute_btn.setToolTip("Unmute (M)" if muted else "Mute (M)")
+        self.mute_btn.setAccessibleName("Unmute" if muted else "Mute")
+
+    def _on_volume_requested(self, volume: int) -> None:
+        self.player.set_volume(volume)
+        self._show_audio_output(volume, self.mute_btn.isChecked())
+
+    def _on_mute_requested(self, muted: bool) -> None:
+        self.player.set_muted(muted)
+        self._show_audio_output(self.volume_slider.value(), muted)
 
     def _host_port(self) -> tuple[str, int]:
         return _parse_server_address(self.host_edit.text())
@@ -746,6 +830,8 @@ class MainWindow(QMainWindow):
         self.open_progress.setVisible(active)
         if active and text:
             self.statusBar().showMessage(text)
+            self.idle_hint.setText(f"Preparing playback…\n\n{text}")
+            self.idle_hint.show()
 
     def _on_open_progress(self, msg: dict) -> None:
         """session_progress from the server (e.g. TensorRT engine build)."""
@@ -815,6 +901,9 @@ class MainWindow(QMainWindow):
         self.resize_combo.blockSignals(False)
         self.conn_label.setText(f"connected: {caps['server_name']}")
         self.connect_btn.setText("Disconnect")
+        self._update_idle_guidance()
+        if self._session_source is None:
+            self.statusBar().showMessage("Choose a video from the file browser.")
         if caps.get("library"):
             self._ensure_server_tab()
             await self.on_refresh_server_library()
@@ -981,6 +1070,7 @@ class MainWindow(QMainWindow):
             self._remove_server_tab()
             self.conn_label.setText("disconnected")
             self.connect_btn.setText("Connect")
+            self._update_idle_guidance()
             return
         try:
             host, port = self._host_port()
@@ -1126,6 +1216,7 @@ class MainWindow(QMainWindow):
             source_path=original_media,
             avg_rate=avg_rate,
         )
+        self.idle_hint.hide()
         # Match Android's ordering: give mpv its per-load loopback first, then
         # release the server pipeline. Previously the server could produce into
         # the bridge while the player had not even begun opening its socket.
@@ -1424,7 +1515,10 @@ class MainWindow(QMainWindow):
 
     def _on_rebuffering(self, buffering: bool) -> None:
         if buffering:
-            self.statusBar().showMessage("buffering… (server behind real-time)")
+            self.statusBar().showMessage(
+                "Buffering local playback…" if self._session_source == "local"
+                else "Buffering… waiting for the stream."
+            )
         else:
             self.statusBar().clearMessage()
 
@@ -1452,6 +1546,11 @@ class MainWindow(QMainWindow):
         self._session_source = None
         self._session_path = None
         self._session_time_base = None
+        self._duration_s = None
+        self._position_s = 0.0
+        self.pos_label.setText("--:-- / --:--")
+        self.player_status.clear()
+        self._update_idle_guidance()
         if self.client is not None and (
             self.client.session is not None
             or getattr(self.client, "has_server_session", False)

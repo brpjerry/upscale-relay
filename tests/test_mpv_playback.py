@@ -50,8 +50,10 @@ def test_local_playback_reports_tracks_position_and_accepts_transport(tmp_path):
     ))
     positions = []
     track_reports = []
+    output_reports = []
     player.position_changed.connect(positions.append)
     player.audio_track_list_changed.connect(lambda tracks, selected: track_reports.append(tracks))
+    player.volume_changed.connect(lambda volume, muted: output_reports.append((volume, muted)))
 
     async def wait_until(predicate):
         async with asyncio.timeout(5):
@@ -64,6 +66,13 @@ def test_local_playback_reports_tracks_position_and_accepts_transport(tmp_path):
             await wait_until(lambda: positions and track_reports)
             assert player.mpv.pause
             assert 0.9 <= positions[-1] <= 1.1
+            # mpv key bindings/config can change output independently of Qt.
+            player.mpv.volume = 37
+            player.mpv.mute = True
+            await wait_until(lambda: output_reports[-1:] == [(37, True)])
+            player.set_volume(65)
+            player.set_muted(False)
+            assert player.audio_output_state() == (65, False)
             player.seek_local(2.0)
             await wait_until(lambda: positions[-1] >= 1.9)
             assert player.mpv.pause  # seeking preserves caller pause intent

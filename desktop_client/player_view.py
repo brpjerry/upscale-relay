@@ -72,6 +72,15 @@ class VideoPreviewView(QWidget):
     def set_audio_delay(self, seconds: float) -> None:
         pass
 
+    def audio_output_state(self) -> tuple[int, bool]:
+        return 100, False
+
+    def set_volume(self, percent: int) -> None:
+        pass
+
+    def set_muted(self, muted: bool) -> None:
+        pass
+
     async def play_local(
         self, path: str, position_s: float = 0.0, *, paused: bool = False,
     ) -> None:

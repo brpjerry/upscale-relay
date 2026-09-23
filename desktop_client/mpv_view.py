@@ -285,6 +285,7 @@ class MpvPlayerView(QOpenGLWidget):
     position_changed = Signal(float)  # seconds
     track_list_changed = Signal(list, object)  # [(sid, title)] subs, selected sid
     audio_track_list_changed = Signal(list, object)  # [(aid, title)] audio, selected aid
+    volume_changed = Signal(int, bool)  # volume percent, muted
     rebuffering = Signal(bool)
     pause_requested = Signal()  # keyboard and toolbar share application intent
     seek_requested = Signal(float)  # relative seconds (arrow keys)
@@ -432,6 +433,7 @@ class MpvPlayerView(QOpenGLWidget):
         self._stats_task: asyncio.Task | None = None
         self._source_path: str | None = None
         self._local_playback = False
+        self._last_audio_output: tuple[int, bool] | None = None
         self._fps = 30.0
         self._fed = 0
         self._pending_start: float | None = None  # seek target for next reload
@@ -793,6 +795,15 @@ class MpvPlayerView(QOpenGLWidget):
     def set_audio_delay(self, seconds: float) -> None:
         self.mpv.audio_delay = seconds
 
+    def audio_output_state(self) -> tuple[int, bool]:
+        return max(0, round(self.mpv.volume or 0)), bool(self.mpv.mute)
+
+    def set_volume(self, percent: int) -> None:
+        self.mpv.volume = max(0, percent)
+
+    def set_muted(self, muted: bool) -> None:
+        self.mpv.mute = bool(muted)
+
     async def play_local(
         self, path: str, position_s: float = 0.0, *, paused: bool = False,
     ) -> None:
@@ -891,6 +902,10 @@ class MpvPlayerView(QOpenGLWidget):
             drop = _prop("frame_drop_count")
             cache = _prop("demuxer_cache_duration")
             buffering = bool(_prop("paused_for_cache"))
+            output = (max(0, round(_prop("volume", 100) or 0)), bool(_prop("mute")))
+            if output != self._last_audio_output:
+                self._last_audio_output = output
+                self.volume_changed.emit(*output)
             mpv_buffered_ms = int((cache or 0) * 1000)
             buffer_stats = self._buffer.stats() if self._buffer is not None else {
                 "chunks": 0, "queued_bytes": 0,
