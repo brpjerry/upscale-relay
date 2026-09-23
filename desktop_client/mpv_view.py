@@ -147,9 +147,18 @@ class _LoopbackStream:
         for sock in (connection, self._listener):
             if sock is not None:
                 try:
+                    # close() in another thread does not interrupt a blocking
+                    # sendall() on Linux. Shutdown wakes the native sender even
+                    # when mpv has stopped reading without closing its socket.
+                    sock.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+                try:
                     sock.close()
                 except OSError:
                     pass
+        if self._thread is not threading.current_thread():
+            self._thread.join(timeout=0.5)
 
     # The old byte-pipe API used close() everywhere. Keep close as the
     # immediate lifecycle operation; end-of-content explicitly uses finish().
@@ -183,6 +192,10 @@ class _LoopbackStream:
             except OSError:
                 pass
             with self._cond:
+                # abort() may have run between accept() and publication. In
+                # that case its socket snapshot could not contain this peer.
+                if self._aborted:
+                    return
                 self._connection = connection
             while not self._aborted:
                 data = self._next_chunk()

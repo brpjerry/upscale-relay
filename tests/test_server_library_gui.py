@@ -345,3 +345,27 @@ def test_loopback_stream_abort_unblocks_listener():
     assert not stream._thread.is_alive()
     assert stream.stats()["chunks"] == 0
     assert stream.stats()["queued_bytes"] == 0
+
+
+def test_loopback_stream_abort_unblocks_a_stalled_reader():
+    """Stop must finish the native sender even if mpv no longer reads."""
+    stream = _LoopbackStream()
+    host, port = stream.uri.removeprefix("tcp://").split(":")
+    receiver = socket.create_connection((host, int(port)))
+    receiver.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+    try:
+        stream.feed(b"x" * (16 * 1024 * 1024))
+        # Wait until the sender has dequeued the large chunk. With the peer's
+        # receive window closed it cannot finish writing this payload.
+        import time
+
+        deadline = time.monotonic() + 2
+        while stream.stats()["chunks"] and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert stream.stats()["chunks"] == 0
+        stream.abort()
+        assert not stream._thread.is_alive()
+        assert stream.stats()["queued_bytes"] == 0
+    finally:
+        receiver.close()
+        stream.abort()
