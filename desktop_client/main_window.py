@@ -987,7 +987,14 @@ class MainWindow(QMainWindow):
             await self.client.start_uplink()
         except Exception as err:
             self._error("Session failed", str(err))
+            # open_session may already have allocated a GPU pipeline before
+            # fonts, media sockets, or the source pump fail. Retire that owner
+            # through the same confirmed teardown barrier as an ordinary stop.
+            await self._teardown_session()
             return
+        except asyncio.CancelledError:
+            await self._teardown_session()
+            raise
         finally:
             self._set_opening(False)
         track = self.client.track
@@ -1311,7 +1318,10 @@ class MainWindow(QMainWindow):
         self._session_source = None
         self._session_path = None
         self._session_time_base = None
-        if self.client is not None and self.client.session is not None:
+        if self.client is not None and (
+            self.client.session is not None
+            or getattr(self.client, "has_server_session", False)
+        ):
             # Close the whole client (server tears the session down with the
             # WS) and reconnect fresh: one session per connection in v1.
             host, port = self.client.host, self.client.port

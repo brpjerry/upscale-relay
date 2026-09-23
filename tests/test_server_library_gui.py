@@ -317,6 +317,79 @@ def test_open_progress_indicator_toggles(window):
     assert window.open_progress.isHidden()
 
 
+@pytest.mark.parametrize("stage", ["open", "attachments", "media", "uplink"])
+def test_startup_failure_releases_allocated_session(window, monkeypatch, stage):
+    class FailingClient(FakeSessionClient):
+        has_server_session = False
+        released = False
+
+        async def open_session(self, config):
+            self.has_server_session = True
+            if stage == "open":
+                raise OSError("open failed after allocation")
+            return await super().open_session(config)
+
+        async def prepare_attachments(self, root):
+            if stage == "attachments":
+                raise OSError("attachment transfer failed")
+
+        async def attach_media(self):
+            if stage == "media":
+                raise OSError("media connection failed")
+
+        async def start_uplink(self):
+            if stage == "uplink":
+                raise OSError("source pump failed")
+
+        async def teardown(self):
+            self.released = True
+
+    class Reconnected(FakeLibraryClient):
+        def __init__(self, host, port):
+            super().__init__()
+
+        async def connect(self):
+            return {"server_name": "test", "models": [{"name": "passthrough"}]}
+
+    errors = []
+    monkeypatch.setattr(window, "_error", lambda *args: errors.append(args))
+    monkeypatch.setattr(main_window, "RelayClient", Reconnected)
+
+    async def scenario():
+        client = FailingClient()
+        window.client = client
+        await window._start_session("Shows/Episode.mkv", source="server_file")
+        assert client.released
+        assert isinstance(window.client, Reconnected)
+        assert not window.stop_btn.isEnabled()
+        assert window._session_path is None
+        assert window.open_progress.isHidden()
+        assert errors and errors[0][0] == "Session failed"
+
+    asyncio.run(scenario())
+
+
+def test_startup_cleanup_does_not_replace_unconfirmed_server(window, monkeypatch):
+    class FailingClient(FakeSessionClient):
+        async def prepare_attachments(self, root):
+            raise OSError("attachment transfer failed")
+
+        async def teardown(self):
+            raise main_window.TeardownNotConfirmedError("native cleanup unconfirmed")
+
+    errors = []
+    monkeypatch.setattr(window, "_error", lambda *args: errors.append(args))
+
+    async def scenario():
+        window.client = FailingClient()
+        await window._start_session("Shows/Episode.mkv", source="server_file")
+        assert window.client is None
+        assert window.conn_label.text() == "server teardown unconfirmed"
+        assert errors[-1][0] == "Server cleanup not confirmed"
+
+    asyncio.run(scenario())
+
+
 def test_loopback_stream_delivers_queued_bytes_and_reports_stats():
     stream = _LoopbackStream()
     host_port = stream.uri.removeprefix("tcp://").split(":")
