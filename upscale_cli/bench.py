@@ -96,19 +96,18 @@ def _bench_decode(width: int, height: int, frames: int, workdir: Path) -> float:
     """Encode a clip once, then measure pure decode fps."""
     clip = workdir / f"bench_{width}x{height}.mkv"
     if not clip.exists():
-        container = av.open(str(clip), mode="w")
-        stream = container.add_stream("libx264", rate=Fraction(30, 1),
-                                      options={"crf": "18", "preset": "fast"})
-        stream.width, stream.height, stream.pix_fmt = width, height, "yuv420p"
-        reformatter = av.video.reformatter.VideoReformatter()
-        for i, rgb in enumerate(_synthetic_frames(width, height, frames)):
-            f = reformatter.reformat(av.VideoFrame.from_ndarray(rgb, format="rgb24"), format="yuv420p")
-            f.pts, f.time_base = i, Fraction(1, 30)
-            for pkt in stream.encode(f):
+        with av.open(str(clip), mode="w") as container:
+            stream = container.add_stream("libx264", rate=Fraction(30, 1),
+                                          options={"crf": "18", "preset": "fast"})
+            stream.width, stream.height, stream.pix_fmt = width, height, "yuv420p"
+            reformatter = av.video.reformatter.VideoReformatter()
+            for i, rgb in enumerate(_synthetic_frames(width, height, frames)):
+                f = reformatter.reformat(av.VideoFrame.from_ndarray(rgb, format="rgb24"), format="yuv420p")
+                f.pts, f.time_base = i, Fraction(1, 30)
+                for pkt in stream.encode(f):
+                    container.mux(pkt)
+            for pkt in stream.encode(None):
                 container.mux(pkt)
-        for pkt in stream.encode(None):
-            container.mux(pkt)
-        container.close()
 
     from .stages import FrameSource
 
@@ -139,22 +138,21 @@ def _bench_encode(width: int, height: int, frames: Sequence[np.ndarray], tier: s
         codec, pix_fmt, options = select_encoder(tier)
     except RuntimeError:
         return "unavailable"
-    out = av.open(str(workdir / f"enc_{tier}.mkv"), mode="w")
-    stream = out.add_stream(codec, rate=Fraction(30, 1), options=options)
-    stream.width, stream.height, stream.pix_fmt = width, height, pix_fmt
-    reformatter = av.video.reformatter.VideoReformatter()
-    elapsed = 0.0
-    for i, rgb in enumerate(frames):
+    with av.open(str(workdir / f"enc_{tier}.mkv"), mode="w") as out:
+        stream = out.add_stream(codec, rate=Fraction(30, 1), options=options)
+        stream.width, stream.height, stream.pix_fmt = width, height, pix_fmt
+        reformatter = av.video.reformatter.VideoReformatter()
+        elapsed = 0.0
+        for i, rgb in enumerate(frames):
+            start = time.perf_counter()
+            f = reformatter.reformat(av.VideoFrame.from_ndarray(rgb, format="rgb24"), format=pix_fmt)
+            f.pts, f.time_base = i, Fraction(1, 30)
+            for pkt in stream.encode(f):
+                out.mux(pkt)
+            elapsed += time.perf_counter() - start
         start = time.perf_counter()
-        f = reformatter.reformat(av.VideoFrame.from_ndarray(rgb, format="rgb24"), format=pix_fmt)
-        f.pts, f.time_base = i, Fraction(1, 30)
-        for pkt in stream.encode(f):
+        for pkt in stream.encode(None):
             out.mux(pkt)
-        elapsed += time.perf_counter() - start
-    start = time.perf_counter()
-    for pkt in stream.encode(None):
-        out.mux(pkt)
-    out.close()
     elapsed += time.perf_counter() - start
     return len(frames) / elapsed
 

@@ -81,3 +81,48 @@ def test_benchmark_still_writes_report_without_nvenc(tmp_path, monkeypatch):
     assert "e2e fps (hevc-qp18)" in text
     assert "| small |" in text
     assert text.count("unavailable") == len(bench.TIERS)
+
+
+@pytest.mark.parametrize("stage", ["decode", "encode"])
+def test_encode_failure_closes_container_before_temporary_cleanup(tmp_path, monkeypatch, stage):
+    (tmp_path / "model.onnx").touch()
+    opened = []
+    directories = []
+
+    class Container:
+        def __init__(self, path, **kwargs):
+            self.file = open(path, "wb")
+            opened.append(self)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            self.close()
+
+        def close(self):
+            self.file.close()
+
+        def add_stream(self, *args, **kwargs):
+            def fail_encode(frame):
+                raise RuntimeError("encoder failure")
+            return SimpleNamespace(encode=fail_encode)
+
+    def run(models, output, frames, ep, fit, workdir):
+        directories.append(workdir)
+        if stage == "decode":
+            bench._bench_decode(64, 64, 1, workdir)
+        else:
+            bench._bench_encode(64, 64, bench._synthetic_frames(64, 64, 1), "lossless-ffv1", workdir)
+
+    monkeypatch.setattr(bench.av, "open", Container)
+    monkeypatch.setattr(bench, "select_encoder", lambda tier: ("ffv1", "yuv420p", {}))
+    monkeypatch.setattr(bench, "_run_bench", run)
+    try:
+        with pytest.raises(RuntimeError, match="encoder failure"):
+            bench.run_bench(str(tmp_path), str(tmp_path / "report.md"))
+        assert opened and all(container.file.closed for container in opened)
+        assert not directories[0].exists()
+    finally:
+        for container in opened:
+            container.close()
