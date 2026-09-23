@@ -30,6 +30,7 @@ from relay_protocol import (
     FLAG_DISCONTINUITY,
     FLAG_EOS,
     FLAG_KEYFRAME,
+    MAX_PAYLOAD_BYTES,
     NO_TS,
     MediaPacket,
 )
@@ -986,10 +987,15 @@ class Pipeline:
         if self._need_discontinuity:
             flags |= FLAG_DISCONTINUITY
             self._need_discontinuity = False
-        self.emit(MediaPacket(
-            payload=data,
-            flags=flags,
-            epoch=epoch,
-            pts=pts if pts is not None else NO_TS,
-            dts=NO_TS,
-        ))
+        # Mux flushes can include a large audio tail or many subtitle events.
+        # Container chunk boundaries are arbitrary: split without changing any
+        # bytes, and mark only the first fragment as the epoch discontinuity.
+        for offset in range(0, len(data), MAX_PAYLOAD_BYTES):
+            self.emit(MediaPacket(
+                payload=data[offset:offset + MAX_PAYLOAD_BYTES],
+                flags=flags,
+                epoch=epoch,
+                pts=pts if pts is not None else NO_TS,
+                dts=NO_TS,
+            ))
+            flags = 0
