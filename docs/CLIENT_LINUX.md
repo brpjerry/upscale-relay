@@ -5,6 +5,43 @@ top of two native pieces: libmpv and PyAV's bundled ffmpeg. Nothing in it is
 Windows-specific. Python 3.12+ required (3.13/3.14 fine); the Windows server
 binaries are built on 3.14, but the client is not tied to that version.
 
+## Arch Linux release package
+
+Download `upscale-relay-client-<version>-1-any.pkg.tar.zst` and `SHA256SUMS`
+from the [GitHub release](https://github.com/brpjerry/upscale-relay/releases).
+In the download directory, verify and install it with pacman:
+
+```bash
+sha256sum -c SHA256SUMS
+sudo pacman -U ./upscale-relay-client-*.pkg.tar.zst
+relay-desktop
+```
+
+This installs the desktop player, an application-menu entry, and the headless
+`relay-client` command. Pacman installs the client dependencies from Arch's
+repositories, including libmpv and Qt's native Wayland plugin. The package
+contains no server, offline upscale CLI, models, or NVIDIA inference runtime.
+No virtualenv or pip installation is needed. Continue with the connection and
+firewall instructions below; the source-install steps are unnecessary.
+
+The pure-Python package is built on x86_64 Arch and uses the build's Python
+minor version. After an Arch Python minor-version upgrade it must be rebuilt
+for that interpreter (or replaced with a release built for it).
+
+To build from a checkout on Arch:
+
+```bash
+sudo pacman -S --needed base-devel python-build python-installer python-setuptools python-wheel
+python packaging/arch/prepare.py dist/pacman
+cd dist/pacman
+makepkg --syncdeps
+```
+
+The build stages only client modules and takes its version, Python dependencies,
+and command entry points from the root `pyproject.toml`. CI runs the same build
+in an Arch container, installs the result, and checks startup outside the source
+tree, including an offscreen GUI/libmpv smoke with isolated settings.
+
 ## 1. System packages
 
 Debian/Ubuntu (24.04 names):

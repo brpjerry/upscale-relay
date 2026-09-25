@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Upscale Relay
+Comment=Play video through an Upscale Relay server
+Exec=relay-desktop
+Icon=video-display
+Terminal=false
+Categories=AudioVideo;Video;Player;
+Keywords=video;upscale;relay;

@@ -1,0 +1,69 @@
+name: Client pacman package
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        type: string
+        default: ''
+      tag:
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Install Arch build and client dependencies
+        run: |
+          pacman -Syu --noconfirm --needed git python-build python-installer \
+            python-setuptools python-wheel python-av python-numpy python-aiohttp \
+            python-zeroconf pyside6 python-qasync python-mpv mpv qt6-wayland \
+            desktop-file-utils
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+      - name: Stage client source and build as an unprivileged user
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          args=()
+          if [[ -n "$RELEASE_TAG" ]]; then args+=(--tag "$RELEASE_TAG"); fi
+          python packaging/arch/prepare.py /tmp/client-package "${args[@]}"
+          useradd --create-home builder
+          chown -R builder:builder /tmp/client-package
+          runuser -u builder -- bash -c 'cd /tmp/client-package && makepkg --noconfirm'
+      - name: Install and smoke test the finished package
+        timeout-minutes: 2
+        run: |
+          pacman -U --noconfirm /tmp/client-package/*.pkg.tar.zst
+          # Run outside the checkout so missing packaged modules cannot be masked.
+          cd /tmp
+          relay-client --help
+          relay-desktop --help
+          python -I "$GITHUB_WORKSPACE/packaging/arch/smoke.py"
+          desktop-file-validate /usr/share/applications/upscale-relay-client.desktop
+          test ! -e /usr/bin/relay-server
+          test ! -e /usr/bin/relay-server-gui
+          test ! -e /usr/bin/upscale-cli
+      - name: Collect package and checksum
+        run: |
+          mkdir -p dist
+          cp /tmp/client-package/*.pkg.tar.zst dist/
+          cd dist
+          sha256sum ./*.pkg.tar.zst > SHA256SUMS
+      - uses: actions/upload-artifact@v7
+        with:
+          name: upscale-relay-client-pacman
+          path: |
+            dist/*.pkg.tar.zst
+            dist/SHA256SUMS
+          if-no-files-found: error

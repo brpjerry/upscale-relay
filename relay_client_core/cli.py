@@ -21,7 +21,7 @@ from fractions import Fraction
 import av
 
 from relay_protocol import NO_TS
-from upscale_cli.fit import RESIZE_ALGORITHMS
+from relay_protocol.video import RESIZE_ALGORITHMS
 
 from .client import RelayClient, SessionConfig
 
