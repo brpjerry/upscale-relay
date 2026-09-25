@@ -13,7 +13,13 @@ permissions:
   contents: write
 
 jobs:
-  release:
+  client-pacman:
+    uses: ./.github/workflows/client-pacman.yml
+    with:
+      ref: refs/tags/${{ github.event.inputs.tag || github.ref_name }}
+      tag: ${{ github.event.inputs.tag || github.ref_name }}
+
+  windows-server:
     runs-on: windows-latest
     env:
       TAG: ${{ github.event.inputs.tag || github.ref_name }}
@@ -92,18 +98,38 @@ jobs:
             -DestinationPath "dist/upscale-relay-server-$env:TAG-windows-x64.zip"
           Compress-Archive -Path dist/upscale-relay-server-gui/* `
             -DestinationPath "dist/upscale-relay-server-gui-$env:TAG-windows-x64.zip"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: upscale-relay-server-release
+          path: dist/*.zip
+          if-no-files-found: error
+
+  publish:
+    needs: [windows-server, client-pacman]
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ github.event.inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: refs/tags/${{ github.event.inputs.tag || github.ref_name }}
+      - uses: actions/download-artifact@v8
+        with:
+          name: upscale-relay-server-release
+          path: dist
+      - uses: actions/download-artifact@v8
+        with:
+          name: upscale-relay-client-pacman
+          path: dist
       - name: Publish GitHub Release
-        shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $notesFile = "release-notes/$env:TAG.md"
-          if (-not (Test-Path $notesFile)) {
-            throw "Missing release notes: $notesFile"
-          }
-          gh release create "$env:TAG" `
-            --verify-tag `
-            --title "Upscale Relay Server $env:TAG" `
-            --generate-notes `
-            --notes-file "$notesFile" `
-            (Get-Item dist/*.zip).FullName
+          notes_file="release-notes/$TAG.md"
+          test -f "$notes_file" || { echo "Missing release notes: $notes_file" >&2; exit 1; }
+          gh release create "$TAG" \
+            --verify-tag \
+            --title "Upscale Relay $TAG" \
+            --generate-notes \
+            --notes-file "$notes_file" \
+            dist/*.zip dist/*.pkg.tar.zst dist/SHA256SUMS

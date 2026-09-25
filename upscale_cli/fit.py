@@ -18,19 +18,8 @@ from typing import Iterable
 
 import av
 
+from relay_protocol.video import DEFAULT_RESIZE_ALGORITHM, RESIZE_ALGORITHMS
 
-DEFAULT_RESIZE_ALGORITHM = "lanczos"
-RESIZE_ALGORITHMS = (
-    "fast-bilinear",
-    "bilinear",
-    "bicubic",
-    "area",
-    "bicublin",
-    "gaussian",
-    "sinc",
-    "lanczos",
-    "spline",
-)
 _INTERPOLATION_NAMES = {
     "fast-bilinear": "FAST_BILINEAR",
     "bilinear": "BILINEAR",
