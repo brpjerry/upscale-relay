@@ -14,7 +14,7 @@ pytest.importorskip("PySide6")
 pytest.importorskip("qasync")
 
 from PySide6.QtWidgets import QApplication
-from qasync import QEventLoop
+from qt_helpers import playback_loop
 
 try:
     from desktop_client.mpv_view import MpvPlayerView
@@ -89,7 +89,7 @@ def test_video_only_and_subtitle_only_originals_play_without_audio(tmp_path, wit
             await asyncio.sleep(0)
 
     try:
-        with QEventLoop(app) as loop:
+        with playback_loop(app) as loop:
             loop.run_until_complete(scenario())
     finally:
         player.mpv.terminate()

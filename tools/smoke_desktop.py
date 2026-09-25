@@ -3,7 +3,8 @@
     QT_QPA_PLATFORM=offscreen python tools/smoke_desktop.py \
         --server 192.0.2.10:8590 --file /path/to/a/long-test-clip.mkv
 
-Use a clip of at least 30 seconds. The default passthrough model isolates
+Use a clip of at least 30 seconds (longer than --resume-seconds plus 5 seconds).
+The default passthrough model isolates
 transport/playback from GPU contention; add --model only after that passes.
 """
 
@@ -60,7 +61,10 @@ async def exercise(window, args):
         await window._start_session(args.file, source=args.source)
         assert window.client is not None and window.client.session is not None, errors
         await wait_until(lambda: window._position_s > 0.5, "initial playback")
-        assert window._duration_s is not None and window._duration_s >= 30, "use a clip >=30 seconds"
+        minimum_duration = max(30, args.resume_seconds + 5)
+        assert window._duration_s is not None and window._duration_s >= minimum_duration, (
+            f"use a clip >={minimum_duration:g} seconds"
+        )
         completed.append("playback")
 
         # Exercise the actual keyboard signal/controller, not just mpv.pause.
@@ -69,9 +73,26 @@ async def exercise(window, args):
         await wait_until(lambda: window._paused and window.player.mpv.pause, "keyboard pause")
         await asyncio.sleep(0.6)
         position = window._position_s
-        await asyncio.sleep(0.6)
+        await asyncio.sleep(args.pause_seconds)
         assert abs(window._position_s - position) < 0.2, "paused playback advanced"
         completed.append("keyboard pause")
+
+        if args.resume_seconds:
+            await window.on_play_pause()
+            await wait_until(lambda: window._position_s > position + 0.5, "resume after pause")
+            resumed_at = window._position_s
+            # Outlast the pre-pause cache: a timed-out TCP reader can otherwise
+            # appear healthy for several seconds before reporting a false EOF.
+            await asyncio.sleep(args.resume_seconds)
+            assert window._session_source == args.source, "resume ended the session"
+            # Position telemetry runs every half second; allow its final tick
+            # to catch up, especially for short smoke runs.
+            await wait_until(
+                lambda: window._position_s >= resumed_at + args.resume_seconds * 0.8,
+                "sustained resume after pause", timeout=5,
+            )
+            await window.on_play_pause()
+            completed.append("sustained resume after pause")
 
         await window._seek_to_seconds(12.0)
         await wait_until(lambda: abs(window._position_s - 12.0) < 0.5
@@ -136,7 +157,13 @@ def main():
     parser.add_argument("--external-aux", action="store_true",
                         help="exercise server-file external audio/subtitle attachment")
     parser.add_argument("--trace", action="store_true")
+    parser.add_argument("--pause-seconds", type=float, default=0.6,
+                        help="pause duration; use 120 to exercise idle TCP readers")
+    parser.add_argument("--resume-seconds", type=float, default=0,
+                        help="observe resumed playback before seeking; use 30 to outlast the cache")
     args = parser.parse_args()
+    if args.pause_seconds < 0 or args.resume_seconds < 0:
+        parser.error("pause and resume durations must be nonnegative")
     if args.external_aux and args.source != "server_file":
         parser.error("--external-aux requires --source server_file")
     app = QApplication([])

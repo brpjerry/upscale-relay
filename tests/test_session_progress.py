@@ -7,12 +7,13 @@ as activity and only fails after a silent inactivity window
 """
 
 import asyncio
-import socket
 import sys
 import time
 from pathlib import Path
 
 import pytest
+
+from ports import free_port_pair
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -21,28 +22,6 @@ import relay_client_core.client as client_mod
 import relay_server.session as session_mod
 from relay_client_core import RelayClient, SessionConfig
 from relay_server.server import RelayServer
-
-
-_next_port = [0]
-
-
-def free_port_pair() -> int:
-    """Walk a private, non-ephemeral range for an unused adjacent pair."""
-    import random
-
-    if _next_port[0] == 0:
-        _next_port[0] = random.randrange(24000, 39000, 2)
-    for _ in range(200):
-        candidate = _next_port[0]
-        _next_port[0] += 2
-        try:
-            with socket.socket() as control, socket.socket() as media:
-                control.bind(("127.0.0.1", candidate))
-                media.bind(("127.0.0.1", candidate + 1))
-            return candidate
-        except OSError:
-            continue
-    raise RuntimeError("no free port pair")
 
 
 @pytest.fixture(scope="module")

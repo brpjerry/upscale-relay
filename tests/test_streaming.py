@@ -5,12 +5,13 @@ mid-play disconnect, slow-client backpressure.
 """
 
 import asyncio
-import socket
 import sys
 from pathlib import Path
 
 import av
 import pytest
+
+from ports import free_port_pair
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -30,33 +31,6 @@ def sample_file() -> str:
 
         make_sample(str(SAMPLE), frames=FRAMES, width=320, height=180, fps=FPS)
     return str(SAMPLE)
-
-
-_next_port = [0]
-
-
-def free_port_pair() -> int:
-    """Find p such that p and p+1 are both free.
-
-    Walks a private range instead of asking the OS for ephemeral ports —
-    check-then-use on ephemeral ports races with concurrent tests and with
-    the OS handing the same port to someone else.
-    """
-    import random
-
-    if _next_port[0] == 0:
-        _next_port[0] = random.randrange(20000, 40000, 2)
-    for _ in range(200):
-        p = _next_port[0]
-        _next_port[0] += 2
-        try:
-            with socket.socket() as s1, socket.socket() as s2:
-                s1.bind(("127.0.0.1", p))
-                s2.bind(("127.0.0.1", p + 1))
-            return p
-        except OSError:
-            continue
-    raise RuntimeError("no free port pair")
 
 
 def source_pts_list(path: str) -> list[int]:

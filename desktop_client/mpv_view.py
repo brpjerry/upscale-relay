@@ -28,6 +28,7 @@ from PySide6.QtGui import QGuiApplication, QOpenGLContext
 from PySide6.QtOpenGLWidgets import QOpenGLWidget
 
 from .options import DesktopOptions
+from .idle_inhibit import IdleInhibitor
 
 
 def _load_mpv():
@@ -297,6 +298,7 @@ class MpvPlayerView(QOpenGLWidget):
     _frame_ready = Signal()  # mpv render thread -> queued repaint on GUI thread
     _playback_restarted = Signal(int)  # libmpv event thread -> GUI thread
     _external_media_ready = Signal(int)  # attach worker -> GUI thread
+    _idle_state_changed = Signal()  # native property observer -> GUI thread
 
     # Bare keys the app reserves: arrows are NOT forwarded (mpv can't seek
     # the live stream — they emit seek_requested for a relay-protocol seek),
@@ -331,7 +333,7 @@ class MpvPlayerView(QOpenGLWidget):
         self.setMouseTracking(True)  # deliver mouse-move without a pressed button
         self._ctx = None  # MpvRenderContext, created in initializeGL
         self._get_proc = None  # ctypes callback — must outlive the render ctx
-        self._frame_ready.connect(self.update)  # queued: emitter is mpv thread
+        self._frame_ready.connect(self._on_frame_ready, Qt.QueuedConnection)
 
         if self.options.headless:
             extra = {
@@ -457,6 +459,21 @@ class MpvPlayerView(QOpenGLWidget):
         self._epoch_released = False
         self._caller_paused = False
         self.client = None
+        self._idle_inhibitor = IdleInhibitor(enabled=not self.options.headless)
+        self._mpv_idle = True
+        self._mpv_paused = True
+        self._idle_state_changed.connect(self._sync_idle_inhibition, Qt.QueuedConnection)
+
+        @self.mpv.property_observer("idle-active")
+        def on_idle(_name, value):
+            self._mpv_idle = value is not False
+            self._idle_state_changed.emit()
+
+        @self.mpv.property_observer("pause")
+        def on_pause(_name, value):
+            self._mpv_paused = value is not False
+            self._idle_state_changed.emit()
+
         self._playback_restarted.connect(self._on_playback_restarted)
         self._external_media_ready.connect(self._on_external_media_ready)
 
@@ -476,6 +493,14 @@ class MpvPlayerView(QOpenGLWidget):
                 return
             if reason in ("MpvEventEndFile.EOF", "eof", "0"):
                 self.finished.emit()
+
+    def _sync_idle_inhibition(self) -> None:
+        # Observe mpv's actual pause state, including input.conf bindings. Do
+        # not read native properties here: stop/reload can still be tearing down.
+        self._idle_inhibitor.set_active(
+            (self._task is not None or self._local_playback)
+            and not self._mpv_idle and not self._mpv_paused
+        )
 
     # -- rendering (libmpv render API) ------------------------------------------
 
@@ -516,6 +541,24 @@ class MpvPlayerView(QOpenGLWidget):
                 "h": round(self.height() * dpr),
             },
         )
+
+    def _on_frame_ready(self) -> None:
+        if self._ctx is None:
+            return
+        window = self.window().windowHandle()
+        if self.isVisible() and window is not None and window.isExposed():
+            self.update()
+            return
+        # Wayland stops delivering paints on another workspace. Acknowledge
+        # those frames through libmpv's render API instead of letting its VO
+        # time out and count intentional non-presentation as dropped frames.
+        # Even skip_rendering requires the owning OpenGL context to be current.
+        self.makeCurrent()
+        try:
+            if QOpenGLContext.currentContext() == self.context() and self._ctx.update():
+                self._ctx.render(skip_rendering=True)
+        finally:
+            self.doneCurrent()
 
     # -- public API -----------------------------------------------------------
 
@@ -567,7 +610,13 @@ class MpvPlayerView(QOpenGLWidget):
         # timestamps place playback at the seek target. External media is
         # attached after playback-restart, when mpv knows that absolute time.
         self._pending_start = None
-        load_options = "pause=yes"
+        # This localhost pipe deliberately goes silent during a user pause or
+        # server watermark hold. mpv's default 60-second TCP read timeout turns
+        # that silence into EOF, which ends playback as soon as its cache drains
+        # after resume. Scope the override to relay epochs; ordinary local/HTTP
+        # playback retains the user's network timeout. Transport errors and
+        # stop/seek still close the pipe explicitly.
+        load_options = "pause=yes,network-timeout=0"
         if self.mpv.mpv_version_tuple >= (0, 38, 0):
             self.mpv.command(
                 "loadfile", self._buffer.uri, "replace", -1, load_options)
@@ -681,6 +730,7 @@ class MpvPlayerView(QOpenGLWidget):
         self.mpv.pause = self._caller_paused
 
     def stop(self) -> None:
+        self._idle_inhibitor.set_active(False)
         self._reloading = True  # suppress EOF caused by retiring our own pipe
         ready = self._local_load_ready
         self._local_load_ready = None

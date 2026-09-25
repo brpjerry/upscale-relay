@@ -41,6 +41,82 @@ def test_keyboard_pause_intent_survives_epoch_release():
         player.close()
 
 
+def test_paused_relay_pipe_survives_network_timeout_and_still_delivers_eof(tmp_path, local_player):
+    """A quiet live pipe must stay readable until protocol EOS, even while paused."""
+    from fractions import Fraction
+    from qt_helpers import playback_loop
+    from upscale_cli.sample import make_sample
+
+    path = tmp_path / "pause.mkv"
+    make_sample(str(path), frames=288, width=64, height=64, fps=24)
+    data = path.read_bytes()
+    player = local_player
+    # Speed up the former 60-second failure without changing the real TCP path.
+    player.mpv.network_timeout = 0.2
+    player.mpv.demuxer_readahead_secs = 30
+    finished, errors = [], []
+    player.finished.connect(lambda: finished.append(True))
+    player.failed.connect(errors.append)
+
+    async def wait_until(predicate):
+        async with asyncio.timeout(8):
+            while not predicate():
+                assert not errors, errors
+                await asyncio.sleep(0.025)
+
+    async def scenario():
+        queue = asyncio.Queue()
+        queue.put_nowait(MediaPacket(data[:len(data) // 2], flags=FLAG_DISCONTINUITY))
+        player.start(SimpleNamespace(downlink_container="matroska"), queue, Fraction(1, 1000))
+        try:
+            await wait_until(lambda: (player.mpv.time_pos or 0) > 0.1)
+            player.set_paused(True)
+            position = player.mpv.time_pos
+            await asyncio.sleep(1)
+            assert abs(player.mpv.time_pos - position) < 0.1
+            queue.put_nowait(MediaPacket(data[len(data) // 2:]))
+            queue.put_nowait(MediaPacket(b"", flags=FLAG_EOS))
+            player.mpv.speed = 4
+            player.set_paused(False)
+            await wait_until(lambda: (player.mpv.time_pos or 0) > 10)
+            await wait_until(lambda: finished)
+            assert not errors
+            # Local playback must restore the ordinary network timeout.
+            await player.play_local(str(path), paused=True)
+            assert player.mpv.network_timeout == pytest.approx(0.2)
+        finally:
+            player.stop()
+            await asyncio.sleep(0)
+
+    with playback_loop(QApplication.instance()) as loop:
+        loop.run_until_complete(scenario())
+
+
+@pytest.mark.parametrize("visible,exposed,expect_skip", [
+    (True, True, False), (True, False, True), (False, True, True),
+])
+def test_frame_notifications_acknowledge_unpresented_frames(monkeypatch, visible, exposed, expect_skip):
+    from desktop_client import mpv_view
+    calls = []
+    context = object()
+    monkeypatch.setattr(mpv_view, "QOpenGLContext", SimpleNamespace(currentContext=lambda: context))
+    render = SimpleNamespace(
+        update=lambda: True,
+        render=lambda **kw: calls.append(kw),
+    )
+    player = SimpleNamespace(
+        _ctx=render,
+        isVisible=lambda: visible,
+        window=lambda: SimpleNamespace(windowHandle=lambda: SimpleNamespace(isExposed=lambda: exposed)),
+        update=lambda: calls.append("paint"),
+        makeCurrent=lambda: calls.append("current"),
+        doneCurrent=lambda: calls.append("done"),
+        context=lambda: context,
+    )
+    MpvPlayerView._on_frame_ready(player)
+    assert calls == (["current", {"skip_rendering": True}, "done"] if expect_skip else ["paint"])
+
+
 def test_local_playback_reports_tracks_position_and_accepts_transport(tmp_path):
     from upscale_cli.sample import make_sample
 
@@ -106,6 +182,48 @@ def local_player():
     player.stop()
     player.mpv.terminate()
     player.close()
+
+
+def test_idle_inhibition_tracks_native_pause_eof_and_stop(tmp_path, local_player):
+    from qt_helpers import playback_loop
+    from upscale_cli.sample import make_sample
+
+    path = tmp_path / "idle.mkv"
+    make_sample(str(path), frames=48, width=64, height=64, fps=24)
+    player = local_player
+    states = []
+    player._idle_inhibitor = SimpleNamespace(set_active=states.append)
+
+    async def wait_until(predicate):
+        async with asyncio.timeout(5):
+            while not predicate():
+                await asyncio.sleep(0.025)
+
+    async def scenario():
+        try:
+            await player.play_local(str(path), paused=True)
+            await asyncio.sleep(0.05)
+            assert not states[-1]
+            # Native property changes cover mpv input.conf bindings as well as
+            # our own toolbar's pause command.
+            player.mpv.pause = False
+            await wait_until(lambda: states[-1])
+            player.mpv.pause = True
+            await wait_until(lambda: not states[-1])
+            player.mpv.pause = False
+            await wait_until(lambda: states[-1])
+            await wait_until(lambda: not states[-1])  # natural EOF
+            await player.play_local(str(path))
+            await wait_until(lambda: states[-1])
+            player.stop()
+            assert not states[-1]  # release before queued native stop events
+            await asyncio.sleep(0.1)
+            assert not states[-1]
+        finally:
+            player.stop()
+
+    with playback_loop(QApplication.instance()) as loop:
+        loop.run_until_complete(scenario())
 
 
 @pytest.mark.parametrize("cancel_task", [False, True])

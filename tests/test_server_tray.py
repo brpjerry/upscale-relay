@@ -9,12 +9,12 @@ import sys
 
 import pytest
 
+from ports import free_port_pair
+
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 pytest.importorskip("PySide6")  # server tray GUI is an optional extra
 pytest.importorskip("qasync")
-
-import socket
 
 from PySide6.QtWidgets import QApplication
 
@@ -28,32 +28,6 @@ from relay_server.tray import (
     ensure_runtime_gui,
     make_icon,
 )
-
-_next_port = [0]
-
-
-def free_port_pair() -> int:
-    """Find p such that p and p+1 are both free (RelayServer binds both).
-
-    Walks a private range rather than check-then-use on ephemeral ports —
-    the same approach as tests/test_streaming.py.
-    """
-    import random
-
-    if _next_port[0] == 0:
-        _next_port[0] = random.randrange(40000, 60000, 2)
-    for _ in range(200):
-        p = _next_port[0]
-        _next_port[0] += 2
-        try:
-            with socket.socket() as s1, socket.socket() as s2:
-                s1.bind(("127.0.0.1", p))
-                s2.bind(("127.0.0.1", p + 1))
-            return p
-        except OSError:
-            continue
-    raise RuntimeError("no free port pair")
-
 
 _TEST_RUN_KEY = r"Software\upscale-relay-tests\Run"
 

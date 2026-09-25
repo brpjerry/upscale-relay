@@ -557,6 +557,33 @@ def test_fullscreen_labels_follow_a_readable_theme(window, background, foregroun
     assert window.pos_label.palette().color(QPalette.WindowText) == QColor(foreground)
 
 
+def test_fullscreen_cursor_hides_on_idle_and_restores_on_motion_and_exit(window, monkeypatch):
+    monkeypatch.setattr(window, "_pointer_over_controls", lambda: False)
+    window.toggle_fullscreen()
+    assert window._cursor_timer.isActive()
+    window._auto_hide_cursor()
+    assert window.player.cursor().shape() == Qt.BlankCursor
+    window._on_player_mouse_moved(100, 100)
+    assert window.player.cursor().shape() != Qt.BlankCursor
+    assert window._cursor_timer.isActive()
+    window._auto_hide_cursor()
+    window.toggle_fullscreen()
+    assert window.player.cursor().shape() != Qt.BlankCursor
+    assert not window._cursor_timer.isActive()
+
+
+@pytest.mark.parametrize("over_controls,dragging", [(True, False), (False, True)])
+def test_fullscreen_controls_keep_cursor_usable(window, monkeypatch, over_controls, dragging):
+    window.toggle_fullscreen()
+    monkeypatch.setattr(window, "_pointer_over_controls", lambda: over_controls)
+    window._slider_down = dragging
+    window._auto_hide_cursor()
+    assert window.player.cursor().shape() != Qt.BlankCursor
+    assert window._cursor_timer.isActive()
+    assert window.controls_panel.cursor().shape() == Qt.ArrowCursor
+    window.toggle_fullscreen()
+
+
 @pytest.mark.parametrize("address,expected", [
     ("server.local", ("server.local", 8590)),
     (" 127.0.0.1:8590 ", ("127.0.0.1", 8590)),

@@ -26,7 +26,7 @@ jobs:
           pacman -Syu --noconfirm --needed git python-build python-installer \
             python-setuptools python-wheel python-av python-numpy python-aiohttp \
             python-zeroconf pyside6 python-qasync python-mpv mpv qt6-wayland \
-            desktop-file-utils
+            python-dbus-next desktop-file-utils
       - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.ref }}

@@ -114,6 +114,12 @@ relay-desktop
 - Enter the server as `<windows-box-ip>:8590` in the toolbar and Connect.
 - Settings persist in `~/.config/upscale-relay/`.
 
+During playback, the client asks the desktop's `org.freedesktop.ScreenSaver`
+service (including Hypridle) to keep the screen awake. Pausing, reaching the end,
+stopping, or closing playback releases the request. This works in windowed and
+fullscreen mode and respects mpv key-binding pauses. The Linux GUI dependencies
+include `dbus-next`; headless tests do not inhibit the desktop.
+
 When a capable server-library session confirms muxed auxiliary tracks, the
 desktop client gets audio and subtitles from the relay Matroska stream and does
 not reopen the full source through `/media`. Subtitle fonts are downloaded by

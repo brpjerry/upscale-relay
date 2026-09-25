@@ -466,6 +466,11 @@ class MainWindow(QMainWindow):
         self._controls_timer.setSingleShot(True)
         self._controls_timer.setInterval(2200)
         self._controls_timer.timeout.connect(self._auto_hide_controls)
+        self.controls_panel.setCursor(Qt.ArrowCursor)
+        self._cursor_timer = QTimer(self)
+        self._cursor_timer.setSingleShot(True)
+        self._cursor_timer.setInterval(2200)
+        self._cursor_timer.timeout.connect(self._auto_hide_cursor)
         self.player.installEventFilter(self)  # reposition overlay on resize
 
         self.split = QSplitter()
@@ -684,6 +689,7 @@ class MainWindow(QMainWindow):
             self._enter_overlay_controls()
             self._was_maximized = self.isMaximized()
             self.showFullScreen()
+            self._show_player_cursor()
             self.player.setFocus()  # keys (Space/F/arrows) go to the video
         else:
             self.playback_settings.setVisible(self._settings_visible_before_fullscreen)
@@ -737,6 +743,8 @@ class MainWindow(QMainWindow):
             return
         self._controls_overlay = False
         self._controls_timer.stop()
+        self._cursor_timer.stop()
+        self.player.unsetCursor()
         self.controls_panel.setStyleSheet("")
         self.controls_panel.setPalette(QPalette())
         self.controls_panel.setAttribute(Qt.WA_StyledBackground, False)
@@ -753,9 +761,27 @@ class MainWindow(QMainWindow):
     def _on_player_mouse_moved(self, x: int, y: int) -> None:
         if not (self._controls_overlay and self.isFullScreen()):
             return
+        self._show_player_cursor()
         reveal_zone = self.controls_panel.sizeHint().height() + 48
         if y >= self.player.height() - reveal_zone:
             self._reveal_controls()
+
+    def _show_player_cursor(self) -> None:
+        self.player.unsetCursor()
+        if self._controls_overlay:
+            self._cursor_timer.start()
+
+    def _pointer_over_controls(self) -> bool:
+        local = self.controls_panel.mapFromGlobal(QCursor.pos())
+        return self.controls_panel.isVisible() and self.controls_panel.rect().contains(local)
+
+    def _auto_hide_cursor(self) -> None:
+        if not self._controls_overlay:
+            return
+        if self._slider_down or self._pointer_over_controls():
+            self._cursor_timer.start()
+            return
+        self.player.setCursor(Qt.BlankCursor)
 
     def _reveal_controls(self) -> None:
         if not self.controls_panel.isVisible():
@@ -769,13 +795,17 @@ class MainWindow(QMainWindow):
             return
         # Keep the bar up while the pointer rests on it or is dragging the seek
         # slider — the player sees no motion there to keep the timer alive.
-        local = self.controls_panel.mapFromGlobal(QCursor.pos())
-        if self._slider_down or self.controls_panel.rect().contains(local):
+        if self._slider_down or self._pointer_over_controls():
             self._controls_timer.start()
             return
         self.controls_panel.hide()
 
     def eventFilter(self, obj, event) -> bool:
+        if obj is self.player and event.type() == QEvent.Enter:
+            self._show_player_cursor()
+        elif obj is self.player and event.type() == QEvent.Leave:
+            self._cursor_timer.stop()
+            self.player.unsetCursor()
         if obj is self.player and event.type() == QEvent.Resize:
             self._position_idle_guidance()
             if self._controls_overlay:

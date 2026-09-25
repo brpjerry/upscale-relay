@@ -2,13 +2,14 @@
 
 import asyncio
 import shutil
-import socket
 import sys
 from fractions import Fraction
 from pathlib import Path
 
 import av
 import pytest
+
+from ports import free_port_pair
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -31,28 +32,6 @@ CHAPTERS_NS = [
     (800_000_000, 1_600_000_000, "Middle"),
     (1_600_000_000, None, None),  # untitled, open-ended
 ]
-
-
-_next_port = [0]
-
-
-def free_port_pair() -> int:
-    """Walk a private, non-ephemeral range for an unused adjacent pair."""
-    import random
-
-    if _next_port[0] == 0:
-        _next_port[0] = random.randrange(40000, 48000, 2)
-    for _ in range(200):
-        candidate = _next_port[0]
-        _next_port[0] += 2
-        try:
-            with socket.socket() as control, socket.socket() as media:
-                control.bind(("127.0.0.1", candidate))
-                media.bind(("127.0.0.1", candidate + 1))
-            return candidate
-        except OSError:
-            continue
-    raise RuntimeError("no free port pair")
 
 
 @pytest.fixture(scope="module")
