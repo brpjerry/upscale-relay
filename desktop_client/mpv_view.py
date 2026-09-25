@@ -331,7 +331,7 @@ class MpvPlayerView(QOpenGLWidget):
         self.setMouseTracking(True)  # deliver mouse-move without a pressed button
         self._ctx = None  # MpvRenderContext, created in initializeGL
         self._get_proc = None  # ctypes callback — must outlive the render ctx
-        self._frame_ready.connect(self.update)  # queued: emitter is mpv thread
+        self._frame_ready.connect(self._on_frame_ready, Qt.QueuedConnection)
 
         if self.options.headless:
             extra = {
@@ -517,6 +517,24 @@ class MpvPlayerView(QOpenGLWidget):
             },
         )
 
+    def _on_frame_ready(self) -> None:
+        if self._ctx is None:
+            return
+        window = self.window().windowHandle()
+        if self.isVisible() and window is not None and window.isExposed():
+            self.update()
+            return
+        # Wayland stops delivering paints on another workspace. Acknowledge
+        # those frames through libmpv's render API instead of letting its VO
+        # time out and count intentional non-presentation as dropped frames.
+        # Even skip_rendering requires the owning OpenGL context to be current.
+        self.makeCurrent()
+        try:
+            if QOpenGLContext.currentContext() == self.context() and self._ctx.update():
+                self._ctx.render(skip_rendering=True)
+        finally:
+            self.doneCurrent()
+
     # -- public API -----------------------------------------------------------
 
     def start(self, session, downlink_q: asyncio.Queue, time_base: Fraction,
@@ -567,7 +585,13 @@ class MpvPlayerView(QOpenGLWidget):
         # timestamps place playback at the seek target. External media is
         # attached after playback-restart, when mpv knows that absolute time.
         self._pending_start = None
-        load_options = "pause=yes"
+        # This localhost pipe deliberately goes silent during a user pause or
+        # server watermark hold. mpv's default 60-second TCP read timeout turns
+        # that silence into EOF, which ends playback as soon as its cache drains
+        # after resume. Scope the override to relay epochs; ordinary local/HTTP
+        # playback retains the user's network timeout. Transport errors and
+        # stop/seek still close the pipe explicitly.
+        load_options = "pause=yes,network-timeout=0"
         if self.mpv.mpv_version_tuple >= (0, 38, 0):
             self.mpv.command(
                 "loadfile", self._buffer.uri, "replace", -1, load_options)

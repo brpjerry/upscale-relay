@@ -102,6 +102,14 @@ constructor options).
 - The downlink is a live Matroska stream via a per-load localhost `tcp://`
   socket. Keep the dedicated sender thread: python-mpv's custom-stream adapter
   copies bytes one at a time in Python and capped lossless HEVC near 200 Mbps.
+- Relay `loadfile` options must disable mpv's network timeout for that epoch.
+  Pausing legitimately silences the TCP pipe; the default 60-second read timeout
+  became a false EOF after resume drained the cache. Stop/seek and real transport
+  failures still close the pipe explicitly; ordinary local playback keeps its
+  configured timeout.
+- When Qt's window is unexposed (e.g. another Wayland workspace), acknowledge
+  render updates with `skip_rendering=True` and a current OpenGL context. Relying
+  only on Qt paints makes libmpv count every hidden frame as a renderer drop.
 - Post-seek: **never** pass `start=`; we run `rebase-start-time=no` so the new
   stream's absolute PTS place playback and external audio aligns itself.
   Reload = `stop`, close old buffer, `await asyncio.sleep(0.15)`, then
