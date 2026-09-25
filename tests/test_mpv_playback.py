@@ -44,7 +44,7 @@ def test_keyboard_pause_intent_survives_epoch_release():
 def test_paused_relay_pipe_survives_network_timeout_and_still_delivers_eof(tmp_path, local_player):
     """A quiet live pipe must stay readable until protocol EOS, even while paused."""
     from fractions import Fraction
-    from qasync import QEventLoop
+    from qt_helpers import playback_loop
     from upscale_cli.sample import make_sample
 
     path = tmp_path / "pause.mkv"
@@ -88,7 +88,7 @@ def test_paused_relay_pipe_survives_network_timeout_and_still_delivers_eof(tmp_p
             player.stop()
             await asyncio.sleep(0)
 
-    with QEventLoop(QApplication.instance()) as loop:
+    with playback_loop(QApplication.instance()) as loop:
         loop.run_until_complete(scenario())
 
 
@@ -185,7 +185,7 @@ def local_player():
 
 
 def test_idle_inhibition_tracks_native_pause_eof_and_stop(tmp_path, local_player):
-    from qasync import QEventLoop
+    from qt_helpers import playback_loop
     from upscale_cli.sample import make_sample
 
     path = tmp_path / "idle.mkv"
@@ -222,7 +222,7 @@ def test_idle_inhibition_tracks_native_pause_eof_and_stop(tmp_path, local_player
         finally:
             player.stop()
 
-    with QEventLoop(QApplication.instance()) as loop:
+    with playback_loop(QApplication.instance()) as loop:
         loop.run_until_complete(scenario())
 
 

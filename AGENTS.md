@@ -175,8 +175,11 @@ constructor options).
 ## Testing conventions
 
 - Integration tests spin the real server in-process on a private port pair
-  (see `tests/test_streaming.py::free_port_pair` — never check-then-use
-  ephemeral ports).
+  (see `tests/ports.py::free_port_pair` — never check-then-use ephemeral
+  ports; Linux's default ephemeral range starts at 32768).
+- Native Qt playback tests use `tests/qt_helpers.py::playback_loop` so closed
+  qasync loops retire their remaining native timers on the GUI thread. Leaving
+  those timers for cyclic GC caused a reproducible crash in the next Qt loop.
 - GUI verification: offscreen smoke pattern — `QT_QPA_PLATFORM=offscreen` +
   `relay-desktop --headless --settings-scope <test>` (or pass matching
   `DesktopOptions`) and drive `MainWindow` slots directly. Seek verification needs a file with a

@@ -4,7 +4,6 @@ import asyncio
 import io
 import os
 import shutil
-import socket
 import subprocess
 import sys
 from fractions import Fraction
@@ -15,6 +14,8 @@ import av
 import numpy as np
 import pytest
 
+from ports import free_port_pair
+
 from relay_client_core import RelayClient, SessionConfig
 from relay_media import AuxiliaryTrack
 from relay_server.library import LibraryPathError, MediaLibrary, _root_name
@@ -24,23 +25,6 @@ from upscale_cli.encode import DEFAULT_LOSSLESS_HEVC_PROFILE
 
 
 ROOT = Path(__file__).resolve().parents[1]
-
-
-def free_port_pair() -> int:
-    import random
-
-    # Walk a private range; do not ask the OS for an ephemeral port and then
-    # release it before use (that check-then-use pattern races allocation).
-    start = random.randrange(40000, 55000, 2)
-    for candidate in range(start, start + 400, 2):
-        try:
-            with socket.socket() as control, socket.socket() as media:
-                control.bind(("127.0.0.1", candidate))
-                media.bind(("127.0.0.1", candidate + 1))
-            return candidate
-        except OSError:
-            continue
-    raise RuntimeError("no free port pair")
 
 
 @pytest.fixture()
@@ -649,7 +633,7 @@ def test_qt_headless_mpv_reads_muxed_audio_without_external_file(
     root, _target = multitrack_library_file
 
     from PySide6.QtWidgets import QApplication
-    from qasync import QEventLoop
+    from qt_helpers import playback_loop
 
     from desktop_client.mpv_view import MpvPlayerView
     from desktop_client.options import DesktopOptions
@@ -715,7 +699,7 @@ def test_qt_headless_mpv_reads_muxed_audio_without_external_file(
     try:
         # Enter Qt once from synchronous code; processEvents inside a coroutine
         # can re-enter queued asyncio timers and corrupt native event ownership.
-        with QEventLoop(app) as loop:
+        with playback_loop(app) as loop:
             loop.run_until_complete(scenario())
     finally:
         if player is not None:
