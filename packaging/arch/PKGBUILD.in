@@ -13,6 +13,7 @@ depends=(
   'python>=@PYTHON_MIN@' 'python<@PYTHON_MAX@'
   'python-av' 'python-numpy' 'python-aiohttp' 'python-zeroconf'
   'pyside6' 'python-qasync' 'python-mpv' 'mpv' 'qt6-wayland'
+  'python-dbus-next'
 )
 makedepends=('python-build' 'python-installer' 'python-setuptools' 'python-wheel')
 source=('client.tar.gz')

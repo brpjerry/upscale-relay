@@ -184,6 +184,48 @@ def local_player():
     player.close()
 
 
+def test_idle_inhibition_tracks_native_pause_eof_and_stop(tmp_path, local_player):
+    from qasync import QEventLoop
+    from upscale_cli.sample import make_sample
+
+    path = tmp_path / "idle.mkv"
+    make_sample(str(path), frames=48, width=64, height=64, fps=24)
+    player = local_player
+    states = []
+    player._idle_inhibitor = SimpleNamespace(set_active=states.append)
+
+    async def wait_until(predicate):
+        async with asyncio.timeout(5):
+            while not predicate():
+                await asyncio.sleep(0.025)
+
+    async def scenario():
+        try:
+            await player.play_local(str(path), paused=True)
+            await asyncio.sleep(0.05)
+            assert not states[-1]
+            # Native property changes cover mpv input.conf bindings as well as
+            # our own toolbar's pause command.
+            player.mpv.pause = False
+            await wait_until(lambda: states[-1])
+            player.mpv.pause = True
+            await wait_until(lambda: not states[-1])
+            player.mpv.pause = False
+            await wait_until(lambda: states[-1])
+            await wait_until(lambda: not states[-1])  # natural EOF
+            await player.play_local(str(path))
+            await wait_until(lambda: states[-1])
+            player.stop()
+            assert not states[-1]  # release before queued native stop events
+            await asyncio.sleep(0.1)
+            assert not states[-1]
+        finally:
+            player.stop()
+
+    with QEventLoop(QApplication.instance()) as loop:
+        loop.run_until_complete(scenario())
+
+
 @pytest.mark.parametrize("cancel_task", [False, True])
 def test_stop_or_cancel_pending_local_load_cleans_up(local_player, monkeypatch, cancel_task):
     player = local_player

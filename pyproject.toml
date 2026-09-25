@@ -19,6 +19,7 @@ gui = [
     "PySide6>=6.6",
     "qasync>=0.27",
     "python-mpv>=1.0",
+    "dbus-next>=0.2.3; sys_platform == 'linux'",
 ]
 # Server tray GUI (Windows): Qt without the client's python-mpv dependency.
 server-gui = [
