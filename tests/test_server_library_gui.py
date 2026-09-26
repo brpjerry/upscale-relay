@@ -45,7 +45,9 @@ class FakePlayer(QWidget):
         self.font_dir = None
 
     def start(self, session, queue, time_base, source_path=None, avg_rate=None,
-              source_has_audio=True):
+              source_has_audio=True, *, paused=False, remembered_tracks=None):
+        self.paused = paused
+        self.remembered_tracks = remembered_tracks
         self.started = (session, queue, time_base, source_path, avg_rate)
         self.source_has_audio = source_has_audio
 
@@ -163,11 +165,14 @@ class FakePagedLibraryClient(FakeLibraryClient):
 
 
 @pytest.fixture()
-def window(monkeypatch):
+def window(monkeypatch, tmp_path):
     app = QApplication.instance() or QApplication([])
     monkeypatch.setattr(main_window, "PlayerView", FakePlayer)
+    from PySide6.QtCore import QSettings
+    QSettings("upscale-relay", "test-server-library-gui").clear()
     result = main_window.MainWindow(options=DesktopOptions(
-        headless=True, settings_scope="test-server-library-gui"
+        headless=True, settings_scope="test-server-library-gui",
+        mpv_config_path=tmp_path / "mpv.conf", log_root=tmp_path / "logs",
     ))
     yield result
     result.client = None

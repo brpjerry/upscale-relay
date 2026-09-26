@@ -1,3 +1,3 @@
 """upscale-cli: offline video upscale pipeline (phase 1 of the video upscale relay)."""
 
-__version__ = "0.20.1"
+__version__ = "0.21.0"

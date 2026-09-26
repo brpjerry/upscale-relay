@@ -64,6 +64,35 @@ The desktop client loads the user's `mpv.conf`/`input.conf`
 re-asserted post-init in `mpv_view.py` because the config file overrides
 constructor options).
 
+## Desktop state and configuration ownership
+
+- `history.py`, `browser_state.py`, `discovery.py`, `mpv_config.py`,
+  `diagnostics.py`, and `playback_state.py` own the corresponding state;
+  `features.py` integrates their controls with the retained tree browsers.
+- History/browser records are versioned QSettings values. Local identities use
+  normalized absolute paths; server identities include configured host/port.
+  Stable progress saves every five seconds; resume excludes the first ten and
+  final 90 seconds. The final 90 seconds count as watched. Autoplay defaults on
+  and walks unwatched siblings in name order only after confirmed epoch EOS.
+- Open/stop/restart/fallback/autoplay transitions serialize native ownership.
+  Capture position, pause, track descriptors, and delays before teardown using
+  cached observations. Preserve the confirmed server barrier when cancelling.
+- `sid`, `slang`, `video-sync`, `interpolation`, and `tscale` belong to the shared
+  user `mpv.conf`, resolved through libmpv. The GUI discloses that edits also
+  affect standalone mpv. Never duplicate these defaults in QSettings, rewrite
+  named profiles, or reload the whole config into active playback. GUI edits
+  apply only exposed properties when stable; external edits wait for a new
+  session. Current-file track choices stay session-only and use descriptors.
+- Diagnostic display and client file logging default off independently. Metrics
+  and timed buffer reports continue with diagnostics hidden. Client logs use
+  timestamped Documents files, bounded queues/rollover, ten-file retention, and
+  URL/token redaction before queuing. Do not dump configuration contents.
+- Tests MUST isolate `settings_scope` and use temporary `mpv_config_path` and
+  `log_root` overrides (the options supply temporary defaults for isolated or
+  headless runs). Disable real discovery unless testing it. Never touch the
+  user's mpv configuration or production history. On CPU-only test machines,
+  use `RELAY_LOSSLESS_HEVC_PROFILE=x265-ultrafast` for the full suite.
+
 ## Hard rules (each one is a native crash or deadlock we actually hit)
 
 **PyAV / libav**
@@ -152,9 +181,11 @@ constructor options).
   frames, rebuffers, stalls. Passthrough takes inference out of the picture;
   put the model back once the behaviour is understood. The tells that you are
   measuring contention rather than the bug are `/status →
-  sessions[].pipeline.fps` below the source frame rate, the client's mpv
-  `cache` draining toward zero, and the client raising its own "server is not
-  keeping up" banner. This cost a round of confounded frame-drop measurements
+  sessions[].pipeline.fps` below the source frame rate and the client's mpv
+  `cache` draining toward zero. Desktop shows buffering and optional metrics;
+  the actionable "server is not keeping up" warning is an Android feature
+  and remains unimplemented on desktop. This cost a round of confounded
+  frame-drop measurements
   on 2026-07-26. Match the *network* the same way: a tier the client's Wi-Fi
   cannot carry starves it just as effectively, and looks identical.
 

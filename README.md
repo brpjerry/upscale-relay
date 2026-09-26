@@ -19,6 +19,15 @@ subtitle fonts by content hash instead of reopening the full source file.
 - **[Android client](https://github.com/brpjerry/upscale-relay-android)** — Kotlin/Compose client
   (separate repository)
 
+Desktop features include nearby-server discovery, saved progress and automatic
+resume, watched markers, optional next-video autoplay (on by default), shared
+Name/Newest sorting, and browser restoration. Playback settings preserve position,
+pause, tracks, and delays across stream restarts. The settings dock also exposes
+shared `mpv.conf` subtitle/sync/interpolation defaults and optional client logs;
+**editing those defaults also affects standalone mpv**. See the
+[desktop feature guide](docs/DESKTOP_FEATURES.md) for thresholds, persistence,
+logging locations, and test isolation.
+
 ## Layout
 
 | package | role |

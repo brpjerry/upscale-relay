@@ -438,3 +438,48 @@ def test_seek_after_network_eos_reloads_the_next_epoch():
             await asyncio.gather(task, return_exceptions=True)
 
     asyncio.run(scenario())
+
+
+def test_stale_terminal_callbacks_cannot_complete_new_load(local_player):
+    player = local_player
+    finished, failed = [], []
+    player.finished.connect(lambda: finished.append(True))
+    player.failed.connect(failed.append)
+    player._reloading = False
+    generation = player._load_generation
+    player._on_terminal(generation - 1, True, "old EOF")
+    player._on_terminal(generation - 1, False, "old failure")
+    assert not finished and not failed
+    player._on_terminal(generation, False, "missing relay EOS")
+    assert not finished
+    assert failed == ["missing relay EOS"]
+
+
+def test_native_eof_without_current_relay_eos_is_failure(tmp_path, local_player):
+    from fractions import Fraction
+    from qt_helpers import playback_loop
+    from upscale_cli.sample import make_sample
+    path = tmp_path / "incomplete.mkv"
+    make_sample(str(path), frames=24, width=64, height=64, fps=24)
+    player = local_player
+    finished, errors = [], []
+    player.finished.connect(lambda: finished.append(True))
+    player.failed.connect(errors.append)
+    async def scenario():
+        queue = asyncio.Queue()
+        queue.put_nowait(MediaPacket(path.read_bytes(), flags=FLAG_DISCONTINUITY))
+        player.start(SimpleNamespace(downlink_container="matroska"), queue, Fraction(1, 1000))
+        try:
+            async with asyncio.timeout(5):
+                while not player._fed:
+                    await asyncio.sleep(0.01)
+                player._buffer.finish()  # transport ends, but protocol never sent EOS
+                while not errors:
+                    await asyncio.sleep(0.02)
+            assert errors == ["Stream ended without confirmed relay EOS"]
+            assert not finished
+        finally:
+            player.stop()
+            await asyncio.sleep(0)
+    with playback_loop(QApplication.instance()) as loop:
+        loop.run_until_complete(scenario())

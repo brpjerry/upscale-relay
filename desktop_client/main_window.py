@@ -7,7 +7,7 @@ import ipaddress
 import time
 from pathlib import Path
 
-from PySide6.QtCore import QDir, QEvent, QStandardPaths, Qt, QTimer
+from PySide6.QtCore import QDir, QEvent, QStandardPaths, Qt, QTimer, Signal
 from PySide6.QtGui import (
     QCursor,
     QIcon,
@@ -28,6 +28,9 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QMainWindow,
+    QMenu,
+    QScrollArea,
+    QGroupBox,
     QMessageBox,
     QProgressBar,
     QPushButton,
@@ -55,6 +58,9 @@ from .chapters import (
     step_target,
 )
 from .settings import AppSettings
+from .features import DesktopFeatures
+from .browser_state import LocalLibraryProxy, restore_server_tree
+from .history import endpoint_key
 from .options import DesktopOptions
 
 try:
@@ -127,8 +133,11 @@ class SeekSlider(QSlider):
     groove so chapter boundaries are visible while scrubbing.
     """
 
+    cancelled = Signal()
+
     def __init__(self, *args) -> None:
         super().__init__(*args)
+        self._cancelled = False
         self._chapter_fractions: list[float] = []
 
     def set_chapter_marks(self, fractions: list[float]) -> None:
@@ -137,12 +146,41 @@ class SeekSlider(QSlider):
 
     def mousePressEvent(self, event) -> None:
         if event.button() == Qt.LeftButton:
+            self._cancelled = False
             value = QStyle.sliderValueFromPosition(
                 self.minimum(), self.maximum(),
                 round(event.position().x()), self.width(),
             )
             self.setSliderPosition(value)
         super().mousePressEvent(event)
+        if event.button() == Qt.LeftButton:
+            self.sliderMoved.emit(self.sliderPosition())
+
+    def _cancel_drag(self):
+        self._cancelled = True
+        self.blockSignals(True)
+        self.setSliderDown(False)
+        self.blockSignals(False)
+        self.cancelled.emit()
+
+    def focusOutEvent(self, event):
+        if self.isSliderDown():
+            self._cancel_drag()
+        super().focusOutEvent(event)
+
+    def keyPressEvent(self, event) -> None:
+        if event.key() == Qt.Key_Escape and self.isSliderDown():
+            self._cancel_drag()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:
+        if self._cancelled:
+            self._cancelled = False
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
 
     def paintEvent(self, event) -> None:
         super().paintEvent(event)
@@ -164,7 +202,7 @@ class SeekSlider(QSlider):
         painter.end()
 
 
-class MainWindow(QMainWindow):
+class MainWindow(DesktopFeatures, QMainWindow):
     def __init__(self, options: DesktopOptions | None = None):
         super().__init__()
         self.options = options or DesktopOptions()
@@ -173,6 +211,7 @@ class MainWindow(QMainWindow):
         self.settings = AppSettings(self.options.settings_scope)
         self.client: RelayClient | None = None
         self._server_caps: dict = {}
+        self._init_feature_state()
 
         # -- toolbar: server + session config --------------------------------
         bar = QToolBar("server")
@@ -228,6 +267,13 @@ class MainWindow(QMainWindow):
         bar.addWidget(self.browser_toggle)
         bar.addWidget(QLabel(" Server "))
         bar.addWidget(self.host_edit)
+        self.nearby_btn = QToolButton()
+        self.nearby_btn.setText("Nearby servers")
+        self.nearby_menu = QMenu(self.nearby_btn)
+        self.nearby_btn.setMenu(self.nearby_menu)
+        self.nearby_btn.setPopupMode(QToolButton.InstantPopup)
+        self._nearby_changed({})
+        bar.addWidget(self.nearby_btn)
         bar.addWidget(self.connect_btn)
         bar.addWidget(self.autoconnect_check)
         spacer = QWidget()
@@ -245,7 +291,10 @@ class MainWindow(QMainWindow):
             "Changing them restarts an active stream."
         )
         explanation.setWordWrap(True)
-        settings_layout.addWidget(explanation)
+        streaming_group = QGroupBox("Streaming")
+        streaming_layout = QVBoxLayout(streaming_group)
+        settings_layout.addWidget(streaming_group)
+        streaming_layout.addWidget(explanation)
         form = QFormLayout()
         form.setRowWrapPolicy(QFormLayout.WrapAllRows)
         for label, combo, help_text in (
@@ -259,10 +308,12 @@ class MainWindow(QMainWindow):
             combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
             combo.setToolTip(help_text)
             form.addRow(label, combo)
-        settings_layout.addLayout(form)
-        settings_layout.addWidget(self.deband_check)
-        settings_layout.addStretch(1)
-        self.playback_settings.setWidget(settings_page)
+        streaming_layout.addLayout(form)
+        streaming_layout.addWidget(self.deband_check)
+        settings_scroll = QScrollArea()
+        settings_scroll.setWidgetResizable(True)
+        settings_scroll.setWidget(settings_page)
+        self.playback_settings.setWidget(settings_scroll)
         self.addDockWidget(Qt.RightDockWidgetArea, self.playback_settings)
         self.playback_settings.hide()
         self.playback_settings_toggle.toggled.connect(self.playback_settings.setVisible)
@@ -275,9 +326,14 @@ class MainWindow(QMainWindow):
         self.fs_model.setNameFilters(VIDEO_EXTENSIONS)
         self.fs_model.setNameFilterDisables(False)
         self.tree = QTreeView()
-        self.tree.setModel(self.fs_model)
+        self.local_proxy = LocalLibraryProxy(self.history, self)
+        self.local_proxy.setSourceModel(self.fs_model)
+        self.local_proxy.set_order(self.settings.browser_sort)
+        self.tree.setModel(self.local_proxy)
         start_dir = self.settings.browse_dir or QDir.homePath()
-        self.tree.setRootIndex(self.fs_model.index(start_dir))
+        if not Path(start_dir).is_dir():
+            start_dir = QDir.homePath()
+        self.tree.setRootIndex(self.local_proxy.mapFromSource(self.fs_model.index(start_dir)))
         for col in range(1, 4):
             self.tree.hideColumn(col)
         self.tree.setHeaderHidden(True)
@@ -298,6 +354,12 @@ class MainWindow(QMainWindow):
         self.local_browser_panel = QWidget()
         bv = QVBoxLayout(self.local_browser_panel)
         bv.setContentsMargins(0, 0, 0, 0)
+        self.sort_combo = QComboBox()
+        self.sort_combo.addItem("Name", "name")
+        self.sort_combo.addItem("Newest", "mtime")
+        self.sort_combo.setCurrentIndex(self.sort_combo.findData(self.settings.browser_sort))
+        self.sort_combo.setToolTip("Sort both local and server libraries; directories stay first")
+        self.sort_combo.activated.connect(self.on_sort_changed)
         bv.addLayout(nav)
         bv.addWidget(self.tree)
 
@@ -307,6 +369,18 @@ class MainWindow(QMainWindow):
         self.browser_panel = QTabWidget()
         self.browser_panel.addTab(self.local_browser_panel, "Local")
         self.browser_panel.tabBar().setVisible(False)
+        # A QTabWidget corner widget gets zero height when its tab bar is
+        # hidden. Keep the shared sort control in an independent header so
+        # local-only browsing has the same usable control as Server browsing.
+        self.browser_container = QWidget()
+        browser_layout = QVBoxLayout(self.browser_container)
+        browser_layout.setContentsMargins(0, 0, 0, 0)
+        sort_row = QHBoxLayout()
+        sort_row.addWidget(QLabel("Sort"))
+        sort_row.addWidget(self.sort_combo)
+        sort_row.addStretch(1)
+        browser_layout.addLayout(sort_row)
+        browser_layout.addWidget(self.browser_panel)
         self.server_browser_panel: QWidget | None = None
         self.server_tree: QTreeView | None = None
         self.server_model: QStandardItemModel | None = None
@@ -428,6 +502,16 @@ class MainWindow(QMainWindow):
         transport = QHBoxLayout()
         transport.addWidget(self.play_btn)
         transport.addWidget(self.stop_btn)
+        self.seek_back_btn = QToolButton()
+        self.seek_back_btn.setText("−10 s")
+        self.seek_back_btn.setToolTip("Seek backward ten seconds")
+        self.seek_forward_btn = QToolButton()
+        self.seek_forward_btn.setText("+10 s")
+        self.seek_forward_btn.setToolTip("Seek forward ten seconds")
+        self.seek_back_btn.clicked.connect(lambda: self.on_seek_relative(-10.0))
+        self.seek_forward_btn.clicked.connect(lambda: self.on_seek_relative(10.0))
+        transport.addWidget(self.seek_back_btn)
+        transport.addWidget(self.seek_forward_btn)
         transport.addWidget(self.chapter_prev_btn)
         transport.addWidget(self.chapter_combo)
         transport.addWidget(self.chapter_next_btn)
@@ -484,7 +568,7 @@ class MainWindow(QMainWindow):
         # to rebuild/render its backing FBO continuously. Use Qt's rubber-band
         # preview and perform the expensive video resize once on release.
         self.split.setOpaqueResize(False)
-        self.split.addWidget(self.browser_panel)
+        self.split.addWidget(self.browser_container)
         self.split.addWidget(player_page)
         self.split.setStretchFactor(1, 1)
         self.split.setSizes([300, 900])
@@ -570,6 +654,7 @@ class MainWindow(QMainWindow):
         self._session_time_base = None
         self.seek_slider.sliderPressed.connect(lambda: setattr(self, "_slider_down", True))
 
+        self._init_feature_controls(settings_layout)
         self._apply_browser_visible(self.settings.browser_visible)
         self._update_idle_guidance()
         if self.settings.auto_connect:
@@ -657,12 +742,12 @@ class MainWindow(QMainWindow):
         if not p.is_dir():
             self.statusBar().showMessage(f"not a directory: {p}", 5000)
             return
-        self.tree.setRootIndex(self.fs_model.index(str(p)))
+        self.tree.setRootIndex(self.local_proxy.mapFromSource(self.fs_model.index(str(p))))
         self.path_edit.setText(str(p))
         self.settings.browse_dir = str(p)
 
     def on_up_dir(self) -> None:
-        current = self.fs_model.filePath(self.tree.rootIndex()) or QDir.rootPath()
+        current = self.fs_model.filePath(self.local_proxy.mapToSource(self.tree.rootIndex())) or QDir.rootPath()
         self._set_browse_root(str(Path(current).parent))
 
     def _on_browser_toggled(self, visible: bool) -> None:
@@ -674,13 +759,13 @@ class MainWindow(QMainWindow):
         back to the same size. Fullscreen hides it too, without disturbing the
         toggle's remembered state."""
         if visible:
-            self.browser_panel.setVisible(True)
+            self.browser_container.setVisible(True)
             self.split.setSizes(self._browser_sizes)
         else:
             sizes = self.split.sizes()
             if sizes and sizes[0] > 0:  # don't overwrite with an already-collapsed width
                 self._browser_sizes = sizes
-            self.browser_panel.setVisible(False)
+            self.browser_container.setVisible(False)
 
     def toggle_fullscreen(self) -> None:
         entering = not self.isFullScreen()
@@ -897,6 +982,7 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(text, 3000)
 
     def _error(self, title: str, message: str) -> None:
+        self.client_log.record("error", title=title, message=message)
         self.statusBar().showMessage(message, 10_000)
         # Non-modal on purpose: a modal dialog spins the Qt event loop inside
         # whatever coroutine raised the error, and qasync then re-enters
@@ -908,6 +994,8 @@ class MainWindow(QMainWindow):
 
     async def _adopt_connected_client(self, client: RelayClient, caps: dict) -> None:
         """Install a connected control client and reflect its capabilities."""
+        self._capture_browser()
+        self._browser_endpoint = endpoint_key(client.host, client.port)
         self.client = client
         self._server_caps = dict(caps)
         client.on_progress = self._on_open_progress
@@ -987,19 +1075,31 @@ class MainWindow(QMainWindow):
         refresh.clicked.connect(self.on_refresh_server_library)
         tree.doubleClicked.connect(self.on_server_file_activated)
         tree.expanded.connect(self.on_server_directory_expanded)
+        tree.setContextMenuPolicy(Qt.CustomContextMenu)
+        tree.customContextMenuRequested.connect(self._server_history_menu)
+        tree.expanded.connect(lambda _: self._browser_save_timer.start())
+        tree.collapsed.connect(lambda _: self._browser_save_timer.start())
+        tree.selectionModel().currentChanged.connect(lambda *_: self._browser_save_timer.start())
+        tree.verticalScrollBar().valueChanged.connect(lambda _: self._browser_save_timer.start())
         self.browser_panel.addTab(panel, "Server")
         self.browser_panel.tabBar().setVisible(True)
 
     def _remove_server_tab(self) -> None:
+        self._capture_browser()
+        self._listing_generation += 1
+        self._restoring_browser = False
         panel = self.server_browser_panel
         if panel is not None:
             index = self.browser_panel.indexOf(panel)
             if index >= 0:
+                self.browser_panel.blockSignals(True)
                 self.browser_panel.removeTab(index)
+                self.browser_panel.blockSignals(False)
             panel.deleteLater()
         self.server_browser_panel = None
         self.server_tree = None
         self.server_model = None
+        self._listing_endpoint = None
         self.server_placeholder = None
         self.server_refresh_btn = None
         self.browser_panel.tabBar().setVisible(self.browser_panel.count() > 1)
@@ -1010,7 +1110,12 @@ class MainWindow(QMainWindow):
             "folder" if is_dir else "video-x-generic",
             QStyle.SP_DirIcon if is_dir else QStyle.SP_FileIcon,
         )
-        item = QStandardItem(icon, node.get("name", ""))
+        label = node.get("name", "")
+        if not is_dir:
+            entry = self.history.entries.get(self._key_for("server_file", node.get("path", "")))
+            if entry:
+                label += f"  —  {entry.description}"
+        item = QStandardItem(icon, label)
         item.setEditable(False)
         item.setData(node.get("path", ""), Qt.UserRole)
         item.setData(node.get("type"), _SERVER_TYPE_ROLE)
@@ -1039,12 +1144,13 @@ class MainWindow(QMainWindow):
         client = self.client
         if client is None or self.server_model is None:
             return
+        generation = self._listing_generation
         if reset:
             parent.removeRows(0, parent.rowCount())
         page = await client.fetch_library_page(
-            path, cursor=cursor, limit=_SERVER_PAGE_SIZE,
+            path, cursor=cursor, limit=_SERVER_PAGE_SIZE, **self._server_sort_kwargs(),
         )
-        if client is not self.client or self.server_model is None:
+        if client is not self.client or self.server_model is None or generation != self._listing_generation:
             return
         root = page["tree"]
         for node in root.get("children", []):
@@ -1061,9 +1167,12 @@ class MainWindow(QMainWindow):
         if item is None or item.data(_SERVER_LOADED_ROLE):
             return
         item.setData(True, _SERVER_LOADED_ROLE)
+        generation = self._listing_generation
         try:
             await self._load_server_page(item, item.data(Qt.UserRole), reset=True)
         except Exception as err:
+            if generation != self._listing_generation:
+                return
             item.removeRows(0, item.rowCount())
             error = QStandardItem(f"Could not load folder: {err}")
             error.setEditable(False)
@@ -1078,18 +1187,25 @@ class MainWindow(QMainWindow):
         assert self.server_placeholder is not None
         assert self.server_tree is not None
         assert self.server_model is not None
+        self._capture_browser()
+        self._listing_generation += 1
+        generation = self._listing_generation
+        context = self.browser_state.context(self._browser_endpoint)
+        self._restoring_browser = True
         self.server_placeholder.setText("Loading server library…")
         self.server_placeholder.setVisible(True)
         self.server_tree.setVisible(False)
         try:
-            page = await client.fetch_library_page(limit=_SERVER_PAGE_SIZE)
+            page = await client.fetch_library_page(limit=_SERVER_PAGE_SIZE, **self._server_sort_kwargs())
         except Exception as err:
-            if client is self.client and self.server_placeholder is not None:
+            if client is self.client and self.server_placeholder is not None and generation == self._listing_generation:
                 self.server_placeholder.setText(f"Could not load server library:\n{err}")
+                self._restoring_browser = False
             return
-        if client is not self.client or self.server_model is None:
+        if client is not self.client or self.server_model is None or generation != self._listing_generation:
             return
         self.server_model.clear()
+        self._listing_endpoint = self._browser_endpoint
         invisible = self.server_model.invisibleRootItem()
         root = page["tree"]
         for node in root.get("children", []):
@@ -1098,16 +1214,49 @@ class MainWindow(QMainWindow):
             self._append_server_more(invisible, "", page["next_cursor"])
         if self.server_model.rowCount() == 0:
             self.server_placeholder.setText("Server library is empty.")
+            self._restoring_browser = False
             return
         self.server_placeholder.setVisible(False)
         self.server_tree.setVisible(True)
+        try:
+            await restore_server_tree(context, self.server_tree, self.server_model,
+                self._load_server_page,
+                lambda: client is self.client and generation == self._listing_generation,
+                type_role=_SERVER_TYPE_ROLE, loaded_role=_SERVER_LOADED_ROLE, cursor_role=_SERVER_CURSOR_ROLE)
+            if generation == self._listing_generation and self.browser_state.tab == "Server":
+                self.browser_panel.setCurrentWidget(self.server_browser_panel)
+        except Exception as err:
+            if generation == self._listing_generation:
+                self.statusBar().showMessage(f"Could not restore library position: {err}", 5000)
+        finally:
+            if generation == self._listing_generation:
+                self._restoring_browser = False
+
+    def _server_sort_kwargs(self):
+        supported = self._server_caps.get("library_sort", [])
+        sort = self.settings.browser_sort
+        self.sort_combo.setToolTip("Directories first. Server uses name order if the selected sort is unsupported."
+                                   if sort not in supported else "Sort both libraries; directories first")
+        return {"sort": sort} if sort in supported else {}
+
+    @asyncSlot(int)
+    async def on_sort_changed(self, _index):
+        self.settings.browser_sort = self.sort_combo.currentData()
+        self.local_proxy.set_order(self.settings.browser_sort)
+        if self.server_browser_panel is not None:
+            await self.on_refresh_server_library()
 
     # -- slots -----------------------------------------------------------------------
 
     @asyncSlot()
     async def on_connect(self) -> None:
+        await self._run_transition(self._connect)
+
+    async def _connect(self) -> None:
         if self.client is not None:
-            await self.client.close()
+            await self._teardown_session()
+            if self.client is not None:
+                await self.client.close()
             self.client = None
             self._remove_server_tab()
             self.conn_label.setText("disconnected")
@@ -1124,6 +1273,9 @@ class MainWindow(QMainWindow):
         client = RelayClient(host, port)
         try:
             caps = await client.connect()
+        except asyncio.CancelledError:
+            await client.close()
+            raise
         except Exception as err:
             await client.close()
             self._error("Connection failed", f"Could not reach {host}:{port}\n{err}")
@@ -1132,7 +1284,7 @@ class MainWindow(QMainWindow):
 
     @asyncSlot("QModelIndex")
     async def on_file_activated(self, index) -> None:
-        path = self.fs_model.filePath(index)
+        path = self.fs_model.filePath(self.local_proxy.mapToSource(index))
         if Path(path).is_dir():
             return
         if self.client is None:
@@ -1152,9 +1304,12 @@ class MainWindow(QMainWindow):
             path = item.data(Qt.UserRole)
             cursor = item.data(_SERVER_CURSOR_ROLE)
             parent.removeRow(item.row())
+            generation = self._listing_generation
             try:
                 await self._load_server_page(parent, path, cursor=cursor)
             except Exception as err:
+                if generation != self._listing_generation:
+                    return
                 error = QStandardItem(f"Could not load more: {err}")
                 error.setEditable(False)
                 error.setData("error", _SERVER_TYPE_ROLE)
@@ -1170,8 +1325,43 @@ class MainWindow(QMainWindow):
             return
         await self._start_session(path, source="server_file")
 
+    async def _run_transition(self, operation):
+        self._save_history()
+        async def run():
+            self._transitioning = True
+            try:
+                return await operation()
+            except asyncio.CancelledError:
+                await self._teardown_session()
+                raise
+            except Exception as err:
+                self._error("Playback transition failed", str(err))
+                await self._teardown_session()
+            finally:
+                self._transitioning = False
+                if self._session_source is None:
+                    self.play_btn.setEnabled(False)
+                    self.stop_btn.setEnabled(False)
+        return await self.transitions.run(run)
+
     async def _start_session(self, path: str, source: str = "uplink",
-                             resume_s: float | None = None) -> None:
+                             resume_s: float | None = None, snapshot=None) -> None:
+        self._restart_snapshot = snapshot
+        async def open_source():
+            if self._closing:
+                return
+            await self._open_session(path, source, resume_s, snapshot)
+        await self._run_transition(open_source)
+        if not self._transitioning:
+            self._restart_snapshot = None
+
+    async def _open_session(self, path: str, source: str = "uplink",
+                            resume_s: float | None = None, snapshot=None) -> None:
+        key = self._key_for(source, path)
+        if resume_s is None:
+            entry = self.history.entries.get(key)
+            resume_s = snapshot.position if snapshot else (entry.resume if entry else 0.0)
+        self._paused = snapshot.paused if snapshot else False
         await self._teardown_session()
         if self.client is None:  # teardown lost the connection and couldn't reconnect
             self._error("Not connected", "Lost the connection to the upscale server.")
@@ -1207,6 +1397,8 @@ class MainWindow(QMainWindow):
         )
         self.settings.model = cfg.model
         self.settings.quality_tier = cfg.quality_tier
+        self.stop_btn.setEnabled(True)
+        self.play_btn.setEnabled(True)
         self._set_opening(True, f"opening session for {Path(path).name}…")
         try:
             session = await self.client.open_session(cfg)
@@ -1221,7 +1413,17 @@ class MainWindow(QMainWindow):
             if hasattr(self.player, "set_subtitle_fonts_dir"):
                 self.player.set_subtitle_fonts_dir(font_dir)
             await self.client.attach_media()
-            await self.client.start_uplink()
+            track = self.client.track
+            initial_tb = track.time_base if track is not None else session.time_base
+            initial_duration = track.duration_seconds() if track is not None else session.duration_s
+            if resume_s and initial_duration:
+                resume_s = min(resume_s, max(0.0, initial_duration - 1.0))
+            if resume_s and initial_tb is not None:
+                # Seek before the first player load and before the local uplink
+                # starts: every packet the player sees belongs to the target epoch.
+                await self.client.seek(int(resume_s / float(initial_tb)))
+            else:
+                await self.client.start_uplink()
         except Exception as err:
             self._error("Session failed", str(err))
             # open_session may already have allocated a GPU pipeline before
@@ -1260,6 +1462,22 @@ class MainWindow(QMainWindow):
         )
         self._session_source = source
         self._session_path = path
+        self._history_key = key
+        self._stable_position = False
+        self._position_s = resume_s or 0.0
+        self.client_log.record("session_start", source=source, path=path, position=resume_s, paused=self._paused)
+        if self.mpv_config:
+            try:
+                self._refresh_mpv_controls(self.mpv_config.read())
+            except Exception as err:
+                self._error("mpv configuration", str(err))
+        if hasattr(self.player, "apply_defaults"):
+            try:
+                defaults = self.mpv_config.effective_values if self.mpv_config else self._next_defaults
+                self.player.apply_defaults(defaults)
+                self._pending_defaults.clear()
+            except Exception as err:
+                self._error("Could not apply mpv defaults", str(err))
         self._session_time_base = time_base
         self.player.client = self.client
         self.player.start(
@@ -1269,7 +1487,13 @@ class MainWindow(QMainWindow):
             source_path=original_media,
             avg_rate=avg_rate,
             source_has_audio=source_has_audio is not False,
+            paused=self._paused,
+            remembered_tracks=snapshot.tracks if snapshot else None,
         )
+        self.audio_delay.setValue(snapshot.audio_delay if snapshot else 0.0)
+        self.sub_delay.setValue(snapshot.sub_delay if snapshot else 0.0)
+        self.player.set_audio_delay(self.audio_delay.value())
+        self.player.set_sub_delay(self.sub_delay.value())
         self.idle_hint.hide()
         # Match Android's ordering: give mpv its per-load loopback first, then
         # release the server pipeline. Previously the server could produce into
@@ -1290,6 +1514,8 @@ class MainWindow(QMainWindow):
             raw_chapters = track.chapters()
         self._set_chapters(normalize_chapters(raw_chapters))
         self._pending_seek_s = None
+        if resume_s:
+            self._arm_pending_seek(resume_s)
         self.seek_slider.setEnabled(self._duration_s is not None)
         self.play_btn.setEnabled(True)
         self.stop_btn.setEnabled(True)
@@ -1299,15 +1525,14 @@ class MainWindow(QMainWindow):
         self.sub_delay.setEnabled(True)
         self.audio_combo.setEnabled(True)
         self.audio_delay.setEnabled(True)
-        self.play_btn.setIcon(self._icon_pause)
-        self.play_btn.setToolTip("Pause (Space)")
-        self._paused = False
+        self.play_btn.setIcon(self._icon_play if self._paused else self._icon_pause)
+        self.play_btn.setToolTip("Play (Space)" if self._paused else "Pause (Space)")
+        # A paused player still needs initial packets to establish its first
+        # frame. The live buffer report applies the usual server watermark.
         self.statusBar().showMessage(
             f"{Path(path).name} -> {session.downlink_codec} "
             f"{session.downlink_width}x{session.downlink_height}"
         )
-        if resume_s:  # restart (e.g. mode change): pick up where we left off
-            await self._resume_at(resume_s)
 
     async def _resume_at(self, target_s: float) -> None:
         if self._duration_s:
@@ -1318,6 +1543,9 @@ class MainWindow(QMainWindow):
 
     async def _seek_to_seconds(self, target_s: float, announce: bool = True) -> None:
         """Shared relay-protocol seek: slider, arrow keys, chapters, resume."""
+        if self._transitioning:
+            return
+        self.client_log.record("seek", target=target_s)
         target_s = max(0.0, target_s)
         if self._duration_s:
             target_s = min(target_s, max(0.0, self._duration_s - 1.0))
@@ -1359,12 +1587,18 @@ class MainWindow(QMainWindow):
         self.player.set_panscan(0.0)
 
     async def _restart_for_playback_setting(self) -> None:
-        """Apply a session-fixed setting without losing the playback place."""
-        if (self.client is not None and self.client.session is not None
-                and self._session_path is not None and self._session_source is not None):
-            await self._start_session(
-                self._session_path, source=self._session_source, resume_s=self._position_s
-            )
+        snapshot = self._restart_snapshot or self._snapshot()
+        if snapshot is None or snapshot.source == "local":
+            return
+        self._restart_snapshot = snapshot
+        self.client_log.record("settings_restart", position=snapshot.position)
+        async def restart():
+            # Coalesce UI changes before allocating another native pipeline.
+            await asyncio.sleep(0.15)
+            await self._open_session(snapshot.path, snapshot.source, snapshot.position, snapshot)
+        await self._run_transition(restart)
+        if not self._transitioning:
+            self._restart_snapshot = None
 
     @asyncSlot(int)
     async def on_model_changed(self, _index: int) -> None:
@@ -1397,6 +1631,13 @@ class MainWindow(QMainWindow):
 
     @asyncSlot()
     async def on_play_pause(self) -> None:
+        if self._transitioning:
+            self._paused = not self._paused
+            if self._restart_snapshot:
+                self._restart_snapshot.paused = self._paused
+            self.player.set_paused(self._paused)
+            self.play_btn.setIcon(self._icon_play if self._paused else self._icon_pause)
+            return
         local = self._session_source == "local"
         if not local and (self.client is None or self.client.session is None):
             return
@@ -1415,10 +1656,14 @@ class MainWindow(QMainWindow):
 
     @asyncSlot()
     async def on_stop(self) -> None:
-        await self._teardown_session()
+        self._restart_snapshot = None
+        await self._run_transition(self._teardown_session)
 
     @asyncSlot()
     async def on_seek(self) -> None:
+        if self.seek_slider._cancelled:
+            self._cancel_scrub()
+            return
         self._slider_down = False
         if self._duration_s is None:
             return
@@ -1427,7 +1672,8 @@ class MainWindow(QMainWindow):
     @asyncSlot(float)
     async def on_seek_relative(self, delta_s: float) -> None:
         """Arrow-key seek: relay-protocol seek relative to current position."""
-        await self._seek_to_seconds(self._position_s + delta_s)
+        base = self._pending_seek_s if self._pending_seek_s is not None else self._position_s
+        await self._seek_to_seconds(base + delta_s)
 
     @asyncSlot(int)
     async def on_chapter_selected(self, index: int) -> None:
@@ -1444,11 +1690,15 @@ class MainWindow(QMainWindow):
 
     @asyncSlot()
     async def on_fallback(self) -> None:
+        await self._run_transition(self._fallback)
+
+    async def _fallback(self) -> None:
         """Drop the relay session and play the original file directly."""
         if self._session_source != "uplink":
             return
         pos = self._position_s
         path = self._session_path
+        self.client_log.record("local_fallback", position=pos)
         if path is None:
             return
         # The control teardown closes the old downlink. Stop its consumer first
@@ -1515,7 +1765,7 @@ class MainWindow(QMainWindow):
             self.chapter_combo.blockSignals(False)
 
     def _on_tracks(self, subs: list, selected_sid=None) -> None:
-        # selected_sid: the track the player auto-selected (subs default on);
+        # selected_sid reflects native defaults or a restored session choice;
         # the fallback preview view still emits just the list.
         self.sub_combo.blockSignals(True)
         self.sub_combo.clear()
@@ -1539,6 +1789,8 @@ class MainWindow(QMainWindow):
         self.audio_combo.blockSignals(False)
 
     def _on_position(self, pos_s: float) -> None:
+        if self._transitioning:
+            return
         if self._pending_seek_s is not None:
             # While the server rebuilds the pipeline after a seek, the
             # reloading stream reports 0/stale positions — hold the bar at
@@ -1548,10 +1800,16 @@ class MainWindow(QMainWindow):
             if not near_target and time.monotonic() - self._pending_seek_t < 15.0:
                 return
             self._pending_seek_s = None
+        if self._transitioning:
+            return
         self._position_s = pos_s
+        if not hasattr(self.player, "telemetry_changed"):
+            self._stable_position = True
         self._show_position(pos_s)
 
     def _show_position(self, pos_s: float) -> None:
+        if self._slider_down:
+            return
         if self._duration_s and not self._slider_down:
             self.seek_slider.blockSignals(True)
             self.seek_slider.setValue(int(pos_s / self._duration_s * 1000))
@@ -1564,7 +1822,7 @@ class MainWindow(QMainWindow):
         """Snap the UI to the seek target and ignore stale positions."""
         self._pending_seek_s = target_s
         self._pending_seek_t = time.monotonic()
-        self._position_s = target_s
+        self._stable_position = False
         self._show_position(target_s)
 
     def _on_rebuffering(self, buffering: bool) -> None:
@@ -1577,19 +1835,63 @@ class MainWindow(QMainWindow):
             self.statusBar().clearMessage()
 
     def _on_player_failed(self, message: str) -> None:
+        if self._closing:
+            return
+        self.client_log.record("playback_failure", message=message)
         self._error("Playback failed", message)
-        asyncio.ensure_future(self._teardown_session())
+        asyncio.ensure_future(self.on_stop())
 
     def _end_session(self, reason: str) -> None:
-        self.statusBar().showMessage(reason, 5000)
-        asyncio.ensure_future(self._teardown_session())
+        if self._transitioning or self._closing:
+            return
+        snapshot = self._snapshot()
+        if snapshot is None:
+            return
+        self._save_history(completed=True)
+        generation = self.transitions.generation
+        async def complete():
+            if generation != self.transitions.generation:
+                return
+            async def advance():
+                active = self.transitions.generation
+                valid = lambda: active == self.transitions.generation and not self._closing
+                next_path = None
+                if self.settings.autoplay and snapshot.source != "local":
+                    try:
+                        next_path = await self._next_sibling(snapshot, valid)
+                    except Exception as err:
+                        self._error("Could not find next video", str(err))
+                if not valid():
+                    return
+                if next_path:
+                    self.client_log.record("autoplay", path=next_path)
+                    await self._open_session(next_path, snapshot.source)
+                else:
+                    await self._teardown_session()
+                    self.statusBar().showMessage(reason, 5000)
+            await self._run_transition(advance)
+        asyncio.ensure_future(complete())
 
     async def _teardown_session(self) -> None:
+        # Never interrupt the confirmed server barrier, even if a newer user
+        # intent cancels the open/restart operation that requested this cleanup.
+        task = asyncio.create_task(self._teardown_impl())
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            await task
+            raise
+
+    async def _teardown_impl(self) -> None:
+        self._save_history()
+        self._capture_browser()
+        if self._session_path:
+            self.client_log.record("session_stop", position=self._position_s)
         self.player.stop()
         self._pending_seek_s = None
         self._set_chapters([])
-        self.play_btn.setEnabled(False)
-        self.stop_btn.setEnabled(False)
+        self.play_btn.setEnabled(self._restart_snapshot is not None and not self._closing)
+        self.stop_btn.setEnabled(self._transitioning and not self._closing)
         self.fallback_btn.setEnabled(False)
         self.fallback_btn.setVisible(True)
         self.seek_slider.setEnabled(False)
@@ -1597,11 +1899,14 @@ class MainWindow(QMainWindow):
         self.sub_delay.setEnabled(False)
         self.audio_combo.setEnabled(False)
         self.audio_delay.setEnabled(False)
+        self._history_key = None
+        self._stable_position = False
         self._session_source = None
         self._session_path = None
         self._session_time_base = None
         self._duration_s = None
         self._position_s = 0.0
+        self._slider_down = False
         self.pos_label.setText("--:-- / --:--")
         self.player_status.clear()
         self._update_idle_guidance()
@@ -1623,6 +1928,9 @@ class MainWindow(QMainWindow):
                 self.connect_btn.setText("Connect")
                 self._error("Server cleanup not confirmed", str(err))
                 return
+            if self._closing:
+                self.client = None
+                return
             client = RelayClient(host, port)
             try:
                 caps = await client.connect()
@@ -1635,7 +1943,37 @@ class MainWindow(QMainWindow):
                 self.connect_btn.setText("Connect")
 
     def closeEvent(self, event) -> None:
-        self.player.stop()
-        if self.client is not None:
-            asyncio.ensure_future(self.client.close())
-        event.accept()
+        self._feature_timer.stop()
+        self._browser_save_timer.stop()
+        if hasattr(self, "config_watcher"):
+            self.config_watcher.close()
+        if self._close_ready:
+            event.accept()
+            return
+        self._save_history()
+        self._capture_browser()
+        self.settings._qs.sync()
+        self._closing = True
+        self._feature_timer.stop()
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            self.player.stop()
+            self.client_log.close()
+            event.accept()
+            return
+        event.ignore()
+        async def close():
+            try:
+                await self._run_transition(self._teardown_session)
+                if self.client is not None:
+                    await self.client.close()
+                task = getattr(self, "_discovery_task", None)
+                if task:
+                    await task
+                await self.discovery.close()
+            finally:
+                self.client_log.close()
+                self._close_ready = True
+                self.close()
+        asyncio.ensure_future(close())

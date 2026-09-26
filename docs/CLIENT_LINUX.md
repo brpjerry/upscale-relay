@@ -9,11 +9,11 @@ binaries are built on 3.14, but the client is not tied to that version.
 
 Download `upscale-relay-client-<version>-1-any.pkg.tar.zst` and `SHA256SUMS`
 from the [GitHub release](https://github.com/brpjerry/upscale-relay/releases).
-In the download directory, verify and install it with pacman:
+In the download directory, verify and install it with yay:
 
 ```bash
 sha256sum -c SHA256SUMS
-sudo pacman -U ./upscale-relay-client-*.pkg.tar.zst
+yay -U ./upscale-relay-client-*.pkg.tar.zst
 relay-desktop
 ```
 
@@ -31,7 +31,7 @@ for that interpreter (or replaced with a release built for it).
 To build from a checkout on Arch:
 
 ```bash
-sudo pacman -S --needed base-devel python-build python-installer python-setuptools python-wheel
+yay -S --needed base-devel python-build python-installer python-setuptools python-wheel
 python packaging/arch/prepare.py dist/pacman
 cd dist/pacman
 makepkg --syncdeps
@@ -56,15 +56,19 @@ sudo apt install python3-venv libmpv2 libxcb-cursor0
 - `libxcb-cursor0` — required by Qt 6.5+ on X11; PySide6 wheels bring the
   rest of Qt themselves.
 
-Fedora: `sudo dnf install mpv-libs libxcb` · Arch: `sudo pacman -S mpv`
+Fedora: `sudo dnf install mpv-libs libxcb` · Arch: `yay -S mpv`
 
 For hardware decode of the HEVC tiers (optional but recommended), install
 your GPU's VA-API/NVDEC userspace:
 - Intel: `intel-media-va-driver-non-free` (Ubuntu) / `intel-media-driver`
 - AMD: `mesa-va-drivers`
-- NVIDIA: the proprietary driver includes NVDEC; mpv uses it via `hwdec=auto-safe`.
+- NVIDIA: the proprietary driver includes NVDEC; the embedded player uses `hwdec=auto-copy-safe`.
 
 FFV1 has no hardware decoder on any platform — it always decodes on the CPU.
+With libmpv older than 0.38 (including Ubuntu 24.04's 0.37), FFV1 relay streams
+use libavformat's Matroska demuxer because the native mpv demuxer does not
+recognize the `V_FFV1` tag emitted by newer FFmpeg. This per-stream override
+preserves absolute timestamps and does not change ordinary local playback.
 
 The embedded Qt/OpenGL player uses mpv's safe copy-back hardware decode mode on
 Linux. In particular, it overrides `hwdec=vaapi` from a user's `mpv.conf` with
@@ -111,8 +115,17 @@ relay-desktop
 - **Wayland sessions** work natively through mpv's render API. If a driver has
   an OpenGL/Wayland interop problem, `QT_QPA_PLATFORM=xcb relay-desktop` is a
   useful XWayland fallback.
-- Enter the server as `<windows-box-ip>:8590` in the toolbar and Connect.
-- Settings persist in `~/.config/upscale-relay/`.
+- Select a **Nearby servers** result, or enter `<windows-box-ip>:8590`, then Connect.
+- Application settings and history persist in `~/.config/upscale-relay/`.
+- Saved progress resumes automatically; next-video autoplay defaults on.
+  Both trees retain Name/Newest sorting and show watched/last-played information.
+- The scrollable settings dock edits subtitle defaults/languages and video
+  sync/interpolation in the resolved user `mpv.conf`. **Changes also affect
+  standalone mpv.** Current-video track choices remain session-only.
+- Diagnostics and client file logging default off. Enabled logs use timestamped
+  files in the Qt-resolved Documents directory, retaining ten files; the dock
+  shows the actual path. See [desktop preferences](DESKTOP_FEATURES.md) for
+  resume thresholds, endpoint identities, restoration, and log bounds.
 
 During playback, the client asks the desktop's `org.freedesktop.ScreenSaver`
 service (including Hypridle) to keep the screen awake. Pausing, reaching the end,

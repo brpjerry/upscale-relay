@@ -21,8 +21,8 @@ contract and [SERVER_LIBRARY.md](SERVER_LIBRARY.md) for server-hosted media.
 | Server-side media library | **Implemented** | Repeatable `--library`, sandboxed single/multi-root listing and Range compatibility delivery, server demux/seek, capability-driven Server tab, negotiated in-band audio/subtitles, and cached subtitle fonts |
 | Server-side framing and resize filters | **Implemented** | Fit preserves the full frame; Cover center-crops before encode; the final post-ONNX downscale is selectable per server or session |
 | Shared-mount path mapping | **Planned** | Negotiated clients use muxed tracks; mapping one relative path to different client/server mount roots for legacy/external or direct-access workflows is not implemented |
-| Polish phase | **Partial** | model discovery/picker, metrics, manual host configuration, mounted shares, and fallback exist; discovery, pairing, hot model reload, and reconnect/resume remain |
-| Android client | **Phase 5.5 device-verified; muxed aux pending** | Server/local playback, recovery, discovery, adaptive UI, background media, and system controls are device-verified; server-library audio/subtitles still use external `/media` until the negotiated muxed-aux migration lands, and PGS/VobSub remains unrun for lack of a sample |
+| Polish phase | **Partial** | model discovery/picker, metrics, manual/discovered hosts, history/resume, autoplay, library sorting/restoration, shared mpv defaults, optional diagnostics/logging, mounted shares, and fallback exist; pairing, hot model reload, and automatic reconnect remain |
+| Android client | **Phase 5.5 and muxed auxiliary tracks implemented** | Server/local playback, recovery, discovery, adaptive UI, background media, and system controls; negotiated muxed audio/subtitles and verified font caching are implemented, with external compatibility fallback |
 
 ## Architecture
 
@@ -155,11 +155,23 @@ decode was fast enough for the measured pipeline.
 
 - PySide6 UI with native libmpv render API support on Wayland, X11, and
   Windows.
-- Local filesystem browser plus a capability-driven Server library tab.
+- Local filesystem browser plus a capability-driven Server library tab, shared
+  Name/Newest sorting, endpoint-specific tree restoration, and watched labels.
+- Asynchronous mDNS browsing beside manual address entry. Selecting a nearby
+  server fills the address; Connect remains explicit.
+- Versioned history (50 entries by default, adjustable 1–1,000), stable progress
+  saves every five seconds, automatic eligible resume before the first stream
+  load, watched actions, and alphabetical next-unwatched-sibling autoplay.
+- Shared `mpv.conf` subtitle/language, sync, and interpolation controls with
+  atomic merges and external-edit watching; current-file track choices remain
+  session-only. These edits also affect standalone mpv.
+- Independent opt-in diagnostic display and bounded client logging to Documents.
+  See [desktop preferences](DESKTOP_FEATURES.md) for defaults and exact policy.
 - Model, quality, fit/cover, resize filter, play/pause, seek, audio/subtitle
   track and delay, fullscreen, telemetry, and local fallback controls. Changing
   a session-fixed model, quality, framing, or resize setting restarts active
-  playback at its current position.
+  playback at its current position while preserving pause intent, metadata-matched
+  track choices, and audio/subtitle delays.
 - Embedded server-library audio/subtitles with cached font registration;
   external local/legacy tracks retain the one post-restart raw-argument
   `audio-add` path.
@@ -215,14 +227,15 @@ path mapping remains planned; see
 
 - **SMB:** OS-mounted shares and Windows UNC library roots work now. A direct
   `smb://` browser with credential storage is not implemented.
-- **Discovery and pairing:** add mDNS advertisement/browsing, a first-connect
-  code, persistent client credentials, and optional TLS.
+- **Pairing:** server advertisement and desktop/Android discovery are implemented.
+  Add a first-connect code, persistent client credentials, and optional TLS.
 - **Model management:** discovery, selection, and mid-play switching work now.
   Add directory watching, manifest validation UX, and benchmark metadata in
   capabilities.
-- **Recovery:** cleanup and manual local fallback work now. Add automatic
-  reconnect with session resume, keepalives/timeouts, and chaos coverage for
-  network outages.
+- **Recovery:** cleanup, saved-position reopening, and manual local fallback work
+  now. Add automatic reconnect with session resume, keepalives/timeouts, and
+  chaos coverage for network outages. Actionable desktop performance warnings,
+  recents, settings/history backup, and fullscreen settings access remain open.
 - **Performance/endurance:** continue per-stage profiling, two-hour drift and
   memory tests, quality-tier network measurements, and native crash diagnosis.
 - **Shared mounts:** map a library-relative identity to distinct server and
@@ -269,8 +282,8 @@ on desktop but is intentionally excluded from Android because it requires
 continuous software decode and the associated battery/thermal cost.
 See [https://github.com/brpjerry/upscale-relay-android/blob/main/docs/ANDROID_CLIENT.md](https://github.com/brpjerry/upscale-relay-android/blob/main/docs/ANDROID_CLIENT.md) for the phases and
 [https://github.com/brpjerry/upscale-relay-android/blob/main/docs/ANDROID_DEVICE_NOTES.md](https://github.com/brpjerry/upscale-relay-android/blob/main/docs/ANDROID_DEVICE_NOTES.md) for the validation record.
-The remaining negotiated muxed-track and verified-font-cache migration is
-specified in the [Android muxed-aux plan](https://github.com/brpjerry/upscale-relay-android/blob/main/docs/MUXED_AUX_TRACKS_PLAN.md).
+The negotiated muxed-track and verified-font-cache migration is implemented;
+its design and acceptance gates are recorded in the [Android muxed-aux plan](https://github.com/brpjerry/upscale-relay-android/blob/main/docs/MUXED_AUX_TRACKS_PLAN.md).
 
 ## Future/stretch work
 

@@ -28,6 +28,7 @@ from PySide6.QtGui import QGuiApplication, QOpenGLContext
 from PySide6.QtOpenGLWidgets import QOpenGLWidget
 
 from .options import DesktopOptions
+from .playback_state import PlaybackTelemetry, match_track, track_descriptor
 from .idle_inhibit import IdleInhibitor
 
 
@@ -282,6 +283,9 @@ def _mpv_key_name(event) -> str | None:
 
 
 class MpvPlayerView(QOpenGLWidget):
+    telemetry_changed = Signal(object)
+    log_message = Signal(str, str, str)
+    _terminal = Signal(int, bool, str)
     stats_changed = Signal(str)
     position_changed = Signal(float)  # seconds
     track_list_changed = Signal(list, object)  # [(sid, title)] subs, selected sid
@@ -402,15 +406,22 @@ class MpvPlayerView(QOpenGLWidget):
                     "input_vo_keyboard": "yes",
                     "input_cursor": "yes",
                 })
+        if self.options.mpv_config_path is not None:
+            config_path = Path(self.options.mpv_config_path)
+            extra["config"] = "no"
+            # Explicit config files keep test runs independent of system/user
+            # configuration and still exercise the actual native parser.
+            if config_path.exists():
+                extra["include"] = str(config_path)
         self.mpv = mpv.MPV(
-            log_handler=None,
-            loglevel="error",
+            log_handler=lambda level, prefix, message: self.log_message.emit(level, prefix, message),
+            loglevel="warn",
             keep_open="no",
             idle="yes",
             **extra,
         )
         self._default_sub_fonts_dir = getattr(self.mpv, "sub_fonts_dir", "")
-        if "config" in extra:
+        if not self.options.headless:
             # mpv.conf won over any constructor option it named; re-assert
             # the plumbing the relay breaks without (runtime sets beat the
             # config file). User prefs — shaders, volume, subtitle style,
@@ -438,6 +449,7 @@ class MpvPlayerView(QOpenGLWidget):
         self._task: asyncio.Task | None = None
         self._stats_task: asyncio.Task | None = None
         self._source_path: str | None = None
+        self._downlink_codec: str | None = None
         self._source_has_audio = True
         self._local_playback = False
         self._local_load_ready: asyncio.Future | None = None
@@ -448,6 +460,14 @@ class MpvPlayerView(QOpenGLWidget):
         self._pending_start: float | None = None  # seek target for next reload
         self._epoch_base = 0  # frames fed before the current epoch's stream
         self._tracks_reported = False
+        self._cached_tracks = []
+        self._cached_audio_delay = 0.0
+        self._cached_sub_delay = 0.0
+        self._remembered_tracks = {}
+        self._defaults = {}
+        self._relay_eos_epoch = None
+        self._transport_failed = False
+        self._entry_generations = {}
         self._chosen_subtitle_id: int | None = None
         self._subtitle_choice_made = False
         self._chosen_audio_id: int | None = None
@@ -488,15 +508,34 @@ class MpvPlayerView(QOpenGLWidget):
             if self._accept_playback_restart:
                 self._playback_restarted.emit(self._load_generation)
 
-        @self.mpv.event_callback("end-file")
+        self._terminal.connect(self._on_terminal)
+
+        @self.mpv.event_callback("start-file", "end-file")
         def on_end(event):
-            reason = str(getattr(event.data, "reason", ""))
-            # Suppress the EOF that our own reload produces when it closes the
-            # old buffer — only a true end-of-content should end the session.
-            if self._reloading:
+            entry = event.data.playlist_entry_id
+            if event.event_id.value == mpv.MpvEventID.START_FILE:
+                self._entry_generations[entry] = self._load_generation
                 return
+            generation = self._entry_generations.pop(entry, -1)
+            if self._reloading or generation != self._load_generation:
+                return
+            reason = str(getattr(event.data, "reason", ""))
             if reason in ("MpvEventEndFile.EOF", "eof", "0"):
-                self.finished.emit()
+                natural = self._local_playback or (
+                    self._relay_eos_epoch is not None
+                    and (self.client is None or self._relay_eos_epoch == self.client.epoch)
+                    and not self._transport_failed)
+                self._terminal.emit(generation, natural, "Stream ended without confirmed relay EOS")
+            elif reason in ("MpvEventEndFile.ERROR", "error", "4"):
+                self._terminal.emit(generation, False, f"mpv playback error {event.data.error}")
+
+    def _on_terminal(self, generation, natural, message):
+        if generation != self._load_generation or self._reloading:
+            return
+        if natural:
+            self.finished.emit()
+        else:
+            self.failed.emit(message)
 
     def _sync_idle_inhibition(self) -> None:
         # Observe mpv's actual pause state, including input.conf bindings. Do
@@ -568,12 +607,14 @@ class MpvPlayerView(QOpenGLWidget):
 
     def start(self, session, downlink_q: asyncio.Queue, time_base: Fraction,
               source_path: str | None = None, avg_rate: Fraction | None = None,
-              source_has_audio: bool = True) -> None:
+              source_has_audio: bool = True, *, paused: bool = False,
+              remembered_tracks: dict | None = None) -> None:
         self.stop()
         if session.downlink_container != "matroska":
             self.failed.emit(f"unsupported downlink container: {session.downlink_container}")
             return
         self._fps = float(avg_rate) if avg_rate else 30.0
+        self._downlink_codec = getattr(session, "downlink_codec", None)
         self._source_path = source_path
         self._source_has_audio = source_has_audio
         self._tracks_reported = False
@@ -581,7 +622,16 @@ class MpvPlayerView(QOpenGLWidget):
         self._subtitle_choice_made = False
         self._chosen_audio_id = None
         self._audio_choice_made = False
-        self._caller_paused = False
+        self._caller_paused = paused
+        self._remembered_tracks = dict(remembered_tracks or {})
+        def explicit(kind):
+            return kind in self._remembered_tracks and (
+                self._remembered_tracks[kind] is None or self._remembered_tracks[kind].get("explicit", True))
+        self._subtitle_choice_made = explicit("sub")
+        self._audio_choice_made = explicit("audio")
+        self._cached_tracks = []
+        self._relay_eos_epoch = None
+        self._transport_failed = False
         self._task = asyncio.create_task(self._consume(downlink_q))
         self._stats_task = asyncio.create_task(self._stats_loop())
 
@@ -597,12 +647,12 @@ class MpvPlayerView(QOpenGLWidget):
         settle = self._reload_settle_until - time.monotonic()
         if settle > 0:
             await asyncio.sleep(settle)
+        self._relay_eos_epoch = None
         self._buffer = _LoopbackStream()
         self._load_generation += 1
         self._fed = 0
-        # A seek is a new Matroska file. Embedded auxiliary tracks get fresh
-        # mpv ids from an identical deterministic header, so enumerate them
-        # again and reapply the user's explicit subtitle choice.
+        # A seek is a new Matroska file. Enumerate its tracks and remap cached
+        # descriptors before releasing the epoch; numeric IDs can change.
         self._tracks_reported = False
         self._restart_seen = False
         self._external_attach_started = False
@@ -621,6 +671,11 @@ class MpvPlayerView(QOpenGLWidget):
         # playback retains the user's network timeout. Transport errors and
         # stop/seek still close the pipe explicitly.
         load_options = "pause=yes,network-timeout=0"
+        if self._downlink_codec == "ffv1" and self.mpv.mpv_version_tuple < (0, 38, 0):
+            # New FFmpeg muxers use V_FFV1. mpv's native Matroska demuxer
+            # learned that tag in 0.38; older libmpv can decode it through
+            # libavformat. Scope this compatibility override to relay epochs.
+            load_options += ",demuxer=lavf,demuxer-lavf-format=matroska"
         if self.mpv.mpv_version_tuple >= (0, 38, 0):
             self.mpv.command(
                 "loadfile", self._buffer.uri, "replace", -1, load_options)
@@ -649,6 +704,7 @@ class MpvPlayerView(QOpenGLWidget):
         except Exception:
             pass
         self._reload_settle_until = time.monotonic() + 0.15
+        self._relay_eos_epoch = None
         self._fed = 0
         self._restart_seen = False
         self._external_ready = False
@@ -678,6 +734,8 @@ class MpvPlayerView(QOpenGLWidget):
         def attach() -> None:
             error: Exception | None = None
             try:
+                if generation != self._load_generation:
+                    return
                 # Add the original once, after the live stream has established
                 # its absolute PTS. mpv exposes all of that demuxer's audio and
                 # subtitle tracks; adding it twice needlessly opens/parses the
@@ -693,13 +751,6 @@ class MpvPlayerView(QOpenGLWidget):
                     "audio-add" if source_has_audio else "sub-add", source,
                     "select" if select else "auto",
                 )
-                if source_has_audio and chosen_audio is not None:
-                    self.mpv.aid = chosen_audio
-                if subtitle_choice_made:
-                    self.mpv.sid = (
-                        chosen_subtitle if chosen_subtitle is not None else "no")
-                elif chosen_subtitle is not None:
-                    self.mpv.sid = chosen_subtitle
 
                 # Unlike Android's MediaCodec build, desktop mpv does not
                 # reliably publish audio-pts while pause=yes holds the epoch.
@@ -711,7 +762,7 @@ class MpvPlayerView(QOpenGLWidget):
                 error = err
             if generation == self._load_generation:
                 if error is not None:
-                    self.failed.emit(f"external media attach: {error!r}")
+                    self._terminal.emit(generation, False, f"external media attach: {error!r}")
                 self._external_media_ready.emit(generation)
 
         threading.Thread(
@@ -730,12 +781,14 @@ class MpvPlayerView(QOpenGLWidget):
         if (self._epoch_released or not self._restart_seen
                 or not self._external_ready or not self._prebuffer_ready):
             return
+        self._autoselect_tracks(self.mpv.track_list or [])
         self._epoch_released = True
         self.mpv.pause = self._caller_paused
 
     def stop(self) -> None:
         self._idle_inhibitor.set_active(False)
         self._reloading = True  # suppress EOF caused by retiring our own pipe
+        self._reload_settle_until = time.monotonic() + 0.15
         ready = self._local_load_ready
         self._local_load_ready = None
         self._pending_local_seek = None
@@ -822,49 +875,73 @@ class MpvPlayerView(QOpenGLWidget):
         self.mouse_moved.emit(pos.x(), pos.y())
         super().mouseMoveEvent(event)
 
+    def apply_defaults(self, values: dict[str, str]) -> None:
+        """Apply only the exposed properties, never reload config into a stream."""
+        self._defaults.update(values)
+        for name, value in values.items():
+            if name == "sid" and self._subtitle_choice_made:
+                continue  # a current-file choice wins over global defaults
+            self.mpv.command("set", name, value)
+        if ("slang" in values or "sid" in values) and not self._subtitle_choice_made:
+            self._remembered_tracks.pop("sub", None)
+            self._tracks_reported = False
+        if "slang" in values and not self._subtitle_choice_made:
+            self.mpv.command("set", "sid", self._defaults.get("sid", "auto"))
+
+    def track_choices(self) -> dict:
+        flags = {"sub": self._subtitle_choice_made, "audio": self._audio_choice_made}
+        return {kind: ({**descriptor, "explicit": flags[kind]} if descriptor is not None else None)
+                for kind, descriptor in self._remembered_tracks.items()}
+
     def _autoselect_tracks(self, tracks: list) -> None:
-        """Subs on by default: external sub-files tracks carry no default
-        flag, so mpv selects none. Prefer the source's default track, else
-        the first. Same fallback for audio (mpv sometimes selects none on
-        live-stream loads)."""
-        if self._subtitle_choice_made:
-            self.mpv.sid = (
-                self._chosen_subtitle_id
-                if self._chosen_subtitle_id is not None else "no"
-            )
-        elif self._chosen_subtitle_id is not None:
-            # Preserve the initially auto-selected track across epochs too.
-            # mpv's own default choice can change when a seek begins between
-            # subtitle packets even though every stream remains in the header.
-            self.mpv.sid = self._chosen_subtitle_id
-        elif self.mpv.sid in (None, False, "no"):
-            subs = [t for t in tracks if t.get("type") == "sub"]
-            if subs:
-                pick = next((t for t in subs if t.get("default")), subs[0])
-                self.mpv.sid = pick["id"]
-        if self._audio_choice_made:
-            self.mpv.aid = self._chosen_audio_id
-        elif self._chosen_audio_id is not None:
-            self.mpv.aid = self._chosen_audio_id
-        elif self.mpv.aid in (None, False, "no"):
-            audio = [t for t in tracks if t.get("type") == "audio"]
-            if audio:
-                self.mpv.aid = audio[0]["id"]
+        self._cached_tracks = [dict(t) for t in tracks]
+        remembered = self._remembered_tracks
+        for kind, prop in (("audio", "aid"), ("sub", "sid")):
+            if kind in remembered:
+                descriptor = remembered[kind]
+                selected = match_track(descriptor, tracks) if descriptor is not None else "no"
+                if selected is not None:
+                    self.mpv.command("set", prop, str(selected))
+            elif kind == "sub":
+                # Native mpv language/default selection, including subtitle off.
+                self.mpv.command("set", "sid", self._defaults.get("sid", "auto"))
+        # Capture automatically chosen tracks too, so an epoch reload preserves
+        # the same descriptor even when the new stream assigns different IDs.
+        for kind, prop in (("audio", "aid"), ("sub", "sid")):
+            selected = getattr(self.mpv, prop)
+            track = next((t for t in tracks if t.get("type") == kind and t.get("id") == selected), None)
+            if track is not None:
+                remembered[kind] = track_descriptor(track, tracks)
+            if kind == "sub":
+                self._chosen_subtitle_id = selected if type(selected) is int else None
+            else:
+                self._chosen_audio_id = selected if type(selected) is int else None
 
     def select_audio(self, aid: int) -> None:
+        track = next((t for t in self._cached_tracks if t.get("type") == "audio" and t.get("id") == aid), None)
+        if track is not None:
+            self._remembered_tracks["audio"] = track_descriptor(track, self._cached_tracks)
         self._chosen_audio_id = aid
         self._audio_choice_made = True
         self.mpv.aid = aid
 
     def select_subtitle(self, sid: int | None) -> None:
+        track = next((t for t in self._cached_tracks if t.get("type") == "sub" and t.get("id") == sid), None)
+        if sid is None or track is not None:
+            self._remembered_tracks["sub"] = track_descriptor(track, self._cached_tracks) if track else None
         self._chosen_subtitle_id = sid
         self._subtitle_choice_made = True
         self.mpv.sid = sid if sid is not None else "no"
 
+    def delay_state(self):
+        return self._cached_audio_delay, self._cached_sub_delay
+
     def set_sub_delay(self, seconds: float) -> None:
+        self._cached_sub_delay = seconds
         self.mpv.sub_delay = seconds
 
     def set_audio_delay(self, seconds: float) -> None:
+        self._cached_audio_delay = seconds
         self.mpv.audio_delay = seconds
 
     def audio_output_state(self) -> tuple[int, bool]:
@@ -982,6 +1059,7 @@ class MpvPlayerView(QOpenGLWidget):
             while True:
                 pkt = await q.get()
                 if pkt is None:
+                    self._transport_failed = True
                     self.failed.emit("downlink closed")
                     return
                 # A receiver batch can have been waiting to publish while a
@@ -990,6 +1068,7 @@ class MpvPlayerView(QOpenGLWidget):
                 if self.client is not None and pkt.epoch != self.client.epoch:
                     continue
                 if pkt.eos:
+                    self._relay_eos_epoch = pkt.epoch
                     if self._buffer is not None:
                         self._buffer.finish()  # mpv plays out and emits eof
                     self._prebuffer_ready = True
@@ -1033,6 +1112,10 @@ class MpvPlayerView(QOpenGLWidget):
         was_buffering = False
         while True:
             await asyncio.sleep(0.5)
+            if self._reloading:
+                if self.client is not None:
+                    self.client.buffered_ms = 0
+                continue
             # Each property read fails independently: a transient error on one
             # must not skip the buffered_ms update — the server paces on the
             # reported value, and a frozen stale report wedges its
@@ -1069,6 +1152,28 @@ class MpvPlayerView(QOpenGLWidget):
             buffered_ms = mpv_buffered_ms + pre_mpv_ms
             if self.client is not None:
                 self.client.buffered_ms = buffered_ms
+            stable = self._epoch_released and not self._reloading and not bool(_prop("seeking", False))
+            if stable:
+                self._cached_audio_delay = float(_prop("audio_delay", 0) or 0)
+                self._cached_sub_delay = float(_prop("sub_delay", 0) or 0)
+                if self._tracks_reported:
+                    for kind, prop, cached in (("audio", "aid", self._chosen_audio_id), ("sub", "sid", self._chosen_subtitle_id)):
+                        selected = _prop(prop)
+                        selected = selected if type(selected) is int else None
+                        if selected != cached:
+                            track = next((t for t in self._cached_tracks if t.get("type") == kind and t.get("id") == selected), None)
+                            if selected is None or track:
+                                self._remembered_tracks[kind] = track_descriptor(track, self._cached_tracks) if track else None
+                                if kind == "sub":
+                                    self._chosen_subtitle_id = selected
+                                    self._subtitle_choice_made = True
+                                else:
+                                    self._chosen_audio_id = selected
+                                    self._audio_choice_made = True
+            self.telemetry_changed.emit(PlaybackTelemetry(
+                float(pos) if pos is not None else None, _prop("duration"), buffered_ms,
+                receive_stats["mbps"], drop or 0, avsync or 0.0, stable,
+            ))
             if buffering != was_buffering:
                 was_buffering = buffering
                 self.rebuffering.emit(buffering)

@@ -77,11 +77,25 @@ routes are advertised and the desktop retains its local-only browser appearance.
 
 ### Client core and desktop UI
 
+`RelayClient.fetch_library_page(..., sort=None)` accepts the optional sort key.
+Desktop uses the persisted Name/Newest preference for both trees, passing a
+server sort only when advertised. A sort change starts a fresh listing;
+generation checks reject late responses from older listings. Older servers keep
+name order while the selected preference is retained.
+
+Desktop history keys server files by normalized configured host/port plus relative
+path. Expanded directories, selected path, selected tab, and scroll anchors survive
+refresh/reconnect; restoration loads up to ten pages per directory, ancestors
+first, with missing paths falling back to the nearest available ancestor. Natural
+completion can open the next unwatched sibling using lazy **name-ordered** pages,
+independent of browser sorting. See [desktop preferences](DESKTOP_FEATURES.md)
+for history/resume thresholds, watched actions, and autoplay boundaries.
+
 - `RelayClient.fetch_library_page()` loads immediate directory pages and
   `media_url()` builds the Range URL for original tracks.
 - The sidebar becomes a tab widget only when a connected server advertises a
-  library. The existing Local tree is unchanged; the Server tab fetches a
-  directory when it is expanded and adds a page only when requested, supports
+  library. The existing Local tree is retained with a sorting/presentation proxy; the Server tab fetches a
+  directory when it is expanded and loads pages on request or bounded restoration, supports
   refresh, and reports empty/error states.
 - The Android browser uses the same shallow directory pages, keeps each
   directory's cursor while navigating, and appends another page from its
@@ -91,8 +105,8 @@ routes are advertised and the desktop retains its local-only browser appearance.
 - The Qt client requests muxed auxiliary tracks from capable servers and does
   not open `/media` after `session_opened` confirms them. Older/external-mode
   sessions still attach `/media` for audio/subtitles.
-- The Android client currently uses the external compatibility path; its
-  protocol/player migration is specified in the
+- Android also negotiates muxed auxiliary tracks and verified cached fonts,
+  retaining the external compatibility fallback. The migration is documented in the
   [Android muxed-aux plan](https://github.com/brpjerry/upscale-relay-android/blob/main/docs/MUXED_AUX_TRACKS_PLAN.md).
 - Local fallback is hidden for server files because the client has no local
   source to play directly.

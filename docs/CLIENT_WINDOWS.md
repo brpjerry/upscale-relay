@@ -59,12 +59,31 @@ the command reports that it cannot find `mpv-1.dll`, `mpv-2.dll`, or
 relay-desktop
 ```
 
+Choose a **Nearby servers** result or enter a server manually, then Connect.
+The Local/Server trees retain sorting and server navigation context. Saved
+progress resumes automatically; alphabetical next-video autoplay defaults on.
+Watched markers and the history limit are available in the browser/settings.
+
+The settings dock displays the `mpv.conf` location resolved by libmpv (including
+portable/config-directory selection). **Subtitle defaults/languages and video
+sync/interpolation changes there also affect standalone mpv.** Current-video
+track selections remain session-only. Application preferences and versioned
+history/browser records use QSettings under `upscale-relay/desktop-client`.
+Client diagnostics and logging default off. Enabled client logs use timestamped
+`upscale-relay-client-*.log` files under the platform Documents directory,
+including OneDrive/redirection, retaining ten files. See the
+[desktop feature guide](DESKTOP_FEATURES.md) for the complete behavior.
+
 For the complete local test suite, including the optional desktop modules:
 
 ```powershell
 $env:RELAY_LOSSLESS_HEVC_PROFILE = "x265-ultrafast"
 python -m pytest tests -q
 ```
+
+For the native continuity smoke specifically, run
+`python -m pytest tests/test_desktop_parity_playback.py -q`. Tests isolate
+QSettings and native configuration/log paths; do not remove that isolation.
 
 CI's Windows core job skips optional GUI tests; its Linux job exercises the
 offscreen GUI and CPU inference tests. A Windows developer environment with
