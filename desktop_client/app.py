@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import argparse
 import sys
+from pathlib import Path
 
 from PySide6.QtWidgets import QApplication
 from qasync import QEventLoop
@@ -28,6 +29,9 @@ def parse_args(argv: list[str] | None = None) -> tuple[DesktopOptions, list[str]
         "--settings-scope", metavar="NAME",
         help="use an isolated QSettings application name (primarily for tests)",
     )
+    parser.add_argument("--mpv-config-path", type=Path, help="override mpv.conf (for isolated tests)")
+    parser.add_argument("--log-root", type=Path, help="override client log directory")
+    parser.add_argument("--no-discovery", action="store_true", help="disable nearby server discovery")
     args, qt_args = parser.parse_known_args(argv)
     return DesktopOptions(
         debug=args.debug,
@@ -37,6 +41,9 @@ def parse_args(argv: list[str] | None = None) -> tuple[DesktopOptions, list[str]
         mpv_scripts=args.mpv_scripts,
         headless=args.headless,
         settings_scope=args.settings_scope,
+        mpv_config_path=args.mpv_config_path,
+        log_root=args.log_root,
+        discovery=False if args.no_discovery else None,
     ), qt_args
 
 

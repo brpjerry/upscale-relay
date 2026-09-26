@@ -1,7 +1,8 @@
 # Quality tier notes
 
-**Hardware decode status:** the client uses `hwdec=auto-safe` by default
-(NVDEC/D3D11 on Windows, VAAPI on Linux) — benefits the HEVC tiers; FFV1 has
+**Hardware decode status:** the client uses `hwdec=auto-safe` on Windows
+and safe copy-back `hwdec=auto-copy-safe` on Linux
+(NVDEC/D3D11 on Windows, VAAPI copy-back on Linux) — benefits the HEVC tiers; FFV1 has
 no hardware decoder anywhere (codec-inherent). Server-side NVDEC source
 decode is opt-in (`RELAY_NVDEC=1`): running it concurrently with NVENC encode
 in one process crashed natively on the dev machine; software source decode
@@ -104,9 +105,8 @@ Operational findings:
   3840x2160: **FFV1 ~61 fps, lossless-HEVC ~116 fps software decode** — both
   comfortable for 24/30 fps content on desktop. Android intentionally does not
   support FFV1 because no hardware decoder exists and sustained software
-  decode would increase battery drain and thermals. Android supports the two
-  HEVC choices instead (see [https://github.com/brpjerry/upscale-relay-android/blob/main/docs/ANDROID_CLIENT.md](https://github.com/brpjerry/upscale-relay-android/blob/main/docs/ANDROID_CLIENT.md)).
-- mpv uses `hwdec=auto-safe` by default. `relay-desktop --no-hwdec` forces
+  decode would increase battery drain and thermals. Android supports the bandwidth-labeled HEVC ladder and True Lossless HEVC instead (see [https://github.com/brpjerry/upscale-relay-android/blob/main/docs/ANDROID_CLIENT.md](https://github.com/brpjerry/upscale-relay-android/blob/main/docs/ANDROID_CLIENT.md)).
+- mpv uses `hwdec=auto-safe` on Windows and `auto-copy-safe` on Linux. `relay-desktop --no-hwdec` forces
   software decode for comparison; the client telemetry reports the decoder
   mpv actually selected.
 - Real lossless bitrate scales with content complexity; anime tends lower,

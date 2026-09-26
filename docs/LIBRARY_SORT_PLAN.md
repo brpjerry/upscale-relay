@@ -1,7 +1,7 @@
 # Plan: sortable library listings (`GET /library` sort parameter)
 
 Status: **implemented** — server (`relay_server/library.py`,
-`relay_server/server.py`) and the Android client both speak this protocol.
+`relay_server/server.py`) and both desktop and Android clients speak this protocol.
 The optional per-node `mtime` response field (section 3) remains deferred.
 
 ## Motivation
@@ -157,8 +157,12 @@ client refetches from offset 0 whenever the toggle changes.
 - Capabilities: `library_sort == ["name", "mtime"]` with `--library`, absent
   or `[]` without.
 
-Desktop client (`desktop_client/main_window.py`) is out of scope; it can
-adopt the same parameter later without protocol changes.
+Desktop uses one persisted Name/Newest preference for Local and Server. The
+local filesystem model is wrapped by a presentation/sorting proxy. Server
+requests send the selected sort only when advertised, retain the preference on
+older servers, and reject responses from obsolete listing generations. Browser
+restoration and autoplay use the same pagination contract; autoplay always walks
+name order. See [desktop preferences](DESKTOP_FEATURES.md).
 
 ## Client status (already shipped in upscale-relay-android)
 

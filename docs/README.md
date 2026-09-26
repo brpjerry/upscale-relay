@@ -7,6 +7,8 @@ instructions remain at the root.
 
 - [Architecture and roadmap](PLAN.md) — design decisions, shipped components,
   remaining work, and future phases.
+- [Desktop gaps relative to Android](DESKTOP_ANDROID_PARITY.md) — source-backed
+  comparison of delivered parity, remaining gaps, and platform-specific behavior.
 - [Wire protocol](PROTOCOL.md) — control messages, media framing, PTS/epoch
   semantics, seeks, and backpressure.
 - [Server-side media library](SERVER_LIBRARY.md) — the implemented `--library`
@@ -32,6 +34,12 @@ instructions remain at the root.
   device acceptance gates.
 
 ## Setup and operations
+
+- [Desktop library and playback preferences](DESKTOP_FEATURES.md) — discovery,
+  history/resume, autoplay, sorting, browser restoration, shared mpv defaults,
+  diagnostic visibility, logging, and verification.
+- [Library sorting](LIBRARY_SORT_PLAN.md) — implemented capability and paginated
+  sort contract used by desktop and Android.
 
 - [Windows client and development setup](CLIENT_WINDOWS.md) — Python
   environment, the exact libmpv archive/DLL layout, verification, GUI tests,

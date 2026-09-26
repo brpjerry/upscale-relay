@@ -97,3 +97,44 @@ class AppSettings:
     @browse_dir.setter
     def browse_dir(self, v: str) -> None:
         self._qs.setValue("browser/dir", v)
+
+    @property
+    def autoplay(self) -> bool:
+        return self._qs.value("library/autoplay", True, type=bool)
+
+    @autoplay.setter
+    def autoplay(self, value: bool):
+        self._qs.setValue("library/autoplay", value)
+
+    @property
+    def history_limit(self) -> int:
+        return max(1, min(1000, self._qs.value("library/history_limit", 50, type=int)))
+
+    @history_limit.setter
+    def history_limit(self, value: int):
+        self._qs.setValue("library/history_limit", max(1, min(1000, value)))
+
+    @property
+    def browser_sort(self) -> str:
+        value = self._qs.value("browser/sort", "name")
+        return value if value in ("name", "mtime") else "name"
+
+    @browser_sort.setter
+    def browser_sort(self, value: str):
+        self._qs.setValue("browser/sort", value)
+
+    @property
+    def diagnostics(self) -> bool:
+        return self._qs.value("diagnostics/display", False, type=bool)
+
+    @diagnostics.setter
+    def diagnostics(self, value: bool):
+        self._qs.setValue("diagnostics/display", value)
+
+    @property
+    def file_logging(self) -> bool:
+        return self._qs.value("diagnostics/file_logging", False, type=bool)
+
+    @file_logging.setter
+    def file_logging(self, value: bool):
+        self._qs.setValue("diagnostics/file_logging", value)

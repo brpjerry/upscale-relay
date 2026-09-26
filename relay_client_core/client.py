@@ -573,9 +573,12 @@ class RelayClient:
 
     async def fetch_library_page(
         self, path: str = "", *, cursor: str | None = None, limit: int = 100,
+        sort: str | None = None,
     ) -> dict:
         """Fetch one page of a directory's immediate children."""
         params = {"path": path, "limit": str(limit)}
+        if sort is not None:
+            params["sort"] = sort
         if cursor is not None:
             params["cursor"] = cursor
         async with self._http.get(

@@ -13,7 +13,7 @@ import socket
 
 log = logging.getLogger("relay.mdns")
 
-SERVICE_TYPE = "_upscalerelay._tcp.local."
+from relay_protocol.discovery import SERVICE_TYPE
 
 
 def txt_properties(protocol_version: int, media_port: int, server_name: str) -> dict[str, str]:
