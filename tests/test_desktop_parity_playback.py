@@ -4,6 +4,7 @@ RELAY_TEST_WAYLAND=1 with QT_QPA_PLATFORM=wayland also exercises the render API
 on a real compositor. Ordinary CI uses the native headless mpv backend.
 """
 import asyncio
+import logging
 import os
 from pathlib import Path
 from types import SimpleNamespace
@@ -42,6 +43,11 @@ def test_passthrough_resume_restart_seek_reopen_and_autoplay(tmp_path, monkeypat
     ))
     monkeypatch.setattr(window, "screen", lambda: SimpleNamespace(size=lambda: QSize(64, 64), devicePixelRatio=lambda: 1))
     errors = []
+    # Preserve native decoder/demuxer warnings in pytest's captured log. A
+    # numeric end-file error alone cannot diagnose differences in distro mpv.
+    window.player.log_message.connect(
+        lambda level, prefix, message: logging.getLogger(__name__).warning(
+            "mpv %s [%s]: %s", level, prefix, message.strip()))
     monkeypatch.setattr(window, "_error", lambda *args: errors.append(args))
     window.settings.quality_tier = "lossless-ffv1"
     window.show()
