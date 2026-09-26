@@ -430,6 +430,10 @@ class MpvPlayerView(QOpenGLWidget):
             self.mpv.hwdec = _render_hwdec_mode(self.options.no_hwdec)
             if not self.options.mpv_osc:
                 self.mpv.osc = False
+        # Apply after mpv.conf so player messages stay legible over bright
+        # video. OSD styling is separate from the source's subtitle styling.
+        self.mpv.osd_shadow_color = "#FF000000"
+        self.mpv.osd_shadow_offset = 2
         self._buffer: _LoopbackStream | None = None
         self._task: asyncio.Task | None = None
         self._stats_task: asyncio.Task | None = None

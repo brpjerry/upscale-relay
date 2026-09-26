@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
     QDockWidget,
     QFileSystemModel,
     QFormLayout,
+    QGraphicsDropShadowEffect,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -321,6 +322,11 @@ class MainWindow(QMainWindow):
         self.idle_hint.setWordWrap(True)
         self.idle_hint.setAttribute(Qt.WA_TransparentForMouseEvents)
         self.idle_hint.setStyleSheet("color: #dddddd; background: transparent;")
+        hint_shadow = QGraphicsDropShadowEffect(self.idle_hint)
+        hint_shadow.setColor(Qt.black)
+        hint_shadow.setOffset(2, 2)
+        hint_shadow.setBlurRadius(4)
+        self.idle_hint.setGraphicsEffect(hint_shadow)
         hint_font = self.idle_hint.font()
         hint_font.setPointSizeF(max(12.0, hint_font.pointSizeF()))
         self.idle_hint.setFont(hint_font)
