@@ -28,14 +28,19 @@ from qt_helpers import playback_loop
 
 
 @pytest.mark.parametrize("source", ["uplink", "server_file"])
-def test_passthrough_resume_restart_seek_reopen_and_autoplay(tmp_path, monkeypatch, source):
+@pytest.mark.parametrize("demuxer", ["default", "lavf"])
+def test_passthrough_resume_restart_seek_reopen_and_autoplay(tmp_path, monkeypatch, source, demuxer):
     source_path = tmp_path / "a.mkv"
     next_path = tmp_path / "b.mkv"
     make_sample(str(source_path), frames=1200, width=64, height=64, fps=10)
     make_sample(str(next_path), frames=120, width=64, height=64, fps=10)
     app = QApplication.instance() or QApplication([])
-    scope = f"test-parity-playback-{source}"
+    scope = f"test-parity-playback-{source}-{demuxer}"
     QSettings("upscale-relay", scope).clear()
+    if demuxer == "lavf":
+        # Exercise the old-mpv FFV1 compatibility path on modern libmpv too;
+        # absolute PTS and pause/seek behavior must agree across demuxers.
+        (tmp_path / "mpv.conf").write_text("demuxer=lavf\ndemuxer-lavf-format=matroska\n")
     window = MainWindow(options=DesktopOptions(
         headless=os.environ.get("RELAY_TEST_WAYLAND") != "1", no_hwdec=True,
         settings_scope=scope, mpv_config_path=tmp_path / "mpv.conf",

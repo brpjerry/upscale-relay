@@ -133,7 +133,8 @@ The feature tests cover history policy, configuration merging/watchers, discover
 sorting/restoration, startup cancellation, pause/track continuity, autoplay,
 logging, and scrub controls. Real passthrough tests cover local and server sources,
 resume, paused restart, seek, reopen, natural completion, and hidden-diagnostics
-buffer reporting. Run native Qt tests through `tests/qt_helpers.py::playback_loop`.
+buffer reporting, with both native and libavformat Matroska demuxers. Run native
+Qt tests through `tests/qt_helpers.py::playback_loop`.
 
 ```bash
 python -m pytest tests -q
@@ -143,7 +144,7 @@ RELAY_LOSSLESS_HEVC_PROFILE=x265-ultrafast python -m pytest tests -q
 QT_QPA_PLATFORM=wayland RELAY_TEST_WAYLAND=1 python -m pytest tests/test_desktop_parity_playback.py -q
 ```
 
-The full Linux suite passed on 2026-09-26: **342 passed, 4 skipped**, using
+The full Linux suite passed on 2026-09-26: **344 passed, 4 skipped**, using
 `RELAY_LOSSLESS_HEVC_PROFILE=x265-ultrafast` on the CPU-only test host. Native
 Wayland and headless passthrough checks also passed for both sources. This is not
 a new GPU throughput benchmark. Windows playback smoke still needs a Windows

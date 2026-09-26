@@ -65,6 +65,10 @@ your GPU's VA-API/NVDEC userspace:
 - NVIDIA: the proprietary driver includes NVDEC; the embedded player uses `hwdec=auto-copy-safe`.
 
 FFV1 has no hardware decoder on any platform — it always decodes on the CPU.
+With libmpv older than 0.38 (including Ubuntu 24.04's 0.37), FFV1 relay streams
+use libavformat's Matroska demuxer because the native mpv demuxer does not
+recognize the `V_FFV1` tag emitted by newer FFmpeg. This per-stream override
+preserves absolute timestamps and does not change ordinary local playback.
 
 The embedded Qt/OpenGL player uses mpv's safe copy-back hardware decode mode on
 Linux. In particular, it overrides `hwdec=vaapi` from a user's `mpv.conf` with

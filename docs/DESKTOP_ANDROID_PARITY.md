@@ -48,7 +48,7 @@ with the delivered features.
 
 The Linux checks include pure policy tests, Qt GUI tests, real headless libmpv
 passthrough, and **native Wayland passthrough for both local and server sources**.
-The full CPU-profile suite passed: **342 passed, 4 skipped**. The native checks
+The full CPU-profile suite passed: **344 passed, 4 skipped**. The native checks
 cover saved resume, paused restart, seek, reopening, and natural completion
 into autoplay. Windows native smoke was not run on this Linux host. See the
 [desktop guide](DESKTOP_FEATURES.md#verification-and-test-isolation) for commands

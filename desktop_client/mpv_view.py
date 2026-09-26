@@ -449,6 +449,7 @@ class MpvPlayerView(QOpenGLWidget):
         self._task: asyncio.Task | None = None
         self._stats_task: asyncio.Task | None = None
         self._source_path: str | None = None
+        self._downlink_codec: str | None = None
         self._source_has_audio = True
         self._local_playback = False
         self._local_load_ready: asyncio.Future | None = None
@@ -613,6 +614,7 @@ class MpvPlayerView(QOpenGLWidget):
             self.failed.emit(f"unsupported downlink container: {session.downlink_container}")
             return
         self._fps = float(avg_rate) if avg_rate else 30.0
+        self._downlink_codec = getattr(session, "downlink_codec", None)
         self._source_path = source_path
         self._source_has_audio = source_has_audio
         self._tracks_reported = False
@@ -669,6 +671,11 @@ class MpvPlayerView(QOpenGLWidget):
         # playback retains the user's network timeout. Transport errors and
         # stop/seek still close the pipe explicitly.
         load_options = "pause=yes,network-timeout=0"
+        if self._downlink_codec == "ffv1" and self.mpv.mpv_version_tuple < (0, 38, 0):
+            # New FFmpeg muxers use V_FFV1. mpv's native Matroska demuxer
+            # learned that tag in 0.38; older libmpv can decode it through
+            # libavformat. Scope this compatibility override to relay epochs.
+            load_options += ",demuxer=lavf,demuxer-lavf-format=matroska"
         if self.mpv.mpv_version_tuple >= (0, 38, 0):
             self.mpv.command(
                 "loadfile", self._buffer.uri, "replace", -1, load_options)
