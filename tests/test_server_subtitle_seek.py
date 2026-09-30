@@ -206,3 +206,29 @@ def test_replayed_long_subtitle_survives_actual_epoch_mux(subtitle_movie):
             await server.stop()
 
     asyncio.run(scenario())
+
+
+def test_far_forward_seek_indexes_only_a_bounded_lookback(subtitle_movie, monkeypatch):
+    # A far seek used to index the whole unplayed prefix (nearly the entire
+    # file for a long remux). It must start its scan within the lookback.
+    monkeypatch.setattr(demux_mod, "_SUBTITLE_LOOKBACK_S", 2.0)
+    track = AuxiliaryTrack(str(subtitle_movie))
+    scanned = []
+    original = track._remember_subtitle_progress
+
+    def remember(packet, **kwargs):
+        catching_up = track.subtitle_index_progress is not None
+        if catching_up and packet.stream.type == "video" and packet.dts is not None:
+            scanned.append(float(packet.dts * packet.time_base))
+        original(packet, **kwargs)
+
+    monkeypatch.setattr(track, "_remember_subtitle_progress", remember)
+    try:
+        assert [p.packet.pts for p in track.packets(10.5)] == [10000]
+        assert scanned and min(scanned) >= 8.0  # keyframe at/before 8.5, not 0
+        assert track._index_covered_s == float("-inf")  # the gap stays unclaimed
+        scanned.clear()
+        list(track.packets(10.5))
+        assert scanned == []  # the indexed window is reused, not rescanned
+    finally:
+        track.close()

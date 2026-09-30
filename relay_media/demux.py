@@ -23,6 +23,12 @@ log = logging.getLogger("relay.media")
 
 
 _AUDIO_PREROLL_S = 0.25
+# An unseen forward seek indexes subtitle events from at most this far before
+# the target. Scanning the whole unplayed prefix instead read nearly the entire
+# file on every far seek (minutes over SMB for a long remux). Dialogue lasts a
+# few seconds; an event that started earlier than this and is still on screen
+# at the target is not replayed.
+_SUBTITLE_LOOKBACK_S = 30.0
 _SAFE_ATTACHMENT_CHAR = re.compile(r"[^A-Za-z0-9._-]+")
 _FONT_MIME_TYPES = {
     "application/x-truetype-font",
@@ -263,6 +269,8 @@ class AuxiliaryTrack:
         self._subtitle_index: SubtitleIndex | None = None
         self._index_covered_s = float("-inf")
         self._index_eof = False
+        # Non-contiguous [start, end) spans indexed by bounded seek lookbacks.
+        self._index_windows: list[tuple[float, float]] = []
         self.subtitle_index_progress: tuple[float, float] | None = None
         raw_attachments = list(self._container.streams.attachments)
         self.attachments = self._cached_attachment_info(path, raw_attachments)
@@ -380,41 +388,59 @@ class AuxiliaryTrack:
                 self._index_covered_s = max(self._index_covered_s, float(stamp * packet.time_base))
 
     def _catch_up_subtitles(self, target_s: float, gen: int) -> bool:
-        """Only unseen forward seeks read extra source data; never decode it.
+        """Index subtitles overlapping an unseen forward seek; never decode.
 
-        The caller holds _lock. Cancellation invalidates gen without acquiring
-        that native lock, so each completed read can end the old scan promptly.
+        Reads at most ``_SUBTITLE_LOOKBACK_S`` of source before the target, not
+        the whole unplayed prefix. The caller holds _lock. Cancellation
+        invalidates gen without acquiring that native lock, so each completed
+        read can end the old scan promptly.
         """
         if not self._subtitle_streams or self._index_eof or self._index_covered_s > target_s:
             return True
-        log.info("indexing subtitles through %.2fs for seek", target_s)
-        self.subtitle_index_progress = (target_s, max(0.0, self._index_covered_s))
+        window_start = max(0.0, target_s - _SUBTITLE_LOOKBACK_S)
+        if any(start <= window_start and end > target_s for start, end in self._index_windows):
+            return True
+        # Extend the contiguous prefix when it already reaches the window, so
+        # normal playback bookkeeping stays exact; otherwise index a detached
+        # window without claiming the gap before it.
+        contiguous = self._index_covered_s >= window_start
+        scan_from = max(0.0, self._index_covered_s) if contiguous else window_start
+        scanned_s = scan_from
+        log.info("indexing subtitles %.2fs..%.2fs for seek", scan_from, target_s)
+        self.subtitle_index_progress = (target_s, scan_from)
         try:
             # This epoch has invalidated the previous auxiliary iterator, so
             # reuse its native owner for catchup. A fourth input container
             # would duplicate large embedded font bundles in memory.
             anchor = self._seek_stream
-            covered_s = max(0.0, self._index_covered_s)
             if anchor is not None and anchor.time_base is not None:
                 self._container.seek(
-                    int(covered_s / float(anchor.time_base)),
+                    int(scan_from / float(anchor.time_base)),
                     stream=anchor, backward=True, any_frame=False,
                 )
             else:
-                self._container.seek(int(covered_s * av.time_base), backward=True, any_frame=False)
+                self._container.seek(int(scan_from * av.time_base), backward=True, any_frame=False)
             index_iterator = iter(self._container.demux([
                 *([anchor] if anchor is not None else []), *self._subtitle_streams,
             ]))
-            while self._index_covered_s <= target_s and not self._index_eof:
+            while scanned_s <= target_s:
                 if gen != self._iter_gen:
                     return False
                 try:
                     packet = next(index_iterator)
                 except StopIteration:
-                    self._index_eof = True
+                    if contiguous:
+                        self._index_eof = True
+                    scanned_s = float("inf")
                     break
-                self._remember_subtitle_progress(packet, contiguous=True)
-                self.subtitle_index_progress = (target_s, max(0.0, self._index_covered_s))
+                self._remember_subtitle_progress(packet, contiguous=contiguous)
+                if anchor is not None and packet.stream.index == anchor.index:
+                    stamp = packet.dts if packet.dts is not None else packet.pts
+                    if stamp is not None and packet.time_base is not None:
+                        scanned_s = max(scanned_s, float(stamp * packet.time_base))
+                self.subtitle_index_progress = (target_s, scanned_s)
+            if not contiguous and gen == self._iter_gen:
+                self._index_windows.append((window_start, scanned_s))
             return gen == self._iter_gen
         finally:
             self.subtitle_index_progress = None
