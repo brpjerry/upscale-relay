@@ -217,7 +217,7 @@ synchronization.
 
 The current server preserves overlapping ASS/SSA, SubRip, WebVTT, and plain-text
 subtitle events with a temporary per-session packet index. Normal demux fills
-it progressively; an unseen forward seek scans at most 30 s of source before
+it progressively; an unseen forward seek scans at most 10 s of source before
 the target (never the whole unplayed prefix, which made far seeks in long files
 read nearly the entire file) without decoding video, and reports `seek_progress.stage:"subtitle_index"`,
 `message`, and `subtitle_indexed_s` while doing so. Repeated/backward seeks reuse

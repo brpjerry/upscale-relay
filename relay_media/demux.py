@@ -28,7 +28,7 @@ _AUDIO_PREROLL_S = 0.25
 # file on every far seek (minutes over SMB for a long remux). Dialogue lasts a
 # few seconds; an event that started earlier than this and is still on screen
 # at the target is not replayed.
-_SUBTITLE_LOOKBACK_S = 30.0
+_SUBTITLE_LOOKBACK_S = 10.0
 _SAFE_ATTACHMENT_CHAR = re.compile(r"[^A-Za-z0-9._-]+")
 _FONT_MIME_TYPES = {
     "application/x-truetype-font",
