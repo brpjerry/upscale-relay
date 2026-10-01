@@ -610,10 +610,19 @@ def main() -> None:
     args = build_arg_parser().parse_args()
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
                         format="%(asctime)s %(name)s %(levelname)s %(message)s")
+    from .instance_lock import AlreadyRunningError, acquire_instance_lock
+
+    try:
+        instance_lock = acquire_instance_lock()
+    except AlreadyRunningError as error:
+        print(f"relay-server: {error}", file=sys.stderr)
+        sys.exit(1)
     try:
         asyncio.run(main_async(args))
     except KeyboardInterrupt:
         pass
+    finally:
+        instance_lock.release()
 
 
 if __name__ == "__main__":
