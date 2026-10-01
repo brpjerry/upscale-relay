@@ -45,6 +45,7 @@ from PySide6.QtWidgets import (
 
 from . import autostart
 from .gui_settings import ServerSettings, available_ep_choices
+from .instance_lock import AlreadyRunningError, acquire_instance_lock
 from .logo import make_icon, paint_logo  # noqa: F401  (re-exported; tests import from here)
 from .server import RelayServer
 
@@ -686,6 +687,15 @@ def main() -> None:
     # A tray-only app: closing the config pane must not exit the process.
     app.setQuitOnLastWindowClosed(False)
 
+    # Before the runtime check and the tray: a second instance must not run
+    # the installer or contend for the GPU. Not in coroutine context yet, so
+    # a modal box is safe here.
+    try:
+        instance_lock = acquire_instance_lock()
+    except AlreadyRunningError as error:
+        QMessageBox.critical(None, _APP_NAME, str(error))
+        sys.exit(1)
+
     if not QSystemTrayIcon.isSystemTrayAvailable():
         QMessageBox.critical(
             None, _APP_NAME,
@@ -707,6 +717,7 @@ def main() -> None:
         # run the initial startup, then hand control to the tray event loop.
         loop.run_until_complete(tray.start())
         loop.run_forever()
+    instance_lock.release()
 
 
 if __name__ == "__main__":

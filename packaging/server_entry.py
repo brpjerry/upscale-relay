@@ -33,6 +33,15 @@ if __name__ == "__main__":
     # Help must remain instant/offline. Ordinary startup prepares the runtime
     # before the server can accept a model-backed session.
     if not any(arg in ("-h", "--help", "--check") for arg in sys.argv[1:]):
+        # Refuse a second server before it can start a concurrent runtime
+        # install; main() re-acquires the same lock as a no-op.
+        from relay_server.instance_lock import AlreadyRunningError, acquire_instance_lock
+
+        try:
+            acquire_instance_lock()
+        except AlreadyRunningError as error:
+            print(f"relay-server: {error}", file=sys.stderr)
+            raise SystemExit(1)
         if not ensure_runtime_console():
             raise SystemExit(1)
     from relay_server.server import main
