@@ -15,6 +15,7 @@ from .discovery import ServerDiscovery
 from .history import HistoryStore, source_key
 from .mpv_config import ConfigWatcher, DEFAULTS, MpvConfig
 from .playback_state import PlaybackSnapshot, Transitions
+from .settings import FAST_FORWARD_MAX_S
 
 
 class DesktopFeatures:
@@ -100,6 +101,14 @@ class DesktopFeatures:
             self.config_watcher = ConfigWatcher(self.mpv_config, self)
             self.config_watcher.changed.connect(self._refresh_mpv_controls)
             self.config_watcher.failed.connect(lambda message: self._error("mpv configuration", message))
+        form = group("Controls")
+        self.fast_forward_spin = QSpinBox()
+        self.fast_forward_spin.setRange(1, FAST_FORWARD_MAX_S)
+        self.fast_forward_spin.setSuffix(" s")
+        self.fast_forward_spin.setValue(self.settings.fast_forward_s)
+        self.fast_forward_spin.setToolTip("How far the fast-forward button and Shift+Right skip ahead.")
+        self.fast_forward_spin.valueChanged.connect(self._set_fast_forward)
+        form.addRow("Fast-forward amount", self.fast_forward_spin)
         form = group("Library")
         self.autoplay_check = QCheckBox("Play the next video automatically")
         self.autoplay_check.setChecked(self.settings.autoplay)
@@ -228,6 +237,10 @@ class DesktopFeatures:
         self.history.limit = value
         self.history.flush()
         self._refresh_history_labels()
+
+    def _set_fast_forward(self, value):
+        self.settings.fast_forward_s = value
+        self._show_fast_forward_amount(self.settings.fast_forward_s)
 
     def _set_diagnostics(self, value):
         self.settings.diagnostics = value

@@ -57,7 +57,7 @@ from .chapters import (
     slider_fractions,
     step_target,
 )
-from .settings import AppSettings
+from .settings import AppSettings, format_skip
 from .features import DesktopFeatures
 from .browser_state import LocalLibraryProxy, restore_server_tree
 from .history import endpoint_key
@@ -510,8 +510,12 @@ class MainWindow(DesktopFeatures, QMainWindow):
         self.seek_forward_btn.setToolTip("Seek forward ten seconds")
         self.seek_back_btn.clicked.connect(lambda: self.on_seek_relative(-10.0))
         self.seek_forward_btn.clicked.connect(lambda: self.on_seek_relative(10.0))
+        self.fast_forward_btn = QToolButton()
+        self.fast_forward_btn.clicked.connect(lambda: self.on_fast_forward())
+        self._show_fast_forward_amount(self.settings.fast_forward_s)
         transport.addWidget(self.seek_back_btn)
         transport.addWidget(self.seek_forward_btn)
+        transport.addWidget(self.fast_forward_btn)
         transport.addWidget(self.chapter_prev_btn)
         transport.addWidget(self.chapter_combo)
         transport.addWidget(self.chapter_next_btn)
@@ -636,6 +640,8 @@ class MainWindow(DesktopFeatures, QMainWindow):
         self.player.rebuffering.connect(self._on_rebuffering)
         if hasattr(self.player, "seek_requested"):
             self.player.seek_requested.connect(self.on_seek_relative)
+        if hasattr(self.player, "fast_forward_requested"):
+            self.player.fast_forward_requested.connect(self.on_fast_forward)
         if hasattr(self.player, "mouse_moved"):
             self.player.mouse_moved.connect(self._on_player_mouse_moved)
         self.player.finished.connect(lambda: self._end_session("end of stream"))
@@ -1674,6 +1680,17 @@ class MainWindow(DesktopFeatures, QMainWindow):
         """Arrow-key seek: relay-protocol seek relative to current position."""
         base = self._pending_seek_s if self._pending_seek_s is not None else self._position_s
         await self._seek_to_seconds(base + delta_s)
+
+    def on_fast_forward(self):
+        """Fast-forward button and Shift+Right: skip the configured amount."""
+        return self.on_seek_relative(float(self.settings.fast_forward_s))
+
+    def _show_fast_forward_amount(self, seconds: int) -> None:
+        self.fast_forward_btn.setText(f"+{format_skip(seconds)}")
+        self.fast_forward_btn.setToolTip(
+            f"Fast forward {format_skip(seconds)} (Shift+Right). "
+            "Change the amount in Playback settings."
+        )
 
     @asyncSlot(int)
     async def on_chapter_selected(self, index: int) -> None:

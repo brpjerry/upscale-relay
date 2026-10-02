@@ -7,6 +7,19 @@ from PySide6.QtCore import QSettings
 _ORG = "upscale-relay"
 _APP = "desktop-client"
 
+FAST_FORWARD_DEFAULT_S = 85  # 1:25, a typical opening sequence
+FAST_FORWARD_MAX_S = 3600
+
+
+def _clamp_fast_forward(value: int) -> int:
+    return max(1, min(FAST_FORWARD_MAX_S, int(value)))
+
+
+def format_skip(seconds: int) -> str:
+    """Compact m:ss label for the fast-forward button ("1:25", "0:30")."""
+    minutes, secs = divmod(int(seconds), 60)
+    return f"{minutes}:{secs:02d}"
+
 
 class AppSettings:
     def __init__(self, scope: str | None = None):
@@ -89,6 +102,14 @@ class AppSettings:
     @deband_enabled.setter
     def deband_enabled(self, v: bool) -> None:
         self._qs.setValue("playback/deband", bool(v))
+
+    @property
+    def fast_forward_s(self) -> int:
+        return _clamp_fast_forward(self._qs.value("playback/fast_forward_s", FAST_FORWARD_DEFAULT_S, type=int))
+
+    @fast_forward_s.setter
+    def fast_forward_s(self, v: int) -> None:
+        self._qs.setValue("playback/fast_forward_s", _clamp_fast_forward(v))
 
     @property
     def browse_dir(self) -> str:
