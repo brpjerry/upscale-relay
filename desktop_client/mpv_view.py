@@ -294,7 +294,6 @@ class MpvPlayerView(QOpenGLWidget):
     rebuffering = Signal(bool)
     pause_requested = Signal()  # keyboard and toolbar share application intent
     seek_requested = Signal(float)  # relative seconds (arrow keys)
-    fast_forward_requested = Signal()  # Shift+Right; the window owns the amount
     chapter_step_requested = Signal(int)  # +1 next / -1 previous (PgUp/PgDn)
     finished = Signal()
     failed = Signal(str)
@@ -310,8 +309,7 @@ class MpvPlayerView(QOpenGLWidget):
     # PgUp/PgDn are relay chapter steps for the same reason (mpv's builtin
     # chapter seek would act on the chapter-less live stream), F is the Qt
     # window's fullscreen (mpv has no window on the render-API path), Esc
-    # propagates up to exit fullscreen, Shift+Right is the configurable fast
-    # forward. Everything else is translated and
+    # propagates up to exit fullscreen. Everything else is translated and
     # forwarded so user input.conf bindings work.
     _SEEK_KEYS = {
         Qt.Key_Left: -5.0, Qt.Key_Right: 5.0,
@@ -860,9 +858,6 @@ class MpvPlayerView(QOpenGLWidget):
             if key in self._CHAPTER_KEYS:
                 self.chapter_step_requested.emit(self._CHAPTER_KEYS[key])
                 return
-        if key == Qt.Key_Right and event.modifiers() & ~Qt.KeypadModifier == Qt.ShiftModifier:
-            self.fast_forward_requested.emit()
-            return
         mpv_key = _mpv_key_name(event)
         if mpv_key is not None and mpv_key not in self._BLOCKED_KEYS:
             try:

@@ -106,9 +106,9 @@ class DesktopFeatures:
         self.fast_forward_spin.setRange(1, FAST_FORWARD_MAX_S)
         self.fast_forward_spin.setSuffix(" s")
         self.fast_forward_spin.setValue(self.settings.fast_forward_s)
-        self.fast_forward_spin.setToolTip("How far the fast-forward button and Shift+Right skip ahead.")
+        self.fast_forward_spin.setToolTip("How far the skip buttons move forward and back.")
         self.fast_forward_spin.valueChanged.connect(self._set_fast_forward)
-        form.addRow("Fast-forward amount", self.fast_forward_spin)
+        form.addRow("Skip amount", self.fast_forward_spin)
         form = group("Library")
         self.autoplay_check = QCheckBox("Play the next video automatically")
         self.autoplay_check.setChecked(self.settings.autoplay)
@@ -240,7 +240,7 @@ class DesktopFeatures:
 
     def _set_fast_forward(self, value):
         self.settings.fast_forward_s = value
-        self._show_fast_forward_amount(self.settings.fast_forward_s)
+        self._show_skip_amount(self.settings.fast_forward_s)
 
     def _set_diagnostics(self, value):
         self.settings.diagnostics = value
