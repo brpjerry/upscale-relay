@@ -7,23 +7,21 @@ import ipaddress
 import time
 from pathlib import Path
 
-from PySide6.QtCore import QDir, QEvent, QStandardPaths, Qt, QTimer, Signal
+from PySide6.QtCore import QDir, QEvent, QPoint, QStandardPaths, Qt, QTimer, Signal
 from PySide6.QtGui import (
     QCursor,
-    QIcon,
-    QPainter,
     QPalette,
     QStandardItem,
     QStandardItemModel,
 )
 from PySide6.QtWidgets import (
-    QCheckBox,
+    QApplication,
     QComboBox,
     QDoubleSpinBox,
-    QDockWidget,
     QFileSystemModel,
     QFormLayout,
-    QGraphicsDropShadowEffect,
+    QFrame,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -32,16 +30,12 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QGroupBox,
     QMessageBox,
-    QProgressBar,
     QPushButton,
     QSizePolicy,
-    QSlider,
     QSplitter,
     QStatusBar,
     QStyle,
     QTabWidget,
-    QToolBar,
-    QToolButton,
     QTreeView,
     QVBoxLayout,
     QWidget,
@@ -57,7 +51,24 @@ from .chapters import (
     slider_fractions,
     step_target,
 )
+from . import theme
 from .settings import AppSettings, format_skip
+from .theme import Icons
+from .widgets import (
+    ControlBar,
+    ElideLabel,
+    FlatSlider,
+    FlatSwitch,
+    IconButton,
+    IdleHint,
+    Logo,
+    SidePanel,
+    Spinner,
+    StatusDot,
+    VolumeSlider,
+    show_slider_tip,
+    tabular,
+)
 from .features import DesktopFeatures
 from .browser_state import LocalLibraryProxy, restore_server_tree
 from .history import endpoint_key
@@ -122,15 +133,16 @@ def _parse_server_address(address: str) -> tuple[str, int]:
     return host, port
 
 
-class SeekSlider(QSlider):
-    """QSlider whose groove clicks jump straight to the clicked position.
+class SeekSlider(FlatSlider):
+    """Seek bar whose groove clicks jump straight to the clicked position.
 
     Stock QSlider treats a groove click as one page-step. Moving the handle
     under the cursor before the default press handling means the click both
     jumps to the timestamp and starts a drag from there.
 
     Chapter starts (as 0..1 fractions) are painted as tick marks over the
-    groove so chapter boundaries are visible while scrubbing.
+    groove so chapter boundaries are visible while scrubbing, and the time
+    under the pointer is shown above the bar.
     """
 
     cancelled = Signal()
@@ -139,10 +151,16 @@ class SeekSlider(QSlider):
         super().__init__(*args)
         self._cancelled = False
         self._chapter_fractions: list[float] = []
+        self._hover_text = None
 
     def set_chapter_marks(self, fractions: list[float]) -> None:
         self._chapter_fractions = fractions
+        self._marks = fractions
         self.update()
+
+    def set_hover_text(self, formatter) -> None:
+        """``formatter(fraction) -> str | None`` labels the pointer position."""
+        self._hover_text = formatter
 
     def mousePressEvent(self, event) -> None:
         if event.button() == Qt.LeftButton:
@@ -155,6 +173,14 @@ class SeekSlider(QSlider):
         super().mousePressEvent(event)
         if event.button() == Qt.LeftButton:
             self.sliderMoved.emit(self.sliderPosition())
+
+    def mouseMoveEvent(self, event) -> None:
+        super().mouseMoveEvent(event)
+        if self._hover_text is not None and self.isEnabled() and self.width() > 0:
+            x = event.position().x()
+            text = self._hover_text(max(0.0, min(1.0, x / self.width())))
+            if text:
+                show_slider_tip(self, x, text)
 
     def _cancel_drag(self):
         self._cancelled = True
@@ -182,55 +208,69 @@ class SeekSlider(QSlider):
             return
         super().mouseReleaseEvent(event)
 
-    def paintEvent(self, event) -> None:
-        super().paintEvent(event)
-        if not self._chapter_fractions:
-            return
-        painter = QPainter(self)
-        color = self.palette().windowText().color()
-        color.setAlpha(150)
-        span = self.maximum() - self.minimum()
-        mid_y = self.height() // 2
-        for fraction in self._chapter_fractions:
-            # Mirror mousePressEvent's mapping so ticks line up with where a
-            # click on that timestamp would land the handle.
-            x = QStyle.sliderPositionFromValue(
-                self.minimum(), self.maximum(),
-                round(self.minimum() + fraction * span), self.width(),
-            )
-            painter.fillRect(x - 1, mid_y - 4, 2, 8, color)
-        painter.end()
+
+def _styled(widget: QWidget, name: str) -> QWidget:
+    """Name a plain container so the theme's style sheet paints its background."""
+    widget.setObjectName(name)
+    widget.setAttribute(Qt.WA_StyledBackground, True)
+    return widget
+
+
+def _hint_label(text: str, role: str = "faint") -> QLabel:
+    label = QLabel(text)
+    label.setProperty("role", role)
+    return label
 
 
 class MainWindow(DesktopFeatures, QMainWindow):
     def __init__(self, options: DesktopOptions | None = None):
+        options = options or DesktopOptions()
+        settings = AppSettings(options.settings_scope)
+        # Before any widget exists, so the window is born with the themed palette.
+        app = QApplication.instance()
+        theme.apply_theme(app, settings.theme_mode)
         super().__init__()
-        self.options = options or DesktopOptions()
+        self.options = options
+        self.settings = settings
         self.setWindowTitle("Upscale Relay")
-        self.resize(1200, 700)
-        self.settings = AppSettings(self.options.settings_scope)
+        self.resize(1280, 780)
+        if hasattr(app.styleHints(), "colorSchemeChanged"):
+            app.styleHints().colorSchemeChanged.connect(self._on_color_scheme_changed)
         self.client: RelayClient | None = None
         self._server_caps: dict = {}
         self._init_feature_state()
 
-        # -- toolbar: server + session config --------------------------------
-        bar = QToolBar("server")
-        bar.setMovable(False)
-        self.addToolBar(bar)
+        # -- top bar: heading + server connection -----------------------------
+        bar = QWidget()
+        bar.setFixedHeight(64)
         self._toolbar = bar  # hidden in fullscreen
-        self.browser_toggle = QToolButton()
+        self.browser_toggle = IconButton(Icons.menu)
         self.browser_toggle.setCheckable(True)
         self.browser_toggle.setChecked(self.settings.browser_visible)
-        self.browser_toggle.setIcon(self._icon("folder", QStyle.SP_DirIcon))
         self.browser_toggle.setToolTip("Show/hide the file browser")
+        self.heading = ElideLabel("Nothing playing")
+        self.heading.setObjectName("heading")
+        # The status bar itself stays hidden; its current message is the
+        # subheading, so every showMessage() call site keeps working.
+        self.subheading = ElideLabel()
+        self.subheading.setProperty("role", "faint")
+        headings = QVBoxLayout()
+        headings.setContentsMargins(0, 0, 0, 0)
+        headings.setSpacing(2)
+        headings.addStretch(1)
+        headings.addWidget(self.heading)
+        headings.addWidget(self.subheading)
+        headings.addStretch(1)
         self.host_edit = QLineEdit(_server_address(
             self.settings.server_host, self.settings.server_port,
         ))
-        self.host_edit.setMinimumWidth(180)
-        self.host_edit.setMaximumWidth(320)
-        self.host_edit.setPlaceholderText("host:port")
+        self.host_edit.setProperty("pill", True)
+        self.host_edit.setMinimumWidth(150)
+        self.host_edit.setMaximumWidth(280)
+        self.host_edit.setPlaceholderText("Server host:port")
+        self.host_edit.setToolTip("Upscale server address")
         self.connect_btn = QPushButton("Connect")
-        self.autoconnect_check = QCheckBox("Auto connect")
+        self.autoconnect_check = FlatSwitch("Connect automatically on launch")
         self.autoconnect_check.setToolTip("Connect to this server automatically on launch")
         self.autoconnect_check.setChecked(self.settings.auto_connect)
         self.model_combo = QComboBox()
@@ -250,47 +290,66 @@ class MainWindow(DesktopFeatures, QMainWindow):
         if self.settings.resize_algorithm:
             self.resize_combo.addItem(self.settings.resize_algorithm, self.settings.resize_algorithm)
             self.resize_combo.setCurrentIndex(1)
-        self.deband_check = QCheckBox("Reduce color banding")
+        self.deband_check = FlatSwitch("Reduce color banding")
         self.deband_check.setToolTip(
             "Smooth visible color steps in gradients during playback."
         )
         self.deband_check.setChecked(self.settings.deband_enabled)
-        self.conn_label = QLabel("disconnected")
-        self.conn_label.setMinimumWidth(120)
-        self.conn_label.setMaximumWidth(300)
-        self.conn_label.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred)
-        self.playback_settings_toggle = QToolButton()
-        self.playback_settings_toggle.setText("Playback settings")
+        self.conn_dot = StatusDot()
+        self.conn_label = ElideLabel("disconnected")
+        self.conn_label.setProperty("role", "dim")
+        self.playback_settings_toggle = IconButton(Icons.settings)
         self.playback_settings_toggle.setCheckable(True)
-        self.playback_settings_toggle.setToolButtonStyle(Qt.ToolButtonTextOnly)
-        self.playback_settings_toggle.setToolTip("Show playback settings")
-        bar.addWidget(self.browser_toggle)
-        bar.addWidget(QLabel(" Server "))
-        bar.addWidget(self.host_edit)
-        self.nearby_btn = QToolButton()
-        self.nearby_btn.setText("Nearby servers")
+        self.playback_settings_toggle.setToolTip("Playback settings")
+        self.nearby_btn = IconButton(Icons.nearby)
+        self.nearby_btn.setToolTip("Nearby servers")
         self.nearby_menu = QMenu(self.nearby_btn)
-        self.nearby_btn.setMenu(self.nearby_menu)
-        self.nearby_btn.setPopupMode(QToolButton.InstantPopup)
+        theme.style_menu(self.nearby_menu)
+        self.nearby_btn.clicked.connect(self._show_nearby_menu)
         self._nearby_changed({})
-        bar.addWidget(self.nearby_btn)
-        bar.addWidget(self.connect_btn)
-        bar.addWidget(self.autoconnect_check)
-        spacer = QWidget()
-        spacer.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
-        bar.addWidget(spacer)
-        bar.addWidget(self.playback_settings_toggle)
+        # Busy ring for session open — visible while the server prepares the
+        # pipeline (a first-use TensorRT engine build can run for minutes;
+        # session_progress messages narrate it in the subheading).
+        self.open_progress = Spinner(18)
+        self.open_progress.setVisible(False)
+        bar_layout = QHBoxLayout(bar)
+        bar_layout.setContentsMargins(14, 0, 16, 0)
+        bar_layout.setSpacing(8)
+        bar_layout.addWidget(self.browser_toggle)
+        bar_layout.addSpacing(4)
+        bar_layout.addLayout(headings, stretch=1)
+        bar_layout.addWidget(self.open_progress)
+        bar_layout.addSpacing(4)
+        bar_layout.addWidget(self.host_edit)
+        bar_layout.addWidget(self.nearby_btn)
+        bar_layout.addWidget(self.connect_btn)
+        bar_layout.addWidget(self.playback_settings_toggle)
 
-        self.playback_settings = QDockWidget("Playback settings", self)
-        self.playback_settings.setObjectName("playbackSettings")
-        self.playback_settings.setFeatures(QDockWidget.DockWidgetClosable)
-        settings_page = QWidget()
+        self.playback_settings = SidePanel()
+        self.playback_settings.setObjectName("settingsPanel")
+        settings_title = QWidget()
+        title_row = QHBoxLayout(settings_title)
+        title_row.setContentsMargins(22, 14, 12, 6)
+        title_label = QLabel("Playback settings")
+        title_label.setObjectName("panelTitle")
+        settings_close = IconButton(Icons.close)
+        settings_close.setToolTip("Close")
+        settings_close.clicked.connect(self.playback_settings.hide)
+        title_row.addWidget(title_label, stretch=1)
+        title_row.addWidget(settings_close)
+        settings_page = _styled(QWidget(), "settingsPage")
         settings_layout = QVBoxLayout(settings_page)
+        settings_layout.setContentsMargins(22, 0, 22, 22)
         explanation = QLabel(
             "Streaming settings apply at the current playback position. "
             "Changing them restarts an active stream."
         )
         explanation.setWordWrap(True)
+        explanation.setProperty("role", "faint")
+        connection_group = QGroupBox("Connection")
+        connection_layout = QVBoxLayout(connection_group)
+        connection_layout.addWidget(self.autoconnect_check)
+        settings_layout.addWidget(connection_group)
         streaming_group = QGroupBox("Streaming")
         streaming_layout = QVBoxLayout(streaming_group)
         settings_layout.addWidget(streaming_group)
@@ -312,15 +371,18 @@ class MainWindow(DesktopFeatures, QMainWindow):
         streaming_layout.addWidget(self.deband_check)
         settings_scroll = QScrollArea()
         settings_scroll.setWidgetResizable(True)
+        settings_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         settings_scroll.setWidget(settings_page)
-        self.playback_settings.setWidget(settings_scroll)
-        self.addDockWidget(Qt.RightDockWidgetArea, self.playback_settings)
-        self.playback_settings.hide()
+        panel_layout = QVBoxLayout(self.playback_settings)
+        panel_layout.setContentsMargins(1, 0, 0, 0)
+        panel_layout.setSpacing(0)
+        panel_layout.addWidget(settings_title)
+        panel_layout.addWidget(settings_scroll, stretch=1)
         self.playback_settings_toggle.toggled.connect(self.playback_settings.setVisible)
-        self.playback_settings.visibilityChanged.connect(self.playback_settings_toggle.setChecked)
+        self.playback_settings.visibilityChanged.connect(self._on_settings_visibility)
         self._settings_visible_before_fullscreen = False
 
-        # -- file browser ------------------------------------------------------
+        # -- sidebar: file browser ---------------------------------------------
         self.fs_model = QFileSystemModel()
         self.fs_model.setRootPath(QDir.rootPath())
         self.fs_model.setNameFilters(VIDEO_EXTENSIONS)
@@ -338,30 +400,34 @@ class MainWindow(DesktopFeatures, QMainWindow):
             self.tree.hideColumn(col)
         self.tree.setHeaderHidden(True)
 
-        self.up_btn = QToolButton()
-        self.up_btn.setIcon(self._icon("go-up", QStyle.SP_FileDialogToParent))
+        self.up_btn = IconButton(Icons.arrow_up, size=30, icon_size=18)
         self.up_btn.setToolTip("Up one directory")
-        self.home_btn = QToolButton()
-        self.home_btn.setIcon(self._icon("go-home", QStyle.SP_DirHomeIcon))
+        self.home_btn = IconButton(Icons.home, size=30, icon_size=18)
         self.home_btn.setToolTip("Home directory")
         self.path_edit = QLineEdit(start_dir)
         self.path_edit.setPlaceholderText("directory path")
         nav = QHBoxLayout()
-        nav.setContentsMargins(0, 0, 0, 0)
+        nav.setContentsMargins(8, 0, 12, 0)
+        nav.setSpacing(2)
         nav.addWidget(self.up_btn)
         nav.addWidget(self.home_btn)
+        nav.addSpacing(4)
         nav.addWidget(self.path_edit)
         self.local_browser_panel = QWidget()
         bv = QVBoxLayout(self.local_browser_panel)
         bv.setContentsMargins(0, 0, 0, 0)
+        bv.setSpacing(8)
         self.sort_combo = QComboBox()
         self.sort_combo.addItem("Name", "name")
         self.sort_combo.addItem("Newest", "mtime")
         self.sort_combo.setCurrentIndex(self.sort_combo.findData(self.settings.browser_sort))
         self.sort_combo.setToolTip("Sort both local and server libraries; directories stay first")
         self.sort_combo.activated.connect(self.on_sort_changed)
+        tree_box = QVBoxLayout()
+        tree_box.setContentsMargins(8, 0, 4, 0)
+        tree_box.addWidget(self.tree)
         bv.addLayout(nav)
-        bv.addWidget(self.tree)
+        bv.addLayout(tree_box)
 
         # With only Local present the tab strip is hidden, preserving the
         # pre-library appearance. A Server tab is created only while connected
@@ -369,91 +435,104 @@ class MainWindow(DesktopFeatures, QMainWindow):
         self.browser_panel = QTabWidget()
         self.browser_panel.addTab(self.local_browser_panel, "Local")
         self.browser_panel.tabBar().setVisible(False)
+        self.browser_panel.tabBar().setDrawBase(False)
+        self.browser_panel.tabBar().setCursor(Qt.PointingHandCursor)
         # A QTabWidget corner widget gets zero height when its tab bar is
         # hidden. Keep the shared sort control in an independent header so
         # local-only browsing has the same usable control as Server browsing.
-        self.browser_container = QWidget()
+        self.browser_container = _styled(QWidget(), "sidebar")
+        self.browser_container.setMinimumWidth(220)
         browser_layout = QVBoxLayout(self.browser_container)
         browser_layout.setContentsMargins(0, 0, 0, 0)
+        browser_layout.setSpacing(0)
+        wordmark = QLabel("Upscale Relay")
+        wordmark.setObjectName("wordmark")
+        header = QWidget()
+        header.setFixedHeight(64)
+        header_row = QHBoxLayout(header)
+        header_row.setContentsMargins(20, 0, 12, 0)
+        header_row.setSpacing(12)
+        header_row.addWidget(Logo())
+        header_row.addWidget(wordmark, stretch=1)
         sort_row = QHBoxLayout()
-        sort_row.addWidget(QLabel("Sort"))
-        sort_row.addWidget(self.sort_combo)
+        sort_row.setContentsMargins(20, 0, 12, 10)
+        sort_row.addWidget(_hint_label("Sort", "dim"))
         sort_row.addStretch(1)
+        sort_row.addWidget(self.sort_combo)
+        footer = _styled(QWidget(), "sidebarFooter")
+        footer.setFixedHeight(50)
+        footer_row = QHBoxLayout(footer)
+        footer_row.setContentsMargins(20, 0, 16, 0)
+        footer_row.setSpacing(10)
+        footer_row.addWidget(self.conn_dot)
+        footer_row.addWidget(self.conn_label, stretch=1)
+        browser_layout.addWidget(header)
         browser_layout.addLayout(sort_row)
-        browser_layout.addWidget(self.browser_panel)
+        browser_layout.addWidget(self.browser_panel, stretch=1)
+        browser_layout.addWidget(footer)
         self.server_browser_panel: QWidget | None = None
         self.server_tree: QTreeView | None = None
         self.server_model: QStandardItemModel | None = None
         self.server_placeholder: QLabel | None = None
-        self.server_refresh_btn: QToolButton | None = None
+        self.server_refresh_btn: IconButton | None = None
 
         # -- player -------------------------------------------------------------
         self.player = PlayerView(options=self.options)
-        self.idle_hint = QLabel(self.player)
+        self.idle_hint = IdleHint(self.player)
         self.idle_hint.setObjectName("idleGuidance")
-        self.idle_hint.setTextFormat(Qt.PlainText)
-        self.idle_hint.setAlignment(Qt.AlignCenter)
-        self.idle_hint.setWordWrap(True)
-        self.idle_hint.setAttribute(Qt.WA_TransparentForMouseEvents)
-        self.idle_hint.setStyleSheet("color: #dddddd; background: transparent;")
-        hint_shadow = QGraphicsDropShadowEffect(self.idle_hint)
-        hint_shadow.setColor(Qt.black)
-        hint_shadow.setOffset(2, 2)
-        hint_shadow.setBlurRadius(4)
-        self.idle_hint.setGraphicsEffect(hint_shadow)
-        hint_font = self.idle_hint.font()
-        hint_font.setPointSizeF(max(12.0, hint_font.pointSizeF()))
-        self.idle_hint.setFont(hint_font)
         if hasattr(self.player, "set_deband"):
             self.player.set_deband(self.settings.deband_enabled)
-        self._icon_play = self._icon("media-playback-start", QStyle.SP_MediaPlay)
-        self._icon_pause = self._icon("media-playback-pause", QStyle.SP_MediaPause)
-        self.play_btn = QToolButton()
-        self.play_btn.setIcon(self._icon_pause)
-        self.play_btn.setToolTip("Pause (Space)")
+        self.play_btn = IconButton(Icons.play, size=40, icon_size=24, filled=True)
+        self.play_btn.setToolTip("Play (Space)")
         self.play_btn.setEnabled(False)
-        self.stop_btn = QToolButton()
-        self.stop_btn.setIcon(self._icon("media-playback-stop", QStyle.SP_MediaStop))
+        self.stop_btn = IconButton(Icons.stop, icon_size=22)
         self.stop_btn.setToolTip("Stop")
         self.stop_btn.setEnabled(False)
-        self.chapter_prev_btn = QToolButton()
-        self.chapter_prev_btn.setIcon(
-            self._icon("media-skip-backward", QStyle.SP_MediaSkipBackward))
+        self.chapter_prev_btn = IconButton(Icons.previous, icon_size=24)
         self.chapter_prev_btn.setToolTip("Previous chapter (PgDn)")
-        self.chapter_next_btn = QToolButton()
-        self.chapter_next_btn.setIcon(
-            self._icon("media-skip-forward", QStyle.SP_MediaSkipForward))
+        self.chapter_next_btn = IconButton(Icons.next, icon_size=24)
         self.chapter_next_btn.setToolTip("Next chapter (PgUp)")
         self.chapter_combo = QComboBox()
         self.chapter_combo.setSizeAdjustPolicy(
             QComboBox.AdjustToMinimumContentsLengthWithIcon)
         self.chapter_combo.setMinimumContentsLength(12)
-        self.chapter_combo.setMaximumWidth(240)
-        self.chapter_combo.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        self.chapter_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.chapter_combo.setToolTip("Jump to a chapter")
+        self.chapter_label = _hint_label("Chapter", "dim")
         # Hidden until a session with chapters starts (_set_chapters).
-        for w in (self.chapter_prev_btn, self.chapter_combo, self.chapter_next_btn):
+        for w in (self.chapter_prev_btn, self.chapter_label, self.chapter_combo,
+                  self.chapter_next_btn):
             w.setVisible(False)
-        self.fullscreen_btn = QToolButton()
-        self.fullscreen_btn.setIcon(self._icon("view-fullscreen", QStyle.SP_TitleBarMaxButton))
+        self.fullscreen_btn = IconButton(Icons.fullscreen, icon_size=22)
         self.fullscreen_btn.setToolTip("Fullscreen — F or double-click the video; Esc exits")
         self.fallback_btn = QPushButton("Play locally")
         self.fallback_btn.setEnabled(False)
+        self.fallback_btn.setVisible(False)  # offered only while a local file streams
         self.fallback_btn.setToolTip("Drop the upscaler and play the original file directly")
-        self.player_status = QLabel("")
-        # Live telemetry can be much wider than the player.  QLabel's default
-        # minimum size hint includes the complete text, which used to make the
-        # transport row resize the top-level window and squeeze the browser as
-        # soon as the first stats sample arrived.  Give it remaining space,
-        # but never let its contents establish the row's minimum width.
-        self.player_status.setMinimumWidth(0)
-        self.player_status.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        # Now playing. These labels elide: live telemetry can be much wider
+        # than the window, and a label whose minimum size hint included the
+        # complete text used to resize the top-level window and squeeze the
+        # browser as soon as the first stats sample arrived.
+        self.now_title = ElideLabel()
+        self.now_title.setObjectName("nowTitle")
+        self.now_detail = ElideLabel(dim=0.62)
+        self.player_status = ElideLabel(dim=0.45)
+        status_font = tabular(self.player_status.font())
+        status_font.setPixelSize(11)
+        self.player_status.setFont(status_font)
 
         self.seek_slider = SeekSlider(Qt.Horizontal)
         self.seek_slider.setRange(0, 1000)
         self.seek_slider.setEnabled(False)
-        self.pos_label = QLabel("--:-- / --:--")
+        self.seek_slider.set_hover_text(
+            lambda fraction: _format_time(fraction * self._duration_s) if self._duration_s else None
+        )
+        self.pos_label = ElideLabel("--:-- / --:--", dim=0.62)
+        self.pos_label.setFont(tabular(self.pos_label.font()))
+        self.pos_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.pos_label.setMinimumWidth(104)
         seek_row = QHBoxLayout()
+        seek_row.setSpacing(12)
         seek_row.addWidget(self.seek_slider, stretch=1)
         seek_row.addWidget(self.pos_label)
 
@@ -489,23 +568,26 @@ class MainWindow(DesktopFeatures, QMainWindow):
             self.player.audio_output_state()
             if hasattr(self.player, "audio_output_state") else (100, False)
         )
-        self.mute_btn = QToolButton()
+        self.mute_btn = IconButton(Icons.volume_high, accent_checked=False)
         self.mute_btn.setCheckable(True)
-        self._icon_volume = self._icon("audio-volume-high", QStyle.SP_MediaVolume)
-        self._icon_muted = self._icon("audio-volume-muted", QStyle.SP_MediaVolumeMuted)
-        self.volume_slider = QSlider(Qt.Horizontal)
+        self.volume_slider = VolumeSlider(Qt.Horizontal)
         self.volume_slider.setRange(0, max(100, volume))
-        self.volume_slider.setFixedWidth(90)
+        self.volume_slider.setFixedWidth(92)
         self.volume_slider.setAccessibleName("Volume")
         self._show_audio_output(volume, muted)
+        self.tracks_btn = IconButton(Icons.subtitles, icon_size=22)
+        self.tracks_btn.setCheckable(True)
+        self.tracks_btn.setToolTip("Audio, subtitles and chapters")
 
         transport = QHBoxLayout()
-        transport.addWidget(self.play_btn)
+        transport.setSpacing(10)
+        transport.addStretch(1)
         transport.addWidget(self.stop_btn)
+        transport.addWidget(self.play_btn)
         # Skip buttons step by the configured fast-forward amount; the chapter
         # buttons around them stay hidden for files without chapters.
-        self.seek_back_btn = QToolButton()
-        self.seek_forward_btn = QToolButton()
+        self.seek_back_btn = IconButton()
+        self.seek_forward_btn = IconButton()
         self.seek_back_btn.clicked.connect(lambda: self.on_skip(-1))
         self.seek_forward_btn.clicked.connect(lambda: self.on_skip(1))
         self._show_skip_amount(self.settings.fast_forward_s)
@@ -513,83 +595,135 @@ class MainWindow(DesktopFeatures, QMainWindow):
         transport.addWidget(self.seek_back_btn)
         transport.addWidget(self.seek_forward_btn)
         transport.addWidget(self.chapter_next_btn)
-        transport.addWidget(self.chapter_combo)
-        transport.addWidget(self.fullscreen_btn)
-        transport.addWidget(self.fallback_btn)
-        transport.addWidget(self.player_status, stretch=1)
-        transport.addWidget(self.mute_btn)
-        transport.addWidget(self.volume_slider)
+        transport.addStretch(1)
+        center = QWidget()
+        center.setMinimumWidth(320)
+        center.setMaximumWidth(760)
+        center_layout = QVBoxLayout(center)
+        center_layout.setContentsMargins(0, 8, 0, 8)
+        center_layout.setSpacing(2)
+        center_layout.addLayout(transport)
+        center_layout.addLayout(seek_row)
+        now_playing = QWidget()
+        now_layout = QVBoxLayout(now_playing)
+        now_layout.setContentsMargins(0, 0, 0, 0)
+        now_layout.setSpacing(3)
+        now_layout.addStretch(1)
+        now_layout.addWidget(self.now_title)
+        now_layout.addWidget(self.now_detail)
+        now_layout.addWidget(self.player_status)
+        now_layout.addStretch(1)
+        tools = QWidget()
+        tools_layout = QHBoxLayout(tools)
+        tools_layout.setContentsMargins(0, 0, 0, 0)
+        tools_layout.setSpacing(6)
+        tools_layout.addStretch(1)
+        tools_layout.addWidget(self.fallback_btn)
+        tools_layout.addSpacing(4)
+        tools_layout.addWidget(self.tracks_btn)
+        tools_layout.addWidget(self.mute_btn)
+        tools_layout.addWidget(self.volume_slider)
+        tools_layout.addSpacing(4)
+        tools_layout.addWidget(self.fullscreen_btn)
+        # Transport bar shared by every view: now playing, transport + seek,
+        # then tracks, volume and fullscreen. It lives in one hideable panel
+        # so fullscreen is just the video.
+        self.controls_panel = ControlBar()
+        self.controls_panel.setObjectName("overlayControls")
+        self.controls_panel.setFixedHeight(88)
+        cv = QHBoxLayout(self.controls_panel)
+        cv.setContentsMargins(*self._CONTROL_MARGINS)
+        cv.setSpacing(16)
+        cv.addWidget(now_playing, stretch=1)
+        cv.addWidget(center, stretch=2)
+        cv.addWidget(tools, stretch=1)
+
         # Track selectors used to share the transport row with chapters and
         # telemetry.  Once a video populated all of them, that single row had
         # an ~900 px minimum and Qt enlarged the window (or stole width from
-        # the browser) to satisfy it.  A dedicated row stays usable at the
-        # player's 480 px minimum and makes metadata updates geometry-neutral.
-        track_controls = QHBoxLayout()
-        track_controls.addWidget(QLabel("audio"))
-        track_controls.addWidget(self.audio_combo)
-        track_controls.addWidget(self.audio_delay)
-        track_controls.addSpacing(8)
-        track_controls.addWidget(QLabel("subs"))
-        track_controls.addWidget(self.sub_combo)
-        track_controls.addWidget(self.sub_delay)
-        track_controls.addStretch(1)
-        # Controls live in one hideable panel so fullscreen is just the video.
-        self.controls_panel = QWidget()
-        cv = QVBoxLayout(self.controls_panel)
-        cv.setContentsMargins(0, 0, 0, 0)
-        cv.addLayout(seek_row)
-        cv.addLayout(transport)
-        cv.addLayout(track_controls)
-        player_page = QWidget()
-        pv = QVBoxLayout(player_page)
-        pv.setContentsMargins(0, 0, 0, 0)
-        pv.addWidget(self.player, stretch=1)
-        pv.addWidget(self.controls_panel)
+        # the browser) to satisfy it.  They live in a card that floats above
+        # the bar instead, so metadata updates are geometry-neutral.
+        self.track_panel = QFrame()
+        self.track_panel.setObjectName("trackPanel")
+        self.track_panel.setCursor(Qt.ArrowCursor)
+        tracks = QGridLayout(self.track_panel)
+        tracks.setContentsMargins(18, 16, 18, 16)
+        tracks.setHorizontalSpacing(10)
+        tracks.setVerticalSpacing(10)
+        tracks.addWidget(_hint_label("Audio", "dim"), 0, 0)
+        tracks.addWidget(self.audio_combo, 0, 1)
+        tracks.addWidget(self.audio_delay, 0, 2)
+        tracks.addWidget(_hint_label("Subtitles", "dim"), 1, 0)
+        tracks.addWidget(self.sub_combo, 1, 1)
+        tracks.addWidget(self.sub_delay, 1, 2)
+        tracks.addWidget(self.chapter_label, 2, 0)
+        tracks.addWidget(self.chapter_combo, 2, 1, 1, 2)
+        tracks.setColumnStretch(1, 1)
 
-        # In fullscreen the same panel is re-parented onto the video as a
-        # bottom overlay, hidden until the pointer nears the bottom edge.
-        self._controls_layout = pv
-        self._controls_overlay = False
-        self.controls_panel.setObjectName("overlayControls")
+        main_page = QWidget()
+        pv = QVBoxLayout(main_page)
+        pv.setContentsMargins(0, 0, 0, 0)
+        pv.setSpacing(0)
+        pv.addWidget(bar)
+        pv.addWidget(self.player, stretch=1)
+
+        self.controls_panel.setCursor(Qt.ArrowCursor)
         self._controls_timer = QTimer(self)
         self._controls_timer.setSingleShot(True)
         self._controls_timer.setInterval(2200)
         self._controls_timer.timeout.connect(self._auto_hide_controls)
-        self.controls_panel.setCursor(Qt.ArrowCursor)
         self._cursor_timer = QTimer(self)
         self._cursor_timer.setSingleShot(True)
         self._cursor_timer.setInterval(2200)
         self._cursor_timer.timeout.connect(self._auto_hide_cursor)
-        self.player.installEventFilter(self)  # reposition overlay on resize
 
         self.split = QSplitter()
         # Resizing a QOpenGLWidget on every handle mouse-move forces mpv and Qt
         # to rebuild/render its backing FBO continuously. Use Qt's rubber-band
         # preview and perform the expensive video resize once on release.
         self.split.setOpaqueResize(False)
+        self.split.setHandleWidth(1)
         self.split.addWidget(self.browser_container)
-        self.split.addWidget(player_page)
+        self.split.addWidget(main_page)
         self.split.setStretchFactor(1, 1)
-        self.split.setSizes([300, 900])
-        self._browser_sizes = [300, 900]  # restored when the browser is re-shown
-        self.setCentralWidget(self.split)
-        self.setStatusBar(QStatusBar())
-        # Indeterminate busy bar for session open — visible while the server
-        # prepares the pipeline (a first-use TensorRT engine build can run for
-        # minutes; session_progress messages narrate it in the status bar).
-        self.open_progress = QProgressBar()
-        self.open_progress.setRange(0, 0)
-        self.open_progress.setFixedWidth(140)
-        self.open_progress.setVisible(False)
-        self.statusBar().addPermanentWidget(self.open_progress)
-        self.statusBar().addPermanentWidget(self.conn_label)
+        self.split.setCollapsible(1, False)
+        self.split.setSizes([300, 980])
+        self._browser_sizes = [300, 980]  # restored when the browser is re-shown
+        # In fullscreen the control bar is re-parented onto the video as a
+        # bottom overlay, hidden until the pointer nears the bottom edge.
+        self._root = QWidget()
+        root_layout = QVBoxLayout(self._root)
+        root_layout.setContentsMargins(0, 0, 0, 0)
+        root_layout.setSpacing(0)
+        root_layout.addWidget(self.split, stretch=1)
+        root_layout.addWidget(self.controls_panel)
+        self._controls_layout = root_layout
+        self._controls_overlay = False
+        self.track_panel.setParent(self._root)
+        self.track_panel.hide()
+        self.playback_settings.setParent(self._root)
+        self.playback_settings.hide()
+        # Installed only now: eventFilter reads the widgets created above, and
+        # an exception raised inside a Qt virtual is a native crash.
+        self.player.installEventFilter(self)  # reposition overlay on resize
+        self._root.installEventFilter(self)  # keep the track card anchored
+        self.setCentralWidget(self._root)
+        status_bar = QStatusBar()
+        status_bar.setSizeGripEnabled(False)
+        self.setStatusBar(status_bar)
+        status_bar.hide()
+        status_bar.messageChanged.connect(self._on_status_message)
+        self._show_connection("disconnected", connected=False)
+        self._show_now_playing(None)
         self.statusBar().showMessage("Connect to a server to start streaming.")
 
         # -- signals ---------------------------------------------------------------
         self.connect_btn.clicked.connect(self.on_connect)
+        self.host_edit.returnPressed.connect(self._on_host_entered)
         self.browser_toggle.toggled.connect(self._on_browser_toggled)
         self.autoconnect_check.toggled.connect(
             lambda v: setattr(self.settings, "auto_connect", v))
+        self.tracks_btn.toggled.connect(self._set_track_panel_visible)
         self.tree.doubleClicked.connect(self.on_file_activated)
         self.up_btn.clicked.connect(self.on_up_dir)
         self.home_btn.clicked.connect(lambda: self._set_browse_root(QDir.homePath()))
@@ -656,66 +790,104 @@ class MainWindow(DesktopFeatures, QMainWindow):
         self._init_feature_controls(settings_layout)
         self._apply_browser_visible(self.settings.browser_visible)
         self._update_idle_guidance()
+        self.player.setFocus()
         if self.settings.auto_connect:
             # Fire once the qasync loop starts (on_connect is a coroutine slot).
             QTimer.singleShot(0, self.on_connect)
 
     # -- helpers ------------------------------------------------------------------
 
-    def _icon(self, theme_name: str, fallback: QStyle.StandardPixmap) -> QIcon:
-        source = QIcon.fromTheme(theme_name)
-        if source.isNull():
-            source = self.style().standardIcon(fallback)
-        # Many icon themes ship a fixed black or white SVG variant selected by
-        # the desktop theme name. That becomes unreadable when a bundled Qt
-        # adopts a different palette (or the system switches at runtime).
-        # Preserve the source alpha/shape and tint action icons from QPalette.
-        result = QIcon()
-        modes = (
-            (QIcon.Normal, QPalette.Active),
-            (QIcon.Active, QPalette.Active),
-            (QIcon.Selected, QPalette.Active),
-            (QIcon.Disabled, QPalette.Disabled),
+    _CONTROL_MARGINS = (20, 0, 16, 0)
+
+    def _show_connection(self, text: str, *, connected: bool, warn: bool = False) -> None:
+        """Reflect the control connection in the sidebar footer and the Connect button."""
+        self.conn_label.setText(text)
+        self.conn_dot.set_state("warn" if warn else "good" if connected else "text_faint")
+        self.connect_btn.setText("Disconnect" if connected else "Connect")
+        # The address matters only until connected; afterwards the heading
+        # gets the room and the sidebar footer names the server.
+        self.host_edit.setVisible(not connected)
+        self.nearby_btn.setVisible(not connected)
+        # Connecting is the primary action only until it has happened.
+        self.connect_btn.setProperty("primary", not connected)
+        self.connect_btn.style().unpolish(self.connect_btn)
+        self.connect_btn.style().polish(self.connect_btn)
+
+    def _show_now_playing(self, title: str | None, detail: str = "") -> None:
+        self.heading.setText(title or "Nothing playing")
+        self.now_title.setText(title or "")
+        self.now_detail.setText(detail if title else "")
+        self.setWindowTitle(f"{title} — Upscale Relay" if title else "Upscale Relay")
+
+    def _on_status_message(self, message: str) -> None:
+        if not message:
+            message = (
+                "Not connected" if self.client is None
+                else "" if self._session_source is not None
+                else "Choose a video from the file browser."
+            )
+        self.subheading.setText(message)
+
+    def _on_host_entered(self) -> None:
+        if self.client is None:
+            self.connect_btn.click()
+
+    def _show_nearby_menu(self) -> None:
+        # popup(), never exec(): a nested event loop re-enters asyncio tasks.
+        self.nearby_menu.popup(self.nearby_btn.mapToGlobal(QPoint(0, self.nearby_btn.height() + 6)))
+
+    def _on_color_scheme_changed(self, *_args) -> None:
+        self._apply_theme_mode(self.settings.theme_mode)
+
+    def _apply_theme_mode(self, mode: str) -> None:
+        theme.apply_theme(QApplication.instance(), mode)
+
+    def _on_settings_visibility(self, visible: bool) -> None:
+        self.playback_settings_toggle.setChecked(visible)
+        if visible:
+            self._position_settings_panel()
+            self.playback_settings.raise_()
+
+    def _position_settings_panel(self) -> None:
+        """Sheet over the right edge, from the top down to the control bar."""
+        width = min(400, self._root.width())
+        bottom = self.controls_panel.mapTo(self._root, QPoint(0, 0)).y()
+        self.playback_settings.setGeometry(self._root.width() - width, 0, width, bottom)
+
+    def _set_track_panel_visible(self, visible: bool) -> None:
+        if visible:
+            self._position_track_panel()
+            self.track_panel.show()
+            self.track_panel.raise_()
+        else:
+            self.track_panel.hide()
+
+    def _position_track_panel(self) -> None:
+        """Float the track card above the right end of the control bar."""
+        size = self.track_panel.sizeHint()
+        width = min(max(size.width(), 420), max(0, self._root.width() - 32))
+        top = self.controls_panel.mapTo(self._root, QPoint(0, 0)).y()
+        self.track_panel.setGeometry(
+            self._root.width() - width - 16, max(8, top - size.height() - 10),
+            width, size.height(),
         )
-        for size in (16, 22, 32, 48):
-            base = source.pixmap(size, size)
-            if base.isNull():
-                continue
-            for mode, group in modes:
-                tinted = base.copy()
-                painter = QPainter(tinted)
-                painter.setCompositionMode(QPainter.CompositionMode_SourceIn)
-                painter.fillRect(
-                    tinted.rect(), self.palette().color(group, QPalette.ButtonText))
-                painter.end()
-                result.addPixmap(tinted, mode)
-        return result if not result.isNull() else source
 
     def _refresh_action_icons(self) -> None:
-        """Rebuild palette-tinted icons after a light/dark or style change."""
-        definitions = (
-            ("browser_toggle", "folder", QStyle.SP_DirIcon),
-            ("up_btn", "go-up", QStyle.SP_FileDialogToParent),
-            ("home_btn", "go-home", QStyle.SP_DirHomeIcon),
-            ("stop_btn", "media-playback-stop", QStyle.SP_MediaStop),
-            ("chapter_prev_btn", "media-skip-backward", QStyle.SP_MediaSkipBackward),
-            ("chapter_next_btn", "media-skip-forward", QStyle.SP_MediaSkipForward),
-            ("fullscreen_btn", "view-fullscreen", QStyle.SP_TitleBarMaxButton),
-            ("server_refresh_btn", "view-refresh", QStyle.SP_BrowserReload),
-        )
-        for name, theme_name, fallback in definitions:
-            widget = getattr(self, name, None)
-            if widget is not None:
-                widget.setIcon(self._icon(theme_name, fallback))
-        self._icon_play = self._icon("media-playback-start", QStyle.SP_MediaPlay)
-        self._icon_pause = self._icon("media-playback-pause", QStyle.SP_MediaPause)
-        if hasattr(self, "play_btn"):
-            self.play_btn.setIcon(
-                self._icon_play if getattr(self, "_paused", False) else self._icon_pause)
-        if hasattr(self, "volume_slider"):
-            self._icon_volume = self._icon("audio-volume-high", QStyle.SP_MediaVolume)
-            self._icon_muted = self._icon("audio-volume-muted", QStyle.SP_MediaVolumeMuted)
-            self._show_audio_output(self.volume_slider.value(), self.mute_btn.isChecked())
+        """Re-tint item-view icons after a light/dark change; the custom
+        widgets read the theme whenever they paint."""
+        if hasattr(self, "local_proxy"):
+            self.local_proxy.invalidate()
+        model = getattr(self, "server_model", None)
+        if model is None:
+            return
+        def visit(parent):
+            for row in range(parent.rowCount()):
+                item = parent.child(row)
+                kind = item.data(_SERVER_TYPE_ROLE)
+                if kind in ("directory", "file"):
+                    item.setIcon(theme.icon(Icons.folder if kind == "directory" else Icons.movie))
+                visit(item)
+        visit(model.invisibleRootItem())
 
     def changeEvent(self, event) -> None:
         super().changeEvent(event)
@@ -770,8 +942,9 @@ class MainWindow(DesktopFeatures, QMainWindow):
         entering = not self.isFullScreen()
         # The transport bar becomes a pointer-revealed overlay in fullscreen
         # rather than just vanishing; everything else hides.
-        for w in (self._toolbar, self.statusBar()):
-            w.setVisible(not entering)
+        self._toolbar.setVisible(not entering)
+        self.tracks_btn.setChecked(False)
+        self.fullscreen_btn.set_icon(Icons.fullscreen_exit if entering else Icons.fullscreen)
         if entering:
             self._settings_visible_before_fullscreen = self.playback_settings.isVisible()
             self.playback_settings.hide()
@@ -792,9 +965,17 @@ class MainWindow(DesktopFeatures, QMainWindow):
 
     def keyPressEvent(self, event) -> None:
         # Unhandled keys from the player view propagate up to here.
-        if event.key() == Qt.Key_Escape and self.isFullScreen():
-            self.toggle_fullscreen()
-            return
+        if event.key() == Qt.Key_Escape:
+            # Innermost first: the track card, the settings sheet, fullscreen.
+            if self.tracks_btn.isChecked():
+                self.tracks_btn.setChecked(False)
+                return
+            if self.playback_settings.isVisible():
+                self.playback_settings.hide()
+                return
+            if self.isFullScreen():
+                self.toggle_fullscreen()
+                return
         super().keyPressEvent(event)
 
     # -- fullscreen control overlay ---------------------------------------------
@@ -807,13 +988,8 @@ class MainWindow(DesktopFeatures, QMainWindow):
         self._controls_overlay = True
         self._controls_layout.removeWidget(self.controls_panel)
         self.controls_panel.setParent(self.player)
-        self.controls_panel.setAttribute(Qt.WA_StyledBackground, True)
+        self.controls_panel.overlay = True
         self._apply_overlay_palette()
-        self.controls_panel.setStyleSheet(
-            "#overlayControls { background-color: palette(window); "
-            "border-top: 1px solid palette(mid); }"
-        )
-        self.controls_panel.layout().setContentsMargins(16, 8, 16, 12)
         self.controls_panel.hide()
         self._position_overlay()
         self.controls_panel.raise_()
@@ -835,15 +1011,13 @@ class MainWindow(DesktopFeatures, QMainWindow):
         self._controls_timer.stop()
         self._cursor_timer.stop()
         self.player.unsetCursor()
-        self.controls_panel.setStyleSheet("")
+        self.controls_panel.overlay = False
         self.controls_panel.setPalette(QPalette())
-        self.controls_panel.setAttribute(Qt.WA_StyledBackground, False)
-        self.controls_panel.layout().setContentsMargins(0, 0, 0, 0)
         self._controls_layout.addWidget(self.controls_panel)  # re-dock below the video
         self.controls_panel.show()
 
     def _position_overlay(self) -> None:
-        h = self.controls_panel.sizeHint().height()
+        h = self.controls_panel.height()  # fixed; the layout's hint is shorter
         self.controls_panel.setGeometry(
             0, self.player.height() - h, self.player.width(), h
         )
@@ -852,7 +1026,7 @@ class MainWindow(DesktopFeatures, QMainWindow):
         if not (self._controls_overlay and self.isFullScreen()):
             return
         self._show_player_cursor()
-        reveal_zone = self.controls_panel.sizeHint().height() + 48
+        reveal_zone = self.controls_panel.height() + 48
         if y >= self.player.height() - reveal_zone:
             self._reveal_controls()
 
@@ -862,8 +1036,10 @@ class MainWindow(DesktopFeatures, QMainWindow):
             self._cursor_timer.start()
 
     def _pointer_over_controls(self) -> bool:
-        local = self.controls_panel.mapFromGlobal(QCursor.pos())
-        return self.controls_panel.isVisible() and self.controls_panel.rect().contains(local)
+        for panel in (self.controls_panel, self.track_panel):
+            if panel.isVisible() and panel.rect().contains(panel.mapFromGlobal(QCursor.pos())):
+                return True
+        return False
 
     def _auto_hide_cursor(self) -> None:
         if not self._controls_overlay:
@@ -888,6 +1064,7 @@ class MainWindow(DesktopFeatures, QMainWindow):
         if self._slider_down or self._pointer_over_controls():
             self._controls_timer.start()
             return
+        self.tracks_btn.setChecked(False)
         self.controls_panel.hide()
 
     def eventFilter(self, obj, event) -> bool:
@@ -896,18 +1073,21 @@ class MainWindow(DesktopFeatures, QMainWindow):
         elif obj is self.player and event.type() == QEvent.Leave:
             self._cursor_timer.stop()
             self.player.unsetCursor()
+        if obj is self.player and event.type() == QEvent.MouseButtonPress:
+            self.tracks_btn.setChecked(False)
         if obj is self.player and event.type() == QEvent.Resize:
             self._position_idle_guidance()
             if self._controls_overlay:
                 self._position_overlay()
+        if obj is self._root and event.type() == QEvent.Resize:
+            if self.track_panel.isVisible():
+                self._position_track_panel()
+            if self.playback_settings.isVisible():
+                self._position_settings_panel()
         return super().eventFilter(obj, event)
 
     def _position_idle_guidance(self) -> None:
-        height = min(180, max(0, self.player.height() - 48))
-        self.idle_hint.setGeometry(
-            24, (self.player.height() - height) // 2,
-            max(0, self.player.width() - 48), height,
-        )
+        self.idle_hint.setGeometry(self.player.rect())
 
     def _update_idle_guidance(self) -> None:
         if self._session_source is not None:
@@ -931,7 +1111,9 @@ class MainWindow(DesktopFeatures, QMainWindow):
         self.mute_btn.blockSignals(True)
         self.mute_btn.setChecked(muted)
         self.mute_btn.blockSignals(False)
-        self.mute_btn.setIcon(self._icon_muted if muted else self._icon_volume)
+        self.mute_btn.set_icon(
+            Icons.volume_off if muted or volume <= 0
+            else Icons.volume_low if volume < 50 else Icons.volume_high)
         self.mute_btn.setToolTip("Unmute (M)" if muted else "Mute (M)")
         self.mute_btn.setAccessibleName("Unmute" if muted else "Mute")
 
@@ -1028,8 +1210,7 @@ class MainWindow(DesktopFeatures, QMainWindow):
         resize_index = self.resize_combo.findData(selected_resize)
         self.resize_combo.setCurrentIndex(resize_index if resize_index >= 0 else 0)
         self.resize_combo.blockSignals(False)
-        self.conn_label.setText(f"connected: {caps['server_name']}")
-        self.connect_btn.setText("Disconnect")
+        self._show_connection(f"connected: {caps['server_name']}", connected=True)
         self._update_idle_guidance()
         if self._session_source is None:
             self.statusBar().showMessage("Choose a video from the file browser.")
@@ -1045,16 +1226,15 @@ class MainWindow(DesktopFeatures, QMainWindow):
         panel = QWidget()
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(0, 0, 0, 0)
-        refresh = QToolButton()
-        refresh.setIcon(self._icon("view-refresh", QStyle.SP_BrowserReload))
-        refresh.setText("Refresh")
-        refresh.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        layout.setSpacing(8)
+        refresh = IconButton(Icons.refresh, size=30, icon_size=18)
         refresh.setToolTip("Refresh the server library")
         row = QHBoxLayout()
-        row.setContentsMargins(0, 0, 0, 0)
+        row.setContentsMargins(20, 0, 12, 0)
+        row.addWidget(_hint_label("Server library", "dim"))
         row.addStretch(1)
         row.addWidget(refresh)
-        placeholder = QLabel("Loading server library…")
+        placeholder = _hint_label("Loading server library…")
         placeholder.setAlignment(Qt.AlignCenter)
         placeholder.setWordWrap(True)
         tree = QTreeView()
@@ -1064,7 +1244,10 @@ class MainWindow(DesktopFeatures, QMainWindow):
         tree.setVisible(False)
         layout.addLayout(row)
         layout.addWidget(placeholder)
-        layout.addWidget(tree, stretch=1)
+        tree_box = QVBoxLayout()
+        tree_box.setContentsMargins(8, 0, 4, 0)
+        tree_box.addWidget(tree)
+        layout.addLayout(tree_box, stretch=1)
 
         self.server_browser_panel = panel
         self.server_tree = tree
@@ -1105,10 +1288,7 @@ class MainWindow(DesktopFeatures, QMainWindow):
 
     def _append_server_node(self, parent: QStandardItem, node: dict) -> None:
         is_dir = node.get("type") == "directory"
-        icon = self._icon(
-            "folder" if is_dir else "video-x-generic",
-            QStyle.SP_DirIcon if is_dir else QStyle.SP_FileIcon,
-        )
+        icon = theme.icon(Icons.folder if is_dir else Icons.movie)
         label = node.get("name", "")
         if not is_dir:
             entry = self.history.entries.get(self._key_for("server_file", node.get("path", "")))
@@ -1258,8 +1438,7 @@ class MainWindow(DesktopFeatures, QMainWindow):
                 await self.client.close()
             self.client = None
             self._remove_server_tab()
-            self.conn_label.setText("disconnected")
-            self.connect_btn.setText("Connect")
+            self._show_connection("disconnected", connected=False)
             self._update_idle_guidance()
             return
         try:
@@ -1524,10 +1703,16 @@ class MainWindow(DesktopFeatures, QMainWindow):
         self.sub_delay.setEnabled(True)
         self.audio_combo.setEnabled(True)
         self.audio_delay.setEnabled(True)
-        self.play_btn.setIcon(self._icon_play if self._paused else self._icon_pause)
+        self.play_btn.set_icon(Icons.play if self._paused else Icons.pause)
         self.play_btn.setToolTip("Play (Space)" if self._paused else "Pause (Space)")
+        self.player.setFocus()  # keys (Space/F/arrows) go to the video
         # A paused player still needs initial packets to establish its first
         # frame. The live buffer report applies the usual server watermark.
+        self._show_now_playing(
+            Path(path).name,
+            f"{cfg.model} · {self.tier_combo.currentText()} · "
+            f"{session.downlink_width}×{session.downlink_height}",
+        )
         self.statusBar().showMessage(
             f"{Path(path).name} -> {session.downlink_codec} "
             f"{session.downlink_width}x{session.downlink_height}"
@@ -1635,7 +1820,7 @@ class MainWindow(DesktopFeatures, QMainWindow):
             if self._restart_snapshot:
                 self._restart_snapshot.paused = self._paused
             self.player.set_paused(self._paused)
-            self.play_btn.setIcon(self._icon_play if self._paused else self._icon_pause)
+            self.play_btn.set_icon(Icons.play if self._paused else Icons.pause)
             return
         local = self._session_source == "local"
         if not local and (self.client is None or self.client.session is None):
@@ -1645,12 +1830,12 @@ class MainWindow(DesktopFeatures, QMainWindow):
         if self._paused:
             if not local:
                 await self.client.pause()
-            self.play_btn.setIcon(self._icon_play)
+            self.play_btn.set_icon(Icons.play)
             self.play_btn.setToolTip("Play (Space)")
         else:
             if not local:
                 await self.client.play()
-            self.play_btn.setIcon(self._icon_pause)
+            self.play_btn.set_icon(Icons.pause)
             self.play_btn.setToolTip("Pause (Space)")
 
     @asyncSlot()
@@ -1724,8 +1909,7 @@ class MainWindow(DesktopFeatures, QMainWindow):
                 self._error("Server cleanup not confirmed", str(err))
             self.client = None
             self._remove_server_tab()
-            self.conn_label.setText("disconnected")
-            self.connect_btn.setText("Connect")
+            self._show_connection("disconnected", connected=False)
         self._session_source = "local"
         self._session_time_base = None
         self._pending_seek_s = None
@@ -1739,6 +1923,7 @@ class MainWindow(DesktopFeatures, QMainWindow):
             return
         if self._session_source != "local":
             return
+        self._show_now_playing(Path(path).name, "Playing locally · upscaler off")
         self.statusBar().showMessage(f"playing locally from {pos:.1f}s (upscaler off)")
 
     def on_sub_selected(self, index: int) -> None:
@@ -1752,8 +1937,11 @@ class MainWindow(DesktopFeatures, QMainWindow):
     def _set_chapters(self, chapters: list[Chapter]) -> None:
         self._chapters = chapters
         visible = bool(chapters)
-        for widget in (self.chapter_prev_btn, self.chapter_combo, self.chapter_next_btn):
+        for widget in (self.chapter_prev_btn, self.chapter_label, self.chapter_combo,
+                       self.chapter_next_btn):
             widget.setVisible(visible)
+        if self.track_panel.isVisible():
+            self._position_track_panel()
         self.chapter_combo.blockSignals(True)
         self.chapter_combo.clear()
         for index, chapter in enumerate(chapters):
@@ -1903,7 +2091,10 @@ class MainWindow(DesktopFeatures, QMainWindow):
         self.play_btn.setEnabled(self._restart_snapshot is not None and not self._closing)
         self.stop_btn.setEnabled(self._transitioning and not self._closing)
         self.fallback_btn.setEnabled(False)
-        self.fallback_btn.setVisible(True)
+        self.fallback_btn.setVisible(False)
+        if self._restart_snapshot is None:
+            self.play_btn.set_icon(Icons.play)
+            self.play_btn.setToolTip("Play (Space)")
         self.seek_slider.setEnabled(False)
         self.sub_combo.setEnabled(False)
         self.sub_delay.setEnabled(False)
@@ -1919,6 +2110,9 @@ class MainWindow(DesktopFeatures, QMainWindow):
         self._slider_down = False
         self.pos_label.setText("--:-- / --:--")
         self.player_status.clear()
+        self.tracks_btn.setChecked(False)
+        self._show_now_playing(None)
+        self._on_status_message(self.statusBar().currentMessage())
         self._update_idle_guidance()
         if self.client is not None and (
             self.client.session is not None
@@ -1934,8 +2128,7 @@ class MainWindow(DesktopFeatures, QMainWindow):
                 # overlap a wedged NVENC owner. Make the risk visible and stop.
                 self.client = None
                 self._remove_server_tab()
-                self.conn_label.setText("server teardown unconfirmed")
-                self.connect_btn.setText("Connect")
+                self._show_connection("server teardown unconfirmed", connected=False, warn=True)
                 self._error("Server cleanup not confirmed", str(err))
                 return
             if self._closing:
@@ -1949,8 +2142,7 @@ class MainWindow(DesktopFeatures, QMainWindow):
                 await client.close()
                 self.client = None
                 self._remove_server_tab()
-                self.conn_label.setText("disconnected")
-                self.connect_btn.setText("Connect")
+                self._show_connection("disconnected", connected=False)
 
     def closeEvent(self, event) -> None:
         self._feature_timer.stop()

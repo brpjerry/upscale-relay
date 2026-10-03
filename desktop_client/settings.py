@@ -112,6 +112,15 @@ class AppSettings:
         self._qs.setValue("playback/fast_forward_s", _clamp_fast_forward(v))
 
     @property
+    def theme_mode(self) -> str:
+        value = self._qs.value("appearance/theme", "auto")
+        return value if value in ("auto", "dark", "light") else "auto"
+
+    @theme_mode.setter
+    def theme_mode(self, v: str) -> None:
+        self._qs.setValue("appearance/theme", v)
+
+    @property
     def browse_dir(self) -> str:
         return self._qs.value("browser/dir", "")
 

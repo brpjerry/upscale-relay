@@ -22,6 +22,11 @@ load-bearing), `docs/CLIENT_LINUX.md` (Linux setup), and
 - `relay_client_core/` — demux/uplink/control/downlink library + `relay-client`
   mock CLI (used by the integration tests).
 - `desktop_client/` — PySide6 + qasync + python-mpv player (`relay-desktop`).
+  QtWidgets, skinned to match MV Player: `theme.py` (dark/light palette, style
+  sheet, Material icon paths rendered through QtSvg) and `widgets.py`
+  (custom-painted buttons/sliders/switches that keep the stock Qt API the
+  tests drive). Text colours travel through QPalette, not style sheet rules —
+  the fullscreen overlay re-palettes its labels.
 - `upscale_cli/` — offline pipeline, ONNX/EP handling, uint8 graph wrapper,
   `upscale-cli` (run/info/sample/bench subcommands).
 
@@ -82,6 +87,9 @@ constructor options).
   nested loop re-enters asyncio tasks and ends in memory corruption.
   `MainWindow._error()` is non-modal on purpose.
 - A garbage-collected `asyncio.StreamWriter` closes its socket — keep refs.
+- A Python exception inside a Qt virtual (`eventFilter`, `sizeHint`,
+  `paintEvent`) is a segfault with an `<invalid frame>` stack, not a
+  traceback. Install event filters only after every widget they read exists.
 - Client must send `buffer_report` on a timer with *live* values; reporting
   only on packet arrival deadlocks the server's watermark pause/resume.
 - Under qasync the loop turns ~once per rendered frame (~25/s) while mpv

@@ -7,7 +7,7 @@ from pathlib import Path, PurePosixPath
 import time
 
 from PySide6.QtCore import QStandardPaths, Qt, QTimer
-from PySide6.QtWidgets import QCheckBox, QComboBox, QFormLayout, QGroupBox, QLabel, QLineEdit, QMenu, QSpinBox
+from PySide6.QtWidgets import QComboBox, QFormLayout, QGroupBox, QLabel, QLineEdit, QMenu, QSpinBox
 
 from .browser_state import BrowserStore
 from .diagnostics import ClientLog
@@ -16,6 +16,8 @@ from .history import HistoryStore, source_key
 from .mpv_config import ConfigWatcher, DEFAULTS, MpvConfig
 from .playback_state import PlaybackSnapshot, Transitions
 from .settings import FAST_FORWARD_MAX_S
+from .theme import style_menu
+from .widgets import FlatSwitch
 
 
 class DesktopFeatures:
@@ -53,6 +55,7 @@ class DesktopFeatures:
         form = group("mpv defaults")
         self.mpv_defaults_notice = QLabel("These settings modify mpv.conf and also affect standalone mpv.")
         self.mpv_defaults_notice.setWordWrap(True)
+        self.mpv_defaults_notice.setProperty("role", "faint")
         form.addRow(self.mpv_defaults_notice)
         self.mpv_config_label = QLabel()
         self.mpv_config_label.setWordWrap(True)
@@ -110,7 +113,7 @@ class DesktopFeatures:
         self.fast_forward_spin.valueChanged.connect(self._set_fast_forward)
         form.addRow("Skip amount", self.fast_forward_spin)
         form = group("Library")
-        self.autoplay_check = QCheckBox("Play the next video automatically")
+        self.autoplay_check = FlatSwitch("Play the next video automatically")
         self.autoplay_check.setChecked(self.settings.autoplay)
         self.autoplay_check.toggled.connect(lambda value: setattr(self.settings, "autoplay", value))
         form.addRow(self.autoplay_check)
@@ -119,13 +122,20 @@ class DesktopFeatures:
         self.history_limit_spin.setValue(self.settings.history_limit)
         self.history_limit_spin.valueChanged.connect(self._set_history_limit)
         form.addRow("History entries", self.history_limit_spin)
+        form = group("Appearance")
+        self.theme_combo = QComboBox()
+        for label, value in (("Follow system", "auto"), ("Dark", "dark"), ("Light", "light")):
+            self.theme_combo.addItem(label, value)
+        self.theme_combo.setCurrentIndex(self.theme_combo.findData(self.settings.theme_mode))
+        self.theme_combo.activated.connect(lambda _index: self._set_theme_mode(self.theme_combo.currentData()))
+        form.addRow("Theme", self.theme_combo)
         form = group("Diagnostics")
-        self.diagnostics_check = QCheckBox("Show playback diagnostics")
+        self.diagnostics_check = FlatSwitch("Show playback diagnostics")
         self.diagnostics_check.setChecked(self.settings.diagnostics)
         self.diagnostics_check.toggled.connect(self._set_diagnostics)
         self.player_status.setVisible(self.settings.diagnostics)
         form.addRow(self.diagnostics_check)
-        self.logging_check = QCheckBox("Write client diagnostic logs")
+        self.logging_check = FlatSwitch("Write client diagnostic logs")
         self.logging_check.setChecked(self.settings.file_logging)
         self.logging_check.toggled.connect(self._set_logging)
         form.addRow(self.logging_check)
@@ -242,6 +252,10 @@ class DesktopFeatures:
         self.settings.fast_forward_s = value
         self._show_skip_amount(self.settings.fast_forward_s)
 
+    def _set_theme_mode(self, mode):
+        self.settings.theme_mode = mode
+        self._apply_theme_mode(mode)
+
     def _set_diagnostics(self, value):
         self.settings.diagnostics = value
         self.player_status.setVisible(value)
@@ -307,6 +321,7 @@ class DesktopFeatures:
         if not path:
             return
         menu = QMenu(tree)
+        style_menu(menu)
         key = self._key_for(source, path)
         for label, watched in (("Mark watched", True), ("Mark unwatched", False)):
             action = menu.addAction(label)

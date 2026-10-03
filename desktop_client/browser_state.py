@@ -6,6 +6,7 @@ from pathlib import PurePosixPath
 
 from PySide6.QtCore import QPoint, QSortFilterProxyModel, Qt
 
+from . import theme
 from .history import source_key
 
 
@@ -25,6 +26,10 @@ class LocalLibraryProxy(QSortFilterProxyModel):
         return key(a) < key(b)
 
     def data(self, index, role=Qt.DisplayRole):
+        if role == Qt.DecorationRole and index.column() == 0:
+            # Theme-tinted outlines instead of the platform's file icons.
+            is_dir = self.sourceModel().isDir(self.mapToSource(index))
+            return theme.icon(theme.Icons.folder if is_dir else theme.Icons.movie)
         value = super().data(index, role)
         if role in (Qt.DisplayRole, Qt.ToolTipRole) and index.column() == 0:
             source = self.mapToSource(index)
