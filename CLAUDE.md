@@ -94,6 +94,18 @@ constructor options).
   traceback. Install event filters only after every widget they read exists.
 - Client must send `buffer_report` on a timer with *live* values; reporting
   only on packet arrival deadlocks the server's watermark pause/resume.
+- Keep mpv's render call blocking (`block_for_target_time`, the default).
+  mpv announces a frame ~one period before its display time and waits the
+  difference out inside `render()` on the GUI thread (38 of every 42 ms at
+  24 fps), which is why UI animations step at the video's frame rate during
+  playback. Measured alternatives on 2026-10-03, both rejected:
+  rendering at once shows every frame a period early (39.5 ms at 24 fps,
+  video ahead of audio, invisible to mpv's `avsync`); waiting on a Qt timer
+  for `next_frame_info.target_time` (nanoseconds, despite the header) is on
+  time in steady state, but any other repaint of the video widget then
+  consumes the pending frame early, and `screenshot-raw` (the auto accent
+  sampler) intermittently stalls mpv's frame delivery ~0.3 s (drops), which
+  it does not do while the render call blocks.
 - Under qasync the loop turns ~once per rendered frame (~25/s) while mpv
   plays. Media pumps must move batches per loop turn: per-packet
   `to_thread`+`drain` capped the uplink at ~12 pkt/s (starved the server
