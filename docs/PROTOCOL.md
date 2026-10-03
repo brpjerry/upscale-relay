@@ -60,6 +60,12 @@ ignored. A server returns `error{code:"bad_message"}` for an unknown client
 request type; a client ignores an unknown server event type so additive
 notifications remain backward compatible.
 
+Both ends send WebSocket pings every 20 s and close the connection when a
+pong does not arrive in time, so a peer that vanished without closing (a
+suspended laptop, a dropped network) is noticed while idle rather than at the
+next request. No message type is involved and no protocol version change is
+required.
+
 ### client → server
 
 | type | fields | notes |
