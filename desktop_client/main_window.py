@@ -86,6 +86,7 @@ _SERVER_TYPE_ROLE = Qt.UserRole + 1
 _SERVER_LOADED_ROLE = Qt.UserRole + 2
 _SERVER_CURSOR_ROLE = Qt.UserRole + 3
 _SERVER_PAGE_SIZE = 100
+_RECONNECT_DELAYS_S = (0.0, 2.0, 5.0)
 
 
 def _format_time(seconds: float) -> str:
@@ -1181,6 +1182,7 @@ class MainWindow(DesktopFeatures, QMainWindow):
         self._server_caps = dict(caps)
         client.on_progress = self._on_open_progress
         client.on_seek_progress = self._on_seek_progress
+        client.on_disconnected = lambda: self._on_control_lost(client)
         self.settings.server_host, self.settings.server_port = client.host, client.port
         current = self.model_combo.currentText()
         self.model_combo.clear()
@@ -1431,6 +1433,45 @@ class MainWindow(DesktopFeatures, QMainWindow):
     async def on_connect(self) -> None:
         await self._run_transition(self._connect)
 
+    def _on_control_lost(self, lost) -> None:
+        """The control connection ended on its own (server restart, suspend,
+        network drop). With nothing playing, replace it quietly so the next
+        play does not fail on a connection that only looked alive. A live
+        session is left to its own failure path: its downlink ends too."""
+        if lost is not self.client or self._closing or self._transitioning:
+            return
+        if self._session_source is not None:
+            return
+        self.client_log.record("control_lost", host=lost.host, port=lost.port)
+        asyncio.ensure_future(self._run_transition(lambda: self._replace_lost_client(lost)))
+
+    async def _replace_lost_client(self, lost) -> None:
+        if lost is not self.client:
+            return
+        self.statusBar().showMessage("Connection to the server was lost; reconnecting…")
+        # After a resume the network can take a moment to come back.
+        for delay in _RECONNECT_DELAYS_S:
+            if delay:
+                await asyncio.sleep(delay)
+            if lost is not self.client or self._closing:
+                return
+            client = RelayClient(lost.host, lost.port)
+            try:
+                caps = await client.connect()
+            except asyncio.CancelledError:
+                await client.close()
+                raise
+            except Exception:
+                await client.close()
+                continue
+            await lost.close()
+            await self._adopt_connected_client(client, caps)
+            return
+        if lost is self.client:
+            await self._connect()  # still set: this is the disconnect branch
+            self.statusBar().showMessage(
+                "Lost the connection to the server. Connect again to continue.")
+
     async def _connect(self) -> None:
         if self.client is not None:
             await self._teardown_session()
@@ -1541,6 +1582,9 @@ class MainWindow(DesktopFeatures, QMainWindow):
             resume_s = snapshot.position if snapshot else (entry.resume if entry else 0.0)
         self._paused = snapshot.paused if snapshot else False
         await self._teardown_session()
+        if self.client is not None and not getattr(self.client, "connected", True):
+            # Nothing was allocated on a dead idle connection; open on a fresh one.
+            await self._replace_lost_client(self.client)
         if self.client is None:  # teardown lost the connection and couldn't reconnect
             self._error("Not connected", "Lost the connection to the upscale server.")
             return

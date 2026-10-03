@@ -387,3 +387,71 @@ def test_chapter_buttons_flank_skip_buttons_and_hide_without_chapters(window):
     assert not window.seek_forward_btn.isHidden()
     window._set_chapters([Chapter(0.0, "Intro"), Chapter(90.0, "Part A")])
     assert not window.chapter_next_btn.isHidden() and not window.chapter_prev_btn.isHidden()
+
+
+def test_idle_control_loss_reconnects_without_an_error(window, monkeypatch):
+    events, errors = setup_lifecycle(window, monkeypatch)
+    monkeypatch.setattr(main_window, "_RECONNECT_DELAYS_S", (0.0,))
+    lost = window.client
+    async def scenario():
+        window._on_control_lost(lost)
+        for _ in range(50):
+            if window.client is not lost:
+                break
+            await asyncio.sleep(0.01)
+        assert window.client is not None and window.client is not lost
+        assert ("closed",) in events  # the dead client's local resources were released
+        assert not errors
+        # A stale notification from the replaced client changes nothing.
+        current = window.client
+        window._on_control_lost(lost)
+        await asyncio.sleep(0.05)
+        assert window.client is current
+    asyncio.run(scenario())
+
+
+def test_control_loss_during_playback_is_left_to_the_session(window, monkeypatch):
+    events, errors = setup_lifecycle(window, monkeypatch)
+    async def scenario():
+        await window._start_session("show.mkv", "server_file")
+        playing = window.client
+        window._on_control_lost(playing)
+        await asyncio.sleep(0.05)
+        assert window.client is playing
+        assert window._session_source == "server_file"
+    asyncio.run(scenario())
+
+
+def test_play_on_a_dead_idle_connection_opens_on_a_fresh_one(window, monkeypatch):
+    events, errors = setup_lifecycle(window, monkeypatch)
+    monkeypatch.setattr(main_window, "_RECONNECT_DELAYS_S", (0.0,))
+    dead = window.client
+    dead.connected = False
+    async def scenario():
+        await window._start_session("show.mkv", "server_file")
+        assert window.client is not dead
+        assert window._session_source == "server_file"
+        assert events.index(("closed",)) < events.index(("open", "show.mkv", "fit"))
+        assert not errors
+    asyncio.run(scenario())
+
+
+def test_failed_reconnect_shows_disconnected(window, monkeypatch):
+    events, errors = setup_lifecycle(window, monkeypatch)
+    monkeypatch.setattr(main_window, "_RECONNECT_DELAYS_S", (0.0, 0.0))
+    class Unreachable(LifecycleClient):
+        async def connect(self):
+            raise ConnectionError("unreachable")
+    monkeypatch.setattr(main_window, "RelayClient", lambda host, port: Unreachable(events, host, port))
+    lost = window.client
+    async def scenario():
+        window._on_control_lost(lost)
+        for _ in range(50):
+            if window.client is None:
+                break
+            await asyncio.sleep(0.01)
+        assert window.client is None
+        assert window.connect_btn.text() == "Connect"
+        assert "Lost the connection" in window.statusBar().currentMessage()
+        assert not errors
+    asyncio.run(scenario())
