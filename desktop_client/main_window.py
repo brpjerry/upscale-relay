@@ -7,8 +7,20 @@ import ipaddress
 import time
 from pathlib import Path
 
-from PySide6.QtCore import QDir, QEvent, QPoint, QStandardPaths, Qt, QTimer, Signal
+from PySide6.QtCore import (
+    QDir,
+    QEasingCurve,
+    QEvent,
+    QPoint,
+    QRect,
+    QStandardPaths,
+    Qt,
+    QTimer,
+    QVariantAnimation,
+    Signal,
+)
 from PySide6.QtGui import (
+    QColor,
     QCursor,
     QPalette,
     QStandardItem,
@@ -55,6 +67,7 @@ from . import theme
 from .settings import AppSettings, format_skip
 from .theme import Icons
 from .widgets import (
+    AutoHideButton,
     ControlBar,
     ElideLabel,
     FlatSlider,
@@ -62,10 +75,13 @@ from .widgets import (
     IconButton,
     IdleHint,
     Logo,
+    PlayerOverlay,
+    Reveal,
     SidePanel,
     Spinner,
     StatusDot,
     VolumeSlider,
+    WheelGuard,
     show_slider_tip,
     tabular,
 )
@@ -229,7 +245,10 @@ class MainWindow(DesktopFeatures, QMainWindow):
         settings = AppSettings(options.settings_scope)
         # Before any widget exists, so the window is born with the themed palette.
         app = QApplication.instance()
-        theme.apply_theme(app, settings.theme_mode)
+        theme.apply_theme(
+            app, settings.theme_mode,
+            theme.DEFAULT_ACCENT if settings.accent == "auto" else settings.accent,
+        )
         super().__init__()
         self.options = options
         self.settings = settings
@@ -323,6 +342,13 @@ class MainWindow(DesktopFeatures, QMainWindow):
         bar_layout.addSpacing(4)
         bar_layout.addWidget(self.host_edit)
         bar_layout.addWidget(self.nearby_btn)
+        # Stop ends the session, so it sits with the connection controls
+        # rather than among the transport buttons; shown only while it applies.
+        self.stop_btn = AutoHideButton("Stop")
+        self.stop_btn.setIcon(theme.icon(Icons.stop, theme.current().text, 16))
+        self.stop_btn.setToolTip("Stop playback")
+        self.stop_btn.setEnabled(False)
+        bar_layout.addWidget(self.stop_btn)
         bar_layout.addWidget(self.connect_btn)
         bar_layout.addWidget(self.playback_settings_toggle)
 
@@ -379,7 +405,7 @@ class MainWindow(DesktopFeatures, QMainWindow):
         panel_layout.setSpacing(0)
         panel_layout.addWidget(settings_title)
         panel_layout.addWidget(settings_scroll, stretch=1)
-        self.playback_settings_toggle.toggled.connect(self.playback_settings.setVisible)
+        self.playback_settings_toggle.toggled.connect(self._set_settings_visible)
         self.playback_settings.visibilityChanged.connect(self._on_settings_visibility)
         self._settings_visible_before_fullscreen = False
 
@@ -481,14 +507,12 @@ class MainWindow(DesktopFeatures, QMainWindow):
         self.player = PlayerView(options=self.options)
         self.idle_hint = IdleHint(self.player)
         self.idle_hint.setObjectName("idleGuidance")
+        self.video_overlay = PlayerOverlay(self.player)
         if hasattr(self.player, "set_deband"):
             self.player.set_deband(self.settings.deband_enabled)
         self.play_btn = IconButton(Icons.play, size=40, icon_size=24, filled=True)
         self.play_btn.setToolTip("Play (Space)")
         self.play_btn.setEnabled(False)
-        self.stop_btn = IconButton(Icons.stop, icon_size=22)
-        self.stop_btn.setToolTip("Stop")
-        self.stop_btn.setEnabled(False)
         self.chapter_prev_btn = IconButton(Icons.previous, icon_size=24)
         self.chapter_prev_btn.setToolTip("Previous chapter (PgDn)")
         self.chapter_next_btn = IconButton(Icons.next, icon_size=24)
@@ -583,17 +607,17 @@ class MainWindow(DesktopFeatures, QMainWindow):
         transport = QHBoxLayout()
         transport.setSpacing(10)
         transport.addStretch(1)
-        transport.addWidget(self.stop_btn)
-        transport.addWidget(self.play_btn)
-        # Skip buttons step by the configured fast-forward amount; the chapter
-        # buttons around them stay hidden for files without chapters.
-        self.seek_back_btn = IconButton()
-        self.seek_forward_btn = IconButton()
+        # Play/pause sits in the middle. The skip buttons beside it step by
+        # the configured fast-forward amount; the chapter buttons outside
+        # those stay hidden for files without chapters.
+        self.seek_back_btn = IconButton(Icons.fast_rewind, icon_size=24)
+        self.seek_forward_btn = IconButton(Icons.fast_forward, icon_size=24)
         self.seek_back_btn.clicked.connect(lambda: self.on_skip(-1))
         self.seek_forward_btn.clicked.connect(lambda: self.on_skip(1))
         self._show_skip_amount(self.settings.fast_forward_s)
         transport.addWidget(self.chapter_prev_btn)
         transport.addWidget(self.seek_back_btn)
+        transport.addWidget(self.play_btn)
         transport.addWidget(self.seek_forward_btn)
         transport.addWidget(self.chapter_next_btn)
         transport.addStretch(1)
@@ -603,8 +627,8 @@ class MainWindow(DesktopFeatures, QMainWindow):
         center_layout = QVBoxLayout(center)
         center_layout.setContentsMargins(0, 8, 0, 8)
         center_layout.setSpacing(2)
-        center_layout.addLayout(transport)
         center_layout.addLayout(seek_row)
+        center_layout.addLayout(transport)
         now_playing = QWidget()
         now_layout = QVBoxLayout(now_playing)
         now_layout.setContentsMargins(0, 0, 0, 0)
@@ -704,6 +728,13 @@ class MainWindow(DesktopFeatures, QMainWindow):
         self.track_panel.hide()
         self.playback_settings.setParent(self._root)
         self.playback_settings.hide()
+        # Motion: the track card rises and fades in, the settings sheet slides
+        # in from the edge, the fullscreen bar slides up from below.
+        self._track_reveal = Reveal(self.track_panel, offset=QPoint(0, 12))
+        self._settings_reveal = Reveal(self.playback_settings, offset=QPoint(48, 0))
+        self._controls_reveal = Reveal(
+            self.controls_panel, offset=QPoint(0, self.controls_panel.height()), fade=False,
+            show_ms=theme.NORMAL, easing=QEasingCurve(QEasingCurve.OutCubic))
         # Installed only now: eventFilter reads the widgets created above, and
         # an exception raised inside a Qt virtual is a native crash.
         self.player.installEventFilter(self)  # reposition overlay on resize
@@ -776,6 +807,8 @@ class MainWindow(DesktopFeatures, QMainWindow):
         self.player.failed.connect(self._on_player_failed)
 
         self._paused = False
+        self._awaiting_first_frame = False
+        self._buffering = False
         self._was_maximized = False
         self._chapters: list[Chapter] = []
         self._duration_s: float | None = None
@@ -788,7 +821,14 @@ class MainWindow(DesktopFeatures, QMainWindow):
         self._session_time_base = None
         self.seek_slider.sliderPressed.connect(lambda: setattr(self, "_slider_down", True))
 
+        self._init_accent()
         self._init_feature_controls(settings_layout)
+        # After every control exists: the wheel scrolls the sheet, never a
+        # value that happens to be under the pointer.
+        self._wheel_guards = (
+            WheelGuard(settings_page, settings_scroll.viewport()),
+            WheelGuard(self.track_panel),
+        )
         self._apply_browser_visible(self.settings.browser_visible)
         self._update_idle_guidance()
         self.player.setFocus()
@@ -837,47 +877,153 @@ class MainWindow(DesktopFeatures, QMainWindow):
         # popup(), never exec(): a nested event loop re-enters asyncio tasks.
         self.nearby_menu.popup(self.nearby_btn.mapToGlobal(QPoint(0, self.nearby_btn.height() + 6)))
 
+    # -- accent colour -----------------------------------------------------------
+    # Either the colour chosen in settings, or ("auto") one that follows the
+    # picture of the playing video, changing slowly.
+
+    def _init_accent(self) -> None:
+        self._accent_average: tuple[float, float, float] | None = None
+        self._restart_accent = True
+        self._accent_glide = QVariantAnimation(self)
+        self._accent_glide.setEasingCurve(QEasingCurve(QEasingCurve.InOutSine))
+        self._accent_glide.valueChanged.connect(self._on_accent_step)
+        self._accent_glide.finished.connect(self._on_accent_landed)
+        self._sample_timer = QTimer(self)
+        self._sample_timer.setInterval(2000)  # each sample costs mpv a frame conversion
+        self._sample_timer.timeout.connect(self._request_accent_sample)
+        if hasattr(self.player, "frame_sampled"):
+            self.player.frame_sampled.connect(self._on_frame_sampled)
+
+    def _glide_accent(self, color, duration: int) -> None:
+        target = QColor(color)
+        self._accent_glide.stop()
+        if target == theme.accent_source():
+            return
+        if not self.isVisible():
+            theme.set_accent(QApplication.instance(), target)
+            return
+        self._accent_glide.setDuration(duration)
+        self._accent_glide.setStartValue(theme.accent_source())
+        self._accent_glide.setEndValue(target)
+        self._accent_glide.start()
+
+    def _on_accent_step(self, color) -> None:
+        theme.set_accent(QApplication.instance(), color)
+        self.update()  # custom-painted widgets read the theme as they repaint
+
+    def _on_accent_landed(self) -> None:
+        theme.set_accent(QApplication.instance(), self._accent_glide.endValue())
+
+    def _accent_setting_changed(self) -> None:
+        choice = self.settings.accent
+        self._sync_accent_sampling()
+        if choice != "auto":
+            self._glide_accent(choice, theme.ACCENT_FADE)
+        elif self._accent_average is None:
+            self._glide_accent(theme.DEFAULT_ACCENT, theme.ACCENT_FADE)
+
+    def _sync_accent_sampling(self) -> None:
+        """Sample the picture only while it can change what is shown."""
+        run = (
+            self.settings.accent == "auto" and self._session_source is not None
+            and not self._paused and hasattr(self.player, "request_frame_sample")
+        )
+        if run and not self._sample_timer.isActive():
+            self._sample_timer.start()
+        elif not run:
+            self._sample_timer.stop()
+        if self._session_source is None:
+            self._accent_average = None
+            if self.settings.accent == "auto":
+                self._glide_accent(theme.DEFAULT_ACCENT, theme.ACCENT_FADE)
+
+    def _request_accent_sample(self) -> None:
+        if not self._awaiting_first_frame:
+            self.player.request_frame_sample()
+
+    def _on_frame_sampled(self, image) -> None:
+        if self.settings.accent != "auto" or self._session_source is None:
+            return
+        sample = theme.accent_from_frame(image)
+        # Blend with the previous samples so quick cuts do not make the UI
+        # flicker, but lean on the newest one so it still keeps up.
+        keep = 0.0 if self._restart_accent or self._accent_average is None else 0.3
+        previous = self._accent_average or (0.0, 0.0, 0.0)
+        self._accent_average = tuple(
+            keep * old + (1 - keep) * new
+            for old, new in zip(previous, (sample.redF(), sample.greenF(), sample.blueF()))
+        )
+        self._restart_accent = False
+        color = QColor.fromRgbF(*self._accent_average, 1.0)
+        target = self._accent_glide.endValue() if self._accent_glide.state() == QVariantAnimation.Running \
+            else theme.accent_source()
+        target = QColor(target)
+        if abs(color.red() - target.red()) + abs(color.green() - target.green()) \
+                + abs(color.blue() - target.blue()) < 10:
+            return
+        self._glide_accent(color, theme.ACCENT_FADE_AUTO)
+
     def _on_color_scheme_changed(self, *_args) -> None:
         self._apply_theme_mode(self.settings.theme_mode)
 
     def _apply_theme_mode(self, mode: str) -> None:
         theme.apply_theme(QApplication.instance(), mode)
 
+    def _controls_top(self) -> int:
+        """Top of the control bar's resting place, in root coordinates."""
+        if self._controls_overlay:
+            return self._root.height() - self.controls_panel.height()
+        return self.controls_panel.y()
+
+    def _set_settings_visible(self, visible: bool) -> None:
+        if visible:
+            self._settings_reveal.show(self._settings_geometry())
+        else:
+            self._settings_reveal.hide()
+
     def _on_settings_visibility(self, visible: bool) -> None:
         self.playback_settings_toggle.setChecked(visible)
-        if visible:
-            self._position_settings_panel()
+        if visible and not self._settings_reveal.shown:
+            # Shown directly (not through the toggle): place it without motion.
+            self.playback_settings.setGeometry(self._settings_geometry())
             self.playback_settings.raise_()
 
-    def _position_settings_panel(self) -> None:
+    def _settings_geometry(self) -> QRect:
         """Sheet over the right edge, from the top down to the control bar."""
         width = min(400, self._root.width())
-        bottom = self.controls_panel.mapTo(self._root, QPoint(0, 0)).y()
-        self.playback_settings.setGeometry(self._root.width() - width, 0, width, bottom)
+        return QRect(self._root.width() - width, 0, width, self._controls_top())
+
+    def _position_settings_panel(self) -> None:
+        if self._settings_reveal.shown:
+            self._settings_reveal.retarget(self._settings_geometry())
+        else:
+            self.playback_settings.setGeometry(self._settings_geometry())
 
     def _set_track_panel_visible(self, visible: bool) -> None:
         if visible:
-            self._position_track_panel()
-            self.track_panel.show()
-            self.track_panel.raise_()
+            self._track_reveal.show(self._track_geometry())
         else:
-            self.track_panel.hide()
+            self._track_reveal.hide()
 
-    def _position_track_panel(self) -> None:
-        """Float the track card above the right end of the control bar."""
+    def _track_geometry(self) -> QRect:
+        """The track card floats above the right end of the control bar."""
         size = self.track_panel.sizeHint()
         width = min(max(size.width(), 420), max(0, self._root.width() - 32))
-        top = self.controls_panel.mapTo(self._root, QPoint(0, 0)).y()
-        self.track_panel.setGeometry(
-            self._root.width() - width - 16, max(8, top - size.height() - 10),
+        return QRect(
+            self._root.width() - width - 16, max(8, self._controls_top() - size.height() - 10),
             width, size.height(),
         )
+
+    def _position_track_panel(self) -> None:
+        self._track_reveal.retarget(self._track_geometry())
 
     def _refresh_action_icons(self) -> None:
         """Re-tint item-view icons after a light/dark change; the custom
         widgets read the theme whenever they paint."""
         if hasattr(self, "local_proxy"):
             self.local_proxy.invalidate()
+        if hasattr(self, "stop_btn"):
+            self.stop_btn.setIcon(theme.icon(Icons.stop, theme.current().text, 16))
         model = getattr(self, "server_model", None)
         if model is None:
             return
@@ -897,7 +1043,11 @@ class MainWindow(DesktopFeatures, QMainWindow):
             QEvent.ApplicationPaletteChange,
             QEvent.StyleChange,
         ):
-            self._refresh_action_icons()
+            # Item-view icons are tinted for dark or light, not for the accent,
+            # which changes the palette often while it follows the video.
+            if getattr(self, "_icons_dark", None) != theme.current().dark:
+                self._icons_dark = theme.current().dark
+                self._refresh_action_icons()
             if getattr(self, "_controls_overlay", False):
                 self._apply_overlay_palette()
 
@@ -945,10 +1095,12 @@ class MainWindow(DesktopFeatures, QMainWindow):
         # rather than just vanishing; everything else hides.
         self._toolbar.setVisible(not entering)
         self.tracks_btn.setChecked(False)
+        self._track_reveal.hide_now()  # the bar it hangs from is about to move
         self.fullscreen_btn.set_icon(Icons.fullscreen_exit if entering else Icons.fullscreen)
         if entering:
-            self._settings_visible_before_fullscreen = self.playback_settings.isVisible()
-            self.playback_settings.hide()
+            self._settings_visible_before_fullscreen = self._settings_reveal.shown \
+                or self.playback_settings.isVisible()
+            self._settings_reveal.hide_now()
             self._apply_browser_visible(False)
             self._enter_overlay_controls()
             self._was_maximized = self.isMaximized()
@@ -987,11 +1139,13 @@ class MainWindow(DesktopFeatures, QMainWindow):
         if self._controls_overlay:
             return
         self._controls_overlay = True
+        # Taken out of the layout but left a child of the root, floating over
+        # the video like the track card. Re-parenting it onto the QOpenGLWidget
+        # left it visible to Qt yet missing from the composited frame.
         self._controls_layout.removeWidget(self.controls_panel)
-        self.controls_panel.setParent(self.player)
         self.controls_panel.overlay = True
         self._apply_overlay_palette()
-        self.controls_panel.hide()
+        self._controls_reveal.hide_now()
         self._position_overlay()
         self.controls_panel.raise_()
 
@@ -1012,16 +1166,22 @@ class MainWindow(DesktopFeatures, QMainWindow):
         self._controls_timer.stop()
         self._cursor_timer.stop()
         self.player.unsetCursor()
+        self._controls_reveal.hide_now()
         self.controls_panel.overlay = False
         self.controls_panel.setPalette(QPalette())
         self._controls_layout.addWidget(self.controls_panel)  # re-dock below the video
         self.controls_panel.show()
 
     def _position_overlay(self) -> None:
+        geometry = self._overlay_geometry()
+        if self._controls_reveal.shown:
+            self._controls_reveal.retarget(geometry)
+        else:
+            self.controls_panel.setGeometry(geometry)
+
+    def _overlay_geometry(self) -> QRect:
         h = self.controls_panel.height()  # fixed; the layout's hint is shorter
-        self.controls_panel.setGeometry(
-            0, self.player.height() - h, self.player.width(), h
-        )
+        return QRect(0, self._root.height() - h, self._root.width(), h)
 
     def _on_player_mouse_moved(self, x: int, y: int) -> None:
         if not (self._controls_overlay and self.isFullScreen()):
@@ -1051,10 +1211,8 @@ class MainWindow(DesktopFeatures, QMainWindow):
         self.player.setCursor(Qt.BlankCursor)
 
     def _reveal_controls(self) -> None:
-        if not self.controls_panel.isVisible():
-            self._position_overlay()
-            self.controls_panel.show()
-            self.controls_panel.raise_()
+        if not self._controls_reveal.shown:
+            self._controls_reveal.show(self._overlay_geometry())  # slides up
         self._controls_timer.start()
 
     def _auto_hide_controls(self) -> None:
@@ -1066,7 +1224,7 @@ class MainWindow(DesktopFeatures, QMainWindow):
             self._controls_timer.start()
             return
         self.tracks_btn.setChecked(False)
-        self.controls_panel.hide()
+        self._controls_reveal.hide()  # slides back down
 
     def eventFilter(self, obj, event) -> bool:
         if obj is self.player and event.type() == QEvent.Enter:
@@ -1078,10 +1236,10 @@ class MainWindow(DesktopFeatures, QMainWindow):
             self.tracks_btn.setChecked(False)
         if obj is self.player and event.type() == QEvent.Resize:
             self._position_idle_guidance()
+        if obj is self._root and event.type() == QEvent.Resize:
             if self._controls_overlay:
                 self._position_overlay()
-        if obj is self._root and event.type() == QEvent.Resize:
-            if self.track_panel.isVisible():
+            if self._track_reveal.shown:
                 self._position_track_panel()
             if self.playback_settings.isVisible():
                 self._position_settings_panel()
@@ -1089,6 +1247,7 @@ class MainWindow(DesktopFeatures, QMainWindow):
 
     def _position_idle_guidance(self) -> None:
         self.idle_hint.setGeometry(self.player.rect())
+        self.video_overlay.setGeometry(self.player.rect())
 
     def _update_idle_guidance(self) -> None:
         if self._session_source is not None:
@@ -1132,10 +1291,21 @@ class MainWindow(DesktopFeatures, QMainWindow):
     def _set_opening(self, active: bool, text: str = "") -> None:
         """Show/hide the indeterminate busy bar while a session opens."""
         self.open_progress.setVisible(active)
+        self.idle_hint.set_busy(active)
         if active and text:
             self.statusBar().showMessage(text)
             self.idle_hint.setText(f"Preparing playback…\n\n{text}")
             self.idle_hint.show()
+        self._update_loading()
+
+    def _update_loading(self) -> None:
+        """Busy ring over the video while a frame the user asked for is still
+        on its way: the first frame of a session, a seek, or a rebuffer. While
+        the guidance card is up, its own ring covers session opening."""
+        self.video_overlay.set_busy(
+            self._session_source is not None and self.idle_hint.isHidden()
+            and (self._awaiting_first_frame or self._pending_seek_s is not None or self._buffering)
+        )
 
     def _on_open_progress(self, msg: dict) -> None:
         """session_progress from the server (e.g. TensorRT engine build)."""
@@ -1712,11 +1882,16 @@ class MainWindow(DesktopFeatures, QMainWindow):
             paused=self._paused,
             remembered_tracks=snapshot.tracks if snapshot else None,
         )
+        self._awaiting_first_frame = True
+        self._buffering = False
+        self._restart_accent = True
         self.audio_delay.setValue(snapshot.audio_delay if snapshot else 0.0)
         self.sub_delay.setValue(snapshot.sub_delay if snapshot else 0.0)
         self.player.set_audio_delay(self.audio_delay.value())
         self.player.set_sub_delay(self.sub_delay.value())
         self.idle_hint.hide()
+        self._update_loading()
+        self._sync_accent_sampling()
         # Match Android's ordering: give mpv its per-load loopback first, then
         # release the server pipeline. Previously the server could produce into
         # the bridge while the player had not even begun opening its socket.
@@ -1871,6 +2046,8 @@ class MainWindow(DesktopFeatures, QMainWindow):
             return
         self._paused = not self._paused
         self.player.set_paused(self._paused)
+        self.video_overlay.flash(Icons.pause if self._paused else Icons.play)
+        self._sync_accent_sampling()
         if self._paused:
             if not local:
                 await self.client.pause()
@@ -1984,7 +2161,7 @@ class MainWindow(DesktopFeatures, QMainWindow):
         for widget in (self.chapter_prev_btn, self.chapter_label, self.chapter_combo,
                        self.chapter_next_btn):
             widget.setVisible(visible)
-        if self.track_panel.isVisible():
+        if self._track_reveal.shown:
             self._position_track_panel()
         self.chapter_combo.blockSignals(True)
         self.chapter_combo.clear()
@@ -2047,6 +2224,8 @@ class MainWindow(DesktopFeatures, QMainWindow):
         self._position_s = pos_s
         if not hasattr(self.player, "telemetry_changed"):
             self._stable_position = True
+        self._awaiting_first_frame = False
+        self._update_loading()
         self._show_position(pos_s)
 
     def _show_position(self, pos_s: float) -> None:
@@ -2066,8 +2245,11 @@ class MainWindow(DesktopFeatures, QMainWindow):
         self._pending_seek_t = time.monotonic()
         self._stable_position = False
         self._show_position(target_s)
+        self._update_loading()
 
     def _on_rebuffering(self, buffering: bool) -> None:
+        self._buffering = buffering
+        self._update_loading()
         if buffering:
             self.statusBar().showMessage(
                 "Buffering local playback…" if self._session_source == "local"
@@ -2155,6 +2337,9 @@ class MainWindow(DesktopFeatures, QMainWindow):
         self.pos_label.setText("--:-- / --:--")
         self.player_status.clear()
         self.tracks_btn.setChecked(False)
+        self._awaiting_first_frame = self._buffering = False
+        self._update_loading()
+        self._sync_accent_sampling()
         self._show_now_playing(None)
         self._on_status_message(self.statusBar().currentMessage())
         self._update_idle_guidance()

@@ -7,9 +7,36 @@ driving them the usual way; only painting and hover/press motion are ours.
 
 from __future__ import annotations
 
-from PySide6.QtCore import QPointF, QRectF, QSize, Qt, QTimer, QVariantAnimation, QEasingCurve, Signal
-from PySide6.QtGui import QColor, QFont, QPainter, QPalette, QPen
-from PySide6.QtWidgets import QAbstractButton, QCheckBox, QFrame, QLabel, QSlider, QStyle, QToolTip, QWidget
+from PySide6.QtCore import (
+    QEasingCurve,
+    QEvent,
+    QObject,
+    QPoint,
+    QPointF,
+    QRect,
+    QRectF,
+    QSize,
+    Qt,
+    QTimer,
+    QVariantAnimation,
+    Signal,
+)
+from PySide6.QtGui import QColor, QFont, QFontMetricsF, QLinearGradient, QPainter, QPalette, QPen
+from PySide6.QtWidgets import (
+    QAbstractButton,
+    QAbstractSpinBox,
+    QApplication,
+    QCheckBox,
+    QComboBox,
+    QFrame,
+    QGraphicsOpacityEffect,
+    QLabel,
+    QPushButton,
+    QSlider,
+    QStyle,
+    QToolTip,
+    QWidget,
+)
 
 from . import theme
 from .theme import Icons, mix
@@ -69,8 +96,10 @@ class IconButton(QAbstractButton):
         self._icon_size = icon_size
         self._filled = filled  # solid accent disc (primary action)
         self._accent_checked = accent_checked
-        self._over_video = False
         self._hover = _Fade(self)
+        self._press = _Fade(self)
+        self.pressed.connect(lambda: self._press.go(1.0))
+        self.released.connect(lambda: self._press.go(0.0))
         self.setCursor(Qt.PointingHandCursor)
         self.setFocusPolicy(Qt.TabFocus)
         self.setAttribute(Qt.WA_Hover)
@@ -105,12 +134,15 @@ class IconButton(QAbstractButton):
         if not self.isEnabled():
             painter.setOpacity(0.35)
         hint = self.sizeHint()
-        rect = QRectF(0, 0, hint.width(), hint.height())
-        rect.moveCenter(QPointF(self.rect().center()) + QPointF(0.5, 0.5))
-        if self.isDown():
+        # Centred on the widget's true centre and kept half a pixel inside it,
+        # so the antialiased edge of the disc is never clipped.
+        rect = QRectF(0, 0, min(hint.width(), self.width()) - 1, min(hint.height(), self.height()) - 1)
+        rect.moveCenter(QRectF(self.rect()).center())
+        if self._press.value > 0:
             # Shrink around the centre, like a pressed key.
+            scale = 1 - 0.08 * self._press.value
             painter.translate(rect.center())
-            painter.scale(0.92, 0.92)
+            painter.scale(scale, scale)
             painter.translate(-rect.center())
         painter.setPen(Qt.NoPen)
         if self._filled:
@@ -236,15 +268,23 @@ class FlatSlider(QSlider):
             painter.setBrush(mix(rest, t.accent_hi, engaged))
             painter.drawRoundedRect(fill, height / 2, height / 2)
         if self._marks:
-            mark = QColor(self.palette().color(QPalette.WindowText))
-            mark.setAlpha(150)
+            # Ticks are exactly as tall as the track, so they read as notches
+            # in the bar: dark over the played part, light over the rest.
+            ahead = QColor(self.palette().color(QPalette.WindowText))
+            ahead.setAlpha(150)
+            played = QColor(t.accent_ink)
+            played.setAlpha(170)
             span = self.maximum() - self.minimum()
+            painter.setRenderHint(QPainter.Antialiasing, False)
             for fraction in self._marks:
                 mx = self._x_for(round(self.minimum() + fraction * span))
-                painter.fillRect(QRectF(mx - 1, self.height() / 2 - 4, 2, 8), mark)
+                if 2 <= mx <= self.width() - 2:
+                    painter.fillRect(QRectF(round(mx) - 1, track.top(), 2, track.height()),
+                                     played if mx < x else ahead)
+            painter.setRenderHint(QPainter.Antialiasing, True)
         if engaged > 0:
             radius = 7 * engaged * (1.15 if self.isSliderDown() else 1.0)
-            cx = max(7.0, min(self.width() - 7.0, x))
+            cx = max(radius + 0.5, min(self.width() - radius - 0.5, x))
             painter.setBrush(QColor(t.text))
             painter.drawEllipse(QPointF(cx, self.height() / 2), radius, radius)
         painter.end()
@@ -419,7 +459,34 @@ class IdleHint(QWidget):
         super().__init__(parent)
         self._title = ""
         self._body = ""
+        self._busy = False
+        self._angle = 0
+        self._timer = QTimer(self)
+        self._timer.setInterval(30)
+        self._timer.timeout.connect(self._spin)
         self.setAttribute(Qt.WA_TransparentForMouseEvents)
+
+    def set_busy(self, busy: bool) -> None:
+        """Swap the icon for a progress ring while something is being prepared."""
+        self._busy = busy
+        if busy and self.isVisible():
+            self._timer.start()
+        elif not busy:
+            self._timer.stop()
+        self.update()
+
+    def _spin(self) -> None:
+        self._angle = (self._angle + 12) % 360
+        self.update()
+
+    def showEvent(self, event) -> None:
+        if self._busy:
+            self._timer.start()
+        super().showEvent(event)
+
+    def hideEvent(self, event) -> None:
+        self._timer.stop()
+        super().hideEvent(event)
 
     def setText(self, text: str) -> None:
         self._title, _, self._body = text.partition("\n\n")
@@ -453,8 +520,15 @@ class IdleHint(QWidget):
         painter.setPen(Qt.NoPen)
         painter.setBrush(mix(theme.SCRIM, t.accent, 0.2))
         painter.drawRoundedRect(tile, 18, 18)
-        pixmap = theme.icon_pixmap(Icons.movie, t.accent, 32, self.devicePixelRatioF())
-        painter.drawPixmap(tile.adjusted(16, 16, -16, -16), pixmap, QRectF(pixmap.rect()))
+        if self._busy:
+            pen = QPen(QColor(t.accent), 3.5)
+            pen.setCapStyle(Qt.RoundCap)
+            painter.setPen(pen)
+            painter.setBrush(Qt.NoBrush)
+            painter.drawArc(tile.adjusted(18, 18, -18, -18), -self._angle * 16, -270 * 16)
+        else:
+            pixmap = theme.icon_pixmap(Icons.movie, t.accent, 32, self.devicePixelRatioF())
+            painter.drawPixmap(tile.adjusted(16, 16, -16, -16), pixmap, QRectF(pixmap.rect()))
         y += 64 + 18
         painter.setFont(title_font)
         painter.setPen(QColor(theme.SCRIM_TEXT))
@@ -469,3 +543,446 @@ class IdleHint(QWidget):
 def show_slider_tip(slider: QSlider, x: float, text: str) -> None:
     """Small time bubble above a slider at pointer position ``x``."""
     QToolTip.showText(slider.mapToGlobal(QPointF(x, -34).toPoint()), text, slider)
+
+
+def emphasized() -> QEasingCurve:
+    """ "Emphasized decelerate": quick start, long soft landing."""
+    curve = QEasingCurve(QEasingCurve.BezierSpline)
+    curve.addCubicBezierSegment(QPointF(0.2, 0.0), QPointF(0.0, 1.0), QPointF(1.0, 1.0))
+    return curve
+
+
+class Reveal(QObject):
+    """Animated show/hide for a child panel that floats over the window.
+
+    Showing glides the panel in from ``offset`` (and fades it, if asked) with
+    a long soft landing; hiding is quick. The panel is really hidden only
+    when the exit finishes, and its final geometry can be re-targeted while
+    shown (window resizes).
+    """
+
+    def __init__(self, widget: QWidget, *, offset: QPoint = QPoint(0, 10), fade: bool = True,
+                 show_ms: int = theme.SLOW, hide_ms: int = theme.FAST, easing=None):
+        super().__init__(widget)
+        self._widget = widget
+        self._offset = offset
+        self._fade = fade
+        self._show_ms, self._hide_ms = show_ms, hide_ms
+        self._easing = easing or emphasized()
+        self._geometry = widget.geometry()
+        self._t = 0.0
+        self._target = 0.0
+        self._animation = QVariantAnimation(self)
+        self._animation.valueChanged.connect(self._apply)
+        self._animation.finished.connect(self._finished)
+
+    @property
+    def shown(self) -> bool:
+        """Whether the panel is (heading for) shown."""
+        return self._target > 0
+
+    def retarget(self, geometry: QRect) -> None:
+        self._geometry = QRect(geometry)
+        self._place()
+
+    def show(self, geometry: QRect) -> None:
+        self._geometry = QRect(geometry)
+        self._run(1.0, self._show_ms, self._easing)
+        self._widget.show()
+        self._widget.raise_()
+
+    def hide(self) -> None:
+        if not self._widget.isVisible():
+            self._target = self._t = 0.0
+            return
+        self._run(0.0, self._hide_ms, QEasingCurve(QEasingCurve.InCubic))
+
+    def hide_now(self) -> None:
+        self._animation.stop()
+        self._target = self._t = 0.0
+        self._clear_effect()
+        self._widget.hide()
+
+    def _run(self, target: float, duration: int, easing) -> None:
+        self._animation.stop()
+        self._target = target
+        if self._t == target:
+            # Already there (e.g. dismissed before the entrance moved at all).
+            self._place()
+            self._finished()
+            return
+        self._animation.setDuration(max(1, round(duration * abs(target - self._t))))
+        self._animation.setEasingCurve(easing)
+        self._animation.setStartValue(self._t)
+        self._animation.setEndValue(target)
+        self._place()
+        self._animation.start()
+
+    def _apply(self, value) -> None:
+        self._t = float(value)
+        self._place()
+
+    def _place(self) -> None:
+        away = 1.0 - self._t
+        self._widget.setGeometry(QRect(
+            self._geometry.topLeft() + QPoint(round(self._offset.x() * away), round(self._offset.y() * away)),
+            self._geometry.size(),
+        ))
+        if self._fade and 0.0 < self._t < 1.0:
+            effect = self._widget.graphicsEffect()
+            if not isinstance(effect, QGraphicsOpacityEffect):
+                effect = QGraphicsOpacityEffect(self._widget)
+                self._widget.setGraphicsEffect(effect)
+            effect.setOpacity(self._t)
+        elif self._fade:
+            self._clear_effect()
+
+    def _clear_effect(self) -> None:
+        # Only ever present mid-transition: a permanent effect would route
+        # every repaint of the panel through an offscreen pixmap.
+        if self._widget.graphicsEffect() is not None:
+            self._widget.setGraphicsEffect(None)
+
+    def _finished(self) -> None:
+        self._t = self._target
+        self._clear_effect()
+        if self._target == 0.0:
+            self._widget.hide()
+
+
+class AutoHideButton(QPushButton):
+    """Push button that exists only while it can be used (the Stop button)."""
+
+    def changeEvent(self, event) -> None:
+        super().changeEvent(event)
+        if event.type() == QEvent.EnabledChange:
+            self.setVisible(self.isEnabled())
+
+
+class WheelGuard(QObject):
+    """Keeps the wheel from changing a combo box or spin box under the pointer.
+
+    Scrolling a panel should scroll the panel; a value changes only through a
+    deliberate click. The wheel event is handed to ``scroll_target`` (the
+    panel's viewport) when there is one, otherwise swallowed.
+    """
+
+    def __init__(self, parent: QWidget, scroll_target: QWidget | None = None):
+        super().__init__(parent)
+        self._scroll_target = scroll_target
+        for child in parent.findChildren(QWidget):
+            if isinstance(child, (QComboBox, QAbstractSpinBox, QSlider)):
+                # StrongFocus drops WheelFocus: a wheel turn no longer focuses it.
+                child.setFocusPolicy(Qt.StrongFocus)
+                child.installEventFilter(self)
+
+    def eventFilter(self, obj, event) -> bool:
+        if event.type() == QEvent.Wheel:
+            if self._scroll_target is not None:
+                QApplication.sendEvent(self._scroll_target, event)
+            return True
+        return False
+
+
+class SegmentedSwitch(QWidget):
+    """Pill of mutually exclusive options with a sliding accent highlight."""
+
+    selected = Signal(str)
+
+    def __init__(self, options: list[tuple[str, str]], parent=None):
+        super().__init__(parent)
+        self._options = options  # (label, key)
+        self._index = 0
+        self._slide = _Fade(self, theme.SLOW)
+        self._slide.setEasingCurve(emphasized())
+        self.setFixedHeight(32)
+        self.setCursor(Qt.PointingHandCursor)
+
+    def sizeHint(self) -> QSize:
+        return QSize(76 * len(self._options), 32)
+
+    def current(self) -> str:
+        return self._options[self._index][1]
+
+    def set_current(self, key: str) -> None:
+        for index, (_label, value) in enumerate(self._options):
+            if value == key:
+                self._index = index
+                self._slide.go(float(index))
+                self.update()
+
+    def mousePressEvent(self, event) -> None:
+        index = int(event.position().x() / max(1.0, self.width() / len(self._options)))
+        index = max(0, min(len(self._options) - 1, index))
+        if index != self._index:
+            self.set_current(self._options[index][1])
+            self.selected.emit(self._options[index][1])
+
+    def paintEvent(self, _event) -> None:
+        t = theme.current()
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor(t.hover))
+        painter.drawRoundedRect(QRectF(self.rect()), 16, 16)
+        cell = (self.width() - 6) / len(self._options)
+        painter.setBrush(QColor(t.accent))
+        painter.drawRoundedRect(QRectF(3 + self._slide.value * cell, 3, cell, self.height() - 6), 13, 13)
+        font = QFont(self.font())
+        font.setPixelSize(12)
+        font.setWeight(QFont.DemiBold)
+        painter.setFont(font)
+        for index, (label, _key) in enumerate(self._options):
+            near = max(0.0, 1.0 - abs(self._slide.value - index))
+            painter.setPen(mix(t.text_dim, t.accent_ink, near))
+            painter.drawText(QRectF(3 + index * cell, 0, cell, self.height()), Qt.AlignCenter, label)
+        painter.end()
+
+
+class AccentPicker(QWidget):
+    """Accent colour: follow the video ("auto"), a preset, or any hue.
+
+    A row with the Auto chip and the preset swatches, and under it a hue strip
+    to click or drag along.
+    """
+
+    picked = Signal(str)  # "auto" or "#rrggbb"
+
+    _SWATCH = 28
+    _STRIP_Y = 46
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._value = "auto"
+        self._hover = None  # "auto", a preset index, or "strip"
+        self._hover_fade = _Fade(self)
+        self._dragging = False
+        self.setMouseTracking(True)
+        self.setCursor(Qt.PointingHandCursor)
+        self.setFixedHeight(64)
+        self.setMinimumWidth(300)
+
+    def value(self) -> str:
+        return self._value
+
+    def set_value(self, value: str) -> None:
+        self._value = value
+        self.update()
+
+    @property
+    def custom(self) -> bool:
+        return self._value != "auto" and self._value not in theme.ACCENT_PRESETS
+
+    # -- geometry ---------------------------------------------------------------
+
+    def _chip_rect(self) -> QRectF:
+        font = QFont(self.font())
+        font.setPixelSize(12)
+        font.setWeight(QFont.DemiBold)
+        return QRectF(0, 0, QFontMetricsF(font).horizontalAdvance("Auto") + 26, self._SWATCH)
+
+    def _swatch_rect(self, index: int) -> QRectF:
+        chip = self._chip_rect()
+        count = len(theme.ACCENT_PRESETS)
+        spacing = min(9.0, max(1.0, (self.width() - chip.width() - count * self._SWATCH) / count))
+        return QRectF(chip.right() + spacing + index * (self._SWATCH + spacing), 0,
+                      self._SWATCH, self._SWATCH)
+
+    def _strip_rect(self) -> QRectF:
+        return QRectF(0, self._STRIP_Y, self.width(), 14)
+
+    def _target_at(self, pos):
+        if self._chip_rect().contains(pos):
+            return "auto"
+        for index in range(len(theme.ACCENT_PRESETS)):
+            if self._swatch_rect(index).contains(pos):
+                return index
+        if self._strip_rect().adjusted(0, -6, 0, 6).contains(pos):
+            return "strip"
+        return None
+
+    # -- interaction ------------------------------------------------------------
+
+    def _pick_hue(self, x: float) -> None:
+        hue = max(0.0, min(0.999, x / max(1, self.width())))
+        self._value = theme.accent_for_hue(hue).name()
+        self.update()
+        self.picked.emit(self._value)
+
+    def mousePressEvent(self, event) -> None:
+        target = self._target_at(event.position())
+        if target == "strip":
+            self._dragging = True
+            self._pick_hue(event.position().x())
+        elif target is not None:
+            self._value = "auto" if target == "auto" else theme.ACCENT_PRESETS[target]
+            self.update()
+            self.picked.emit(self._value)
+
+    def mouseMoveEvent(self, event) -> None:
+        if self._dragging:
+            self._pick_hue(event.position().x())
+            return
+        target = self._target_at(event.position())
+        if target != self._hover:
+            self._hover = target
+            self._hover_fade._value = 0.0
+            self._hover_fade.go(1.0 if target is not None else 0.0)
+            self.update()
+
+    def mouseReleaseEvent(self, _event) -> None:
+        self._dragging = False
+
+    def leaveEvent(self, event) -> None:
+        self._hover = None
+        self._hover_fade.go(0.0)
+        self.update()
+        super().leaveEvent(event)
+
+    # -- painting ---------------------------------------------------------------
+
+    def paintEvent(self, _event) -> None:
+        t = theme.current()
+        glow = self._hover_fade.value
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+
+        chip = self._chip_rect().adjusted(1, 1, -1, -1)
+        auto = self._value == "auto"
+        fill = QColor(t.accent_soft) if auto else mix(t.hover, t.pressed, glow if self._hover == "auto" else 0.0)
+        painter.setPen(QPen(QColor(t.accent), 2) if auto else Qt.NoPen)
+        painter.setBrush(fill)
+        painter.drawRoundedRect(chip, chip.height() / 2, chip.height() / 2)
+        font = QFont(self.font())
+        font.setPixelSize(12)
+        font.setWeight(QFont.DemiBold)
+        painter.setFont(font)
+        painter.setPen(QColor(t.accent_hi if auto else t.text))
+        painter.drawText(chip, Qt.AlignCenter, "Auto")
+
+        for index, preset in enumerate(theme.ACCENT_PRESETS):
+            cell = self._swatch_rect(index)
+            chosen = self._value == preset
+            if chosen:
+                painter.setPen(QPen(QColor(preset), 2))
+                painter.setBrush(Qt.NoBrush)
+                painter.drawEllipse(cell.adjusted(1, 1, -1, -1))
+            radius = 9.0 * (1.0 + (0.2 * glow if self._hover == index and not chosen else 0.0))
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QColor(preset))
+            painter.drawEllipse(cell.center(), radius, radius)
+
+        strip = self._strip_rect()
+        height = 6 + 2 * (glow if self._hover == "strip" or self._dragging else 0.0)
+        bar = QRectF(0, strip.center().y() - height / 2, strip.width(), height)
+        gradient = QLinearGradient(bar.topLeft(), bar.topRight())
+        for step in range(7):
+            gradient.setColorAt(step / 6, theme.accent_for_hue(min(0.999, step / 6)))
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(gradient)
+        painter.drawRoundedRect(bar, height / 2, height / 2)
+        if self.custom:
+            color = QColor(self._value)
+            x = max(7.0, min(self.width() - 7.0, max(0.0, color.hslHueF()) * self.width()))
+            painter.setPen(QPen(QColor(t.text), 2))
+            painter.setBrush(color)
+            painter.drawEllipse(QPointF(x, strip.center().y()), 6, 6)
+        painter.end()
+
+
+class PlayerOverlay(QWidget):
+    """Feedback drawn over the video: a busy ring while it loads or seeks,
+    and a play/pause mark that flashes on toggle. Never takes the mouse."""
+
+    _DISC = 84
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self._busy = _Fade(self, theme.NORMAL)
+        self._busy_on = False
+        self._angle = 0
+        self._spin = QTimer(self)
+        self._spin.setInterval(30)
+        self._spin.timeout.connect(self._step)
+        self._flash = QVariantAnimation(self)
+        self._flash.setDuration(520)
+        self._flash.setStartValue(0.0)
+        self._flash.setEndValue(1.0)
+        self._flash.valueChanged.connect(lambda _v: self.update(self._centre()))
+        self._flash_icon = Icons.pause
+
+    def _centre(self) -> QRect:
+        side = round(self._DISC * 1.3) + 4
+        return QRect((self.width() - side) // 2, (self.height() - side) // 2, side, side)
+
+    def _step(self) -> None:
+        self._angle = (self._angle + 12) % 360
+        if not self._busy_on and self._busy.value <= 0:
+            self._spin.stop()
+        self.update(self._centre())
+
+    @property
+    def busy(self) -> bool:
+        return self._busy_on
+
+    def set_busy(self, busy: bool) -> None:
+        if busy == self._busy_on:
+            return
+        self._busy_on = busy
+        self._busy.go(1.0 if busy else 0.0)
+        if busy and self.isVisible():
+            self._spin.start()
+
+    def flash(self, icon: str) -> None:
+        """Briefly show ``icon`` (the state just entered) in the middle."""
+        self._flash_icon = icon
+        self._flash.stop()
+        if self.isVisible():
+            self._flash.start()
+
+    def hideEvent(self, event) -> None:
+        self._spin.stop()
+        super().hideEvent(event)
+
+    def showEvent(self, event) -> None:
+        if self._busy_on:
+            self._spin.start()
+        super().showEvent(event)
+
+    def paintEvent(self, _event) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setRenderHint(QPainter.SmoothPixmapTransform)
+        centre = QPointF(self.width() / 2, self.height() / 2)
+        busy = self._busy.value
+        if busy > 0:
+            scrim = QColor(theme.SCRIM)
+            scrim.setAlphaF(0.7 * busy)
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(scrim)
+            painter.drawEllipse(centre, 36, 36)
+            ring = QColor(theme.current().accent)
+            ring.setAlphaF(busy)
+            pen = QPen(ring, 4)
+            pen.setCapStyle(Qt.RoundCap)
+            painter.setPen(pen)
+            painter.setBrush(Qt.NoBrush)
+            painter.drawArc(QRectF(centre.x() - 18, centre.y() - 18, 36, 36), -self._angle * 16, -270 * 16)
+        if self._flash.state() == QVariantAnimation.Running:
+            k = float(self._flash.currentValue())
+            opacity = 0.95 * (1 - k ** 3)
+            scale = 0.8 + 0.45 * (1 - (1 - k) ** 3)
+            painter.setOpacity(opacity)
+            radius = self._DISC / 2 * scale
+            scrim = QColor(theme.SCRIM)
+            scrim.setAlphaF(0.7)
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(scrim)
+            painter.drawEllipse(centre, radius, radius)
+            size = 44 * scale
+            nudge = 3 * scale if self._flash_icon == Icons.play else 0
+            pixmap = theme.icon_pixmap(self._flash_icon, theme.SCRIM_TEXT, 44, self.devicePixelRatioF() * 1.3)
+            painter.drawPixmap(QRectF(centre.x() - size / 2 + nudge, centre.y() - size / 2, size, size),
+                               pixmap, QRectF(pixmap.rect()))
+        painter.end()

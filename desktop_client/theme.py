@@ -11,6 +11,7 @@ custom-painted widgets in ``widgets.py`` read ``current()`` at paint time.
 from __future__ import annotations
 
 import atexit
+import math
 import shutil
 import tempfile
 from dataclasses import dataclass
@@ -18,7 +19,7 @@ from functools import lru_cache
 from pathlib import Path
 
 from PySide6.QtCore import QByteArray, QRectF, Qt
-from PySide6.QtGui import QColor, QIcon, QPainter, QPalette, QPixmap
+from PySide6.QtGui import QColor, QIcon, QImage, QPainter, QPalette, QPixmap
 from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import QApplication
 
@@ -30,6 +31,12 @@ NORMAL = 190
 SLOW = 340
 
 DEFAULT_ACCENT = "#8b7dff"
+ACCENT_PRESETS = (
+    "#8b7dff", "#5b9dff", "#3ec9d6", "#4fd68f", "#c5d94a", "#f5b84a", "#ff8f4d", "#ff6f91", "#f06bd8",
+)
+ACCENT_FADE = 300        # a colour the user picked
+ACCENT_FADE_AUTO = 800   # a colour following the video
+_ACCENT_LUMINANCE = 0.33  # relative luminance every accent shares
 # Things drawn over video look the same in both modes.
 SCRIM = "#0c0d10"
 SCRIM_TEXT = "#eef0f4"
@@ -54,6 +61,8 @@ class Icons:
     pause = "M6 19h4V5H6v14zm8-14v14h4V5h-4z"
     stop = "M6 6h12v12H6z"
     next = "M6 18l8.5-6L6 6v12zM16 6v12h2V6h-2z"
+    fast_forward = "M4 18l8.5-6L4 6v12zm9-12v12l8.5-6L13 6z"
+    fast_rewind = "M11 18V6l-8.5 6 8.5 6zm.5-6l8.5 6V6l-8.5 6z"
     previous = "M6 6h2v12H6zm3.5 6l8.5 6V6z"
     fullscreen = "M7 14H5v5h5v-2H7v-3zm-2-4h2V7h3V5H5v5zm12 7h-3v2h5v-5h-2v3zM14 5v2h3v3h2V5h-5z"
     fullscreen_exit = "M5 16h3v3h2v-5H5v2zm3-8H5v2h5V5H8v3zm6 11h2v-3h3v-2h-5v5zm2-11V5h-2v5h5V8h-3z"
@@ -134,7 +143,69 @@ def build(dark: bool, accent: str = DEFAULT_ACCENT) -> Theme:
     )
 
 
+def accent_for_hue(hue: float, saturation: float = 0.78) -> QColor:
+    """A colour of the given hue (0..1) at the brightness all accents share.
+
+    HSL lightness does not track perceived brightness across hues (yellow is
+    far brighter than blue), so this solves for a fixed luminance instead.
+    """
+    hue -= int(hue)
+    lo, hi = 0.2, 0.95
+    for _ in range(18):
+        mid = (lo + hi) / 2
+        if _luminance(QColor.fromHslF(hue, saturation, mid, 1.0)) < _ACCENT_LUMINANCE:
+            lo = mid
+        else:
+            hi = mid
+    return QColor.fromHslF(hue, saturation, (lo + hi) / 2, 1.0)
+
+
+def accent_from_frame(image: QImage) -> QColor:
+    """The accent for one (thumbnail-sized) video frame: its dominant hue, or
+    for a colourless frame a neutral from light grey (black) to white (bright)."""
+    bins = 36
+    weight = [0.0] * bins
+    sat_sum = [0.0] * bins
+    total = 0.0
+    brightness = 0
+    pixels = image.width() * image.height()
+    if pixels == 0:
+        return QColor(DEFAULT_ACCENT)
+    for y in range(image.height()):
+        for x in range(image.width()):
+            color = image.pixelColor(x, y)
+            brightness += max(color.red(), color.green(), color.blue())
+            h, s, v = color.hsvHueF(), color.hsvSaturationF(), color.valueF()
+            # Colourful, bright pixels count most; near-grey ones not at all.
+            if h < 0 or s < 0.18 or v < 0.2:
+                continue
+            w = s * s * v
+            index = min(bins - 1, int(h * bins))
+            weight[index] += w
+            sat_sum[index] += w * s
+            total += w
+    # Too little colour to call: a few stray pixels should not pick the accent.
+    if total < pixels * 0.012:
+        level = 0.76 + 0.24 * brightness / (pixels * 255.0)
+        return QColor.fromRgbF(level, level, level, 1.0)
+    best = max(range(bins), key=lambda i: weight[i] + 0.6 * (weight[(i + 1) % bins] + weight[i - 1]))
+    # Weighted circular mean over the winning bin and its neighbours.
+    x = y = w = s = 0.0
+    for d in range(-2, 3):
+        i = (best + d) % bins
+        angle = (i + 0.5) / bins * 2 * math.pi
+        x += weight[i] * math.cos(angle)
+        y += weight[i] * math.sin(angle)
+        w += weight[i]
+        s += sat_sum[i]
+    hue = math.atan2(y, x) / (2 * math.pi) % 1.0
+    saturation = s / w if w > 0 else 0.0
+    # Keep it clearly coloured but never neon.
+    return accent_for_hue(hue, max(0.55, min(0.9, 0.4 + saturation * 0.6)))
+
+
 _current = build(True)
+_accent = QColor(DEFAULT_ACCENT)  # as chosen; build() adapts it to light mode
 _applied: tuple | None = None
 _asset_dir: Path | None = None
 
@@ -237,7 +308,7 @@ def _palette(t: Theme) -> QPalette:
     palette = QPalette()
     roles = {
         QPalette.Window: t.bg, QPalette.WindowText: t.text,
-        QPalette.Base: t.raised, QPalette.AlternateBase: t.surface,
+        QPalette.Base: t.raised, QPalette.AlternateBase: t.accent_soft,
         QPalette.Text: t.text, QPalette.PlaceholderText: t.text_faint,
         QPalette.Button: t.hover, QPalette.ButtonText: t.text,
         QPalette.Highlight: t.accent, QPalette.HighlightedText: t.accent_ink,
@@ -252,6 +323,10 @@ def _palette(t: Theme) -> QPalette:
 
 
 def _style_sheet(t: Theme, a: dict[str, str]) -> str:
+    # Accent colours are palette references (highlight, highlighted-text, link,
+    # alternate-base), never literals: a palette change then recolours them
+    # for free, where a new style sheet would re-polish every widget (~70 ms,
+    # a visible hitch in the video when the accent follows the picture).
     return f"""
 QWidget {{ font-size: 13px; }}
 QToolTip {{ background: {t.pressed}; color: {t.text}; border: 0; padding: 5px 8px; font-size: 12px; }}
@@ -266,22 +341,22 @@ QLabel[role="dim"] {{ color: {t.text_dim}; font-size: 12px; }}
 QLabel[role="faint"] {{ color: {t.text_faint}; font-size: 12px; }}
 
 QLineEdit {{ background: {t.raised}; border: 1px solid transparent; border-radius: {RADIUS_SMALL}px;
-    padding: 0 10px; min-height: 30px; selection-background-color: {t.accent}; selection-color: {t.accent_ink}; }}
+    padding: 0 10px; min-height: 30px; selection-background-color: palette(highlight); selection-color: palette(highlighted-text); }}
 QLineEdit:hover {{ background: {t.hover}; }}
-QLineEdit:focus {{ background: {t.hover}; border-color: {t.accent}; }}
+QLineEdit:focus {{ background: {t.hover}; border-color: palette(highlight); }}
 QLineEdit[pill="true"] {{ border-radius: 17px; min-height: 32px; padding: 0 14px; }}
 
 QPushButton {{ background: {t.hover}; color: {t.text}; border: 0; border-radius: {RADIUS_SMALL}px;
     padding: 0 14px; min-height: 34px; font-weight: 600; }}
 QPushButton:hover, QPushButton:pressed {{ background: {t.pressed}; }}
 QPushButton:disabled {{ color: {t.text_faint}; }}
-QPushButton[primary="true"] {{ background: {t.accent}; color: {t.accent_ink}; }}
-QPushButton[primary="true"]:hover {{ background: {t.accent_hi}; }}
+QPushButton[primary="true"] {{ background: palette(highlight); color: palette(highlighted-text); }}
+QPushButton[primary="true"]:hover {{ background: palette(link); }}
 
 QComboBox {{ background: {t.raised}; border: 1px solid transparent; border-radius: {RADIUS_SMALL}px;
     padding: 0 10px; min-height: 30px; }}
 QComboBox:hover, QComboBox:on {{ background: {t.hover}; }}
-QComboBox:focus {{ border-color: {t.accent}; }}
+QComboBox:focus {{ border-color: palette(highlight); }}
 QComboBox:disabled {{ color: {t.text_faint}; }}
 QComboBox::drop-down {{ border: 0; width: 26px; }}
 QComboBox::down-arrow {{ image: url({a['down']}); width: 16px; height: 16px; }}
@@ -290,9 +365,9 @@ QComboBox QAbstractItemView {{ background: {t.raised}; border: 1px solid {t.line
 QComboBox QAbstractItemView::item {{ min-height: 30px; padding: 0 8px; border-radius: {RADIUS_SMALL}px; }}
 
 QAbstractSpinBox {{ background: {t.raised}; border: 1px solid transparent; border-radius: {RADIUS_SMALL}px;
-    padding: 0 8px; min-height: 30px; selection-background-color: {t.accent}; selection-color: {t.accent_ink}; }}
+    padding: 0 8px; min-height: 30px; selection-background-color: palette(highlight); selection-color: palette(highlighted-text); }}
 QAbstractSpinBox:hover {{ background: {t.hover}; }}
-QAbstractSpinBox:focus {{ border-color: {t.accent}; }}
+QAbstractSpinBox:focus {{ border-color: palette(highlight); }}
 QAbstractSpinBox:disabled {{ color: {t.text_faint}; }}
 QAbstractSpinBox::up-button, QAbstractSpinBox::down-button {{ border: 0; background: transparent; width: 20px; }}
 QAbstractSpinBox::up-arrow {{ image: url({a['up']}); width: 12px; height: 12px; }}
@@ -301,10 +376,10 @@ QAbstractSpinBox::down-arrow {{ image: url({a['down']}); width: 12px; height: 12
 QTreeView {{ background: transparent; border: 0; outline: 0; show-decoration-selected: 1; }}
 QTreeView::item {{ min-height: 30px; padding: 0 4px; border: 0; color: {t.text_dim}; }}
 QTreeView::item:hover {{ background: {t.hover}; color: {t.text}; }}
-QTreeView::item:selected {{ background: {t.accent_soft}; color: {t.text}; }}
+QTreeView::item:selected {{ background: palette(alternate-base); color: {t.text}; }}
 QTreeView::branch {{ background: transparent; }}
 QTreeView::branch:hover {{ background: {t.hover}; }}
-QTreeView::branch:selected {{ background: {t.accent_soft}; }}
+QTreeView::branch:selected {{ background: palette(alternate-base); }}
 QTreeView::branch:has-children:closed {{ image: url({a['right']}); }}
 QTreeView::branch:has-children:open {{ image: url({a['down']}); }}
 
@@ -322,7 +397,7 @@ QTabWidget::pane {{ border: 0; }}
 QTabBar::tab {{ background: transparent; color: {t.text_dim}; border: 0; border-radius: {RADIUS_SMALL}px;
     padding: 6px 16px; margin: 0 2px 6px 2px; font-weight: 600; }}
 QTabBar::tab:hover {{ background: {t.hover}; color: {t.text}; }}
-QTabBar::tab:selected {{ background: {t.accent_soft}; color: {t.accent_hi}; }}
+QTabBar::tab:selected {{ background: palette(alternate-base); color: palette(link); }}
 
 QSplitter::handle {{ background: {t.line}; }}
 #settingsPanel {{ background: {t.surface}; border-left: 1px solid {t.line}; }}
@@ -340,14 +415,35 @@ QMessageBox {{ background: {t.raised}; }}
 """
 
 
-def apply_theme(app: QApplication, mode: str = "auto") -> Theme:
+def accent_source() -> QColor:
+    return QColor(_accent)
+
+
+def set_accent(app: QApplication, color: str | QColor) -> Theme:
+    """Change the accent. Cheap enough to call on every step of a glide: the
+    custom widgets read ``current()`` as they repaint, and the style sheet's
+    accent colours are palette references."""
+    global _current, _accent
+    _accent = QColor(color)
+    _current = build(_current.dark, _accent.name())
+    app.setPalette(_palette(_current))
+    return _current
+
+
+def apply_theme(app: QApplication, mode: str = "auto", accent: str | QColor | None = None) -> Theme:
     """Install the palette and style sheet for ``mode`` ("auto", "dark", "light")."""
+    global _accent
+    if accent is not None:
+        _accent = QColor(accent)
+    return _install(app, system_dark(app) if mode == "auto" else mode != "light")
+
+
+def _install(app: QApplication, dark: bool) -> Theme:
     global _current, _applied
-    dark = system_dark(app) if mode == "auto" else mode != "light"
     key = (id(app), dark)
     if _applied == key:
-        return _current
-    _current = build(dark)
+        return set_accent(app, _accent)
+    _current = build(dark, _accent.name())
     # With a style sheet installed Qt stops handing a parent's palette down to
     # its children unless asked; the fullscreen overlay relies on that.
     QApplication.setAttribute(Qt.AA_UseStyleSheetPropagationInWidgetStyles, True)

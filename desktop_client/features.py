@@ -17,7 +17,7 @@ from .mpv_config import ConfigWatcher, DEFAULTS, MpvConfig
 from .playback_state import PlaybackSnapshot, Transitions
 from .settings import FAST_FORWARD_MAX_S
 from .theme import style_menu
-from .widgets import FlatSwitch
+from .widgets import AccentPicker, FlatSwitch, SegmentedSwitch
 
 
 class DesktopFeatures:
@@ -123,12 +123,19 @@ class DesktopFeatures:
         self.history_limit_spin.valueChanged.connect(self._set_history_limit)
         form.addRow("History entries", self.history_limit_spin)
         form = group("Appearance")
-        self.theme_combo = QComboBox()
-        for label, value in (("Follow system", "auto"), ("Dark", "dark"), ("Light", "light")):
-            self.theme_combo.addItem(label, value)
-        self.theme_combo.setCurrentIndex(self.theme_combo.findData(self.settings.theme_mode))
-        self.theme_combo.activated.connect(lambda _index: self._set_theme_mode(self.theme_combo.currentData()))
-        form.addRow("Theme", self.theme_combo)
+        self.theme_switch = SegmentedSwitch([("Auto", "auto"), ("Dark", "dark"), ("Light", "light")])
+        self.theme_switch.set_current(self.settings.theme_mode)
+        self.theme_switch.selected.connect(self._set_theme_mode)
+        form.addRow("Theme", self.theme_switch)
+        # Accent colour: follow the video, a preset, or any hue.
+        self.accent_picker = AccentPicker()
+        self.accent_picker.set_value(self.settings.accent)
+        self.accent_picker.picked.connect(self._set_accent)
+        self.accent_hint = QLabel()
+        self.accent_hint.setProperty("role", "faint")
+        form.addRow("Accent colour", self.accent_picker)
+        form.addRow(self.accent_hint)
+        self._show_accent_hint()
         form = group("Diagnostics")
         self.diagnostics_check = FlatSwitch("Show playback diagnostics")
         self.diagnostics_check.setChecked(self.settings.diagnostics)
@@ -256,6 +263,17 @@ class DesktopFeatures:
         self.settings.theme_mode = mode
         self._apply_theme_mode(mode)
 
+    def _set_accent(self, value):
+        self.settings.accent = value
+        self._show_accent_hint()
+        self._accent_setting_changed()
+
+    def _show_accent_hint(self):
+        value = self.settings.accent
+        self.accent_hint.setText(
+            "Follows the video that is playing" if value == "auto"
+            else "Custom" if self.accent_picker.custom else "")
+
     def _set_diagnostics(self, value):
         self.settings.diagnostics = value
         self.player_status.setVisible(value)
@@ -273,6 +291,10 @@ class DesktopFeatures:
 
     def _on_telemetry(self, sample):
         self._stable_position = sample.stable
+        if sample.stable and self._awaiting_first_frame:
+            # A session opened paused reports no position change to wait for.
+            self._awaiting_first_frame = False
+            self._update_loading()
         if self._duration_s is None and sample.duration:
             self._duration_s = sample.duration
         if time.monotonic() - self._last_log_sample >= 10:

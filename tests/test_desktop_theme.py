@@ -7,8 +7,9 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 pytest.importorskip("PySide6")
 pytest.importorskip("qasync")
 
-from PySide6.QtCore import QSettings, Qt
-from PySide6.QtGui import QColor, QPalette
+from PySide6.QtCore import QPoint, QPointF, QSettings, Qt
+from PySide6.QtGui import QColor, QImage, QPalette, QWheelEvent
+from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication
 
 import desktop_client.main_window as main_window
@@ -65,7 +66,7 @@ def test_settings_sheet_overlays_without_growing_the_window(window):
     QApplication.instance().processEvents()
     minimum = window.minimumSizeHint().width()
     window.playback_settings_toggle.setChecked(True)
-    QApplication.instance().processEvents()
+    QTest.qWait(500)  # the sheet slides in; synchronous test, outside coroutine context
     assert window.playback_settings.isVisible()
     assert window.minimumSizeHint().width() == minimum
     sheet = window.playback_settings.geometry()
@@ -93,8 +94,9 @@ def test_track_card_follows_its_button_and_escape_closes_it(window):
     assert window.track_panel.isVisible()
     assert window.audio_combo.isVisible()
     window.keyPressEvent(QKeyEvent(QKeyEvent.KeyPress, Qt.Key_Escape, Qt.NoModifier))
-    assert not window.track_panel.isVisible()
     assert not window.tracks_btn.isChecked()
+    QTest.qWait(300)  # the card fades out before it is hidden
+    assert not window.track_panel.isVisible()
 
 
 def test_status_messages_surface_in_the_subheading(window):
@@ -103,3 +105,116 @@ def test_status_messages_surface_in_the_subheading(window):
     window.statusBar().clearMessage()
     assert window.subheading.text() == "Not connected"
     assert window.statusBar().isHidden()
+
+
+def test_accent_for_hue_holds_one_brightness_across_hues():
+    from desktop_client.theme import _luminance
+    values = [_luminance(theme.accent_for_hue(hue / 12)) for hue in range(12)]
+    assert max(values) - min(values) < 0.02
+    assert abs(values[0] - 0.33) < 0.02
+
+
+def test_accent_from_frame_follows_the_dominant_colour_and_ignores_grey():
+    QApplication.instance() or QApplication([])
+    frame = QImage(16, 9, QImage.Format_RGB32)
+    frame.fill(QColor("#101010"))            # letterbox-dark background
+    for x in range(10):
+        for y in range(6):
+            frame.setPixelColor(x, y, QColor("#1e6fe0"))  # a blue subject
+    blue = theme.accent_from_frame(frame)
+    assert abs(blue.hslHueF() - QColor("#1e6fe0").hslHueF()) < 0.04
+    frame.fill(QColor("#f4f4f4"))
+    neutral = theme.accent_from_frame(frame)
+    assert neutral.hslSaturationF() < 0.05 and neutral.lightnessF() > 0.9
+
+
+def test_accent_choice_persists_and_restyles(window):
+    app = QApplication.instance()
+    window.show()
+    assert window.settings.accent == "auto"
+    window.accent_picker.picked.emit("#4fd68f")
+    assert window.settings.accent == "#4fd68f"
+    QTest.qWait(theme.ACCENT_FADE + 200)  # the colour glides to its target
+    assert theme.accent_source() == QColor("#4fd68f")
+    assert app.palette().color(QPalette.Highlight) == QColor(theme.current().accent)
+    assert window.connect_btn.palette().color(QPalette.Highlight) == QColor(theme.current().accent)
+    window.accent_picker.picked.emit("auto")
+    QTest.qWait(theme.ACCENT_FADE + 200)
+    assert theme.accent_source() == QColor(theme.DEFAULT_ACCENT)  # nothing is playing
+    assert window.accent_hint.text() == "Follows the video that is playing"
+
+
+def test_wheel_over_a_settings_dropdown_scrolls_the_sheet_instead(window):
+    window.resize(900, 500)
+    window.show()
+    window.playback_settings.show()
+    QApplication.instance().processEvents()
+    combo = window.fit_combo
+    before = combo.currentIndex()
+    from PySide6.QtWidgets import QScrollArea
+    bar = window.playback_settings.findChild(QScrollArea).verticalScrollBar()
+    assert bar.maximum() > 0
+    centre = QPointF(combo.rect().center())
+    wheel = QWheelEvent(centre, QPointF(combo.mapToGlobal(centre.toPoint())), QPoint(0, 0), QPoint(0, -240),
+                        Qt.NoButton, Qt.NoModifier, Qt.NoScrollPhase, False)
+    QApplication.sendEvent(combo, wheel)
+    assert combo.currentIndex() == before
+    assert bar.value() > 0
+
+
+def test_stop_button_sits_by_connect_and_shows_only_while_usable(window):
+    window.show()
+    assert window.stop_btn.parentWidget() is window.connect_btn.parentWidget()
+    assert not window.stop_btn.isVisible()
+    window.stop_btn.setEnabled(True)
+    assert window.stop_btn.isVisible()
+    window.stop_btn.setEnabled(False)
+    assert not window.stop_btn.isVisible()
+
+
+def test_busy_ring_covers_first_frame_seek_and_rebuffer(window):
+    window.show()
+    window._session_source = "server_file"
+    window.idle_hint.hide()
+    window._awaiting_first_frame = True
+    window._update_loading()
+    assert window.video_overlay.busy
+    window._on_position(1.0)
+    assert not window.video_overlay.busy
+    window._arm_pending_seek(60.0)
+    assert window.video_overlay.busy
+    window._on_position(60.2)
+    assert not window.video_overlay.busy
+    window._on_rebuffering(True)
+    assert window.video_overlay.busy
+    window._on_rebuffering(False)
+    assert not window.video_overlay.busy
+    window._session_source = None
+
+
+def test_raw_screenshot_reduces_to_a_colour_thumbnail():
+    pytest.importorskip("mpv")
+    from desktop_client.mpv_view import _thumbnail
+    width, height, stride = 64, 36, 64 * 4 + 8  # stride wider than the row, as mpv may pad
+    row = bytes([200, 100, 50, 0]) * width + bytes(8)  # b, g, r, unused
+    image = _thumbnail({"w": width, "h": height, "stride": stride, "format": "bgr0", "data": row * height})
+    assert (image.width(), image.height()) == (16, 9)
+    assert image.pixelColor(8, 4) == QColor(50, 100, 200)
+    assert _thumbnail({"w": width, "h": height, "stride": stride, "format": "yuv420p", "data": b""}) is None
+
+
+def test_fullscreen_bar_floats_over_the_window_not_the_video(window):
+    window.resize(900, 600)
+    window.show()
+    window.toggle_fullscreen()
+    try:
+        # A child of the GL video widget was visible to Qt but not composited.
+        assert window.controls_panel.parentWidget() is window._root
+        window._reveal_controls()
+        QTest.qWait(theme.NORMAL + 150)  # slides up
+        bar = window.controls_panel.geometry()
+        assert window.controls_panel.isVisible()
+        assert bar.bottom() == window._root.height() - 1
+    finally:
+        window.toggle_fullscreen()
+    assert window.controls_panel.isVisible()

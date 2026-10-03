@@ -121,6 +121,16 @@ class AppSettings:
         self._qs.setValue("appearance/theme", v)
 
     @property
+    def accent(self) -> str:
+        """"auto" (follow the video) or a "#rrggbb" colour."""
+        value = str(self._qs.value("appearance/accent", "auto"))
+        return value if value == "auto" or (len(value) == 7 and value.startswith("#")) else "auto"
+
+    @accent.setter
+    def accent(self, v: str) -> None:
+        self._qs.setValue("appearance/accent", v)
+
+    @property
     def browse_dir(self) -> str:
         return self._qs.value("browser/dir", "")
 

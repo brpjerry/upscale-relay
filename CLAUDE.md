@@ -26,7 +26,9 @@ load-bearing), `docs/CLIENT_LINUX.md` (Linux setup), and
   sheet, Material icon paths rendered through QtSvg) and `widgets.py`
   (custom-painted buttons/sliders/switches that keep the stock Qt API the
   tests drive). Text colours travel through QPalette, not style sheet rules —
-  the fullscreen overlay re-palettes its labels.
+  the fullscreen overlay re-palettes its labels — and accent colours in the
+  style sheet are `palette(...)` references, so an accent change is a palette
+  change (~2 ms) rather than a new style sheet (~70 ms re-polish, a video hitch).
 - `upscale_cli/` — offline pipeline, ONNX/EP handling, uint8 graph wrapper,
   `upscale-cli` (run/info/sample/bench subcommands).
 
@@ -115,6 +117,14 @@ constructor options).
   `paintGL → mpv_render_context_render → vaSyncSurface → iHD` when the user's
   `hwdec=vaapi` exposed a retired zero-copy Intel surface. Copy-back retains
   hardware decode; never restore zero-copy VA-API as the default here.
+- Overlays (track card, settings sheet, fullscreen control bar) are children
+  of the window's root widget, positioned over the video. A widget re-parented
+  onto the `QOpenGLWidget` at runtime was visible to Qt but missing from the
+  composited frame.
+- Do not read the video framebuffer back on the GUI thread: every
+  `glReadPixels`/`grabFramebuffer` stalled ~150 ms on the Intel laptop, and a
+  `glBlitFramebuffer` from it returned black. The auto accent samples through
+  mpv's asynchronous `screenshot-raw` instead (`request_frame_sample`).
 - For external auxiliary media, load the video-only epoch paused, then issue
   exactly one raw-argument `audio-add` after mpv's `playback-restart`; that
   demuxer contributes both audio and subtitle tracks. Attaching during
