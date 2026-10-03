@@ -342,3 +342,48 @@ def test_shared_sort_control_has_height_with_local_only_browser(window):
     assert window.sort_combo.height() > 0
     window._apply_browser_visible(False)
     assert not window.sort_combo.isVisible()
+
+
+
+def test_skip_buttons_default_to_85_s_and_follow_the_setting(window, monkeypatch):
+    events, errors = setup_lifecycle(window, monkeypatch)
+    assert window.settings.fast_forward_s == 85
+    assert window.fast_forward_spin.value() == 85
+    assert window.seek_forward_btn.text() == "+1:25"
+    assert window.seek_back_btn.text() == "\u22121:25"
+    async def scenario():
+        await window._start_session("show.mkv", "server_file")
+        window._on_position(100.0)
+        await window.on_skip(1)
+        assert events[-1] == ("seek", 185000)
+        window._on_position(185.0)
+        window.fast_forward_spin.setValue(30)
+        assert window.settings.fast_forward_s == 30
+        assert window.seek_forward_btn.text() == "+0:30"
+        assert window.seek_back_btn.text() == "\u22120:30"
+        await window.on_skip(-1)
+        assert events[-1] == ("seek", 155000)
+        assert not errors
+    asyncio.run(scenario())
+
+
+def test_skip_amount_clamps(window):
+    window.settings.fast_forward_s = 0
+    assert window.settings.fast_forward_s == 1
+    window.settings.fast_forward_s = 99999
+    assert window.settings.fast_forward_s == 3600
+
+
+def test_chapter_buttons_flank_skip_buttons_and_hide_without_chapters(window):
+    from desktop_client.chapters import Chapter
+    layout = window.seek_back_btn.parentWidget().layout()
+    row = next(layout.itemAt(i).layout() for i in range(layout.count())
+               if layout.itemAt(i).layout() and layout.itemAt(i).layout().indexOf(window.seek_back_btn) >= 0)
+    order = [row.indexOf(w) for w in (window.chapter_prev_btn, window.seek_back_btn,
+                                       window.seek_forward_btn, window.chapter_next_btn)]
+    assert order == sorted(order) and order == list(range(order[0], order[0] + 4))
+    window._set_chapters([])
+    assert window.chapter_next_btn.isHidden() and window.chapter_prev_btn.isHidden()
+    assert not window.seek_forward_btn.isHidden()
+    window._set_chapters([Chapter(0.0, "Intro"), Chapter(90.0, "Part A")])
+    assert not window.chapter_next_btn.isHidden() and not window.chapter_prev_btn.isHidden()

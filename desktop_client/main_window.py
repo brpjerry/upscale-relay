@@ -57,7 +57,7 @@ from .chapters import (
     slider_fractions,
     step_target,
 )
-from .settings import AppSettings
+from .settings import AppSettings, format_skip
 from .features import DesktopFeatures
 from .browser_state import LocalLibraryProxy, restore_server_tree
 from .history import endpoint_key
@@ -502,19 +502,18 @@ class MainWindow(DesktopFeatures, QMainWindow):
         transport = QHBoxLayout()
         transport.addWidget(self.play_btn)
         transport.addWidget(self.stop_btn)
+        # Skip buttons step by the configured fast-forward amount; the chapter
+        # buttons around them stay hidden for files without chapters.
         self.seek_back_btn = QToolButton()
-        self.seek_back_btn.setText("−10 s")
-        self.seek_back_btn.setToolTip("Seek backward ten seconds")
         self.seek_forward_btn = QToolButton()
-        self.seek_forward_btn.setText("+10 s")
-        self.seek_forward_btn.setToolTip("Seek forward ten seconds")
-        self.seek_back_btn.clicked.connect(lambda: self.on_seek_relative(-10.0))
-        self.seek_forward_btn.clicked.connect(lambda: self.on_seek_relative(10.0))
+        self.seek_back_btn.clicked.connect(lambda: self.on_skip(-1))
+        self.seek_forward_btn.clicked.connect(lambda: self.on_skip(1))
+        self._show_skip_amount(self.settings.fast_forward_s)
+        transport.addWidget(self.chapter_prev_btn)
         transport.addWidget(self.seek_back_btn)
         transport.addWidget(self.seek_forward_btn)
-        transport.addWidget(self.chapter_prev_btn)
-        transport.addWidget(self.chapter_combo)
         transport.addWidget(self.chapter_next_btn)
+        transport.addWidget(self.chapter_combo)
         transport.addWidget(self.fullscreen_btn)
         transport.addWidget(self.fallback_btn)
         transport.addWidget(self.player_status, stretch=1)
@@ -1674,6 +1673,17 @@ class MainWindow(DesktopFeatures, QMainWindow):
         """Arrow-key seek: relay-protocol seek relative to current position."""
         base = self._pending_seek_s if self._pending_seek_s is not None else self._position_s
         await self._seek_to_seconds(base + delta_s)
+
+    def on_skip(self, direction: int):
+        """Skip buttons: move by the configured amount (+1 forward, -1 back)."""
+        return self.on_seek_relative(direction * float(self.settings.fast_forward_s))
+
+    def _show_skip_amount(self, seconds: int) -> None:
+        amount = format_skip(seconds)
+        self.seek_back_btn.setText(f"−{amount}")
+        self.seek_back_btn.setToolTip(f"Skip back {amount} (set in Playback settings)")
+        self.seek_forward_btn.setText(f"+{amount}")
+        self.seek_forward_btn.setToolTip(f"Fast forward {amount} (set in Playback settings)")
 
     @asyncSlot(int)
     async def on_chapter_selected(self, index: int) -> None:
