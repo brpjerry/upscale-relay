@@ -597,6 +597,14 @@ class Reveal(QObject):
             return
         self._run(0.0, self._hide_ms, QEasingCurve(QEasingCurve.InCubic))
 
+    def show_now(self, geometry: QRect) -> None:
+        self._animation.stop()
+        self._geometry = QRect(geometry)
+        self._target = self._t = 1.0
+        self._place()
+        self._widget.show()
+        self._widget.raise_()
+
     def hide_now(self) -> None:
         self._animation.stop()
         self._target = self._t = 0.0
@@ -648,6 +656,45 @@ class Reveal(QObject):
         self._clear_effect()
         if self._target == 0.0:
             self._widget.hide()
+
+
+class SlideSlot(QWidget):
+    """Holds one widget so it can slide out of view instead of being squeezed.
+
+    While an extent is held, the widget keeps that width (or height) and stays
+    anchored to the slot's far edge, so narrowing the slot moves it off the
+    near edge with its layout intact. With nothing held it simply fills the slot.
+    """
+
+    def __init__(self, child: QWidget, orientation=Qt.Horizontal, parent=None):
+        super().__init__(parent)
+        self._child = child
+        self._orientation = orientation
+        self._held: int | None = None
+        child.setParent(self)
+
+    def hold(self, extent: int | None) -> None:
+        self._held = extent
+        self.updateGeometry()
+        self._place()
+
+    def sizeHint(self) -> QSize:
+        return self._child.sizeHint()
+
+    def minimumSizeHint(self) -> QSize:
+        return QSize(0, 0) if self._held is not None else self._child.minimumSizeHint()
+
+    def resizeEvent(self, event) -> None:
+        self._place()
+        super().resizeEvent(event)
+
+    def _place(self) -> None:
+        if self._orientation == Qt.Horizontal:
+            width = max(self.width(), self._held or 0)
+            self._child.setGeometry(self.width() - width, 0, width, self.height())
+        else:
+            height = max(self.height(), self._held or 0)
+            self._child.setGeometry(0, self.height() - height, self.width(), height)
 
 
 class AutoHideButton(QPushButton):

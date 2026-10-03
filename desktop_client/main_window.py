@@ -78,10 +78,12 @@ from .widgets import (
     PlayerOverlay,
     Reveal,
     SidePanel,
+    SlideSlot,
     Spinner,
     StatusDot,
     VolumeSlider,
     WheelGuard,
+    emphasized,
     show_slider_tip,
     tabular,
 )
@@ -103,6 +105,8 @@ _SERVER_LOADED_ROLE = Qt.UserRole + 2
 _SERVER_CURSOR_ROLE = Qt.UserRole + 3
 _SERVER_PAGE_SIZE = 100
 _RECONNECT_DELAYS_S = (0.0, 2.0, 5.0)
+_SIDEBAR_MIN_WIDTH = 220
+_TOP_BAR_HEIGHT = 64
 
 
 def _format_time(seconds: float) -> str:
@@ -262,7 +266,6 @@ class MainWindow(DesktopFeatures, QMainWindow):
 
         # -- top bar: heading + server connection -----------------------------
         bar = QWidget()
-        bar.setFixedHeight(64)
         self._toolbar = bar  # hidden in fullscreen
         self.browser_toggle = IconButton(Icons.menu)
         self.browser_toggle.setCheckable(True)
@@ -468,7 +471,6 @@ class MainWindow(DesktopFeatures, QMainWindow):
         # hidden. Keep the shared sort control in an independent header so
         # local-only browsing has the same usable control as Server browsing.
         self.browser_container = _styled(QWidget(), "sidebar")
-        self.browser_container.setMinimumWidth(220)
         browser_layout = QVBoxLayout(self.browser_container)
         browser_layout.setContentsMargins(0, 0, 0, 0)
         browser_layout.setSpacing(0)
@@ -689,7 +691,9 @@ class MainWindow(DesktopFeatures, QMainWindow):
         pv = QVBoxLayout(main_page)
         pv.setContentsMargins(0, 0, 0, 0)
         pv.setSpacing(0)
-        pv.addWidget(bar)
+        self._toolbar_slot = SlideSlot(bar, Qt.Vertical)
+        self._toolbar_slot.setFixedHeight(_TOP_BAR_HEIGHT)
+        pv.addWidget(self._toolbar_slot)
         pv.addWidget(self.player, stretch=1)
 
         self.controls_panel.setCursor(Qt.ArrowCursor)
@@ -708,7 +712,12 @@ class MainWindow(DesktopFeatures, QMainWindow):
         # preview and perform the expensive video resize once on release.
         self.split.setOpaqueResize(False)
         self.split.setHandleWidth(1)
-        self.split.addWidget(self.browser_container)
+        # The sidebar and the top bar sit in slots so they can slide away
+        # (sidebar toggle, fullscreen) instead of being squeezed or cut.
+        self._sidebar_slot = SlideSlot(self.browser_container, Qt.Horizontal)
+        self._sidebar_slot.setMinimumWidth(_SIDEBAR_MIN_WIDTH)
+        self._slides: dict[str, QVariantAnimation] = {}
+        self.split.addWidget(self._sidebar_slot)
         self.split.addWidget(main_page)
         self.split.setStretchFactor(1, 1)
         self.split.setCollapsible(1, False)
@@ -1074,26 +1083,111 @@ class MainWindow(DesktopFeatures, QMainWindow):
 
     def _on_browser_toggled(self, visible: bool) -> None:
         self.settings.browser_visible = visible
-        self._apply_browser_visible(visible)
+        self._slide_browser(visible)
 
     def _apply_browser_visible(self, visible: bool) -> None:
-        """Collapse/expand the file browser, remembering its width so it comes
-        back to the same size. Fullscreen hides it too, without disturbing the
-        toggle's remembered state."""
+        """Collapse/expand the file browser at once, remembering its width so
+        it comes back to the same size. Fullscreen hides it too, without
+        disturbing the toggle's remembered state."""
+        self._stop_slide("sidebar")
+        slot = self._sidebar_slot
+        slot.hold(None)
+        slot.setMinimumWidth(_SIDEBAR_MIN_WIDTH)
         if visible:
-            self.browser_container.setVisible(True)
+            slot.setVisible(True)
             self.split.setSizes(self._browser_sizes)
         else:
             sizes = self.split.sizes()
-            if sizes and sizes[0] > 0:  # don't overwrite with an already-collapsed width
+            if slot.isVisible() and sizes and sizes[0] >= _SIDEBAR_MIN_WIDTH:
+                self._browser_sizes = sizes  # never a collapsed or mid-slide width
+            slot.setVisible(False)
+
+    # -- sliding chrome ---------------------------------------------------------
+    # The sidebar and top bar slide rather than pop. Each step really resizes
+    # the video widget, which is acceptable for a short, bounded glide (unlike
+    # an open-ended splitter drag, which stays rubber-banded).
+
+    def _stop_slide(self, key: str) -> None:
+        running = self._slides.pop(key, None)
+        if running is not None:
+            running.stop()
+            running.deleteLater()
+
+    def _slide(self, key: str, start: int, end: int, apply, done) -> None:
+        self._stop_slide(key)
+        animation = QVariantAnimation(self)
+        animation.setDuration(theme.SLOW)
+        animation.setEasingCurve(emphasized())
+        animation.setStartValue(float(start))
+        animation.setEndValue(float(end))
+        animation.valueChanged.connect(lambda value: apply(round(float(value))))
+
+        def finished() -> None:
+            if self._slides.get(key) is animation:
+                del self._slides[key]
+            animation.deleteLater()
+            done()
+        animation.finished.connect(finished)
+        self._slides[key] = animation
+        animation.start()
+
+    def _slide_browser(self, visible: bool) -> None:
+        slot = self._sidebar_slot
+        if not self.isVisible():
+            self._apply_browser_visible(visible)
+            return
+        sizes = self.split.sizes()
+        current = sizes[0] if slot.isVisible() else 0
+        if visible:
+            target = self._browser_sizes[0]
+        else:
+            target = 0
+            if current >= _SIDEBAR_MIN_WIDTH and "sidebar" not in self._slides:
                 self._browser_sizes = sizes
-            self.browser_container.setVisible(False)
+        if current == target:
+            self._apply_browser_visible(visible)
+            return
+
+        def apply(width: int) -> None:
+            total = sum(self.split.sizes())  # live: the window may be resizing too
+            width = max(1, min(width, total - 1))  # 0 would collapse the pane
+            self.split.setSizes([width, total - width])
+
+        self._stop_slide("sidebar")
+        slot.hold(max(current, self._browser_sizes[0]))
+        slot.setMinimumWidth(0)
+        slot.setVisible(True)
+        apply(max(1, current))
+        self._slide("sidebar", current, target, apply, lambda: self._apply_browser_visible(visible))
+
+    def _apply_toolbar_visible(self, visible: bool) -> None:
+        self._stop_slide("toolbar")
+        self._toolbar_slot.hold(None)
+        self._toolbar_slot.setFixedHeight(_TOP_BAR_HEIGHT)
+        self._toolbar_slot.setVisible(visible)
+
+    def _slide_toolbar(self, visible: bool) -> None:
+        slot = self._toolbar_slot
+        if not self.isVisible():
+            self._apply_toolbar_visible(visible)
+            return
+        current = slot.height() if slot.isVisible() else 0
+        target = _TOP_BAR_HEIGHT if visible else 0
+        if current == target:
+            self._apply_toolbar_visible(visible)
+            return
+        self._stop_slide("toolbar")
+        slot.hold(_TOP_BAR_HEIGHT)
+        slot.setFixedHeight(max(1, current))
+        slot.setVisible(True)
+        self._slide("toolbar", current, target, lambda height: slot.setFixedHeight(max(1, height)),
+                    lambda: self._apply_toolbar_visible(visible))
 
     def toggle_fullscreen(self) -> None:
         entering = not self.isFullScreen()
         # The transport bar becomes a pointer-revealed overlay in fullscreen
         # rather than just vanishing; everything else hides.
-        self._toolbar.setVisible(not entering)
+        self._slide_toolbar(not entering)
         self.tracks_btn.setChecked(False)
         self._track_reveal.hide_now()  # the bar it hangs from is about to move
         self.fullscreen_btn.set_icon(Icons.fullscreen_exit if entering else Icons.fullscreen)
@@ -1101,7 +1195,7 @@ class MainWindow(DesktopFeatures, QMainWindow):
             self._settings_visible_before_fullscreen = self._settings_reveal.shown \
                 or self.playback_settings.isVisible()
             self._settings_reveal.hide_now()
-            self._apply_browser_visible(False)
+            self._slide_browser(False)
             self._enter_overlay_controls()
             self._was_maximized = self.isMaximized()
             self.showFullScreen()
@@ -1109,7 +1203,7 @@ class MainWindow(DesktopFeatures, QMainWindow):
             self.player.setFocus()  # keys (Space/F/arrows) go to the video
         else:
             self.playback_settings.setVisible(self._settings_visible_before_fullscreen)
-            self._apply_browser_visible(self.browser_toggle.isChecked())
+            self._slide_browser(self.browser_toggle.isChecked())
             self._exit_overlay_controls()
             if self._was_maximized:
                 self.showMaximized()
@@ -1145,9 +1239,14 @@ class MainWindow(DesktopFeatures, QMainWindow):
         self._controls_layout.removeWidget(self.controls_panel)
         self.controls_panel.overlay = True
         self._apply_overlay_palette()
-        self._controls_reveal.hide_now()
-        self._position_overlay()
-        self.controls_panel.raise_()
+        if self.isVisible():
+            # Stays where it was for a moment, then slides off the bottom.
+            self._controls_reveal.show_now(self._overlay_geometry())
+            self._controls_reveal.hide()
+        else:
+            self._controls_reveal.hide_now()
+            self._position_overlay()
+            self.controls_panel.raise_()
 
     def _apply_overlay_palette(self) -> None:
         # Keep foreground, disabled text, control surfaces and focus colors in

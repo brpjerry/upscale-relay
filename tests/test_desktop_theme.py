@@ -218,3 +218,37 @@ def test_fullscreen_bar_floats_over_the_window_not_the_video(window):
     finally:
         window.toggle_fullscreen()
     assert window.controls_panel.isVisible()
+
+
+def test_sidebar_slides_away_and_back_to_its_width(window):
+    window.resize(1100, 600)
+    window.show()
+    QApplication.instance().processEvents()
+    width = window.split.sizes()[0]
+    assert width >= 220
+    window.browser_toggle.setChecked(False)
+    assert window._sidebar_slot.isVisible()  # still sliding out
+    QTest.qWait(theme.SLOW + 200)
+    assert not window._sidebar_slot.isVisible()
+    assert not window.sort_combo.isVisible()
+    window.browser_toggle.setChecked(True)
+    QTest.qWait(theme.SLOW + 200)
+    assert window._sidebar_slot.isVisible()
+    assert window.split.sizes()[0] == width
+    assert window.browser_container.width() == window._sidebar_slot.width()  # fills its slot again
+
+
+def test_fullscreen_slides_the_chrome_out_and_restores_it(window):
+    window.resize(1100, 600)
+    window.show()
+    QApplication.instance().processEvents()
+    width = window.split.sizes()[0]
+    window.toggle_fullscreen()
+    QTest.qWait(theme.SLOW + 200)
+    assert not window._toolbar_slot.isVisible()
+    assert not window._sidebar_slot.isVisible()
+    window.toggle_fullscreen()
+    QTest.qWait(theme.SLOW + 200)
+    assert window._toolbar_slot.isVisible() and window._toolbar_slot.height() == 64
+    assert window._sidebar_slot.isVisible() and window.split.sizes()[0] == width
+    assert window.controls_panel.isVisible()
