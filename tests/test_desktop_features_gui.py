@@ -379,9 +379,11 @@ def test_chapter_buttons_flank_skip_buttons_and_hide_without_chapters(window):
     layout = window.seek_back_btn.parentWidget().layout()
     row = next(layout.itemAt(i).layout() for i in range(layout.count())
                if layout.itemAt(i).layout() and layout.itemAt(i).layout().indexOf(window.seek_back_btn) >= 0)
-    order = [row.indexOf(w) for w in (window.chapter_prev_btn, window.seek_back_btn,
+    # Play/pause sits in the middle, skip beside it, chapters outside.
+    order = [row.indexOf(w) for w in (window.chapter_prev_btn, window.seek_back_btn, window.play_btn,
                                        window.seek_forward_btn, window.chapter_next_btn)]
-    assert order == sorted(order) and order == list(range(order[0], order[0] + 4))
+    assert order == sorted(order) and order == list(range(order[0], order[0] + 5))
+    assert row.indexOf(window.stop_btn) < 0  # Stop lives beside Connect instead
     window._set_chapters([])
     assert window.chapter_next_btn.isHidden() and window.chapter_prev_btn.isHidden()
     assert not window.seek_forward_btn.isHidden()

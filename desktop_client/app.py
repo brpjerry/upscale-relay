@@ -14,7 +14,6 @@ from PySide6.QtWidgets import QApplication
 from qasync import QEventLoop
 
 from .options import DesktopOptions
-from .theme import apply_system_theme
 
 
 def parse_args(argv: list[str] | None = None) -> tuple[DesktopOptions, list[str]]:
@@ -65,7 +64,6 @@ def main() -> None:
     import locale
 
     locale.setlocale(locale.LC_NUMERIC, "C")
-    apply_system_theme(app)
     from .main_window import MainWindow
 
     loop = QEventLoop(app)

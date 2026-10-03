@@ -22,6 +22,13 @@ load-bearing), `docs/CLIENT_LINUX.md` (Linux setup), and
 - `relay_client_core/` — demux/uplink/control/downlink library + `relay-client`
   mock CLI (used by the integration tests).
 - `desktop_client/` — PySide6 + qasync + python-mpv player (`relay-desktop`).
+  QtWidgets, skinned to match MV Player: `theme.py` (dark/light palette, style
+  sheet, Material icon paths rendered through QtSvg) and `widgets.py`
+  (custom-painted buttons/sliders/switches that keep the stock Qt API the
+  tests drive). Text colours travel through QPalette, not style sheet rules —
+  the fullscreen overlay re-palettes its labels — and accent colours in the
+  style sheet are `palette(...)` references, so an accent change is a palette
+  change (~2 ms) rather than a new style sheet (~70 ms re-polish, a video hitch).
 - `upscale_cli/` — offline pipeline, ONNX/EP handling, uint8 graph wrapper,
   `upscale-cli` (run/info/sample/bench subcommands).
 
@@ -82,8 +89,23 @@ constructor options).
   nested loop re-enters asyncio tasks and ends in memory corruption.
   `MainWindow._error()` is non-modal on purpose.
 - A garbage-collected `asyncio.StreamWriter` closes its socket — keep refs.
+- A Python exception inside a Qt virtual (`eventFilter`, `sizeHint`,
+  `paintEvent`) is a segfault with an `<invalid frame>` stack, not a
+  traceback. Install event filters only after every widget they read exists.
 - Client must send `buffer_report` on a timer with *live* values; reporting
   only on packet arrival deadlocks the server's watermark pause/resume.
+- Keep mpv's render call blocking (`block_for_target_time`, the default).
+  mpv announces a frame ~one period before its display time and waits the
+  difference out inside `render()` on the GUI thread (38 of every 42 ms at
+  24 fps), which is why UI animations step at the video's frame rate during
+  playback. Measured alternatives on 2026-10-03, both rejected:
+  rendering at once shows every frame a period early (39.5 ms at 24 fps,
+  video ahead of audio, invisible to mpv's `avsync`); waiting on a Qt timer
+  for `next_frame_info.target_time` (nanoseconds, despite the header) is on
+  time in steady state, but any other repaint of the video widget then
+  consumes the pending frame early, and `screenshot-raw` (the auto accent
+  sampler) intermittently stalls mpv's frame delivery ~0.3 s (drops), which
+  it does not do while the render call blocks.
 - Under qasync the loop turns ~once per rendered frame (~25/s) while mpv
   plays. Media pumps must move batches per loop turn: per-packet
   `to_thread`+`drain` capped the uplink at ~12 pkt/s (starved the server
@@ -107,6 +129,14 @@ constructor options).
   `paintGL → mpv_render_context_render → vaSyncSurface → iHD` when the user's
   `hwdec=vaapi` exposed a retired zero-copy Intel surface. Copy-back retains
   hardware decode; never restore zero-copy VA-API as the default here.
+- Overlays (track card, settings sheet, fullscreen control bar) are children
+  of the window's root widget, positioned over the video. A widget re-parented
+  onto the `QOpenGLWidget` at runtime was visible to Qt but missing from the
+  composited frame.
+- Do not read the video framebuffer back on the GUI thread: every
+  `glReadPixels`/`grabFramebuffer` stalled ~150 ms on the Intel laptop, and a
+  `glBlitFramebuffer` from it returned black. The auto accent samples through
+  mpv's asynchronous `screenshot-raw` instead (`request_frame_sample`).
 - For external auxiliary media, load the video-only epoch paused, then issue
   exactly one raw-argument `audio-add` after mpv's `playback-restart`; that
   demuxer contributes both audio and subtitle tracks. Attaching during
