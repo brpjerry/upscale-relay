@@ -108,6 +108,11 @@ _DOWNLINK_SOCKET_BUFFER = 4 * 1024 * 1024
 # without keepalives this degrades to the old fixed 240 s timeout.
 OPEN_SESSION_TIMEOUT_S = 240.0
 TEARDOWN_TIMEOUT_S = 30.0
+# Client-side ping on the control WebSocket. The server pings too, but a peer
+# that vanished without a FIN (laptop suspend, Wi-Fi drop) leaves this end
+# looking connected until the next request; with a heartbeat aiohttp closes
+# the socket after a missed pong and the control reader ends.
+CONTROL_HEARTBEAT_S = 20.0
 
 
 class TeardownNotConfirmedError(RuntimeError):
@@ -324,6 +329,9 @@ class RelayClient:
         # thread).
         self.on_progress = None
         self.on_seek_progress = None
+        # Called with no arguments (same task/thread) when the control
+        # connection ends without close()/teardown() having been requested.
+        self.on_disconnected = None
         self._last_activity = time.monotonic()
         self._attachment_view_dir: Path | None = None
 
@@ -335,6 +343,14 @@ class RelayClient:
         return self._has_server_session
 
     @property
+    def connected(self) -> bool:
+        """False once the control connection has ended, for any reason."""
+        return (
+            self._ws is not None and not self._ws.closed
+            and self._reader_task is not None and not self._reader_task.done()
+        )
+
+    @property
     def base_url(self) -> str:
         host = self.host.strip("[]")
         if ":" in host:
@@ -342,7 +358,9 @@ class RelayClient:
         return f"http://{host}:{self.port}"
 
     async def connect(self) -> dict:
-        self._ws = await self._http.ws_connect(f"{self.base_url}/control")
+        self._ws = await self._http.ws_connect(
+            f"{self.base_url}/control", heartbeat=CONTROL_HEARTBEAT_S,
+        )
         self._reader_task = asyncio.create_task(self._control_reader())
         self.capabilities = await self._request(
             "capabilities", "hello",
@@ -434,6 +452,11 @@ class RelayClient:
                 if not fut.done():
                     fut.set_exception(ConnectionError("control connection closed"))
             self._pending.clear()
+            if not self._closing and self.on_disconnected is not None:
+                try:
+                    self.on_disconnected()
+                except Exception:
+                    log.exception("on_disconnected callback failed")
 
     async def open_session(self, cfg: SessionConfig) -> SessionInfo:
         if cfg.source not in ("uplink", "server_file"):
