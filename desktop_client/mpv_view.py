@@ -360,6 +360,7 @@ class MpvPlayerView(QOpenGLWidget):
         self._sample_pending = False
         self._sampling_broken = False
         self._screen_watched = False
+        self._report_display = False
         self._display_rate = 0.0
         self._get_proc = None  # ctypes callback — must outlive the render ctx
         self._frame_ready.connect(self._on_frame_ready, Qt.QueuedConnection)
@@ -597,19 +598,26 @@ class MpvPlayerView(QOpenGLWidget):
             handle.screenChanged.connect(lambda _screen: self._report_display_rate())
         self._report_display_rate()
 
+    def set_display_rate_reporting(self, enabled: bool) -> None:
+        """Opt in to (or out of) telling mpv the display's refresh rate."""
+        self._report_display = bool(enabled)
+        self._report_display_rate()
+
     def _report_display_rate(self) -> None:
         """Tell mpv the refresh rate of the screen this window is on.
 
         Through the render API mpv cannot see the display, so its display-sync
-        modes (`video-sync=display-*`) silently fell back to audio timing.
+        modes (`video-sync=display-*`) silently fall back to audio timing.
         Given the rate, such a mode renders once per refresh instead of once
         per video frame and no longer waits inside render(); the interface
-        then repaints at the display's rate during playback. `video-sync=audio`
-        is unaffected.
+        then repaints at the display's rate during playback, for about 3 W
+        more in fullscreen on the laptop. Opt-in for that reason; with it off
+        the rate is left unknown (0), and `video-sync=audio` is unaffected
+        either way.
         """
         screen = self.screen()
-        rate = screen.refreshRate() if screen is not None else 0.0
-        if self.options.headless or rate <= 0 or rate == self._display_rate:
+        rate = screen.refreshRate() if screen is not None and self._report_display else 0.0
+        if self.options.headless or rate < 0 or rate == self._display_rate:
             return
         try:
             self.mpv["display-fps-override"] = float(rate)

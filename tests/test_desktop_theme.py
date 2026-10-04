@@ -274,3 +274,49 @@ def test_auto_accent_samples_only_at_restarts_under_display_sync(window):
     window._request_accent_sample()
     assert len(requests) == 4
     window._session_source = None
+
+
+def test_display_pacing_is_opt_in_and_reaches_the_player(window):
+    calls = []
+    window.player.set_display_rate_reporting = calls.append
+    assert window.settings.display_sync is False
+    assert not window.display_sync_check.isChecked()
+    window.display_sync_check.setChecked(True)
+    assert window.settings.display_sync is True
+    assert calls == [True]
+    window.display_sync_check.setChecked(False)
+    assert calls == [True, False]
+
+
+def test_video_timing_hint_explains_switch_and_mode_together(window):
+    sync = window.mpv_controls["video-sync"]
+    assert sync.itemData(sync.findText("Audio (default)")) == "audio"
+    assert sync.findData("display-resample") >= 0 and sync.findData("display-vdrop") >= 0
+    values = dict(window._next_defaults)
+    window._refresh_mpv_controls({**values, "video-sync": "audio"})
+    assert "paced by audio" in window.display_sync_hint.text()
+    window._refresh_mpv_controls({**values, "video-sync": "display-resample"})
+    assert sync.currentData() == "display-resample"
+    assert "set but inactive" in window.display_sync_hint.text()
+    window.display_sync_check.setChecked(True)
+    assert "paced by the display" in window.display_sync_hint.text()
+    window._refresh_mpv_controls({**values, "video-sync": "audio"})
+    assert "No effect yet" in window.display_sync_hint.text()
+
+
+def test_display_rate_is_reported_only_when_enabled():
+    pytest.importorskip("mpv")
+    from types import SimpleNamespace
+    from desktop_client.mpv_view import MpvPlayerView
+    sent = {}
+    player = SimpleNamespace(
+        options=SimpleNamespace(headless=False), _display_rate=0.0, _report_display=False,
+        screen=lambda: SimpleNamespace(refreshRate=lambda: 120.0), mpv=sent,
+    )
+    player._report_display_rate = lambda: MpvPlayerView._report_display_rate(player)
+    MpvPlayerView._report_display_rate(player)
+    assert sent == {}                                   # off: mpv is told nothing
+    MpvPlayerView.set_display_rate_reporting(player, True)
+    assert sent == {"display-fps-override": 120.0}
+    MpvPlayerView.set_display_rate_reporting(player, False)
+    assert sent == {"display-fps-override": 0.0}        # back to unknown

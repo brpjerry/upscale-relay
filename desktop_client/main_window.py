@@ -512,6 +512,8 @@ class MainWindow(DesktopFeatures, QMainWindow):
         self.video_overlay = PlayerOverlay(self.player)
         if hasattr(self.player, "set_deband"):
             self.player.set_deband(self.settings.deband_enabled)
+        if hasattr(self.player, "set_display_rate_reporting"):
+            self.player.set_display_rate_reporting(self.settings.display_sync)
         self.play_btn = IconButton(Icons.play, size=40, icon_size=24, filled=True)
         self.play_btn.setToolTip("Play (Space)")
         self.play_btn.setEnabled(False)

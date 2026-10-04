@@ -104,6 +104,15 @@ class AppSettings:
         self._qs.setValue("playback/deband", bool(v))
 
     @property
+    def display_sync(self) -> bool:
+        """Tell mpv the display's refresh rate, so its display-sync modes work."""
+        return self._qs.value("playback/display_sync", False, type=bool)
+
+    @display_sync.setter
+    def display_sync(self, v: bool) -> None:
+        self._qs.setValue("playback/display_sync", bool(v))
+
+    @property
     def fast_forward_s(self) -> int:
         return _clamp_fast_forward(self._qs.value("playback/fast_forward_s", FAST_FORWARD_DEFAULT_S, type=int))
 

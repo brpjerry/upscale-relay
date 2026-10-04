@@ -52,6 +52,18 @@ class DesktopFeatures:
             form.setRowWrapPolicy(QFormLayout.WrapAllRows)
             layout.addWidget(box)
             return form
+        # Video timing: how mpv paces frames. The switch is ours; the mode is
+        # mpv's own video-sync option and lives in mpv.conf with the defaults.
+        timing_form = group("Video timing")
+        self.display_sync_check = FlatSwitch("Pace video by the display")
+        self.display_sync_check.setChecked(self.settings.display_sync)
+        self.display_sync_check.setToolTip(
+            "Tell mpv the display's refresh rate so a display synchronization mode can take effect.")
+        self.display_sync_check.toggled.connect(self._set_display_sync)
+        timing_form.addRow(self.display_sync_check)
+        self.display_sync_hint = QLabel()
+        self.display_sync_hint.setWordWrap(True)
+        self.display_sync_hint.setProperty("role", "faint")
         form = group("mpv defaults")
         self.mpv_defaults_notice = QLabel("These settings modify mpv.conf and also affect standalone mpv.")
         self.mpv_defaults_notice.setWordWrap(True)
@@ -67,7 +79,13 @@ class DesktopFeatures:
         self.mpv_controls = {}
         choices = {
             "sid": [("Auto", "auto"), ("Off", "no")],
-            "video-sync": [(v, v) for v in ("audio", "display-resample", "display-resample-vdrop", "display-resample-desync", "display-tempo", "display-vdrop", "display-adrop", "display-desync", "desync")],
+            "video-sync": [
+                ("Audio (default)", "audio"),
+                ("Display, resample audio to match (display-resample)", "display-resample"),
+                ("Display, repeat or drop video frames (display-vdrop)", "display-vdrop"),
+                *((v, v) for v in ("display-resample-vdrop", "display-resample-desync", "display-tempo",
+                                   "display-adrop", "display-desync", "desync")),
+            ],
             "interpolation": [("Off", "no"), ("On", "yes")],
             "tscale": [(v, v) for v in ("oversample", "linear", "catmull_rom", "mitchell")],
         }
@@ -84,7 +102,8 @@ class DesktopFeatures:
                     widget.addItem(label, value)
                 widget.activated.connect(lambda _index, key=name: self._edit_mpv_default(key, self.mpv_controls[key].currentData()))
             self.mpv_controls[name] = widget
-            form.addRow(titles[name], widget)
+            (timing_form if name == "video-sync" else form).addRow(titles[name], widget)
+        timing_form.addRow(self.display_sync_hint)
         self.mpv_config = None
         try:
             native = getattr(self.player, "mpv", None)
@@ -100,6 +119,7 @@ class DesktopFeatures:
             self.mpv_config_label.setText(str(err))
             for control in self.mpv_controls.values():
                 control.setEnabled(False)
+        self._show_display_sync_hint()
         if self.mpv_config is not None:
             self.config_watcher = ConfigWatcher(self.mpv_config, self)
             self.config_watcher.changed.connect(self._refresh_mpv_controls)
@@ -212,6 +232,7 @@ class DesktopFeatures:
                     index = control.count() - 1
                 control.setCurrentIndex(index)
             control.blockSignals(False)
+        self._show_display_sync_hint()
         if self.mpv_config:
             overrides = [f"{key}={value}" for key, value in self.mpv_config.effective_values.items()
                          if value != values[key]]
@@ -262,6 +283,30 @@ class DesktopFeatures:
     def _set_theme_mode(self, mode):
         self.settings.theme_mode = mode
         self._apply_theme_mode(mode)
+
+    def _set_display_sync(self, value):
+        self.settings.display_sync = value
+        if hasattr(self.player, "set_display_rate_reporting"):
+            self.player.set_display_rate_reporting(value)
+        self._show_display_sync_hint()
+
+    def _show_display_sync_hint(self):
+        """Say what the switch and the mode add up to; either alone does nothing."""
+        mode = self._next_defaults.get("video-sync", "audio")
+        display_mode = mode.startswith("display-")
+        if self.settings.display_sync and display_mode:
+            text = ("Video is paced by the display and the interface stays fluid during playback. "
+                    "This draws more power (about 3 W in fullscreen on a laptop).")
+        elif self.settings.display_sync:
+            text = ("No effect yet: Video synchronization is set to audio. "
+                    "Choose a Display mode to pace video by the display.")
+        elif display_mode:
+            text = (f"{mode} is set but inactive: mpv cannot see the display from inside this player. "
+                    "Turn the switch on to let it take effect.")
+        else:
+            text = ("Video is paced by audio. During playback the interface updates once per video frame. "
+                    "The mode is saved to mpv.conf.")
+        self.display_sync_hint.setText(text)
 
     def _set_accent(self, value):
         self.settings.accent = value

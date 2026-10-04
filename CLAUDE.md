@@ -107,8 +107,10 @@ constructor options).
   sampler) intermittently stalls mpv's frame delivery ~0.3 s (drops), which
   it does not do while the render call blocks.
 - The supported way to a fluid UI during playback is mpv's display sync:
-  `MpvPlayerView` reports the screen's refresh rate (`display-fps-override`;
-  the render API cannot see the display), so `video-sync=display-*` renders
+  with "Pace video by the display" on (off by default: +3 W in fullscreen on
+  the laptop), `MpvPlayerView` reports the screen's refresh rate
+  (`display-fps-override`; the render API cannot see the display), so
+  `video-sync=display-*` renders
   once per refresh and does not wait inside `render()` (120 paints/s at
   0.7 ms on the laptop, vsync-jitter ~0.14, no drops). `interpolation` is not
   what does this; it only blends frames. Under display sync `screenshot-raw`
