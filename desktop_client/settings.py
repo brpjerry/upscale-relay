@@ -104,12 +104,40 @@ class AppSettings:
         self._qs.setValue("playback/deband", bool(v))
 
     @property
+    def display_sync(self) -> bool:
+        """Tell mpv the display's refresh rate, so its display-sync modes work."""
+        return self._qs.value("playback/display_sync", False, type=bool)
+
+    @display_sync.setter
+    def display_sync(self, v: bool) -> None:
+        self._qs.setValue("playback/display_sync", bool(v))
+
+    @property
     def fast_forward_s(self) -> int:
         return _clamp_fast_forward(self._qs.value("playback/fast_forward_s", FAST_FORWARD_DEFAULT_S, type=int))
 
     @fast_forward_s.setter
     def fast_forward_s(self, v: int) -> None:
         self._qs.setValue("playback/fast_forward_s", _clamp_fast_forward(v))
+
+    @property
+    def theme_mode(self) -> str:
+        value = self._qs.value("appearance/theme", "auto")
+        return value if value in ("auto", "dark", "light") else "auto"
+
+    @theme_mode.setter
+    def theme_mode(self, v: str) -> None:
+        self._qs.setValue("appearance/theme", v)
+
+    @property
+    def accent(self) -> str:
+        """"auto" (follow the video) or a "#rrggbb" colour."""
+        value = str(self._qs.value("appearance/accent", "auto"))
+        return value if value == "auto" or (len(value) == 7 and value.startswith("#")) else "auto"
+
+    @accent.setter
+    def accent(self, v: str) -> None:
+        self._qs.setValue("appearance/accent", v)
 
     @property
     def browse_dir(self) -> str:

@@ -24,12 +24,32 @@ from fractions import Fraction
 from pathlib import Path
 
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QGuiApplication, QOpenGLContext
+from PySide6.QtGui import QGuiApplication, QImage, QOpenGLContext, qRgb
 from PySide6.QtOpenGLWidgets import QOpenGLWidget
 
 from .options import DesktopOptions
 from .playback_state import PlaybackTelemetry, match_track, track_descriptor
 from .idle_inhibit import IdleInhibitor
+
+
+
+def _thumbnail(shot: dict, columns: int = 16, rows: int = 9, reach: int = 6) -> QImage | None:
+    """Reduce a raw mpv screenshot (bgr0) to a few short averages per row,
+    enough to judge the picture's dominant colour."""
+    width, height, stride, data = shot["w"], shot["h"], shot["stride"], shot["data"]
+    if shot.get("format") != "bgr0" or width <= 0 or height <= 0:
+        return None
+    view = memoryview(data)
+    image = QImage(columns, rows, QImage.Format_RGB32)
+    for j in range(rows):
+        line = int((j + 0.5) * height / rows) * stride
+        for i in range(columns):
+            centre = int((i + 0.5) * width / columns)
+            span = view[line + max(0, centre - reach) * 4:line + min(width, centre + reach) * 4]
+            count = len(span) // 4
+            image.setPixel(i, j, qRgb(
+                sum(span[2::4]) // count, sum(span[1::4]) // count, sum(span[0::4]) // count))
+    return image
 
 
 def _load_mpv():
@@ -299,6 +319,7 @@ class MpvPlayerView(QOpenGLWidget):
     failed = Signal(str)
     fullscreen_toggled = Signal()  # F key / double-click; the window fullscreens
     mouse_moved = Signal(int, int)  # cursor x, y in the view; drives fullscreen control reveal
+    frame_sampled = Signal(object)  # QImage thumbnail of the picture, on request
     _frame_ready = Signal()  # mpv render thread -> queued repaint on GUI thread
     _playback_restarted = Signal(int)  # libmpv event thread -> GUI thread
     _external_media_ready = Signal(int)  # attach worker -> GUI thread
@@ -336,6 +357,11 @@ class MpvPlayerView(QOpenGLWidget):
         self.setFocusPolicy(Qt.StrongFocus)  # receive keys for mpv forwarding
         self.setMouseTracking(True)  # deliver mouse-move without a pressed button
         self._ctx = None  # MpvRenderContext, created in initializeGL
+        self._sample_pending = False
+        self._sampling_broken = False
+        self._screen_watched = False
+        self._report_display = False
+        self._display_rate = 0.0
         self._get_proc = None  # ctypes callback — must outlive the render ctx
         self._frame_ready.connect(self._on_frame_ready, Qt.QueuedConnection)
 
@@ -563,6 +589,83 @@ class MpvPlayerView(QOpenGLWidget):
         # The GL context is destroyed before the widget on teardown — free the
         # render context first, while the GL context is still alive.
         self.context().aboutToBeDestroyed.connect(self._free_render_ctx)
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        handle = self.window().windowHandle()
+        if handle is not None and not self._screen_watched:
+            self._screen_watched = True
+            handle.screenChanged.connect(lambda _screen: self._report_display_rate())
+        self._report_display_rate()
+
+    def set_display_rate_reporting(self, enabled: bool) -> None:
+        """Opt in to (or out of) telling mpv the display's refresh rate."""
+        self._report_display = bool(enabled)
+        self._report_display_rate()
+
+    def _report_display_rate(self) -> None:
+        """Tell mpv the refresh rate of the screen this window is on.
+
+        Through the render API mpv cannot see the display, so its display-sync
+        modes (`video-sync=display-*`) silently fall back to audio timing.
+        Given the rate, such a mode renders once per refresh instead of once
+        per video frame and no longer waits inside render(); the interface
+        then repaints at the display's rate during playback, for about 3 W
+        more in fullscreen on the laptop. Opt-in for that reason; with it off
+        the rate is left unknown (0), and `video-sync=audio` is unaffected
+        either way.
+        """
+        screen = self.screen()
+        rate = screen.refreshRate() if screen is not None and self._report_display else 0.0
+        if self.options.headless or rate < 0 or rate == self._display_rate:
+            return
+        try:
+            self.mpv["display-fps-override"] = float(rate)
+            self._display_rate = rate
+        except Exception:
+            pass
+
+    def display_sync_active(self) -> bool:
+        """Whether mpv is pacing video by the display (a `display-*` sync mode
+        with a known refresh rate) rather than by audio."""
+        if self.options.headless or self._reloading:
+            return False
+        try:
+            return bool(self.mpv._get_property("display-sync-active"))
+        except Exception:
+            return False
+
+    def request_frame_sample(self) -> None:
+        """Ask for a thumbnail of the current picture (``frame_sampled``).
+
+        The picture comes from mpv's own asynchronous raw screenshot, taken on
+        mpv's threads from the decoded frame. Reading the widget's framebuffer
+        back instead stalled the GUI thread ~150 ms per read here, and the
+        render path is not a place to experiment (see CLAUDE.md hard rules).
+        """
+        if (self._sample_pending or self._sampling_broken or self.options.headless
+                or self._reloading or not self._epoch_released):
+            return
+        self._sample_pending = True
+        try:
+            self.mpv.command_async("screenshot-raw", "video", callback=self._on_raw_screenshot)
+        except Exception:
+            self._sample_pending = False
+            self._sampling_broken = True
+
+    def _on_raw_screenshot(self, error, result) -> None:
+        # libmpv event thread. Only bytes are touched here; the tiny image
+        # crosses to the GUI thread through the (queued) signal.
+        self._sample_pending = False
+        if error or not result:
+            return
+        try:
+            image = _thumbnail(result)
+        except Exception:
+            self._sampling_broken = True
+            return
+        if image is not None:
+            self.frame_sampled.emit(image)
 
     def _free_render_ctx(self) -> None:
         if self._ctx is not None:

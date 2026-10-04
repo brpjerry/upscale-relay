@@ -7,7 +7,7 @@ from pathlib import Path, PurePosixPath
 import time
 
 from PySide6.QtCore import QStandardPaths, Qt, QTimer
-from PySide6.QtWidgets import QCheckBox, QComboBox, QFormLayout, QGroupBox, QLabel, QLineEdit, QMenu, QSpinBox
+from PySide6.QtWidgets import QComboBox, QFormLayout, QGroupBox, QLabel, QLineEdit, QMenu, QSpinBox
 
 from .browser_state import BrowserStore
 from .diagnostics import ClientLog
@@ -16,6 +16,8 @@ from .history import HistoryStore, source_key
 from .mpv_config import ConfigWatcher, DEFAULTS, MpvConfig
 from .playback_state import PlaybackSnapshot, Transitions
 from .settings import FAST_FORWARD_MAX_S
+from .theme import style_menu
+from .widgets import AccentPicker, FlatSwitch, SegmentedSwitch
 
 
 class DesktopFeatures:
@@ -50,9 +52,22 @@ class DesktopFeatures:
             form.setRowWrapPolicy(QFormLayout.WrapAllRows)
             layout.addWidget(box)
             return form
+        # Video timing: how mpv paces frames. The switch is ours; the mode is
+        # mpv's own video-sync option and lives in mpv.conf with the defaults.
+        timing_form = group("Video timing")
+        self.display_sync_check = FlatSwitch("Pace video by the display")
+        self.display_sync_check.setChecked(self.settings.display_sync)
+        self.display_sync_check.setToolTip(
+            "Tell mpv the display's refresh rate so a display synchronization mode can take effect.")
+        self.display_sync_check.toggled.connect(self._set_display_sync)
+        timing_form.addRow(self.display_sync_check)
+        self.display_sync_hint = QLabel()
+        self.display_sync_hint.setWordWrap(True)
+        self.display_sync_hint.setProperty("role", "faint")
         form = group("mpv defaults")
         self.mpv_defaults_notice = QLabel("These settings modify mpv.conf and also affect standalone mpv.")
         self.mpv_defaults_notice.setWordWrap(True)
+        self.mpv_defaults_notice.setProperty("role", "faint")
         form.addRow(self.mpv_defaults_notice)
         self.mpv_config_label = QLabel()
         self.mpv_config_label.setWordWrap(True)
@@ -64,7 +79,13 @@ class DesktopFeatures:
         self.mpv_controls = {}
         choices = {
             "sid": [("Auto", "auto"), ("Off", "no")],
-            "video-sync": [(v, v) for v in ("audio", "display-resample", "display-resample-vdrop", "display-resample-desync", "display-tempo", "display-vdrop", "display-adrop", "display-desync", "desync")],
+            "video-sync": [
+                ("Audio (default)", "audio"),
+                ("Display, resample audio to match (display-resample)", "display-resample"),
+                ("Display, repeat or drop video frames (display-vdrop)", "display-vdrop"),
+                *((v, v) for v in ("display-resample-vdrop", "display-resample-desync", "display-tempo",
+                                   "display-adrop", "display-desync", "desync")),
+            ],
             "interpolation": [("Off", "no"), ("On", "yes")],
             "tscale": [(v, v) for v in ("oversample", "linear", "catmull_rom", "mitchell")],
         }
@@ -81,7 +102,8 @@ class DesktopFeatures:
                     widget.addItem(label, value)
                 widget.activated.connect(lambda _index, key=name: self._edit_mpv_default(key, self.mpv_controls[key].currentData()))
             self.mpv_controls[name] = widget
-            form.addRow(titles[name], widget)
+            (timing_form if name == "video-sync" else form).addRow(titles[name], widget)
+        timing_form.addRow(self.display_sync_hint)
         self.mpv_config = None
         try:
             native = getattr(self.player, "mpv", None)
@@ -97,6 +119,7 @@ class DesktopFeatures:
             self.mpv_config_label.setText(str(err))
             for control in self.mpv_controls.values():
                 control.setEnabled(False)
+        self._show_display_sync_hint()
         if self.mpv_config is not None:
             self.config_watcher = ConfigWatcher(self.mpv_config, self)
             self.config_watcher.changed.connect(self._refresh_mpv_controls)
@@ -110,7 +133,7 @@ class DesktopFeatures:
         self.fast_forward_spin.valueChanged.connect(self._set_fast_forward)
         form.addRow("Skip amount", self.fast_forward_spin)
         form = group("Library")
-        self.autoplay_check = QCheckBox("Play the next video automatically")
+        self.autoplay_check = FlatSwitch("Play the next video automatically")
         self.autoplay_check.setChecked(self.settings.autoplay)
         self.autoplay_check.toggled.connect(lambda value: setattr(self.settings, "autoplay", value))
         form.addRow(self.autoplay_check)
@@ -119,13 +142,27 @@ class DesktopFeatures:
         self.history_limit_spin.setValue(self.settings.history_limit)
         self.history_limit_spin.valueChanged.connect(self._set_history_limit)
         form.addRow("History entries", self.history_limit_spin)
+        form = group("Appearance")
+        self.theme_switch = SegmentedSwitch([("Auto", "auto"), ("Dark", "dark"), ("Light", "light")])
+        self.theme_switch.set_current(self.settings.theme_mode)
+        self.theme_switch.selected.connect(self._set_theme_mode)
+        form.addRow("Theme", self.theme_switch)
+        # Accent colour: follow the video, a preset, or any hue.
+        self.accent_picker = AccentPicker()
+        self.accent_picker.set_value(self.settings.accent)
+        self.accent_picker.picked.connect(self._set_accent)
+        self.accent_hint = QLabel()
+        self.accent_hint.setProperty("role", "faint")
+        form.addRow("Accent colour", self.accent_picker)
+        form.addRow(self.accent_hint)
+        self._show_accent_hint()
         form = group("Diagnostics")
-        self.diagnostics_check = QCheckBox("Show playback diagnostics")
+        self.diagnostics_check = FlatSwitch("Show playback diagnostics")
         self.diagnostics_check.setChecked(self.settings.diagnostics)
         self.diagnostics_check.toggled.connect(self._set_diagnostics)
         self.player_status.setVisible(self.settings.diagnostics)
         form.addRow(self.diagnostics_check)
-        self.logging_check = QCheckBox("Write client diagnostic logs")
+        self.logging_check = FlatSwitch("Write client diagnostic logs")
         self.logging_check.setChecked(self.settings.file_logging)
         self.logging_check.toggled.connect(self._set_logging)
         form.addRow(self.logging_check)
@@ -195,6 +232,7 @@ class DesktopFeatures:
                     index = control.count() - 1
                 control.setCurrentIndex(index)
             control.blockSignals(False)
+        self._show_display_sync_hint()
         if self.mpv_config:
             overrides = [f"{key}={value}" for key, value in self.mpv_config.effective_values.items()
                          if value != values[key]]
@@ -242,6 +280,45 @@ class DesktopFeatures:
         self.settings.fast_forward_s = value
         self._show_skip_amount(self.settings.fast_forward_s)
 
+    def _set_theme_mode(self, mode):
+        self.settings.theme_mode = mode
+        self._apply_theme_mode(mode)
+
+    def _set_display_sync(self, value):
+        self.settings.display_sync = value
+        if hasattr(self.player, "set_display_rate_reporting"):
+            self.player.set_display_rate_reporting(value)
+        self._show_display_sync_hint()
+
+    def _show_display_sync_hint(self):
+        """Say what the switch and the mode add up to; either alone does nothing."""
+        mode = self._next_defaults.get("video-sync", "audio")
+        display_mode = mode.startswith("display-")
+        if self.settings.display_sync and display_mode:
+            text = ("Video is paced by the display and the interface stays fluid during playback. "
+                    "This draws more power (about 3 W in fullscreen on a laptop).")
+        elif self.settings.display_sync:
+            text = ("No effect yet: Video synchronization is set to audio. "
+                    "Choose a Display mode to pace video by the display.")
+        elif display_mode:
+            text = (f"{mode} is set but inactive: mpv cannot see the display from inside this player. "
+                    "Turn the switch on to let it take effect.")
+        else:
+            text = ("Video is paced by audio. During playback the interface updates once per video frame. "
+                    "The mode is saved to mpv.conf.")
+        self.display_sync_hint.setText(text)
+
+    def _set_accent(self, value):
+        self.settings.accent = value
+        self._show_accent_hint()
+        self._accent_setting_changed()
+
+    def _show_accent_hint(self):
+        value = self.settings.accent
+        self.accent_hint.setText(
+            "Follows the video that is playing" if value == "auto"
+            else "Custom" if self.accent_picker.custom else "")
+
     def _set_diagnostics(self, value):
         self.settings.diagnostics = value
         self.player_status.setVisible(value)
@@ -259,6 +336,10 @@ class DesktopFeatures:
 
     def _on_telemetry(self, sample):
         self._stable_position = sample.stable
+        if sample.stable and self._awaiting_first_frame:
+            # A session opened paused reports no position change to wait for.
+            self._awaiting_first_frame = False
+            self._update_loading()
         if self._duration_s is None and sample.duration:
             self._duration_s = sample.duration
         if time.monotonic() - self._last_log_sample >= 10:
@@ -307,6 +388,7 @@ class DesktopFeatures:
         if not path:
             return
         menu = QMenu(tree)
+        style_menu(menu)
         key = self._key_for(source, path)
         for label, watched in (("Mark watched", True), ("Mark unwatched", False)):
             action = menu.addAction(label)
