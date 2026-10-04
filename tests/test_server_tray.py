@@ -164,9 +164,50 @@ def test_runtime_setup_close_cancels_installer(app):
     dialog = RuntimeSetupDialog()
     process = FakeProcess()
     dialog.set_process(process)
-    dialog.reject()
+    dialog.show()
+    assert dialog.close()  # a refused close would also veto QApplication.quit()
     assert dialog.cancelled
     assert process.terminated
+    assert not dialog.isVisible()
+
+
+def test_runtime_setup_closes_before_the_installer_has_started(app):
+    dialog = RuntimeSetupDialog()
+    dialog.show()
+    assert dialog.close()
+    assert dialog.cancelled
+    assert not dialog.isVisible()
+
+
+def test_cancelling_setup_stops_the_installers_children(monkeypatch):
+    # The installer's child inherits its stdout pipe; killing only the
+    # installer left run_installer_process blocked on that pipe forever.
+    import threading
+
+    from relay_server import runtime_bootstrap
+
+    child = "import time; time.sleep(60)"
+    parent = (
+        "import subprocess, sys, time\n"
+        f"subprocess.Popen([sys.executable, '-c', {child!r}])\n"
+        "print('started', flush=True)\n"
+        "time.sleep(60)\n"
+    )
+    monkeypatch.setattr(
+        runtime_bootstrap, "installer_command", lambda: [sys.executable, "-c", parent],
+    )
+    started = threading.Event()
+    processes = []
+    runner = threading.Thread(
+        target=runtime_bootstrap.run_installer_process,
+        args=(lambda _line: started.set(), processes.append),
+        daemon=True,
+    )
+    runner.start()
+    assert started.wait(20)
+    runtime_bootstrap.terminate_process_tree(processes[0])
+    runner.join(10)
+    assert not runner.is_alive()
 
 
 def test_runtime_setup_failure_shows_detail_and_closes(app):
@@ -386,6 +427,53 @@ def test_controller_serializes_overlapping_restarts(settings, monkeypatch):
     asyncio.run(scenario())
 
 
+def test_tray_gui_needs_only_qt_essentials_and_no_mpv():
+    # The server GUI borrows the desktop client's theme and widgets; that must
+    # not drag in the client's player stack or a Qt module outside Essentials.
+    import subprocess
+
+    code = (
+        "import sys, relay_server.tray\n"
+        "qt = {n.split('.')[1] for n in sys.modules if n.startswith('PySide6.Qt')}\n"
+        "extra = qt - {'QtCore', 'QtGui', 'QtWidgets', 'QtSvg'}\n"
+        "assert not extra, extra\n"
+        "assert 'mpv' not in sys.modules and 'desktop_client.main_window' not in sys.modules\n"
+    )
+    subprocess.run([sys.executable, "-c", code], check=True)
+
+
+def test_config_status_drives_dot_and_spinner(app, settings):
+    dialog = ConfigDialog(settings)
+    try:
+        dialog.show()
+        dialog.set_server_status("Restarting server…", "", True)
+        assert dialog.busy_spinner.isVisible()
+        assert dialog.status_dot._color == "warn"
+        dialog.set_server_status("Running", "", False)
+        assert not dialog.busy_spinner.isVisible()
+        assert dialog.status_dot._color == "good"
+        dialog.set_server_status("Could not start: port unavailable", "", False)
+        assert dialog.status_dot._color == "bad"
+    finally:
+        dialog.close()
+        dialog.deleteLater()
+
+
+def test_theme_keeps_server_rules_across_a_scheme_switch(app):
+    from desktop_client import theme
+    from relay_server.tray import _STYLE_MARK, apply_theme
+
+    try:
+        apply_theme(app)
+        apply_theme(app)
+        assert app.styleSheet().count(_STYLE_MARK) == 1
+        theme.apply_theme(app, "light" if theme.current().dark else "dark")
+        assert _STYLE_MARK not in app.styleSheet()
+    finally:
+        apply_theme(app)
+    assert app.styleSheet().count(_STYLE_MARK) == 1
+
+
 def test_config_port_reserves_media_port_and_explains_restart(app, settings):
     dialog = ConfigDialog(settings)
     try:
@@ -432,6 +520,31 @@ def test_tray_persists_failure_and_disables_restart_while_busy(app, settings, mo
         asyncio.run(scenario())
     finally:
         tray.dialog.close()
+        tray.tray.hide()
+
+
+def test_quit_exits_even_when_busy_and_the_server_will_not_stop(app, settings, monkeypatch):
+    from relay_server import tray as tray_module
+
+    tray = TrayApp(settings)
+    armed, quits = [], []
+    monkeypatch.setattr(tray_module, "_arm_exit_watchdog", lambda: armed.append(True))
+    monkeypatch.setattr(tray_module, "_QUIT_STOP_TIMEOUT_S", 0.05)
+    monkeypatch.setattr(tray_module.QApplication, "quit", lambda: quits.append(True))
+
+    async def never_stops():
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(tray.controller, "stop", never_stops)
+    tray._set_status("Restarting server…", busy=True)  # a start that never finished
+    assert tray._quit_action.isEnabled()
+    try:
+        asyncio.run(tray.quit())
+        assert armed == [True]
+        assert quits == [True]
+        asyncio.run(tray.quit())  # a second Quit is a no-op
+        assert quits == [True]
+    finally:
         tray.tray.hide()
 
 

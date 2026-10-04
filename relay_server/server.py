@@ -15,11 +15,12 @@ import json
 import logging
 import re
 import sys
+import weakref
 from collections.abc import Callable
 from pathlib import Path
 from typing import Iterable
 
-from aiohttp import WSMsgType, web, web_fileresponse
+from aiohttp import WSCloseCode, WSMsgType, web, web_fileresponse
 
 from relay_protocol import (
     DIR_DOWNLINK,
@@ -114,6 +115,10 @@ class RelayServer:
         self._runner = None
         self._stop_task = None
         self._media_handlers: dict[asyncio.Task, asyncio.StreamWriter] = {}
+        # Every open control WebSocket, including those with no Session yet
+        # (a client browsing the library). stop() closes them itself: aiohttp
+        # otherwise waits out its shutdown timeout for each idle handler.
+        self._control_sockets: weakref.WeakSet[web.WebSocketResponse] = weakref.WeakSet()
         self._mdns = MdnsAdvertiser(
             port=self.port,
             media_port=self.media_port,
@@ -216,6 +221,7 @@ class RelayServer:
     async def handle_control(self, request: web.Request) -> web.WebSocketResponse:
         ws = web.WebSocketResponse(heartbeat=20)
         await ws.prepare(request)
+        self._control_sockets.add(ws)
         peer_ip = request.remote or "unknown"
         if peer_ip not in self._seen_ips:
             self._seen_ips.add(peer_ip)
@@ -537,6 +543,13 @@ class RelayServer:
         )
         if media is not None:
             await media.wait_closed()
+        for ws in list(self._control_sockets):
+            try:
+                await asyncio.wait_for(
+                    ws.close(code=WSCloseCode.GOING_AWAY, message=b"server shutdown"), 2.0,
+                )
+            except Exception as error:  # an unresponsive peer must not stall shutdown
+                log.warning("control socket did not close cleanly: %r", error)
         if runner is not None:
             try:
                 await runner.cleanup()

@@ -18,7 +18,12 @@ load-bearing), `docs/CLIENT_LINUX.md` (Linux setup), and
   `gui_settings.py` (qasync, `relay-server-gui`), with `autostart.py`
   (HKCU Run key, GUI-only) and `logo.py` (runtime-drawn icon; regenerate
   `packaging/icon.ico` via `packaging/make_icon.py` after changing it);
-  `server.py` stays Qt-import-free so the headless CLI is unaffected.
+  `server.py` stays Qt-import-free so the headless CLI is unaffected. The
+  tray GUI wears the desktop client's look by importing `desktop_client.theme`
+  and `desktop_client.widgets` (plus a few rules of its own in
+  `tray._style_sheet`), so those two modules must stay Qt-Essentials-only and
+  mpv-free — the `server-gui` extra installs neither python-mpv nor the
+  PySide6 Addons wheel, and `tests/test_server_tray.py` checks it.
 - `relay_client_core/` — demux/uplink/control/downlink library + `relay-client`
   mock CLI (used by the integration tests).
 - `desktop_client/` — PySide6 + qasync + python-mpv player (`relay-desktop`).

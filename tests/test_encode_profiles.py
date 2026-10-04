@@ -89,3 +89,37 @@ def test_shipped_default_is_p4_low_delay():
         pytest.skip("default profile overridden by RELAY_LOSSLESS_HEVC_PROFILE")
     assert encode.DEFAULT_LOSSLESS_HEVC_PROFILE == "nvenc-p4-low-delay"
     assert encode.TIERS["lossless-hevc"][0][2]["preset"] == "p4"
+
+
+def test_diagnose_encoder_open_reports_what_libav_said():
+    import av
+
+    # A software encoder, so this runs without a GPU: libav rejects the option
+    # in its log, while the exception alone only says "Invalid argument".
+    lines = encode.diagnose_encoder_open("libx264", {"preset": "no-such-preset"})
+    assert any("no-such-preset" in line for line in lines), lines
+    assert av.logging.get_level() is None  # the log callback is off again
+    assert encode.diagnose_encoder_open("libx264", {"preset": "ultrafast"}) == []
+
+
+def test_nvenc_session_limit_is_named_from_the_libav_log():
+    error = RuntimeError("Generic error in an external library")
+    said = "hevc_nvenc: OpenEncodeSessionEx failed: incompatible client key (21): (no details)"
+    assert encode._encoder_failure_category(error, said) == "session/resource exhaustion"
+    said = "hevc_nvenc: InitializeEncoder failed: invalid param (8): Frame dimensions are less"
+    assert encode._encoder_failure_category(error, said) != "session/resource exhaustion"
+
+
+def test_forget_probe_makes_the_next_selection_probe_again(monkeypatch):
+    calls = []
+    monkeypatch.setattr(encode, "_probe_encoder_or_raise", lambda *a, **k: calls.append(a))
+    encode._PROBE_SUCCESSES.clear()
+    try:
+        codec, pix_fmt, options = encode.select_encoder("lossless-hevc", "x265-ultrafast")
+        encode.select_encoder("lossless-hevc", "x265-ultrafast")
+        assert len(calls) == 1
+        encode.forget_probe(codec, pix_fmt, options)
+        encode.select_encoder("lossless-hevc", "x265-ultrafast")
+        assert len(calls) == 2
+    finally:
+        encode._PROBE_SUCCESSES.clear()
