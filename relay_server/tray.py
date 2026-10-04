@@ -23,10 +23,8 @@ from PySide6.QtCore import QStandardPaths, Qt, Signal
 from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
     QApplication,
-    QCheckBox,
     QComboBox,
     QDialog,
-    QDialogButtonBox,
     QFileDialog,
     QFormLayout,
     QHBoxLayout,
@@ -42,6 +40,14 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+
+# The look is the desktop client's: its palette/style sheet and custom-painted
+# controls are imported, not copied, so the two stay in step. Both modules are
+# Qt-only (no mpv), which is what keeps the server GUI free of the client's
+# other dependencies — tests/test_server_tray.py holds that line.
+from desktop_client import theme
+from desktop_client.theme import Icons
+from desktop_client.widgets import FlatSwitch, Spinner, StatusDot, WheelGuard
 
 from . import autostart
 from .gui_settings import ServerSettings, available_ep_choices
@@ -61,6 +67,40 @@ _console_stderr = None
 _LOG_MAX_BYTES = 8 * 1024 * 1024
 _LOG_BACKUPS = 3
 
+_STYLE_MARK = "/* relay-server */"
+
+
+def _style_sheet(t: theme.Theme) -> str:
+    """Rules for the stock widgets only this GUI uses (the client has neither)."""
+    return f"""
+{_STYLE_MARK}
+QListWidget {{ background: {t.raised}; border: 0; border-radius: {theme.RADIUS_SMALL}px; padding: 4px; outline: 0; }}
+QListWidget::item {{ min-height: 28px; padding: 0 6px; border-radius: {theme.RADIUS_SMALL}px; color: {t.text_dim}; }}
+QListWidget::item:hover {{ background: {t.hover}; color: {t.text}; }}
+QListWidget::item:selected {{ background: palette(alternate-base); color: {t.text}; }}
+QProgressBar {{ background: {t.pressed}; border: 0; border-radius: 3px; min-height: 6px; max-height: 6px; }}
+QProgressBar::chunk {{ background: palette(highlight); border-radius: 3px; }}
+"""
+
+
+def apply_theme(app: QApplication) -> theme.Theme:
+    """Install the client theme, following the Windows light/dark setting."""
+    t = theme.apply_theme(app, "auto")
+    # A light/dark switch installs a fresh client style sheet; ours rides on it.
+    sheet = app.styleSheet()
+    if _STYLE_MARK not in sheet:
+        app.setStyleSheet(sheet + _style_sheet(t))
+    return t
+
+
+def _label(text: str = "", role: str | None = None) -> QLabel:
+    label = QLabel(text)
+    label.setTextFormat(Qt.PlainText)
+    label.setWordWrap(True)
+    if role:
+        label.setProperty("role", role)
+    return label
+
 
 class RuntimeSetupDialog(QDialog):
     """Non-modal first-run progress for the large NVIDIA runtime download."""
@@ -76,17 +116,24 @@ class RuntimeSetupDialog(QDialog):
         self.cancelled = False
         self.failed = False
 
+        heading = QLabel("Setting up the NVIDIA runtime")
+        heading.setObjectName("heading")
         self.label = QLabel(
             "Installing the pinned TensorRT/CUDA runtime. This one-time "
             "download is several gigabytes and may take a while."
         )
         self.label.setWordWrap(True)
+        self.label.setProperty("role", "dim")
         self.progress = QProgressBar()
         self.progress.setRange(0, 0)
+        self.progress.setTextVisible(False)
         self.cancel_button = QPushButton("Cancel")
         self.cancel_button.clicked.connect(self.cancel)
 
         layout = QVBoxLayout(self)
+        layout.setContentsMargins(22, 20, 22, 18)
+        layout.setSpacing(12)
+        layout.addWidget(heading)
         layout.addWidget(self.label)
         layout.addWidget(self.progress)
         layout.addWidget(self.cancel_button, alignment=Qt.AlignRight)
@@ -98,15 +145,24 @@ class RuntimeSetupDialog(QDialog):
 
     def set_process(self, process) -> None:
         self._process = process
-        if self.cancelled and process.poll() is None:
-            process.terminate()
+        if self.cancelled:
+            self._stop_installer()
+
+    def _stop_installer(self) -> None:
+        from .runtime_bootstrap import terminate_process_tree
+
+        if self._process is not None:
+            terminate_process_tree(self._process)
 
     def cancel(self) -> None:
         self.cancelled = True
         self.label.setText("Cancelling setup…")
         self.cancel_button.setEnabled(False)
-        if self._process is not None and self._process.poll() is None:
-            self._process.terminate()
+        self._stop_installer()
+        # Close at once: a dialog that stays up until the installer's pipe
+        # drains cannot be closed if that never happens, and a refused close
+        # also vetoes QApplication.quit().
+        self.hide()
 
     def reject(self) -> None:
         # Treat the title-bar close gesture exactly like the visible Cancel
@@ -290,6 +346,37 @@ def configure_file_logging(enabled: bool) -> Path | None:
     return diagnostics_log_path()
 
 
+_QUIT_STOP_TIMEOUT_S = 10.0
+_QUIT_EXIT_TIMEOUT_S = 25.0
+
+
+def _arm_exit_watchdog(timeout: float = _QUIT_EXIT_TIMEOUT_S) -> None:
+    """Guarantee that Quit ends the process, and say why it had to be forced.
+
+    Interpreter exit joins every non-daemon thread, so one stage or
+    ``to_thread`` worker stuck in a native call keeps the process alive after
+    the tray icon is gone. If that happens, write every thread's stack to the
+    log (the evidence a hang otherwise never leaves) and exit hard.
+    """
+    import faulthandler
+    import threading
+
+    def expire() -> None:
+        log.error("still running %.0f s after Quit; dumping threads and forcing exit", timeout)
+        stream = _diagnostics_log or _console_stderr
+        if stream is not None:
+            try:
+                faulthandler.dump_traceback(file=stream, all_threads=True)
+                stream.flush()
+            except (OSError, ValueError):
+                pass
+        os._exit(1)
+
+    timer = threading.Timer(timeout, expire)
+    timer.daemon = True
+    timer.start()
+
+
 class ServerController:
     """Owns the current ``RelayServer`` and rebuilds it on a config change.
 
@@ -382,12 +469,14 @@ class ConfigDialog(QDialog):
         super().__init__(parent)
         self._settings = settings
         self.setWindowTitle(f"{_APP_NAME} — Configuration")
-        self.status_label = QLabel("Stopped")
-        self.status_label.setTextFormat(Qt.PlainText)
-        self.status_label.setWordWrap(True)
-        self.address_label = QLabel()
-        self.address_label.setTextFormat(Qt.PlainText)
-        self.address_label.setWordWrap(True)
+        self.setMinimumWidth(480)
+        self.status_dot = StatusDot()
+        self.status_label = _label("Stopped")
+        self.status_label.setObjectName("heading")
+        self.busy_spinner = Spinner(18)
+        self.busy_spinner.hide()
+        self.address_label = _label(role="dim")
+        self.address_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
 
         self.ep_combo = QComboBox()
         self.ep_combo.addItems(available_ep_choices())
@@ -400,54 +489,86 @@ class ConfigDialog(QDialog):
         self.library_remove_button = QPushButton("Remove selected")
         self.library_add_button.clicked.connect(self._add_library_folder)
         self.library_remove_button.clicked.connect(self._remove_library_folders)
-        library_widget = QWidget()
-        library_layout = QVBoxLayout(library_widget)
-        library_layout.setContentsMargins(0, 0, 0, 0)
-        library_layout.addWidget(self.library_list)
         library_buttons = QHBoxLayout()
         library_buttons.addWidget(self.library_add_button)
         library_buttons.addWidget(self.library_remove_button)
         library_buttons.addStretch(1)
-        library_layout.addLayout(library_buttons)
         self.models_edit = QLineEdit()
-        self.mdns_check = QCheckBox("Advertise on the LAN via mDNS/DNS-SD")
-        self.logging_check = QCheckBox(
-            f"Write server log to {diagnostics_log_path()}"
-        )
-        self.autostart_check = QCheckBox("Start automatically when I sign in to Windows")
+        self.mdns_check = FlatSwitch("Advertise on the LAN via mDNS/DNS-SD")
+        self.logging_check = FlatSwitch("Write a server log")
+        self.logging_check.setToolTip(str(diagnostics_log_path()))
+        self.autostart_check = FlatSwitch("Start automatically when I sign in to Windows")
 
-        form = QFormLayout(self)
-        form.addRow("Server status:", self.status_label)
-        form.addRow("Connect to:", self.address_label)
-        form.addRow("Execution provider:", self.ep_combo)
-        form.addRow("Control port:", self.port_spin)
-        form.addRow("Media library folders:", library_widget)
-        form.addRow("Models folder:", _folder_row(self.models_edit, self))
-        form.addRow("", self.mdns_check)
-        form.addRow("", self.logging_check)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(22, 20, 22, 18)
+        layout.setSpacing(10)
+
+        status_row = QHBoxLayout()
+        status_row.setSpacing(10)
+        status_row.addWidget(self.status_dot, 0, Qt.AlignVCenter)
+        status_row.addWidget(self.status_label, 1)
+        status_row.addWidget(self.busy_spinner, 0, Qt.AlignVCenter)
+        layout.addLayout(status_row)
+        layout.addWidget(self.address_label)
+        layout.addSpacing(8)
+
+        form = QFormLayout()
+        form.setContentsMargins(0, 0, 0, 0)
+        form.setHorizontalSpacing(16)
+        form.setVerticalSpacing(10)
+        form.setLabelAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        form.addRow(_label("Execution provider", "dim"), self.ep_combo)
+        form.addRow(_label("Control port", "dim"), self.port_spin)
+        form.addRow(_label("Models folder", "dim"), _folder_row(self.models_edit, self))
+        layout.addLayout(form)
+        layout.addSpacing(8)
+
+        layout.addWidget(_label("Media library folders", "dim"))
+        layout.addWidget(self.library_list, 1)
+        layout.addLayout(library_buttons)
+        layout.addSpacing(8)
+
+        layout.addWidget(self.mdns_check)
+        layout.addWidget(self.logging_check)
         if autostart.is_supported():
-            form.addRow("", self.autostart_check)
+            layout.addWidget(self.autostart_check)
         else:
             self.autostart_check.hide()
+        layout.addSpacing(8)
 
-        buttons = QDialogButtonBox(
-            QDialogButtonBox.Apply | QDialogButtonBox.Close
-        )
-        self.apply_button = buttons.button(QDialogButtonBox.Apply)
-        self.apply_button.setText("Apply and restart")
+        layout.addWidget(_label(
+            "Applying settings restarts the server and disconnects active playback.", "faint",
+        ))
+        self.apply_button = QPushButton("Apply and restart")
+        self.apply_button.setProperty("primary", True)
+        self.apply_button.setDefault(True)
         self.apply_button.clicked.connect(self._on_apply)
-        buttons.button(QDialogButtonBox.Close).clicked.connect(self.hide)
-        consequence = QLabel("Applying settings restarts the server and disconnects active playback.")
-        consequence.setWordWrap(True)
-        form.addRow(consequence)
-        form.addRow(buttons)
+        close_button = QPushButton("Close")
+        close_button.setAutoDefault(False)
+        close_button.clicked.connect(self.hide)
+        buttons = QHBoxLayout()
+        buttons.addStretch(1)
+        buttons.addWidget(close_button)
+        buttons.addWidget(self.apply_button)
+        layout.addLayout(buttons)
 
+        # Kept on the instance: a wheel turn over the pane must not change a value.
+        self._wheel_guard = WheelGuard(self)
         self.load()
 
     def set_server_status(self, status: str, address: str, busy: bool = False) -> None:
         self.status_label.setText(status)
         self.address_label.setText(address)
         self.apply_button.setEnabled(not busy)
+        self.busy_spinner.setVisible(busy)
+        if busy:
+            self.status_dot.set_state("warn")
+        elif status == "Running":
+            self.status_dot.set_state("good")
+        elif status.startswith("Could not"):
+            self.status_dot.set_state("bad")
+        else:
+            self.status_dot.set_state("text_faint")
 
     def load(self) -> None:
         """Populate the fields from the persisted settings."""
@@ -510,6 +631,7 @@ class TrayApp:
         self.controller.event_callback = self._server_event
         self.dialog: ConfigDialog | None = None
         self._busy = False
+        self._quitting = False
         self._status = "Stopped"
 
         self.tray = QSystemTrayIcon(make_icon())
@@ -517,11 +639,12 @@ class TrayApp:
         # Held on the instance: setContextMenu does not give Qt Python-side
         # ownership, so a local would be garbage-collected out from under it.
         self._menu = menu = QMenu()
-        self._configure_action = QAction("Configure…", menu)
+        theme.style_menu(menu)
+        self._configure_action = QAction(theme.icon(Icons.settings), "Configure…", menu)
         self._configure_action.triggered.connect(self.open_config)
-        self._restart_action = QAction("Restart server", menu)
+        self._restart_action = QAction(theme.icon(Icons.refresh), "Restart server", menu)
         self._restart_action.triggered.connect(lambda: asyncio.ensure_future(self.restart()))
-        self._quit_action = QAction("Quit", menu)
+        self._quit_action = QAction(theme.icon(Icons.close), "Quit", menu)
         self._quit_action.triggered.connect(lambda: asyncio.ensure_future(self.quit()))
         self._status_action = QAction(self._status, menu)
         self._status_action.setEnabled(False)
@@ -570,10 +693,24 @@ class TrayApp:
         self._notify(f"Restarted on port {self.settings.port}")
 
     async def quit(self) -> None:
-        if self._busy:
+        """Stop the server and exit. Always available, and always ends.
+
+        Quit used to be refused while a start/restart was in flight and then
+        waited on the server without limit, so one stuck await left a process
+        that could only be killed from Task Manager, with nothing in the log.
+        """
+        if self._quitting:
             return
+        self._quitting = True
+        log.info("quit requested (status: %s)", self._status)
+        _arm_exit_watchdog()
         self._set_status("Stopping server…", busy=True)
-        await self.controller.stop()
+        try:
+            await asyncio.wait_for(self.controller.stop(), _QUIT_STOP_TIMEOUT_S)
+        except Exception as err:  # includes the timeout
+            log.error("server did not stop cleanly before exit: %r", err)
+        else:
+            log.info("server stopped; exiting")
         QApplication.quit()
 
     def _connection_address(self) -> str:
@@ -590,7 +727,6 @@ class TrayApp:
         self._address_action.setText(address)
         self.tray.setToolTip(f"{_APP_NAME}\n{status}\n{address}")
         self._restart_action.setEnabled(not busy)
-        self._quit_action.setEnabled(not busy)
         if self.dialog is not None:
             self.dialog.set_server_status(status, address, busy)
 
@@ -686,6 +822,9 @@ def main() -> None:
     app.setWindowIcon(make_icon())
     # A tray-only app: closing the config pane must not exit the process.
     app.setQuitOnLastWindowClosed(False)
+    apply_theme(app)
+    if hasattr(app.styleHints(), "colorSchemeChanged"):
+        app.styleHints().colorSchemeChanged.connect(lambda _scheme: apply_theme(app))
 
     # Before the runtime check and the tray: a second instance must not run
     # the installer or contend for the GPU. Not in coroutine context yet, so

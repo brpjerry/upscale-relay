@@ -420,6 +420,8 @@ def run_installer_process(
         text=True,
         encoding="utf-8",
         errors="replace",
+        # Its own group on POSIX, so terminate_process_tree can signal it whole.
+        start_new_session=os.name != "nt",
     )
     if on_process is not None:
         on_process(proc)
@@ -428,6 +430,37 @@ def run_installer_process(
         if on_line is not None:
             on_line(line.rstrip())
     return proc.wait()
+
+
+def terminate_process_tree(proc) -> None:
+    """Stop the installer and everything it started.
+
+    The installer runs its own children (the validation probe), and they
+    inherit its stdout pipe. Terminating only the installer leaves them
+    running and the pipe open, so ``run_installer_process`` never sees EOF and
+    a cancelled setup never finishes cancelling.
+    """
+    if proc.poll() is not None:
+        return
+    pid = getattr(proc, "pid", None)
+    try:
+        if pid is not None and os.name == "nt":
+            subprocess.run(
+                ["taskkill", "/PID", str(pid), "/T", "/F"],
+                capture_output=True, timeout=10, check=False,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+        elif pid is not None:
+            import signal
+
+            os.killpg(pid, signal.SIGTERM)
+    except (OSError, subprocess.SubprocessError):
+        pass
+    if proc.poll() is None:
+        try:
+            proc.terminate()
+        except OSError:
+            pass
 
 
 def ensure_runtime_console() -> bool:

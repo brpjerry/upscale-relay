@@ -707,6 +707,8 @@ class Pipeline:
             except Exception as err:  # pragma: no cover - defensive
                 if not self._closed.is_set():
                     log.exception("pipeline stage %s failed", fn.__name__)
+                    if fn.__name__ == "_finish_work" and "avcodec_open2" in str(err):
+                        self._log_encoder_open_failure()
                     self.on_error(f"pipeline: {err!r}")
             finally:
                 if downstream is not None:
@@ -736,6 +738,36 @@ class Pipeline:
                                 self._finish_cleanup_error = err
                         self._aux_template_container = None
         return run
+
+    def _log_encoder_open_failure(self) -> None:
+        """Record why the encoder would not open (finish thread only).
+
+        The stream's encoder opens lazily on the first frame, long after
+        select_encoder's cached probe passed, and libav's reason never
+        reaches the exception. Ask libav again with its log captured, and
+        drop the cached probe so the next session fails at selection with
+        that reason instead of after it reports "playing".
+        """
+        from upscale_cli.encode import diagnose_encoder_open, forget_probe
+
+        try:
+            forget_probe(self._enc_codec, self._enc_pix_fmt, self._enc_options)
+            said = diagnose_encoder_open(
+                self._enc_codec, self._enc_options, self.out_w, self.out_h, self._enc_pix_fmt,
+            )
+        except Exception:
+            log.exception("encoder open diagnosis failed")
+            return
+        if said:
+            log.error(
+                "encoder %s %dx%d would not open; libav says: %s",
+                self._enc_codec, self.out_w, self.out_h, " | ".join(said),
+            )
+        else:
+            log.error(
+                "encoder %s %dx%d failed to open but opened on retry (transient)",
+                self._enc_codec, self.out_w, self.out_h,
+            )
 
     # Stage 1: packets -> decoded frames (+ discard window + backpressure)
 

@@ -189,10 +189,53 @@ def _probe_key(codec: str, pix_fmt: str, options: dict[str, str]):
     return codec, pix_fmt, tuple(sorted(options.items()))
 
 
-def _encoder_failure_category(error: BaseException) -> str:
-    text = str(error).lower()
+def forget_probe(codec: str, pix_fmt: str, options: dict[str, str]) -> None:
+    """Probe this encoder again next time: it just failed to open for real."""
+    with _PROBE_LOCK:
+        _PROBE_SUCCESSES.discard(_probe_key(codec, pix_fmt, options))
+
+
+def diagnose_encoder_open(
+    codec: str, options: dict[str, str], width: int = 256, height: int = 256,
+    pix_fmt: str = "yuv420p",
+) -> list[str]:
+    """What libav itself says when this encoder will not open.
+
+    PyAV discards libav's log by default, so an NVENC failure arrives as a
+    bare "Generic error in an external library" whatever the cause (the
+    12-session limit reads ``OpenEncodeSessionEx failed: incompatible client
+    key (21)`` in the log, and nothing at all in the exception). This opens
+    one more probe context with the log captured and returns its lines; an
+    empty list means the encoder opened this time.
+
+    Call it only after a failure. The log callback is installed just for the
+    duration of the probe — it stays off while frames are flowing.
+    """
+    lines: list[str] = []
+    with _PROBE_LOCK:
+        previous = av.logging.get_level()
+        av.logging.set_level(av.logging.VERBOSE)
+        try:
+            with av.logging.Capture(local=True) as entries:
+                try:
+                    _probe_encoder_or_raise(codec, options, width, height, pix_fmt)
+                except Exception as error:
+                    lines.append(f"{type(error).__name__}: {error}")
+                else:
+                    return []
+        finally:
+            av.logging.set_level(previous)
+    return [
+        f"{name}: {message.strip()}" for _level, name, message in entries if message.strip()
+    ] + lines
+
+
+def _encoder_failure_category(error: BaseException, detail: str = "") -> str:
+    text = f"{error} {detail}".lower()
     if any(term in text for term in (
-        "no free", "resource", "session", "out of memory", "too many",
+        "no free", "resource", "session limit", "out of memory", "too many",
+        # NVENC's answer to one session more than the driver allows.
+        "incompatible client key",
     )):
         return "session/resource exhaustion"
     if any(term in text for term in ("option", "invalid argument", "not supported")):
@@ -260,7 +303,13 @@ def select_encoder(
                     _probe_encoder_or_raise(codec, options, pix_fmt=pix_fmt)
                     _PROBE_SUCCESSES.add(key)
         except Exception as err:
-            failures.append((codec, _encoder_failure_category(err), err))
+            try:
+                said = " | ".join(diagnose_encoder_open(codec, options, pix_fmt=pix_fmt))
+            except Exception:  # diagnosis must never mask the failure itself
+                said = ""
+            if said:
+                print(f"encode: {codec} failed to open; libav: {said}", file=sys.stderr)
+            failures.append((codec, _encoder_failure_category(err, said), err))
             continue
         else:
             profile_text = (
