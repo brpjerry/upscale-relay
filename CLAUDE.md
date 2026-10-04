@@ -106,8 +106,16 @@ constructor options).
   consumes the pending frame early, and `screenshot-raw` (the auto accent
   sampler) intermittently stalls mpv's frame delivery ~0.3 s (drops), which
   it does not do while the render call blocks.
+- The supported way to a fluid UI during playback is mpv's display sync:
+  `MpvPlayerView` reports the screen's refresh rate (`display-fps-override`;
+  the render API cannot see the display), so `video-sync=display-*` renders
+  once per refresh and does not wait inside `render()` (120 paints/s at
+  0.7 ms on the laptop, vsync-jitter ~0.14, no drops). `interpolation` is not
+  what does this; it only blends frames. Under display sync `screenshot-raw`
+  holds mpv's rendering up ~0.3 s, so the auto accent samples only at
+  open/seek/pause there (`_request_accent_sample`).
 - Under qasync the loop turns ~once per rendered frame (~25/s) while mpv
-  plays. Media pumps must move batches per loop turn: per-packet
+  plays in `video-sync=audio` (the default). Media pumps must move batches per loop turn: per-packet
   `to_thread`+`drain` capped the uplink at ~12 pkt/s (starved the server
   below realtime), and the 64 KiB StreamReader default capped the downlink
   at ~1.6 MB/s. See `_UPLINK_BATCH` / `_DOWNLINK_READ_LIMIT` in

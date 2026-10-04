@@ -359,6 +359,8 @@ class MpvPlayerView(QOpenGLWidget):
         self._ctx = None  # MpvRenderContext, created in initializeGL
         self._sample_pending = False
         self._sampling_broken = False
+        self._screen_watched = False
+        self._display_rate = 0.0
         self._get_proc = None  # ctypes callback — must outlive the render ctx
         self._frame_ready.connect(self._on_frame_ready, Qt.QueuedConnection)
 
@@ -586,6 +588,44 @@ class MpvPlayerView(QOpenGLWidget):
         # The GL context is destroyed before the widget on teardown — free the
         # render context first, while the GL context is still alive.
         self.context().aboutToBeDestroyed.connect(self._free_render_ctx)
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        handle = self.window().windowHandle()
+        if handle is not None and not self._screen_watched:
+            self._screen_watched = True
+            handle.screenChanged.connect(lambda _screen: self._report_display_rate())
+        self._report_display_rate()
+
+    def _report_display_rate(self) -> None:
+        """Tell mpv the refresh rate of the screen this window is on.
+
+        Through the render API mpv cannot see the display, so its display-sync
+        modes (`video-sync=display-*`) silently fell back to audio timing.
+        Given the rate, such a mode renders once per refresh instead of once
+        per video frame and no longer waits inside render(); the interface
+        then repaints at the display's rate during playback. `video-sync=audio`
+        is unaffected.
+        """
+        screen = self.screen()
+        rate = screen.refreshRate() if screen is not None else 0.0
+        if self.options.headless or rate <= 0 or rate == self._display_rate:
+            return
+        try:
+            self.mpv["display-fps-override"] = float(rate)
+            self._display_rate = rate
+        except Exception:
+            pass
+
+    def display_sync_active(self) -> bool:
+        """Whether mpv is pacing video by the display (a `display-*` sync mode
+        with a known refresh rate) rather than by audio."""
+        if self.options.headless or self._reloading:
+            return False
+        try:
+            return bool(self.mpv._get_property("display-sync-active"))
+        except Exception:
+            return False
 
     def request_frame_sample(self) -> None:
         """Ask for a thumbnail of the current picture (``frame_sampled``).

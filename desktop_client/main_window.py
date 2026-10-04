@@ -892,6 +892,8 @@ class MainWindow(DesktopFeatures, QMainWindow):
 
     def _init_accent(self) -> None:
         self._accent_average: tuple[float, float, float] | None = None
+        self._accent_step_t = 0.0
+        self._accent_sample_due = True
         self._restart_accent = True
         self._accent_glide = QVariantAnimation(self)
         self._accent_glide.setEasingCurve(QEasingCurve(QEasingCurve.InOutSine))
@@ -917,6 +919,13 @@ class MainWindow(DesktopFeatures, QMainWindow):
         self._accent_glide.start()
 
     def _on_accent_step(self, color) -> None:
+        # Each step repaints the whole window (every widget follows the
+        # palette), so take about twenty a second rather than one per refresh:
+        # the video shares this thread and must keep hitting its frame times.
+        now = time.monotonic()
+        if now - self._accent_step_t < 0.05:
+            return
+        self._accent_step_t = now
         theme.set_accent(QApplication.instance(), color)
         self.update()  # custom-painted widgets read the theme as they repaint
 
@@ -947,13 +956,29 @@ class MainWindow(DesktopFeatures, QMainWindow):
                 self._glide_accent(theme.DEFAULT_ACCENT, theme.ACCENT_FADE)
 
     def _request_accent_sample(self) -> None:
-        if not self._awaiting_first_frame:
-            self.player.request_frame_sample()
+        if self._awaiting_first_frame or self._pending_seek_s is not None:
+            return
+        # A raw screenshot is free while mpv waits for a frame's time inside
+        # its render call (audio sync). Under display sync it holds mpv's
+        # rendering up ~0.3 s, a visible hitch, so there the picture is
+        # sampled only where one cannot be seen: as playback (re)starts after
+        # opening or seeking, and when paused.
+        display_synced = getattr(self.player, "display_sync_active", lambda: False)()
+        if display_synced and not self._accent_sample_due:
+            return
+        self._accent_sample_due = False
+        self.player.request_frame_sample()
 
     def _on_frame_sampled(self, image) -> None:
         if self.settings.accent != "auto" or self._session_source is None:
             return
         sample = theme.accent_from_frame(image)
+        if (sample.hslSaturationF() < 0.1
+                and getattr(self.player, "display_sync_active", lambda: False)()):
+            # Under display sync this one sample stands until the next seek
+            # or pause; a colourless frame (a logo, a fade) should not leave
+            # the interface grey for that long.
+            sample = QColor(theme.DEFAULT_ACCENT)
         # Blend with the previous samples so quick cuts do not make the UI
         # flicker, but lean on the newest one so it still keeps up.
         keep = 0.0 if self._restart_accent or self._accent_average is None else 0.3
@@ -1984,6 +2009,7 @@ class MainWindow(DesktopFeatures, QMainWindow):
         self._awaiting_first_frame = True
         self._buffering = False
         self._restart_accent = True
+        self._accent_sample_due = True
         self.audio_delay.setValue(snapshot.audio_delay if snapshot else 0.0)
         self.sub_delay.setValue(snapshot.sub_delay if snapshot else 0.0)
         self.player.set_audio_delay(self.audio_delay.value())
@@ -2147,6 +2173,9 @@ class MainWindow(DesktopFeatures, QMainWindow):
         self.player.set_paused(self._paused)
         self.video_overlay.flash(Icons.pause if self._paused else Icons.play)
         self._sync_accent_sampling()
+        if (self._paused and self.settings.accent == "auto"
+                and hasattr(self.player, "request_frame_sample")):
+            self.player.request_frame_sample()  # the frame it stopped on
         if self._paused:
             if not local:
                 await self.client.pause()
@@ -2343,6 +2372,7 @@ class MainWindow(DesktopFeatures, QMainWindow):
         self._pending_seek_s = target_s
         self._pending_seek_t = time.monotonic()
         self._stable_position = False
+        self._accent_sample_due = True
         self._show_position(target_s)
         self._update_loading()
 

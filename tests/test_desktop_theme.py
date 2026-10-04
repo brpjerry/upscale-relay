@@ -252,3 +252,25 @@ def test_fullscreen_slides_the_chrome_out_and_restores_it(window):
     assert window._toolbar_slot.isVisible() and window._toolbar_slot.height() == 64
     assert window._sidebar_slot.isVisible() and window.split.sizes()[0] == width
     assert window.controls_panel.isVisible()
+
+
+def test_auto_accent_samples_only_at_restarts_under_display_sync(window):
+    requests = []
+    window.player.request_frame_sample = lambda: requests.append(1)
+    window.player.display_sync_active = lambda: True
+    window._session_source = "server_file"
+    window._accent_sample_due = True
+    window._request_accent_sample()
+    window._request_accent_sample()          # periodic ticks after the first are skipped
+    assert len(requests) == 1
+    window._arm_pending_seek(30.0)
+    window._request_accent_sample()          # not while the seek is still landing
+    assert len(requests) == 1
+    window._on_position(30.1)
+    window._request_accent_sample()
+    assert len(requests) == 2
+    window.player.display_sync_active = lambda: False
+    window._request_accent_sample()          # audio sync: every tick samples
+    window._request_accent_sample()
+    assert len(requests) == 4
+    window._session_source = None
