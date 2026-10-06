@@ -112,10 +112,10 @@ constructor options).
   sampler) intermittently stalls mpv's frame delivery ~0.3 s (drops), which
   it does not do while the render call blocks.
 - The supported way to a fluid UI during playback is mpv's display sync:
-  with "Pace video by the display" set to Windowed or Always (Off by default;
-  Windowed hands timing back to mpv ~0.9 s after entering fullscreen, where
-  display pacing costs +3 W, and mpv switches either way in ~0.2 s with no
-  drop — `_apply_display_pacing`), `MpvPlayerView` reports the screen's refresh rate
+  with "Fluid interface during playback" on (off by default; it hands timing
+  back to mpv ~0.9 s after entering fullscreen, where display pacing costs
+  +3 W, and mpv switches either way in ~0.2 s with no drop —
+  `_apply_display_pacing`), `MpvPlayerView` reports the screen's refresh rate
   (`display-fps-override`; the render API cannot see the display), so
   `video-sync=display-*` renders
   once per refresh and does not wait inside `render()` (120 paints/s at

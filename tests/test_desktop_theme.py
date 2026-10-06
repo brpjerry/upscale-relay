@@ -281,13 +281,13 @@ def test_auto_accent_samples_only_at_restarts_under_display_sync(window):
     window._session_source = None
 
 
-def test_display_pacing_is_opt_in_and_follows_fullscreen_in_windowed_mode(window):
+def test_display_pacing_is_opt_in_and_follows_fullscreen(window):
     calls = []
     window.player.set_display_rate_reporting = calls.append
-    assert window.settings.display_sync == "off"
-    assert window.display_sync_switch.current() == "off"
-    window.display_sync_switch.selected.emit("windowed")
-    assert window.settings.display_sync == "windowed"
+    assert window.settings.display_sync is False
+    assert not window.display_sync_check.isChecked()
+    window.display_sync_check.setChecked(True)
+    assert window.settings.display_sync is True
     assert calls[-1] is True
     window.show()
     window.toggle_fullscreen()
@@ -295,22 +295,14 @@ def test_display_pacing_is_opt_in_and_follows_fullscreen_in_windowed_mode(window
     assert wait_until(lambda: calls[-1] is False)  # the transition settles: mpv's own timing
     window.toggle_fullscreen()
     assert calls[-1] is True                      # fluid again before the exit motion
-    window.display_sync_switch.selected.emit("always")
-    window.toggle_fullscreen()
-    QTest.qWait(1200)                             # past the settle point (synchronous test, outside coroutine context)
-    assert calls[-1] is True                      # always: fullscreen too
-    window.toggle_fullscreen()
-    window.display_sync_switch.selected.emit("off")
+    window.display_sync_check.setChecked(False)
     assert calls[-1] is False
 
 
-def test_display_pacing_setting_migrates_the_old_switch(window):
-    window.settings._qs.setValue("playback/display_sync", True)
-    assert window.settings.display_sync == "windowed"
-    window.settings._qs.setValue("playback/display_sync", False)
-    assert window.settings.display_sync == "off"
-    window.settings.display_sync = "bogus"
-    assert window.settings.display_sync == "off"
+def test_display_pacing_setting_reads_earlier_mode_names(window):
+    for stored, expected in ((True, True), ("windowed", True), ("always", True), (False, False), ("off", False), ("bogus", False)):
+        window.settings._qs.setValue("playback/display_sync", stored)
+        assert window.settings.display_sync is expected, stored
 
 
 def test_video_timing_hint_explains_switch_and_mode_together(window):
@@ -323,12 +315,12 @@ def test_video_timing_hint_explains_switch_and_mode_together(window):
     window._refresh_mpv_controls({**values, "video-sync": "display-resample"})
     assert sync.currentData() == "display-resample"
     assert "set but inactive" in window.display_sync_hint.text()
-    window.display_sync_switch.selected.emit("windowed")
+    window.display_sync_check.setChecked(True)
     assert "while the window is not fullscreen" in window.display_sync_hint.text()
-    window.display_sync_switch.selected.emit("always")
-    assert "fullscreen included" in window.display_sync_hint.text()
     window._refresh_mpv_controls({**values, "video-sync": "audio"})
     assert "No effect yet" in window.display_sync_hint.text()
+    window._refresh_mpv_controls({**values, "video-sync": "display-tempo"})  # from mpv.conf, not offered
+    assert sync.currentData() == "display-tempo" and sync.currentText() == "Configured: display-tempo"
 
 
 def test_display_rate_is_reported_only_when_enabled():

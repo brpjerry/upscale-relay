@@ -1233,18 +1233,16 @@ class MainWindow(DesktopFeatures, QMainWindow):
                     lambda: self._apply_toolbar_visible(visible))
 
     # -- display pacing policy ----------------------------------------------------
-    # "windowed": the display paces video (fluid interface) except once the
-    # window has settled in fullscreen, where mpv's own frame timing is worth
-    # more than a fluid interface and the display pacing costs ~3 W. The
-    # transition itself stays paced by the display in both directions; mpv
-    # switches within ~0.2 s either way without dropping a frame.
+    # With the setting on, the display paces video (fluid interface) except
+    # once the window has settled in fullscreen, where mpv's own frame timing
+    # is worth more than a fluid interface and the display pacing costs ~3 W.
+    # The transition itself stays paced by the display in both directions;
+    # mpv switches within ~0.2 s either way without dropping a frame.
 
     def _apply_display_pacing(self) -> None:
         if not hasattr(self.player, "set_display_rate_reporting"):
             return
-        choice = self.settings.display_sync
-        enabled = choice == "always" or (choice == "windowed" and not self._fullscreen_settled)
-        self.player.set_display_rate_reporting(enabled)
+        self.player.set_display_rate_reporting(self.settings.display_sync and not self._fullscreen_settled)
 
     def _on_fullscreen_settled(self) -> None:
         if self.isFullScreen():
