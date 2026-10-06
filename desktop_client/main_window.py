@@ -106,6 +106,9 @@ _SERVER_CURSOR_ROLE = Qt.UserRole + 3
 _SERVER_PAGE_SIZE = 100
 _RECONNECT_DELAYS_S = (0.0, 2.0, 5.0)
 _SIDEBAR_MIN_WIDTH = 220
+# Chrome slides for theme.SLOW ms; give the compositor's own fullscreen motion
+# and the last repaints a moment more before handing frame timing back to mpv.
+_FULLSCREEN_SETTLE_MS = 900
 _TOP_BAR_HEIGHT = 64
 
 
@@ -512,8 +515,14 @@ class MainWindow(DesktopFeatures, QMainWindow):
         self.video_overlay = PlayerOverlay(self.player)
         if hasattr(self.player, "set_deband"):
             self.player.set_deband(self.settings.deband_enabled)
-        if hasattr(self.player, "set_display_rate_reporting"):
-            self.player.set_display_rate_reporting(self.settings.display_sync)
+        # Display pacing follows a policy (settings x fullscreen state); the
+        # fullscreen transition settles before the policy is re-evaluated.
+        self._fullscreen_settled = False
+        self._pacing_timer = QTimer(self)
+        self._pacing_timer.setSingleShot(True)
+        self._pacing_timer.setInterval(_FULLSCREEN_SETTLE_MS)
+        self._pacing_timer.timeout.connect(self._on_fullscreen_settled)
+        self._apply_display_pacing()
         self.play_btn = IconButton(Icons.play, size=40, icon_size=24, filled=True)
         self.play_btn.setToolTip("Play (Space)")
         self.play_btn.setEnabled(False)
@@ -1210,8 +1219,32 @@ class MainWindow(DesktopFeatures, QMainWindow):
         self._slide("toolbar", current, target, lambda height: slot.setFixedHeight(max(1, height)),
                     lambda: self._apply_toolbar_visible(visible))
 
+    # -- display pacing policy ----------------------------------------------------
+    # "windowed": the display paces video (fluid interface) except once the
+    # window has settled in fullscreen, where mpv's own frame timing is worth
+    # more than a fluid interface and the display pacing costs ~3 W. The
+    # transition itself stays paced by the display in both directions; mpv
+    # switches within ~0.2 s either way without dropping a frame.
+
+    def _apply_display_pacing(self) -> None:
+        if not hasattr(self.player, "set_display_rate_reporting"):
+            return
+        choice = self.settings.display_sync
+        enabled = choice == "always" or (choice == "windowed" and not self._fullscreen_settled)
+        self.player.set_display_rate_reporting(enabled)
+
+    def _on_fullscreen_settled(self) -> None:
+        if self.isFullScreen():
+            self._fullscreen_settled = True
+            self._apply_display_pacing()
+
     def toggle_fullscreen(self) -> None:
         entering = not self.isFullScreen()
+        self._pacing_timer.stop()
+        self._fullscreen_settled = False
+        self._apply_display_pacing()  # leaving: fluid again before anything moves
+        if entering:
+            self._pacing_timer.start()  # entering: hand timing back once settled
         # The transport bar becomes a pointer-revealed overlay in fullscreen
         # rather than just vanishing; everything else hides.
         self._slide_toolbar(not entering)

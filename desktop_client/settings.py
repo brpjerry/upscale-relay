@@ -104,13 +104,18 @@ class AppSettings:
         self._qs.setValue("playback/deband", bool(v))
 
     @property
-    def display_sync(self) -> bool:
-        """Tell mpv the display's refresh rate, so its display-sync modes work."""
-        return self._qs.value("playback/display_sync", False, type=bool)
+    def display_sync(self) -> str:
+        """When to tell mpv the display's refresh rate (so its display-sync
+        modes work): "off", "windowed" (not while settled in fullscreen), or
+        "always"."""
+        value = self._qs.value("playback/display_sync", "off")
+        if value in (True, "true"):  # the earlier on/off switch
+            return "windowed"
+        return value if value in ("off", "windowed", "always") else "off"
 
     @display_sync.setter
-    def display_sync(self, v: bool) -> None:
-        self._qs.setValue("playback/display_sync", bool(v))
+    def display_sync(self, v: str) -> None:
+        self._qs.setValue("playback/display_sync", v if v in ("off", "windowed", "always") else "off")
 
     @property
     def fast_forward_s(self) -> int:

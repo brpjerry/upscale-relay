@@ -55,12 +55,13 @@ class DesktopFeatures:
         # Video timing: how mpv paces frames. The switch is ours; the mode is
         # mpv's own video-sync option and lives in mpv.conf with the defaults.
         timing_form = group("Video timing")
-        self.display_sync_check = FlatSwitch("Pace video by the display")
-        self.display_sync_check.setChecked(self.settings.display_sync)
-        self.display_sync_check.setToolTip(
-            "Tell mpv the display's refresh rate so a display synchronization mode can take effect.")
-        self.display_sync_check.toggled.connect(self._set_display_sync)
-        timing_form.addRow(self.display_sync_check)
+        self.display_sync_switch = SegmentedSwitch([("Off", "off"), ("Windowed", "windowed"), ("Always", "always")])
+        self.display_sync_switch.set_current(self.settings.display_sync)
+        self.display_sync_switch.setToolTip(
+            "When to tell mpv the display's refresh rate so a display synchronization mode can take effect. "
+            "Windowed: while the window is not fullscreen and while entering or leaving fullscreen.")
+        self.display_sync_switch.selected.connect(self._set_display_sync)
+        timing_form.addRow("Pace video by the display", self.display_sync_switch)
         self.display_sync_hint = QLabel()
         self.display_sync_hint.setWordWrap(True)
         self.display_sync_hint.setProperty("role", "faint")
@@ -286,23 +287,26 @@ class DesktopFeatures:
 
     def _set_display_sync(self, value):
         self.settings.display_sync = value
-        if hasattr(self.player, "set_display_rate_reporting"):
-            self.player.set_display_rate_reporting(value)
+        self._apply_display_pacing()
         self._show_display_sync_hint()
 
     def _show_display_sync_hint(self):
         """Say what the switch and the mode add up to; either alone does nothing."""
         mode = self._next_defaults.get("video-sync", "audio")
         display_mode = mode.startswith("display-")
-        if self.settings.display_sync and display_mode:
-            text = ("Video is paced by the display and the interface stays fluid during playback. "
-                    "This draws more power (about 3 W in fullscreen on a laptop).")
-        elif self.settings.display_sync:
+        choice = self.settings.display_sync
+        if choice == "windowed" and display_mode:
+            text = ("The interface stays fluid while the window is not fullscreen and while entering or "
+                    "leaving fullscreen; settled in fullscreen, mpv keeps its own frame timing (less power).")
+        elif choice == "always" and display_mode:
+            text = ("Video is paced by the display and the interface stays fluid during playback, "
+                    "fullscreen included. This draws more power (about 3 W in fullscreen on a laptop).")
+        elif choice != "off":
             text = ("No effect yet: Video synchronization is set to audio. "
                     "Choose a Display mode to pace video by the display.")
         elif display_mode:
             text = (f"{mode} is set but inactive: mpv cannot see the display from inside this player. "
-                    "Turn the switch on to let it take effect.")
+                    "Choose Windowed or Always to let it take effect.")
         else:
             text = ("Video is paced by audio. During playback the interface updates once per video frame. "
                     "The mode is saved to mpv.conf.")
