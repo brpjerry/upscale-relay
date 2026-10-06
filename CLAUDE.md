@@ -112,8 +112,10 @@ constructor options).
   sampler) intermittently stalls mpv's frame delivery ~0.3 s (drops), which
   it does not do while the render call blocks.
 - The supported way to a fluid UI during playback is mpv's display sync:
-  with "Pace video by the display" on (off by default: +3 W in fullscreen on
-  the laptop), `MpvPlayerView` reports the screen's refresh rate
+  with "Fluid interface during playback" on (off by default; it hands timing
+  back to mpv ~0.9 s after entering fullscreen, where display pacing costs
+  +3 W, and mpv switches either way in ~0.2 s with no drop —
+  `_apply_display_pacing`), `MpvPlayerView` reports the screen's refresh rate
   (`display-fps-override`; the render API cannot see the display), so
   `video-sync=display-*` renders
   once per refresh and does not wait inside `render()` (120 paints/s at
@@ -144,6 +146,13 @@ constructor options).
   `paintGL → mpv_render_context_render → vaSyncSurface → iHD` when the user's
   `hwdec=vaapi` exposed a retired zero-copy Intel surface. Copy-back retains
   hardware decode; never restore zero-copy VA-API as the default here.
+- Through a fullscreen transition the video widget is pinned out of its
+  layout at its final size (`_pin_player`): every resize of a QOpenGLWidget
+  re-allocates its framebuffer and makes mpv render at the new size, and the
+  chrome slides plus the compositor's motion produced 17-23 of them per
+  transition (100-200 ms stalls, ~12 dropped frames). Hyprland sends one
+  configure for fullscreen and animates the rest itself; the resize storm was
+  our own sidebar slide moving the splitter.
 - Overlays (track card, settings sheet, fullscreen control bar) are children
   of the window's root widget, positioned over the video. A widget re-parented
   onto the `QOpenGLWidget` at runtime was visible to Qt but missing from the

@@ -55,10 +55,11 @@ class DesktopFeatures:
         # Video timing: how mpv paces frames. The switch is ours; the mode is
         # mpv's own video-sync option and lives in mpv.conf with the defaults.
         timing_form = group("Video timing")
-        self.display_sync_check = FlatSwitch("Pace video by the display")
+        self.display_sync_check = FlatSwitch("Fluid interface during playback")
         self.display_sync_check.setChecked(self.settings.display_sync)
         self.display_sync_check.setToolTip(
-            "Tell mpv the display's refresh rate so a display synchronization mode can take effect.")
+            "Tell mpv the display's refresh rate so a display synchronization mode can take effect "
+            "while the window is not fullscreen and while entering or leaving fullscreen.")
         self.display_sync_check.toggled.connect(self._set_display_sync)
         timing_form.addRow(self.display_sync_check)
         self.display_sync_hint = QLabel()
@@ -79,12 +80,12 @@ class DesktopFeatures:
         self.mpv_controls = {}
         choices = {
             "sid": [("Auto", "auto"), ("Off", "no")],
+            # The two display modes worth choosing; any other value found in
+            # mpv.conf is still shown and kept ("Configured: ...").
             "video-sync": [
                 ("Audio (default)", "audio"),
                 ("Display, resample audio to match (display-resample)", "display-resample"),
                 ("Display, repeat or drop video frames (display-vdrop)", "display-vdrop"),
-                *((v, v) for v in ("display-resample-vdrop", "display-resample-desync", "display-tempo",
-                                   "display-adrop", "display-desync", "desync")),
             ],
             "interpolation": [("Off", "no"), ("On", "yes")],
             "tscale": [(v, v) for v in ("oversample", "linear", "catmull_rom", "mitchell")],
@@ -286,8 +287,7 @@ class DesktopFeatures:
 
     def _set_display_sync(self, value):
         self.settings.display_sync = value
-        if hasattr(self.player, "set_display_rate_reporting"):
-            self.player.set_display_rate_reporting(value)
+        self._apply_display_pacing()
         self._show_display_sync_hint()
 
     def _show_display_sync_hint(self):
@@ -295,8 +295,8 @@ class DesktopFeatures:
         mode = self._next_defaults.get("video-sync", "audio")
         display_mode = mode.startswith("display-")
         if self.settings.display_sync and display_mode:
-            text = ("Video is paced by the display and the interface stays fluid during playback. "
-                    "This draws more power (about 3 W in fullscreen on a laptop).")
+            text = ("Video is paced by the display while the window is not fullscreen and through "
+                    "fullscreen transitions; settled in fullscreen, mpv keeps its own frame timing.")
         elif self.settings.display_sync:
             text = ("No effect yet: Video synchronization is set to audio. "
                     "Choose a Display mode to pace video by the display.")

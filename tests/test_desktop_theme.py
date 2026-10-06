@@ -37,6 +37,18 @@ def window(monkeypatch, tmp_path):
     theme.apply_theme(app, "auto")
 
 
+def wait_until(condition, timeout_ms=4000):
+    """Spin the event loop until ``condition()`` holds; animations run on the
+    wall clock, so a loaded CI runner needs more than their nominal length."""
+    from PySide6.QtCore import QDeadlineTimer
+    deadline = QDeadlineTimer(timeout_ms)
+    while not condition():
+        if deadline.hasExpired():
+            return False
+        QTest.qWait(20)
+    return True
+
+
 def test_theme_mode_switches_palette_and_persists(window):
     app = QApplication.instance()
     window.show()
@@ -66,8 +78,8 @@ def test_settings_sheet_overlays_without_growing_the_window(window):
     QApplication.instance().processEvents()
     minimum = window.minimumSizeHint().width()
     window.playback_settings_toggle.setChecked(True)
-    QTest.qWait(500)  # the sheet slides in; synchronous test, outside coroutine context
-    assert window.playback_settings.isVisible()
+    assert wait_until(window.playback_settings.isVisible)  # the sheet slides in
+    QTest.qWait(500)
     assert window.minimumSizeHint().width() == minimum
     sheet = window.playback_settings.geometry()
     assert sheet.right() == window._root.width() - 1
@@ -95,8 +107,7 @@ def test_track_card_follows_its_button_and_escape_closes_it(window):
     assert window.audio_combo.isVisible()
     window.keyPressEvent(QKeyEvent(QKeyEvent.KeyPress, Qt.Key_Escape, Qt.NoModifier))
     assert not window.tracks_btn.isChecked()
-    QTest.qWait(300)  # the card fades out before it is hidden
-    assert not window.track_panel.isVisible()
+    assert wait_until(lambda: not window.track_panel.isVisible())  # the card fades out first
 
 
 def test_status_messages_surface_in_the_subheading(window):
@@ -228,13 +239,10 @@ def test_sidebar_slides_away_and_back_to_its_width(window):
     assert width >= 220
     window.browser_toggle.setChecked(False)
     assert window._sidebar_slot.isVisible()  # still sliding out
-    QTest.qWait(theme.SLOW + 200)
-    assert not window._sidebar_slot.isVisible()
+    assert wait_until(lambda: not window._sidebar_slot.isVisible())
     assert not window.sort_combo.isVisible()
     window.browser_toggle.setChecked(True)
-    QTest.qWait(theme.SLOW + 200)
-    assert window._sidebar_slot.isVisible()
-    assert window.split.sizes()[0] == width
+    assert wait_until(lambda: window._sidebar_slot.isVisible() and window.split.sizes()[0] == width)
     assert window.browser_container.width() == window._sidebar_slot.width()  # fills its slot again
 
 
@@ -244,13 +252,10 @@ def test_fullscreen_slides_the_chrome_out_and_restores_it(window):
     QApplication.instance().processEvents()
     width = window.split.sizes()[0]
     window.toggle_fullscreen()
-    QTest.qWait(theme.SLOW + 200)
-    assert not window._toolbar_slot.isVisible()
-    assert not window._sidebar_slot.isVisible()
+    assert wait_until(lambda: not window._toolbar_slot.isVisible() and not window._sidebar_slot.isVisible())
     window.toggle_fullscreen()
-    QTest.qWait(theme.SLOW + 200)
-    assert window._toolbar_slot.isVisible() and window._toolbar_slot.height() == 64
-    assert window._sidebar_slot.isVisible() and window.split.sizes()[0] == width
+    assert wait_until(lambda: window._toolbar_slot.isVisible() and window._toolbar_slot.height() == 64
+                      and window._sidebar_slot.isVisible() and window.split.sizes()[0] == width)
     assert window.controls_panel.isVisible()
 
 
@@ -276,16 +281,28 @@ def test_auto_accent_samples_only_at_restarts_under_display_sync(window):
     window._session_source = None
 
 
-def test_display_pacing_is_opt_in_and_reaches_the_player(window):
+def test_display_pacing_is_opt_in_and_follows_fullscreen(window):
     calls = []
     window.player.set_display_rate_reporting = calls.append
     assert window.settings.display_sync is False
     assert not window.display_sync_check.isChecked()
     window.display_sync_check.setChecked(True)
     assert window.settings.display_sync is True
-    assert calls == [True]
+    assert calls[-1] is True
+    window.show()
+    window.toggle_fullscreen()
+    assert calls[-1] is True                      # still paced by the display while the chrome slides
+    assert wait_until(lambda: calls[-1] is False)  # the transition settles: mpv's own timing
+    window.toggle_fullscreen()
+    assert calls[-1] is True                      # fluid again before the exit motion
     window.display_sync_check.setChecked(False)
-    assert calls == [True, False]
+    assert calls[-1] is False
+
+
+def test_display_pacing_setting_reads_earlier_mode_names(window):
+    for stored, expected in ((True, True), ("windowed", True), ("always", True), (False, False), ("off", False), ("bogus", False)):
+        window.settings._qs.setValue("playback/display_sync", stored)
+        assert window.settings.display_sync is expected, stored
 
 
 def test_video_timing_hint_explains_switch_and_mode_together(window):
@@ -299,9 +316,11 @@ def test_video_timing_hint_explains_switch_and_mode_together(window):
     assert sync.currentData() == "display-resample"
     assert "set but inactive" in window.display_sync_hint.text()
     window.display_sync_check.setChecked(True)
-    assert "paced by the display" in window.display_sync_hint.text()
+    assert "while the window is not fullscreen" in window.display_sync_hint.text()
     window._refresh_mpv_controls({**values, "video-sync": "audio"})
     assert "No effect yet" in window.display_sync_hint.text()
+    window._refresh_mpv_controls({**values, "video-sync": "display-tempo"})  # from mpv.conf, not offered
+    assert sync.currentData() == "display-tempo" and sync.currentText() == "Configured: display-tempo"
 
 
 def test_display_rate_is_reported_only_when_enabled():
@@ -320,3 +339,22 @@ def test_display_rate_is_reported_only_when_enabled():
     assert sent == {"display-fps-override": 120.0}
     MpvPlayerView.set_display_rate_reporting(player, False)
     assert sent == {"display-fps-override": 0.0}        # back to unknown
+
+
+def test_video_is_pinned_through_a_fullscreen_transition(window):
+    window.resize(1100, 600)
+    window.show()
+    QApplication.instance().processEvents()
+    layout = window._player_layout
+    assert layout.indexOf(window.player) >= 0
+    window.toggle_fullscreen()
+    # Out of the layout, at the screen's size, held at the window's origin.
+    assert layout.indexOf(window.player) < 0
+    assert window.player.size() == window.screen().size()
+    assert window.player.mapTo(window._root, QPoint(0, 0)) == QPoint(0, 0)
+    assert wait_until(lambda: layout.indexOf(window.player) >= 0)  # one resize at the end
+    window.toggle_fullscreen()
+    assert layout.indexOf(window.player) < 0
+    assert wait_until(lambda: layout.indexOf(window.player) >= 0
+                      and window._toolbar_slot.isVisible() and window._sidebar_slot.isVisible())
+    assert window.player.geometry().topLeft() == QPoint(0, 64)  # back in its place under the top bar

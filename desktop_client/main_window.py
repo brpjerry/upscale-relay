@@ -106,6 +106,13 @@ _SERVER_CURSOR_ROLE = Qt.UserRole + 3
 _SERVER_PAGE_SIZE = 100
 _RECONNECT_DELAYS_S = (0.0, 2.0, 5.0)
 _SIDEBAR_MIN_WIDTH = 220
+# Chrome slides for theme.SLOW ms; give the compositor's own fullscreen motion
+# and the last repaints a moment more before handing frame timing back to mpv.
+_FULLSCREEN_SETTLE_MS = 900
+# How long the video widget stays pinned through a fullscreen transition: the
+# chrome slides for theme.SLOW ms and the compositor's own motion takes
+# 400-470 ms (measured on Hyprland); both run at once.
+_FS_PIN_MS = 600
 _TOP_BAR_HEIGHT = 64
 
 
@@ -512,8 +519,18 @@ class MainWindow(DesktopFeatures, QMainWindow):
         self.video_overlay = PlayerOverlay(self.player)
         if hasattr(self.player, "set_deband"):
             self.player.set_deband(self.settings.deband_enabled)
-        if hasattr(self.player, "set_display_rate_reporting"):
-            self.player.set_display_rate_reporting(self.settings.display_sync)
+        # Display pacing follows a policy (settings x fullscreen state); the
+        # fullscreen transition settles before the policy is re-evaluated.
+        self._fullscreen_settled = False
+        self._unpin_timer = QTimer(self)
+        self._unpin_timer.setSingleShot(True)
+        self._unpin_timer.setInterval(_FS_PIN_MS)
+        self._unpin_timer.timeout.connect(self._unpin_player)
+        self._pacing_timer = QTimer(self)
+        self._pacing_timer.setSingleShot(True)
+        self._pacing_timer.setInterval(_FULLSCREEN_SETTLE_MS)
+        self._pacing_timer.timeout.connect(self._on_fullscreen_settled)
+        self._apply_display_pacing()
         self.play_btn = IconButton(Icons.play, size=40, icon_size=24, filled=True)
         self.play_btn.setToolTip("Play (Space)")
         self.play_btn.setEnabled(False)
@@ -697,6 +714,10 @@ class MainWindow(DesktopFeatures, QMainWindow):
         self._toolbar_slot.setFixedHeight(_TOP_BAR_HEIGHT)
         pv.addWidget(self._toolbar_slot)
         pv.addWidget(self.player, stretch=1)
+        self._player_layout = pv
+        self._player_parent = main_page
+        self._player_pinned = False
+        self._pinned_size = None
 
         self.controls_panel.setCursor(Qt.ArrowCursor)
         self._controls_timer = QTimer(self)
@@ -750,6 +771,7 @@ class MainWindow(DesktopFeatures, QMainWindow):
         # an exception raised inside a Qt virtual is a native crash.
         self.player.installEventFilter(self)  # reposition overlay on resize
         self._root.installEventFilter(self)  # keep the track card anchored
+        self._player_parent.installEventFilter(self)  # hold a pinned video still
         self.setCentralWidget(self._root)
         status_bar = QStatusBar()
         status_bar.setSizeGripEnabled(False)
@@ -1210,32 +1232,88 @@ class MainWindow(DesktopFeatures, QMainWindow):
         self._slide("toolbar", current, target, lambda height: slot.setFixedHeight(max(1, height)),
                     lambda: self._apply_toolbar_visible(visible))
 
+    # -- display pacing policy ----------------------------------------------------
+    # With the setting on, the display paces video (fluid interface) except
+    # once the window has settled in fullscreen, where mpv's own frame timing
+    # is worth more than a fluid interface and the display pacing costs ~3 W.
+    # The transition itself stays paced by the display in both directions;
+    # mpv switches within ~0.2 s either way without dropping a frame.
+
+    def _apply_display_pacing(self) -> None:
+        if not hasattr(self.player, "set_display_rate_reporting"):
+            return
+        self.player.set_display_rate_reporting(self.settings.display_sync and not self._fullscreen_settled)
+
+    def _on_fullscreen_settled(self) -> None:
+        if self.isFullScreen():
+            self._fullscreen_settled = True
+            self._apply_display_pacing()
+
     def toggle_fullscreen(self) -> None:
         entering = not self.isFullScreen()
-        # The transport bar becomes a pointer-revealed overlay in fullscreen
-        # rather than just vanishing; everything else hides.
-        self._slide_toolbar(not entering)
+        self._pacing_timer.stop()
+        self._fullscreen_settled = False
+        self._apply_display_pacing()  # leaving: fluid again before anything moves
+        if entering:
+            self._pacing_timer.start()  # entering: hand timing back once settled
         self.tracks_btn.setChecked(False)
         self._track_reveal.hide_now()  # the bar it hangs from is about to move
         self.fullscreen_btn.set_icon(Icons.fullscreen_exit if entering else Icons.fullscreen)
+        if self.isVisible():
+            # The chrome slides and the window's size change would each resize
+            # the video widget many times (a framebuffer re-allocation and an
+            # mpv render at every size: measured as 100-200 ms stalls and a
+            # dozen dropped frames per transition). Pin it at its final size
+            # for the whole transition instead: the chrome slides over it and
+            # the window reveals or crops it. One resize at the end.
+            self._pin_player(self.screen().size() if entering else self.player.size())
+            self._unpin_timer.start()
         if entering:
             self._settings_visible_before_fullscreen = self._settings_reveal.shown \
                 or self.playback_settings.isVisible()
             self._settings_reveal.hide_now()
+            self._was_maximized = self.isMaximized()
+            # The transport bar becomes a pointer-revealed overlay in
+            # fullscreen rather than just vanishing; everything else slides away.
+            self._slide_toolbar(False)
             self._slide_browser(False)
             self._enter_overlay_controls()
-            self._was_maximized = self.isMaximized()
             self.showFullScreen()
             self._show_player_cursor()
             self.player.setFocus()  # keys (Space/F/arrows) go to the video
         else:
             self.playback_settings.setVisible(self._settings_visible_before_fullscreen)
-            self._slide_browser(self.browser_toggle.isChecked())
             self._exit_overlay_controls()
             if self._was_maximized:
                 self.showMaximized()
             else:
                 self.showNormal()
+            self._slide_toolbar(True)
+            self._slide_browser(self.browser_toggle.isChecked())
+
+    def _pin_player(self, size) -> None:
+        """Take the video widget out of the layout at ``size`` until
+        ``_unpin_player``; see toggle_fullscreen."""
+        if self._player_pinned:
+            return
+        self._player_pinned = True
+        self._pinned_size = size
+        self._player_layout.removeWidget(self.player)
+        self._hold_pinned_player()
+
+    def _hold_pinned_player(self) -> None:
+        """Keep the pinned video at the window's top-left whatever its parent
+        does (the sidebar sliding moves the parent): moved, never resized."""
+        if self._player_pinned:
+            origin = self.player.parentWidget().mapFrom(self._root, QPoint(0, 0))
+            self.player.setGeometry(QRect(origin, self._pinned_size))
+
+    def _unpin_player(self) -> None:
+        if not self._player_pinned:
+            return
+        self._player_pinned = False
+        self._player_layout.addWidget(self.player, stretch=1)
+
 
     def keyPressEvent(self, event) -> None:
         # Unhandled keys from the player view propagate up to here.
@@ -1362,6 +1440,8 @@ class MainWindow(DesktopFeatures, QMainWindow):
             self.tracks_btn.setChecked(False)
         if obj is self.player and event.type() == QEvent.Resize:
             self._position_idle_guidance()
+        if obj is self._player_parent and event.type() in (QEvent.Move, QEvent.Resize):
+            self._hold_pinned_player()
         if obj is self._root and event.type() == QEvent.Resize:
             if self._controls_overlay:
                 self._position_overlay()

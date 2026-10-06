@@ -105,8 +105,11 @@ class AppSettings:
 
     @property
     def display_sync(self) -> bool:
-        """Tell mpv the display's refresh rate, so its display-sync modes work."""
-        return self._qs.value("playback/display_sync", False, type=bool)
+        """Tell mpv the display's refresh rate (so its display-sync modes
+        work) while the window is not settled in fullscreen."""
+        value = self._qs.value("playback/display_sync", False)
+        # Earlier builds stored a mode name here.
+        return value in (True, "true", "windowed", "always")
 
     @display_sync.setter
     def display_sync(self, v: bool) -> None:
