@@ -347,3 +347,22 @@ def test_display_rate_is_reported_only_when_enabled():
     assert sent == {"display-fps-override": 120.0}
     MpvPlayerView.set_display_rate_reporting(player, False)
     assert sent == {"display-fps-override": 0.0}        # back to unknown
+
+
+def test_video_is_pinned_through_a_fullscreen_transition(window):
+    window.resize(1100, 600)
+    window.show()
+    QApplication.instance().processEvents()
+    layout = window._player_layout
+    assert layout.indexOf(window.player) >= 0
+    window.toggle_fullscreen()
+    # Out of the layout, at the screen's size, held at the window's origin.
+    assert layout.indexOf(window.player) < 0
+    assert window.player.size() == window.screen().size()
+    assert window.player.mapTo(window._root, QPoint(0, 0)) == QPoint(0, 0)
+    assert wait_until(lambda: layout.indexOf(window.player) >= 0)  # one resize at the end
+    window.toggle_fullscreen()
+    assert layout.indexOf(window.player) < 0
+    assert wait_until(lambda: layout.indexOf(window.player) >= 0
+                      and window._toolbar_slot.isVisible() and window._sidebar_slot.isVisible())
+    assert window.player.geometry().topLeft() == QPoint(0, 64)  # back in its place under the top bar

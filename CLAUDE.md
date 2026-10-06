@@ -146,6 +146,13 @@ constructor options).
   `paintGL → mpv_render_context_render → vaSyncSurface → iHD` when the user's
   `hwdec=vaapi` exposed a retired zero-copy Intel surface. Copy-back retains
   hardware decode; never restore zero-copy VA-API as the default here.
+- Through a fullscreen transition the video widget is pinned out of its
+  layout at its final size (`_pin_player`): every resize of a QOpenGLWidget
+  re-allocates its framebuffer and makes mpv render at the new size, and the
+  chrome slides plus the compositor's motion produced 17-23 of them per
+  transition (100-200 ms stalls, ~12 dropped frames). Hyprland sends one
+  configure for fullscreen and animates the rest itself; the resize storm was
+  our own sidebar slide moving the splitter.
 - Overlays (track card, settings sheet, fullscreen control bar) are children
   of the window's root widget, positioned over the video. A widget re-parented
   onto the `QOpenGLWidget` at runtime was visible to Qt but missing from the
