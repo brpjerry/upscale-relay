@@ -109,9 +109,10 @@ _SIDEBAR_MIN_WIDTH = 220
 # Chrome slides for theme.SLOW ms; give the compositor's own fullscreen motion
 # and the last repaints a moment more before handing frame timing back to mpv.
 _FULLSCREEN_SETTLE_MS = 900
-# How long the video widget stays pinned through a fullscreen transition: the
-# chrome slides for theme.SLOW ms and the compositor's own motion takes
-# 400-470 ms (measured on Hyprland); both run at once.
+# How long the video widget stays pinned entering fullscreen: the chrome
+# slides for theme.SLOW ms and the compositor's own motion takes 400-470 ms
+# (measured on Hyprland); both run at once. Leaving, the pin ends as soon as
+# the window has its windowed size, and this is only the fallback.
 _FS_PIN_MS = 600
 _TOP_BAR_HEIGHT = 64
 
@@ -525,7 +526,7 @@ class MainWindow(DesktopFeatures, QMainWindow):
         self._unpin_timer = QTimer(self)
         self._unpin_timer.setSingleShot(True)
         self._unpin_timer.setInterval(_FS_PIN_MS)
-        self._unpin_timer.timeout.connect(self._unpin_player)
+        self._unpin_timer.timeout.connect(self._settle_player)
         self._pacing_timer = QTimer(self)
         self._pacing_timer.setSingleShot(True)
         self._pacing_timer.setInterval(_FULLSCREEN_SETTLE_MS)
@@ -718,6 +719,7 @@ class MainWindow(DesktopFeatures, QMainWindow):
         self._player_parent = main_page
         self._player_pinned = False
         self._pinned_size = None
+        self._reveal_pending = False  # leaving fullscreen: chrome waits for the window
 
         self.controls_panel.setCursor(Qt.ArrowCursor)
         self._controls_timer = QTimer(self)
@@ -1141,6 +1143,7 @@ class MainWindow(DesktopFeatures, QMainWindow):
         self._stop_slide("sidebar")
         slot = self._sidebar_slot
         slot.hold(None)
+        slot.set_hidden(0.0)
         slot.setMinimumWidth(_SIDEBAR_MIN_WIDTH)
         if visible:
             slot.setVisible(True)
@@ -1154,7 +1157,9 @@ class MainWindow(DesktopFeatures, QMainWindow):
     # -- sliding chrome ---------------------------------------------------------
     # The sidebar and top bar slide rather than pop. Each step really resizes
     # the video widget, which is acceptable for a short, bounded glide (unlike
-    # an open-ended splitter drag, which stays rubber-banded).
+    # an open-ended splitter drag, which stays rubber-banded). Leaving
+    # fullscreen is the exception: the bars slide in over space the layout
+    # has already given them (_reveal_chrome), so the video does not move.
 
     def _stop_slide(self, key: str) -> None:
         running = self._slides.pop(key, None)
@@ -1162,14 +1167,14 @@ class MainWindow(DesktopFeatures, QMainWindow):
             running.stop()
             running.deleteLater()
 
-    def _slide(self, key: str, start: int, end: int, apply, done) -> None:
+    def _slide(self, key: str, start: float, end: float, apply, done) -> None:
         self._stop_slide(key)
         animation = QVariantAnimation(self)
         animation.setDuration(theme.SLOW)
         animation.setEasingCurve(emphasized())
         animation.setStartValue(float(start))
         animation.setEndValue(float(end))
-        animation.valueChanged.connect(lambda value: apply(round(float(value))))
+        animation.valueChanged.connect(lambda value: apply(float(value)))
 
         def finished() -> None:
             if self._slides.get(key) is animation:
@@ -1197,9 +1202,9 @@ class MainWindow(DesktopFeatures, QMainWindow):
             self._apply_browser_visible(visible)
             return
 
-        def apply(width: int) -> None:
+        def apply(width: float) -> None:
             total = sum(self.split.sizes())  # live: the window may be resizing too
-            width = max(1, min(width, total - 1))  # 0 would collapse the pane
+            width = max(1, min(round(width), total - 1))  # 0 would collapse the pane
             self.split.setSizes([width, total - width])
 
         self._stop_slide("sidebar")
@@ -1212,6 +1217,7 @@ class MainWindow(DesktopFeatures, QMainWindow):
     def _apply_toolbar_visible(self, visible: bool) -> None:
         self._stop_slide("toolbar")
         self._toolbar_slot.hold(None)
+        self._toolbar_slot.set_hidden(0.0)
         self._toolbar_slot.setFixedHeight(_TOP_BAR_HEIGHT)
         self._toolbar_slot.setVisible(visible)
 
@@ -1229,8 +1235,22 @@ class MainWindow(DesktopFeatures, QMainWindow):
         slot.hold(_TOP_BAR_HEIGHT)
         slot.setFixedHeight(max(1, current))
         slot.setVisible(True)
-        self._slide("toolbar", current, target, lambda height: slot.setFixedHeight(max(1, height)),
+        self._slide("toolbar", current, target, lambda height: slot.setFixedHeight(max(1, round(height))),
                     lambda: self._apply_toolbar_visible(visible))
+
+    def _reveal_chrome(self) -> None:
+        """Leaving fullscreen: give the top bar and sidebar their full size in
+        the layout at once, so the video's one resize lands on its windowed
+        geometry first, then slide the bars into the space they already own."""
+        browser = self.browser_toggle.isChecked()
+        self._apply_toolbar_visible(True)
+        self._apply_browser_visible(browser)
+        slots = {"toolbar": self._toolbar_slot}
+        if browser:
+            slots["sidebar"] = self._sidebar_slot
+        for key, slot in slots.items():
+            slot.set_hidden(1.0)
+            self._slide(key, 1.0, 0.0, slot.set_hidden, lambda slot=slot: slot.set_hidden(0.0))
 
     # -- display pacing policy ----------------------------------------------------
     # With the setting on, the display paces video (fluid interface) except
@@ -1259,14 +1279,19 @@ class MainWindow(DesktopFeatures, QMainWindow):
         self.tracks_btn.setChecked(False)
         self._track_reveal.hide_now()  # the bar it hangs from is about to move
         self.fullscreen_btn.set_icon(Icons.fullscreen_exit if entering else Icons.fullscreen)
+        self._reveal_pending = False
         if self.isVisible():
             # The chrome slides and the window's size change would each resize
             # the video widget many times (a framebuffer re-allocation and an
             # mpv render at every size: measured as 100-200 ms stalls and a
-            # dozen dropped frames per transition). Pin it at its final size
-            # for the whole transition instead: the chrome slides over it and
-            # the window reveals or crops it. One resize at the end.
+            # dozen dropped frames per transition). Pin it instead, so it is
+            # resized once. Entering, it is pinned at the screen's size while
+            # the chrome slides off it and the window grows to reveal it.
+            # Leaving, it stays as it is until the window has its windowed
+            # size; then it takes its final geometry and the chrome slides in
+            # around it (_settle_player).
             self._pin_player(self.screen().size() if entering else self.player.size())
+            self._reveal_pending = not entering
             self._unpin_timer.start()
         if entering:
             self._settings_visible_before_fullscreen = self._settings_reveal.shown \
@@ -1288,8 +1313,9 @@ class MainWindow(DesktopFeatures, QMainWindow):
                 self.showMaximized()
             else:
                 self.showNormal()
-            self._slide_toolbar(True)
-            self._slide_browser(self.browser_toggle.isChecked())
+            if not self._reveal_pending:
+                self._apply_toolbar_visible(True)
+                self._apply_browser_visible(self.browser_toggle.isChecked())
 
     def _pin_player(self, size) -> None:
         """Take the video widget out of the layout at ``size`` until
@@ -1313,6 +1339,19 @@ class MainWindow(DesktopFeatures, QMainWindow):
             return
         self._player_pinned = False
         self._player_layout.addWidget(self.player, stretch=1)
+
+    def _settle_player(self) -> None:
+        """End a fullscreen transition: the video goes back into the layout,
+        its one resize. Leaving, this runs once the window has its windowed
+        size (the pin timer is the fallback for a window whose size never
+        changes), and the chrome takes its space in the layout first, so the
+        video lands on its final geometry while the bars slide in."""
+        self._unpin_timer.stop()
+        if self._reveal_pending:
+            self._reveal_pending = False
+            self._reveal_chrome()
+            self.split.refresh()  # the splitter handle reappears now, not a turn later
+        self._unpin_player()
 
 
     def keyPressEvent(self, event) -> None:
@@ -1443,6 +1482,10 @@ class MainWindow(DesktopFeatures, QMainWindow):
         if obj is self._player_parent and event.type() in (QEvent.Move, QEvent.Resize):
             self._hold_pinned_player()
         if obj is self._root and event.type() == QEvent.Resize:
+            if self._reveal_pending:
+                # The window has its windowed size; settle once the layouts
+                # have taken it in.
+                QTimer.singleShot(0, self._settle_player)
             if self._controls_overlay:
                 self._position_overlay()
             if self._track_reveal.shown:

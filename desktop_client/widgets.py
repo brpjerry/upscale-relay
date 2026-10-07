@@ -664,6 +664,8 @@ class SlideSlot(QWidget):
     While an extent is held, the widget keeps that width (or height) and stays
     anchored to the slot's far edge, so narrowing the slot moves it off the
     near edge with its layout intact. With nothing held it simply fills the slot.
+    ``set_hidden`` moves it off the near edge without changing the slot's size,
+    so the layout around the slot (the video) stays where it is.
     """
 
     def __init__(self, child: QWidget, orientation=Qt.Horizontal, parent=None):
@@ -671,11 +673,17 @@ class SlideSlot(QWidget):
         self._child = child
         self._orientation = orientation
         self._held: int | None = None
+        self._hidden = 0.0
         child.setParent(self)
 
     def hold(self, extent: int | None) -> None:
         self._held = extent
         self.updateGeometry()
+        self._place()
+
+    def set_hidden(self, fraction: float) -> None:
+        """Shift the widget ``fraction`` of its extent past the near edge."""
+        self._hidden = fraction
         self._place()
 
     def sizeHint(self) -> QSize:
@@ -691,10 +699,12 @@ class SlideSlot(QWidget):
     def _place(self) -> None:
         if self._orientation == Qt.Horizontal:
             width = max(self.width(), self._held or 0)
-            self._child.setGeometry(self.width() - width, 0, width, self.height())
+            shift = round(width * self._hidden)
+            self._child.setGeometry(self.width() - width - shift, 0, width, self.height())
         else:
             height = max(self.height(), self._held or 0)
-            self._child.setGeometry(0, self.height() - height, self.width(), height)
+            shift = round(height * self._hidden)
+            self._child.setGeometry(0, self.height() - height - shift, self.width(), height)
 
 
 class AutoHideButton(QPushButton):

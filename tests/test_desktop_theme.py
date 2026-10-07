@@ -358,3 +358,30 @@ def test_video_is_pinned_through_a_fullscreen_transition(window):
     assert wait_until(lambda: layout.indexOf(window.player) >= 0
                       and window._toolbar_slot.isVisible() and window._sidebar_slot.isVisible())
     assert window.player.geometry().topLeft() == QPoint(0, 64)  # back in its place under the top bar
+
+
+def test_leaving_fullscreen_resizes_the_video_before_the_chrome_slides_in(window, monkeypatch):
+    window.resize(1100, 600)
+    window.show()
+    QApplication.instance().processEvents()
+    windowed = window.player.geometry()
+    sidebar = window.split.sizes()[0]
+    window.toggle_fullscreen()
+    assert wait_until(lambda: window._player_layout.indexOf(window.player) >= 0)
+    at_unpin = []
+    unpin = window._unpin_player
+
+    def record() -> None:
+        at_unpin.append((window._toolbar_slot.isVisible(), window._toolbar_slot.height(),
+                         window.split.sizes()[0], window._toolbar_slot._child.y(),
+                         window.browser_container.x()))
+        unpin()
+    monkeypatch.setattr(window, "_unpin_player", record)
+    window.toggle_fullscreen()
+    assert wait_until(lambda: window._player_layout.indexOf(window.player) >= 0)
+    # The chrome already owned its space, still slid out, when the video went
+    # back into the layout: the video's one resize was to its final geometry.
+    assert window.player.geometry() == windowed
+    assert at_unpin == [(True, 64, sidebar, -64, -sidebar)]
+    assert wait_until(lambda: window._toolbar_slot._child.y() == 0 and window.browser_container.x() == 0)
+    assert window.player.geometry() == windowed  # the bars slid in; the video did not move
