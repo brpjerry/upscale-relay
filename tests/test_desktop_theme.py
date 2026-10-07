@@ -7,10 +7,10 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 pytest.importorskip("PySide6")
 pytest.importorskip("qasync")
 
-from PySide6.QtCore import QPoint, QPointF, QSettings, Qt
+from PySide6.QtCore import QObject, QPoint, QPointF, QSettings, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QImage, QPalette, QWheelEvent
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QWidget
 
 import desktop_client.main_window as main_window
 from desktop_client import theme
@@ -358,3 +358,137 @@ def test_video_is_pinned_through_a_fullscreen_transition(window):
     assert wait_until(lambda: layout.indexOf(window.player) >= 0
                       and window._toolbar_slot.isVisible() and window._sidebar_slot.isVisible())
     assert window.player.geometry().topLeft() == QPoint(0, 64)  # back in its place under the top bar
+
+
+def test_display_sync_state_follows_the_observed_vsync_ratio():
+    pytest.importorskip("mpv")
+    from types import SimpleNamespace
+    from desktop_client.mpv_view import MpvPlayerView
+    # mpv never announces a change of display-sync-active; vsync-ratio is
+    # observable and exists exactly while display sync is active.
+    player = SimpleNamespace(options=SimpleNamespace(headless=False), _reloading=False, _observed={})
+    assert not MpvPlayerView.display_sync_active(player)
+    player._observed["vsync-ratio"] = 5.0
+    assert MpvPlayerView.display_sync_active(player)
+    player._observed["vsync-ratio"] = None
+    assert not MpvPlayerView.display_sync_active(player)
+
+
+def test_sidebar_hide_pins_the_video_at_the_size_it_lands_at(window):
+    window.resize(1100, 600)
+    window.show()
+    QApplication.instance().processEvents()
+    layout = window._player_layout
+    final = QSize(window._root.width(), window.player.height())
+    window.browser_toggle.setChecked(False)
+    # The sidebar slides off a video already at its final size...
+    assert layout.indexOf(window.player) < 0
+    assert window.player.size() == final
+    assert window.player.mapTo(window._root, QPoint(0, 0)).x() == 0
+    assert wait_until(lambda: not window._sidebar_slot.isVisible())
+    # ...which rejoins the layout exactly where it is.
+    assert layout.indexOf(window.player) >= 0
+    QApplication.instance().processEvents()
+    assert window.player.size() == final
+    assert window.player.mapTo(window._root, QPoint(0, 0)).x() == 0
+
+
+def test_showing_the_sidebar_mid_hide_releases_the_pin(window):
+    window.resize(1100, 600)
+    window.show()
+    QApplication.instance().processEvents()
+    width = window.split.sizes()[0]
+    window.browser_toggle.setChecked(False)
+    assert window._player_pinned
+    window.browser_toggle.setChecked(True)  # the show slide resizes the video
+    assert not window._player_pinned
+    assert wait_until(lambda: "sidebar" not in window._slides)
+    assert window.split.sizes()[0] == width and not window._player_pinned
+
+
+def test_fullscreen_takes_over_a_sidebar_slide_pin(window):
+    window.resize(1100, 600)
+    window.show()
+    QApplication.instance().processEvents()
+    window.browser_toggle.setChecked(False)
+    window.toggle_fullscreen()
+    try:
+        # Held at the screen's size now, and released by fullscreen's timer,
+        # not by the end of the sidebar slide it interrupted.
+        assert window._player_pinned and not window._slide_pinned
+        assert window.player.size() == window.screen().size()
+        assert wait_until(lambda: "sidebar" not in window._slides)
+        assert window._player_pinned
+        assert wait_until(lambda: not window._player_pinned)
+    finally:
+        window.toggle_fullscreen()
+    assert wait_until(lambda: not window._player_pinned and window._toolbar_slot.isVisible())
+
+
+class _FrameSource(QObject):
+    frameSwapped = Signal()
+
+
+def _frame_slide(start=0, end=300):
+    from desktop_client.main_window import _FrameSlide
+    QApplication.instance() or QApplication([])
+    view, nudge = _FrameSource(), QWidget()
+    values, landed = [], []
+    slide = _FrameSlide(view, nudge, start, end, values.append)
+    slide.finished.connect(lambda: landed.append(values[-1] if values else None))
+    return slide, view, nudge, values, landed
+
+
+def test_frame_slide_steps_once_per_presented_frame_and_lands():
+    slide, view, _nudge, values, landed = _frame_slide()
+    slide.start()
+    for _ in range(500):
+        if landed:
+            break
+        QTest.qWait(8)
+        view.frameSwapped.emit()
+    assert values == sorted(values) and len(set(values)) == len(values)  # applied only when it moves
+    assert len(values) > 10 and landed == [300]
+    view.frameSwapped.emit()  # finished: later frames change nothing
+    assert landed == [300] and values[-1] == 300
+
+
+def test_frame_slide_lands_when_no_frames_are_presented():
+    # An unexposed window presents nothing; the slide must still finish.
+    slide, _view, _nudge, values, landed = _frame_slide()
+    slide.start()
+    assert wait_until(lambda: landed, timeout_ms=theme.SLOW + 1000)
+    assert landed == [300] and values[-1] == 300
+
+
+def test_stopped_frame_slide_ignores_later_frames():
+    slide, view, _nudge, values, landed = _frame_slide()
+    slide.start()
+    QTest.qWait(30)
+    view.frameSwapped.emit()
+    slide.stop()
+    applied = list(values)
+    view.frameSwapped.emit()
+    QTest.qWait(120)  # past the stall interval too
+    assert values == applied and not landed
+
+
+def test_window_slides_step_on_the_video_frames_when_it_presents_them(window, monkeypatch):
+    from desktop_client.main_window import _FrameSlide
+    source = _FrameSource(window)
+    window.player.frameSwapped = source.frameSwapped
+    monkeypatch.setattr(window, "_frame_paced", lambda: True)
+    frames = QTimer(window)
+    frames.timeout.connect(source.frameSwapped.emit)
+    frames.start(8)
+    window.resize(1100, 600)
+    window.show()
+    QApplication.instance().processEvents()
+    width = window.split.sizes()[0]
+    window.browser_toggle.setChecked(False)
+    assert isinstance(window._slides["sidebar"], _FrameSlide)
+    assert wait_until(lambda: not window._sidebar_slot.isVisible())
+    window.browser_toggle.setChecked(True)
+    assert isinstance(window._slides["sidebar"], _FrameSlide)
+    assert wait_until(lambda: window._sidebar_slot.isVisible() and window.split.sizes()[0] == width)
+    frames.stop()

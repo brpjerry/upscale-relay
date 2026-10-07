@@ -68,6 +68,16 @@ mpv = _load_mpv()
 # Cache pause remains enabled for recovery; this only reduces its initial wait.
 CACHE_PAUSE_WAIT_S = 0.5
 
+# Properties the periodic stats read, kept current by mpv's event thread.
+# vsync-ratio stands in for display-sync-active, which mpv never announces a
+# change of: it exists exactly while display sync is active.
+_OBSERVED_PROPERTIES = (
+    "time-pos", "duration", "avsync", "frame-drop-count",
+    "demuxer-cache-duration", "paused-for-cache", "seeking", "path",
+    "volume", "mute", "audio-delay", "sub-delay", "aid", "sid",
+    "hwdec-current", "vsync-ratio",
+)
+
 
 def _render_hwdec_mode(no_hwdec: bool, platform: str | None = None) -> str:
     """Return the hardware decode mode safe for the embedded render path.
@@ -410,6 +420,14 @@ class MpvPlayerView(QOpenGLWidget):
                 # timeline restarts at 0, which desyncs the external audio
                 # and made `start=<target>` seek beyond the data (freeze).
                 "rebase_start_time": "no",
+                # Hand each frame over at its display time rather than 50 ms
+                # (about a period at 24 fps) before it. render() blocks until
+                # that time on the GUI thread, so the default spent ~40 of
+                # every 42 ms there: resizes and slides ran at 12-14 fps.
+                # Frames still land on time (3 ms median after target, 99.6-
+                # 100% on the 5-vsync cadence of 24 fps at 120 Hz, against
+                # 83-85% with the default). Display sync ignores this option.
+                "video_timing_offset": 0,
             }
             # Hardware decode for the HEVC tiers; FFV1 has no hw decoder and
             # mpv falls back silently. Linux uses copy-back: an actual core
@@ -456,6 +474,7 @@ class MpvPlayerView(QOpenGLWidget):
             # to Qt's paintGL, so reassert the safe copy-back mode below.
             self.mpv.vo = "libmpv"  # render API; a conf vo= would pop a window
             self.mpv.rebase_start_time = False  # docs/PROTOCOL.md PTS semantics
+            self.mpv.video_timing_offset = 0  # GUI thread free between frames
             self.mpv.keep_open = False
             self.mpv.idle = True
             self.mpv.cache = True  # live-stream buffering, sized for the
@@ -524,6 +543,13 @@ class MpvPlayerView(QOpenGLWidget):
             self._mpv_paused = value is not False
             self._idle_state_changed.emit()
 
+        # A synchronous read waits for mpv's core, which can itself be waiting
+        # for this thread to render: under display sync two reads in one stats
+        # tick stalled ~210 ms. The GUI thread reads these from the cache.
+        self._observed: dict[str, object] = {}
+        for name in _OBSERVED_PROPERTIES:
+            self.mpv.observe_property(name, self._on_observed)
+
         self._playback_restarted.connect(self._on_playback_restarted)
         self._external_media_ready.connect(self._on_external_media_ready)
 
@@ -554,6 +580,14 @@ class MpvPlayerView(QOpenGLWidget):
                 self._terminal.emit(generation, natural, "Stream ended without confirmed relay EOS")
             elif reason in ("MpvEventEndFile.ERROR", "error", "4"):
                 self._terminal.emit(generation, False, f"mpv playback error {event.data.error}")
+
+    def _on_observed(self, name, value) -> None:
+        # libmpv event thread; a dict store is atomic under the GIL.
+        self._observed[name] = value
+
+    def _observation(self, name: str, default=None):
+        value = self._observed.get(name)
+        return default if value is None else value
 
     def _on_terminal(self, generation, natural, message):
         if generation != self._load_generation or self._reloading:
@@ -630,10 +664,7 @@ class MpvPlayerView(QOpenGLWidget):
         with a known refresh rate) rather than by audio."""
         if self.options.headless or self._reloading:
             return False
-        try:
-            return bool(self.mpv._get_property("display-sync-active"))
-        except Exception:
-            return False
+        return self._observed.get("vsync-ratio") is not None
 
     def request_frame_sample(self) -> None:
         """Ask for a thumbnail of the current picture (``frame_sampled``).
@@ -1219,21 +1250,17 @@ class MpvPlayerView(QOpenGLWidget):
                 if self.client is not None:
                     self.client.buffered_ms = 0
                 continue
-            # Each property read fails independently: a transient error on one
-            # must not skip the buffered_ms update — the server paces on the
-            # reported value, and a frozen stale report wedges its
+            # Observed values (see _OBSERVED_PROPERTIES), not synchronous
+            # reads. They stay live while paused: buffered_ms must keep
+            # following the real buffer, because the server paces on the
+            # reported value and a frozen stale report wedges its
             # backpressure pause while the real buffer drains.
-            def _prop(name, default=None):
-                try:
-                    return getattr(self.mpv, name)
-                except Exception:
-                    return default
-
-            pos = _prop("time_pos")
+            _prop = self._observation
+            pos = _prop("time-pos")
             avsync = _prop("avsync")
-            drop = _prop("frame_drop_count")
-            cache = _prop("demuxer_cache_duration")
-            buffering = bool(_prop("paused_for_cache"))
+            drop = _prop("frame-drop-count")
+            cache = _prop("demuxer-cache-duration")
+            buffering = bool(_prop("paused-for-cache"))
             output = (max(0, round(_prop("volume", 100) or 0)), bool(_prop("mute")))
             if output != self._last_audio_output:
                 self._last_audio_output = output
@@ -1257,8 +1284,8 @@ class MpvPlayerView(QOpenGLWidget):
                 self.client.buffered_ms = buffered_ms
             stable = self._epoch_released and not self._reloading and not bool(_prop("seeking", False))
             if stable:
-                self._cached_audio_delay = float(_prop("audio_delay", 0) or 0)
-                self._cached_sub_delay = float(_prop("sub_delay", 0) or 0)
+                self._cached_audio_delay = float(_prop("audio-delay", 0) or 0)
+                self._cached_sub_delay = float(_prop("sub-delay", 0) or 0)
                 if self._tracks_reported:
                     for kind, prop, cached in (("audio", "aid", self._chosen_audio_id), ("sub", "sid", self._chosen_subtitle_id)):
                         selected = _prop(prop)
@@ -1281,7 +1308,7 @@ class MpvPlayerView(QOpenGLWidget):
                 was_buffering = buffering
                 self.rebuffering.emit(buffering)
             if pos is not None:
-                hwdec = _prop("hwdec_current") or "sw"
+                hwdec = _prop("hwdec-current") or "sw"
                 loopback_mib = buffer_stats["queued_bytes"] / (1024 * 1024)
                 self.position_changed.emit(float(pos))
                 self.stats_changed.emit(

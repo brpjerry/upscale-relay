@@ -11,8 +11,10 @@ from PySide6.QtCore import (
     QDir,
     QEasingCurve,
     QEvent,
+    QObject,
     QPoint,
     QRect,
+    QSize,
     QStandardPaths,
     Qt,
     QTimer,
@@ -248,6 +250,71 @@ def _hint_label(text: str, role: str = "faint") -> QLabel:
     label = QLabel(text)
     label.setProperty("role", role)
     return label
+
+
+class _FrameSlide(QObject):
+    """A chrome slide stepped once per frame the video widget presents.
+
+    QVariantAnimation steps on Qt's 16 ms animation timer: at most 60 steps
+    a second on a 120 Hz display, at moments unrelated to when frames reach
+    the screen. (QAnimationDriver, which would move it onto the frame clock,
+    is not exposed by PySide6.) Here every presented frame (``frameSwapped``)
+    applies the eased value for that moment. A step that moves nothing
+    repaints one pixel of ``nudge`` for the next frame: frameSwapped follows
+    any repaint of the window, and this one costs no mpv render.
+    """
+
+    finished = Signal()
+
+    def __init__(self, view, nudge: QWidget, start: int, end: int, apply, parent=None):
+        super().__init__(parent)
+        self._view = view
+        self._nudge = nudge
+        self._start = start
+        self._end = end
+        self._apply = apply
+        self._curve = emphasized()
+        self._t0 = 0.0
+        self._value: int | None = None
+        self._running = False
+        # Frames stop while the window is unexposed (another workspace);
+        # step on a timer then so the slide still lands.
+        self._stall = QTimer(self)
+        self._stall.setSingleShot(True)
+        self._stall.setInterval(50)
+        self._stall.timeout.connect(self._step)
+
+    def start(self) -> None:
+        self._t0 = time.monotonic()
+        self._value = self._start
+        self._running = True
+        self._view.frameSwapped.connect(self._step)
+        self._step()
+
+    def stop(self) -> None:
+        if self._running:
+            self._running = False
+            self._stall.stop()
+            self._view.frameSwapped.disconnect(self._step)
+
+    def _step(self) -> None:
+        if not self._running:
+            return
+        progress = min(1.0, (time.monotonic() - self._t0) * 1000 / theme.SLOW)
+        eased = self._curve.valueForProgress(progress)
+        value = round(self._start + (self._end - self._start) * eased)
+        if progress >= 1.0:
+            self.stop()
+            if value != self._value:
+                self._apply(value)
+            self.finished.emit()
+            return
+        if value != self._value:
+            self._value = value
+            self._apply(value)
+        else:
+            self._nudge.update(QRect(0, 0, 1, 1))
+        self._stall.start()
 
 
 class MainWindow(DesktopFeatures, QMainWindow):
@@ -730,16 +797,21 @@ class MainWindow(DesktopFeatures, QMainWindow):
         self._cursor_timer.timeout.connect(self._auto_hide_cursor)
 
         self.split = QSplitter()
-        # Resizing a QOpenGLWidget on every handle mouse-move forces mpv and Qt
-        # to rebuild/render its backing FBO continuously. Use Qt's rubber-band
-        # preview and perform the expensive video resize once on release.
-        self.split.setOpaqueResize(False)
+        # Live resizing: every handle move resizes the video widget, which
+        # re-allocates its framebuffer and has mpv render at the new size.
+        # That costs ~1 ms (~6 ms for a 4K source) now that mpv hands frames
+        # over at their display time (video_timing_offset in mpv_view.py).
+        # It cost ~80 ms while render() waited out each frame on this thread,
+        # which is why this used to be rubber-banded. Display sync drops
+        # frames during a drag: mpv counts every extra render as a vsync.
+        self.split.setOpaqueResize(True)
         self.split.setHandleWidth(1)
         # The sidebar and the top bar sit in slots so they can slide away
         # (sidebar toggle, fullscreen) instead of being squeezed or cut.
         self._sidebar_slot = SlideSlot(self.browser_container, Qt.Horizontal)
         self._sidebar_slot.setMinimumWidth(_SIDEBAR_MIN_WIDTH)
-        self._slides: dict[str, QVariantAnimation] = {}
+        self._slides: dict[str, QVariantAnimation | _FrameSlide] = {}
+        self._slide_pinned = False  # the sidebar's hide slide holds the pin
         self.split.addWidget(self._sidebar_slot)
         self.split.addWidget(main_page)
         self.split.setStretchFactor(1, 1)
@@ -1150,11 +1222,14 @@ class MainWindow(DesktopFeatures, QMainWindow):
             if slot.isVisible() and sizes and sizes[0] >= _SIDEBAR_MIN_WIDTH:
                 self._browser_sizes = sizes  # never a collapsed or mid-slide width
             slot.setVisible(False)
+        self._release_slide_pin()  # after the slot: the layout is final now
 
     # -- sliding chrome ---------------------------------------------------------
-    # The sidebar and top bar slide rather than pop. Each step really resizes
-    # the video widget, which is acceptable for a short, bounded glide (unlike
-    # an open-ended splitter drag, which stays rubber-banded).
+    # The sidebar and top bar slide rather than pop, one step per presented
+    # frame (_FrameSlide). Showing the sidebar resizes the video widget at
+    # each step; hiding it pins the video at the size it ends up at and slides
+    # the sidebar off it, as fullscreen does. Pinning the show slide as well
+    # would re-letterbox the video visibly when it unpins.
 
     def _stop_slide(self, key: str) -> None:
         running = self._slides.pop(key, None)
@@ -1162,14 +1237,25 @@ class MainWindow(DesktopFeatures, QMainWindow):
             running.stop()
             running.deleteLater()
 
-    def _slide(self, key: str, start: int, end: int, apply, done) -> None:
+    def _frame_paced(self) -> bool:
+        """Whether slides can step on the video widget's presented frames.
+        Offscreen/headless runs, the preview player and a window that is not
+        on screen present none; those slides keep Qt's animation timer."""
+        handle = self.windowHandle()
+        return (not self.options.headless and hasattr(self.player, "frameSwapped")
+                and self.player.isVisible() and handle is not None and handle.isExposed())
+
+    def _slide(self, key: str, start: int, end: int, apply, done, nudge: QWidget) -> None:
         self._stop_slide(key)
-        animation = QVariantAnimation(self)
-        animation.setDuration(theme.SLOW)
-        animation.setEasingCurve(emphasized())
-        animation.setStartValue(float(start))
-        animation.setEndValue(float(end))
-        animation.valueChanged.connect(lambda value: apply(round(float(value))))
+        if self._frame_paced():
+            animation = _FrameSlide(self.player, nudge, start, end, apply, self)
+        else:
+            animation = QVariantAnimation(self)
+            animation.setDuration(theme.SLOW)
+            animation.setEasingCurve(emphasized())
+            animation.setStartValue(float(start))
+            animation.setEndValue(float(end))
+            animation.valueChanged.connect(lambda value: apply(round(float(value))))
 
         def finished() -> None:
             if self._slides.get(key) is animation:
@@ -1203,11 +1289,22 @@ class MainWindow(DesktopFeatures, QMainWindow):
             self.split.setSizes([width, total - width])
 
         self._stop_slide("sidebar")
+        if visible:
+            self._release_slide_pin()  # reversing a hide: resize from here on
+        elif not self._player_pinned:
+            # Its final size: the full width, the height it has now.
+            self._pin_player(QSize(self._root.width(), self.player.height()))
+            self._slide_pinned = True
         slot.hold(max(current, self._browser_sizes[0]))
         slot.setMinimumWidth(0)
         slot.setVisible(True)
         apply(max(1, current))
-        self._slide("sidebar", current, target, apply, lambda: self._apply_browser_visible(visible))
+        self._slide("sidebar", current, target, apply, lambda: self._apply_browser_visible(visible), slot)
+
+    def _release_slide_pin(self) -> None:
+        if self._slide_pinned:
+            self._slide_pinned = False
+            self._unpin_player()
 
     def _apply_toolbar_visible(self, visible: bool) -> None:
         self._stop_slide("toolbar")
@@ -1230,7 +1327,7 @@ class MainWindow(DesktopFeatures, QMainWindow):
         slot.setFixedHeight(max(1, current))
         slot.setVisible(True)
         self._slide("toolbar", current, target, lambda height: slot.setFixedHeight(max(1, height)),
-                    lambda: self._apply_toolbar_visible(visible))
+                    lambda: self._apply_toolbar_visible(visible), slot)
 
     # -- display pacing policy ----------------------------------------------------
     # With the setting on, the display paces video (fluid interface) except
@@ -1267,6 +1364,7 @@ class MainWindow(DesktopFeatures, QMainWindow):
             # for the whole transition instead: the chrome slides over it and
             # the window reveals or crops it. One resize at the end.
             self._pin_player(self.screen().size() if entering else self.player.size())
+            self._slide_pinned = False  # a sidebar slide's pin is now this one
             self._unpin_timer.start()
         if entering:
             self._settings_visible_before_fullscreen = self._settings_reveal.shown \
@@ -1293,12 +1391,12 @@ class MainWindow(DesktopFeatures, QMainWindow):
 
     def _pin_player(self, size) -> None:
         """Take the video widget out of the layout at ``size`` until
-        ``_unpin_player``; see toggle_fullscreen."""
-        if self._player_pinned:
-            return
-        self._player_pinned = True
+        ``_unpin_player``; see toggle_fullscreen. Pinning it again only
+        changes the size it is held at."""
         self._pinned_size = size
-        self._player_layout.removeWidget(self.player)
+        if not self._player_pinned:
+            self._player_pinned = True
+            self._player_layout.removeWidget(self.player)
         self._hold_pinned_player()
 
     def _hold_pinned_player(self) -> None:

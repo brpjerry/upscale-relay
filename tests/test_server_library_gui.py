@@ -323,8 +323,10 @@ def test_media_metadata_cannot_expand_transport_minimum_width(window):
     assert window.controls_panel.minimumSizeHint().width() == baseline
 
 
-def test_splitter_defers_expensive_video_resize_until_release(window):
-    assert not window.split.opaqueResize()
+def test_splitter_resizes_the_video_live(window):
+    # A resize costs ~1-2 ms once mpv renders at each frame's display time
+    # (video_timing_offset); it was rubber-banded while render() waited.
+    assert window.split.opaqueResize()
 
 
 def test_open_progress_indicator_toggles(window):

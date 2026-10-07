@@ -184,6 +184,43 @@ def local_player():
     player.close()
 
 
+def test_periodic_stats_read_observed_properties_not_native_ones(tmp_path, local_player):
+    """A synchronous property read waits for mpv's core, which can be waiting
+    for the GUI thread to render: two such reads in one stats tick stalled
+    ~210 ms under display sync. Ticks read what mpv's event thread observed."""
+    from qt_helpers import playback_loop
+    from upscale_cli.sample import make_sample
+
+    path = tmp_path / "stats.mkv"
+    make_sample(str(path), frames=240, width=64, height=64, fps=24)
+    player = local_player
+    positions = []
+    player.position_changed.connect(positions.append)
+
+    async def scenario():
+        await player.play_local(str(path))
+        async with asyncio.timeout(5):
+            while not (player._tracks_reported and positions):
+                await asyncio.sleep(0.025)
+        reads = []
+        native = player.mpv._get_property
+        player.mpv._get_property = lambda name, *args, **kwargs: (
+            reads.append(name), native(name, *args, **kwargs))[1]
+        try:
+            ticks = len(positions)
+            await asyncio.sleep(1.2)
+        finally:
+            del player.mpv._get_property
+            player.stop()  # cancel the stats task while this loop still runs
+            await asyncio.sleep(0)
+        assert len(positions) >= ticks + 2
+        assert positions[-1] > positions[ticks - 1]  # live values, not a stale cache
+        assert reads == []
+
+    with playback_loop(QApplication.instance()) as loop:
+        loop.run_until_complete(scenario())
+
+
 def test_idle_inhibition_tracks_native_pause_eof_and_stop(tmp_path, local_player):
     from qt_helpers import playback_loop
     from upscale_cli.sample import make_sample

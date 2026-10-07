@@ -120,8 +120,53 @@ constructor options).
 - A garbage-collected `asyncio.StreamWriter` closes its socket — keep refs.
 - Client must send `buffer_report` on a timer with *live* values; reporting
   only on packet arrival deadlocks the server's watermark pause/resume.
-- Under qasync the loop turns ~once per rendered frame (~25/s) while mpv
-  plays. Media pumps must move batches per loop turn: per-packet
+- Keep mpv's render call blocking (`block_for_target_time`, the default)
+  and keep `video-timing-offset=0` (set in `mpv_view.py`, re-asserted after
+  `mpv.conf`). With mpv's default offset (0.05 s) a frame is announced ~one
+  period early and `render()` waits the difference out on the GUI thread
+  (~40 of every 42 ms at 24 fps): sidebar slides ran at 12-14 fps, a live
+  splitter drag at 9 fps (230 ms behind the pointer), and only 83-85% of
+  frames landed on the 5-vsync cadence of 24 fps at 120 Hz. With offset 0
+  the frame is announced at its display time and `render()` returns at once:
+  paints ~2.5 ms, frames submitted 3 ms median after target (p95 5-6 ms),
+  99.6-100% on cadence, 0 drops (2026-10-07, Lunar Lake 120 Hz; MV Player
+  has run offset 0 since its first commit). The rejected alternatives never
+  included offset 0. Measured on 2026-10-03 and rejected: rendering without
+  `block_for_target_time` shows every frame a period early (39.5 ms at 24 fps,
+  video ahead of audio, invisible to mpv's `avsync`); waiting on a Qt timer
+  for `next_frame_info.target_time` (nanoseconds, despite the header) is on
+  time in steady state, but any other repaint of the video widget then
+  consumes the pending frame early, and `screenshot-raw` intermittently
+  stalls frame delivery ~0.3 s (with offset 0 and the blocking call, 15 s of
+  sampling once a second dropped nothing).
+- A fluid UI during playback no longer needs display sync. With
+  `video-timing-offset=0` the GUI thread is free between frames: chrome
+  slides step once per presented frame (`_FrameSlide`, on the video widget's
+  `frameSwapped`, with a timer fallback while the window is unexposed;
+  100-120 fps at 1080p, 0 drops) and the splitter resizes live (~110 fps,
+  edge 2-3 px behind the pointer, ~15 ms lag). "Fluid interface during
+  playback" (off by default) still opts into mpv's display sync: it hands
+  timing back to mpv ~0.9 s after entering fullscreen, where display pacing
+  costs +3 W, and mpv switches either way in ~0.2 s with no drop
+  (`_apply_display_pacing`); `MpvPlayerView` reports the screen's refresh
+  rate (`display-fps-override`; the render API cannot see the display), so
+  `video-sync=display-*` renders once per refresh. Display sync drops video
+  whenever the video widget resizes, because mpv counts every extra
+  `render()` as a vsync: 13-18 drops per sidebar show slide (2-3 for the
+  pinned hide slide) and 70-77 per live splitter drag. `interpolation` only
+  blends frames. Under display sync `screenshot-raw` holds mpv's rendering
+  up ~0.3 s, so the auto accent samples only at open/seek/pause there
+  (`_request_accent_sample`).
+- No synchronous mpv property reads in periodic GUI-thread code. A read
+  waits for mpv's core, which can be waiting for the GUI thread to render:
+  two of `_stats_loop`'s reads stalled ~210 ms under display sync. The stats
+  tick reads `_OBSERVED_PROPERTIES`, cached by mpv's event thread (they stay
+  live while paused, so `buffer_report` still carries live values). mpv never
+  announces `display-sync-active` changes; `display_sync_active()` reads the
+  observed `vsync-ratio`, which exists exactly while display sync is active.
+- Under qasync the loop turned ~once per rendered frame (~25/s) while
+  `render()` waited out each frame (before `video-timing-offset=0`). Media
+  pumps must move batches per loop turn regardless: per-packet
   `to_thread`+`drain` capped the uplink at ~12 pkt/s (starved the server
   below realtime), and the 64 KiB StreamReader default capped the downlink
   at ~1.6 MB/s. See `_UPLINK_BATCH` / `_DOWNLINK_READ_LIMIT` in
