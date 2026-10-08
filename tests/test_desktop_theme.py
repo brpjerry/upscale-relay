@@ -259,12 +259,17 @@ def test_fullscreen_slides_the_chrome_out_and_restores_it(window):
     assert window.controls_panel.isVisible()
 
 
-def test_auto_accent_samples_only_at_restarts_under_display_sync(window):
+def test_auto_accent_samples_only_at_open_seek_and_pause(window):
+    # Each raw screenshot holds mpv's frame delivery up; sampled every 2 s,
+    # 13-14% of fullscreen frames landed a refresh or more off schedule.
     requests = []
     window.player.request_frame_sample = lambda: requests.append(1)
-    window.player.display_sync_active = lambda: True
     window._session_source = "server_file"
     window._accent_sample_due = True
+    window._awaiting_first_frame = True
+    window._request_accent_sample()          # not before the first frame
+    assert requests == []
+    window._awaiting_first_frame = False
     window._request_accent_sample()
     window._request_accent_sample()          # periodic ticks after the first are skipped
     assert len(requests) == 1
@@ -273,11 +278,8 @@ def test_auto_accent_samples_only_at_restarts_under_display_sync(window):
     assert len(requests) == 1
     window._on_position(30.1)
     window._request_accent_sample()
-    assert len(requests) == 2
-    window.player.display_sync_active = lambda: False
-    window._request_accent_sample()          # audio sync: every tick samples
     window._request_accent_sample()
-    assert len(requests) == 4
+    assert len(requests) == 2
     window._session_source = None
 
 
@@ -292,9 +294,9 @@ def test_display_pacing_is_opt_in_and_follows_fullscreen(window):
     window.show()
     window.toggle_fullscreen()
     assert calls[-1] is True                      # still paced by the display while the chrome slides
-    assert wait_until(lambda: calls[-1] is False)  # the transition settles: mpv's own timing
+    assert wait_until(lambda: calls[-1] is False)  # settled in fullscreen: mpv's own timing
     window.toggle_fullscreen()
-    assert calls[-1] is True                      # fluid again before the exit motion
+    assert calls[-1] is True                      # paced by the display again before the exit motion
     window.display_sync_check.setChecked(False)
     assert calls[-1] is False
 
@@ -317,8 +319,15 @@ def test_video_timing_hint_explains_switch_and_mode_together(window):
     assert "set but inactive" in window.display_sync_hint.text()
     window.display_sync_check.setChecked(True)
     assert "while the window is not fullscreen" in window.display_sync_hint.text()
-    window._refresh_mpv_controls({**values, "video-sync": "audio"})
+    window._refresh_mpv_controls({**values, "video-sync": "display-resample", "interpolation": "yes"})
+    assert "Motion interpolation works only while the window is not fullscreen" in window.display_sync_hint.text()
+    window._refresh_mpv_controls({**values, "video-sync": "audio", "interpolation": "yes"})
     assert "No effect yet" in window.display_sync_hint.text()
+    assert "Motion interpolation is on but has no effect" in window.display_sync_hint.text()
+    window.display_sync_check.setChecked(False)
+    window._refresh_mpv_controls({**values, "video-sync": "audio", "interpolation": "no"})
+    assert window.display_sync_hint.text() == "Video is paced by audio, mpv's default. The mode is saved to mpv.conf."
+    window._refresh_mpv_controls({**values, "video-sync": "audio"})
     window._refresh_mpv_controls({**values, "video-sync": "display-tempo"})  # from mpv.conf, not offered
     assert sync.currentData() == "display-tempo" and sync.currentText() == "Configured: display-tempo"
 
@@ -385,20 +394,6 @@ def test_reversing_fullscreen_midway_continues_the_control_bar_from_where_it_is(
     assert window.controls_panel.isVisible() and not window._controls_dock.isVisible()
 
 
-def test_display_sync_state_follows_the_observed_vsync_ratio():
-    pytest.importorskip("mpv")
-    from types import SimpleNamespace
-    from desktop_client.mpv_view import MpvPlayerView
-    # mpv never announces a change of display-sync-active; vsync-ratio is
-    # observable and exists exactly while display sync is active.
-    player = SimpleNamespace(options=SimpleNamespace(headless=False), _reloading=False, _observed={})
-    assert not MpvPlayerView.display_sync_active(player)
-    player._observed["vsync-ratio"] = 5.0
-    assert MpvPlayerView.display_sync_active(player)
-    player._observed["vsync-ratio"] = None
-    assert not MpvPlayerView.display_sync_active(player)
-
-
 def test_sidebar_hide_pins_the_video_at_the_size_it_lands_at(window):
     window.resize(1100, 600)
     window.show()
@@ -451,52 +446,69 @@ class _FrameSource(QObject):
     frameSwapped = Signal()
 
 
-def _frame_slide(start=0, end=300):
-    from desktop_client.main_window import _FrameSlide
+def _frame_animation(start=0, end=300, frames=True):
+    from desktop_client.widgets import FrameAnimation, emphasized
     QApplication.instance() or QApplication([])
     view, nudge = _FrameSource(), QWidget()
     values, landed = [], []
-    slide = _FrameSlide(view, nudge, start, end, values.append)
-    slide.finished.connect(lambda: landed.append(values[-1] if values else None))
-    return slide, view, nudge, values, landed
+    animation = FrameAnimation(frames=(lambda: view.frameSwapped) if frames else None, nudge=nudge)
+    animation.setDuration(theme.SLOW)
+    animation.setEasingCurve(emphasized())
+    animation.setStartValue(start)
+    animation.setEndValue(end)
+    animation.valueChanged.connect(values.append)
+    animation.finished.connect(lambda: landed.append(values[-1] if values else None))
+    return animation, view, nudge, values, landed
 
 
-def test_frame_slide_steps_once_per_presented_frame_and_lands():
-    slide, view, _nudge, values, landed = _frame_slide()
-    slide.start()
+def test_frame_animation_steps_once_per_presented_frame_and_lands():
+    animation, view, _nudge, values, landed = _frame_animation()
+    animation.start()
+    assert animation.frame_paced
+    steps = len(values)
+    view.frameSwapped.emit()
+    assert len(values) == steps + 1  # one step per presented frame
     for _ in range(500):
         if landed:
             break
         QTest.qWait(8)
         view.frameSwapped.emit()
-    assert values == sorted(values) and len(set(values)) == len(values)  # applied only when it moves
-    assert len(values) > 10 and landed == [300]
+    assert values == sorted(values) and len(values) > 10 and landed == [300.0]
+    count = len(values)
     view.frameSwapped.emit()  # finished: later frames change nothing
-    assert landed == [300] and values[-1] == 300
+    assert len(values) == count and not animation.frame_paced
 
 
-def test_frame_slide_lands_when_no_frames_are_presented():
-    # An unexposed window presents nothing; the slide must still finish.
-    slide, _view, _nudge, values, landed = _frame_slide()
-    slide.start()
+def test_frame_animation_lands_when_no_frames_are_presented():
+    # An unexposed window presents nothing; the animation must still finish.
+    animation, _view, _nudge, values, landed = _frame_animation()
+    animation.start()
     assert wait_until(lambda: landed, timeout_ms=theme.SLOW + 1000)
-    assert landed == [300] and values[-1] == 300
+    assert landed == [300.0]
 
 
-def test_stopped_frame_slide_ignores_later_frames():
-    slide, view, _nudge, values, landed = _frame_slide()
-    slide.start()
+def test_stopped_frame_animation_ignores_later_frames():
+    animation, view, _nudge, values, landed = _frame_animation()
+    animation.start()
     QTest.qWait(30)
     view.frameSwapped.emit()
-    slide.stop()
+    animation.stop()
     applied = list(values)
     view.frameSwapped.emit()
     QTest.qWait(120)  # past the stall interval too
     assert values == applied and not landed
 
 
+def test_frame_animation_without_frames_is_a_timed_animation():
+    # The tray GUI and offscreen runs have no frames to follow.
+    animation, _view, _nudge, values, landed = _frame_animation(frames=False)
+    animation.start()
+    assert not animation.frame_paced
+    assert wait_until(lambda: landed, timeout_ms=theme.SLOW + 1000)
+    assert values[-1] == 300.0
+
+
 def test_window_slides_step_on_the_video_frames_when_it_presents_them(window, monkeypatch):
-    from desktop_client.main_window import _FrameSlide
     source = _FrameSource(window)
     window.player.frameSwapped = source.frameSwapped
     monkeypatch.setattr(window, "_frame_paced", lambda: True)
@@ -508,10 +520,10 @@ def test_window_slides_step_on_the_video_frames_when_it_presents_them(window, mo
     QApplication.instance().processEvents()
     width = window.split.sizes()[0]
     window.browser_toggle.setChecked(False)
-    assert isinstance(window._slides["sidebar"], _FrameSlide)
+    assert window._slides["sidebar"].frame_paced
     assert wait_until(lambda: not window._sidebar_slot.isVisible())
     window.browser_toggle.setChecked(True)
-    assert isinstance(window._slides["sidebar"], _FrameSlide)
+    assert window._slides["sidebar"].frame_paced
     assert wait_until(lambda: window._sidebar_slot.isVisible() and window.split.sizes()[0] == width)
     frames.stop()
 
@@ -523,6 +535,7 @@ def test_resize_skips_the_render_qt_would_discard_and_requests_one_that_shows():
     renders = []
     player = SimpleNamespace(
         _ctx=SimpleNamespace(render=lambda **kw: renders.append(kw)), _resizing=True,
+        _scaling=False, _picture_fbo=None,
         devicePixelRatioF=lambda: 1.0, defaultFramebufferObject=lambda: 1,
         width=lambda: 64, height=lambda: 36,
     )
@@ -585,3 +598,151 @@ def test_pointer_calls_the_bar_back_while_it_slides_away(window):
     finally:
         window.toggle_fullscreen()
     assert wait_until(lambda: window._controls_layout.indexOf(window.controls_panel) == 1)
+
+
+def test_fit_letterboxes_and_pillarboxes():
+    pytest.importorskip("mpv")
+    from desktop_client.mpv_view import _fit
+    assert _fit(1440, 900, 16 / 9) == (0.0, 45.0, 1440.0, 810.0)
+    assert _fit(2000, 900, 16 / 9) == pytest.approx((200.0, 0.0, 1600.0, 900.0))
+
+
+def test_resizes_scale_the_picture_only_when_mpv_simply_letterboxes_it():
+    pytest.importorskip("mpv")
+    from types import SimpleNamespace
+    from desktop_client.mpv_view import MpvPlayerView
+    plain = {"dwidth": 1920, "dheight": 1080, "panscan": 0.0, "video-zoom": 0.0, "keepaspect": True,
+             "video-unscaled": False, "video-rotate": 0}
+    player = SimpleNamespace(_ctx=object(), _scaling_broken=False, _observed=dict(plain))
+    assert MpvPlayerView._picture_aspect(player) == pytest.approx(16 / 9)
+    for name, value in (("panscan", 1.0), ("video-zoom", 0.5), ("video-pan-x", 0.1), ("video-align-y", 1.0),
+                        ("video-unscaled", True), ("video-rotate", 90), ("keepaspect", False), ("dwidth", None)):
+        player._observed = {**plain, name: value}
+        assert MpvPlayerView._picture_aspect(player) is None, name  # rendered at every size instead
+    player._observed = dict(plain)
+    player._scaling_broken = True
+    assert MpvPlayerView._picture_aspect(player) is None
+
+
+class _FakeFbo:
+    handles = iter(range(100, 200))
+
+    def __init__(self, size):
+        self._size = size
+        self._handle = next(self.handles)
+
+    def width(self):
+        return self._size.width()
+
+    def height(self):
+        return self._size.height()
+
+    def handle(self):
+        return self._handle
+
+
+class _GlRecorder:
+    def __init__(self):
+        self.calls = []
+
+    def __getattr__(self, name):
+        return lambda *args: self.calls.append((name, args))
+
+
+def test_scaled_paint_maps_the_picture_onto_where_mpv_would_put_it(monkeypatch):
+    pytest.importorskip("mpv")
+    from types import SimpleNamespace
+    from desktop_client import mpv_view
+    from desktop_client.mpv_view import MpvPlayerView
+    gl = _GlRecorder()
+    monkeypatch.setattr(mpv_view, "QOpenGLContext",
+                        SimpleNamespace(currentContext=lambda: SimpleNamespace(extraFunctions=lambda: gl)))
+    monkeypatch.setattr(mpv_view, "QOpenGLFramebufferObject", _FakeFbo)
+    renders, frames = [], [False]
+    player = SimpleNamespace(
+        _ctx=SimpleNamespace(update=lambda: frames[0], render=lambda **kw: renders.append(kw["opengl_fbo"])),
+        _picture_fbo=None, _picture_due=True, _picture_aspect=lambda: 16 / 9,
+        defaultFramebufferObject=lambda: 7,
+    )
+    # The resize starts: the current frame goes into our own framebuffer once.
+    assert MpvPlayerView._paint_scaled(player, 2254, 1472)
+    first = player._picture_fbo
+    assert renders == [{"fbo": first.handle(), "w": 2254, "h": 1472}]
+    # Grown to fullscreen with no new video frame: no render, only a blit,
+    # scaled so the picture lands on its fullscreen letterbox (0, 90, 2880x1620).
+    gl.calls.clear()
+    assert MpvPlayerView._paint_scaled(player, 2880, 1800)
+    assert len(renders) == 1
+    blit = next(args for name, args in gl.calls if name == "glBlitFramebuffer")
+    src = blit[:4]
+    dst = blit[4:8]
+    assert src == (0, 0, 2254, 1472)
+    scale = 2880 / 2254
+    picture_bottom = dst[1] + (1472 - 2254 * 9 / 16) / 2 * scale
+    assert dst[0] == 0 and dst[2] == 2880
+    assert picture_bottom == pytest.approx(90, abs=1)
+    assert ("glBindFramebuffer", (mpv_view._GL_DRAW_FRAMEBUFFER, 7)) in gl.calls
+    # A new video frame once the view has outgrown the picture: re-rendered at this size.
+    frames[0] = True
+    assert MpvPlayerView._paint_scaled(player, 2880, 1800)
+    assert player._picture_fbo is not first
+    assert renders[-1] == {"fbo": player._picture_fbo.handle(), "w": 2880, "h": 1800}
+
+
+def test_a_failing_scaled_paint_falls_back_instead_of_escaping_the_qt_virtual():
+    pytest.importorskip("mpv")
+    from types import SimpleNamespace
+    from desktop_client.mpv_view import MpvPlayerView
+    renders, logged = [], []
+
+    def broken(_width, _height):
+        raise RuntimeError("no blit")
+
+    player = SimpleNamespace(
+        _ctx=SimpleNamespace(render=lambda **kw: renders.append(kw["opengl_fbo"])),
+        _resizing=False, _scaling=True, _scaling_broken=False, _picture_fbo=None,
+        _paint_scaled=broken, devicePixelRatioF=lambda: 2.0, width=lambda: 100, height=lambda: 50,
+        defaultFramebufferObject=lambda: 7, log_message=SimpleNamespace(emit=lambda *args: logged.append(args)),
+    )
+    MpvPlayerView.paintGL(player)  # an exception here would be a native crash
+    assert renders == [{"fbo": 7, "w": 200, "h": 100}]
+    assert player._scaling_broken and not player._scaling and logged
+
+
+def test_resizing_settles_into_one_sharp_render():
+    pytest.importorskip("mpv")
+    from desktop_client.mpv_view import MpvPlayerView
+    QApplication.instance() or QApplication([])
+    player = MpvPlayerView(options=DesktopOptions(headless=True, settings_scope=SCOPE))
+    try:
+        player._picture_aspect = lambda: 16 / 9
+        updates = []
+        player.update = lambda *args: updates.append(args)
+        player.resize(320, 180)
+        player.show()
+        player.resize(400, 200)
+        assert player._scaling and player._picture_due
+        updates.clear()
+        assert wait_until(lambda: not player._scaling, timeout_ms=1000)
+        assert updates  # the sharp render at the settled size
+    finally:
+        player.close()
+        player.mpv.terminate()
+
+
+def test_overlays_step_on_the_video_frames_when_it_presents_them(window, monkeypatch):
+    source = _FrameSource(window)
+    window.player.frameSwapped = source.frameSwapped
+    monkeypatch.setattr(window, "_frame_paced", lambda: True)
+    frames = QTimer(window)
+    frames.timeout.connect(source.frameSwapped.emit)
+    frames.start(8)
+    window.resize(1100, 600)
+    window.show()
+    QApplication.instance().processEvents()
+    window.tracks_btn.setChecked(True)
+    assert window._track_reveal._animation.frame_paced
+    assert wait_until(lambda: window._track_reveal._t == 1.0)
+    window.tracks_btn.setChecked(False)
+    assert wait_until(lambda: not window.track_panel.isVisible())
+    frames.stop()

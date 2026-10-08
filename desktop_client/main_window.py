@@ -11,7 +11,6 @@ from PySide6.QtCore import (
     QDir,
     QEasingCurve,
     QEvent,
-    QObject,
     QPoint,
     QRect,
     QSize,
@@ -78,6 +77,7 @@ from .widgets import (
     IdleHint,
     Logo,
     PlayerOverlay,
+    FrameAnimation,
     Reveal,
     SidePanel,
     SlideSlot,
@@ -246,71 +246,6 @@ def _hint_label(text: str, role: str = "faint") -> QLabel:
     label = QLabel(text)
     label.setProperty("role", role)
     return label
-
-
-class _FrameSlide(QObject):
-    """A chrome slide stepped once per frame the video widget presents.
-
-    QVariantAnimation steps on Qt's 16 ms animation timer: at most 60 steps
-    a second on a 120 Hz display, at moments unrelated to when frames reach
-    the screen. (QAnimationDriver, which would move it onto the frame clock,
-    is not exposed by PySide6.) Here every presented frame (``frameSwapped``)
-    applies the eased value for that moment. A step that moves nothing
-    repaints one pixel of ``nudge`` for the next frame: frameSwapped follows
-    any repaint of the window, and this one costs no mpv render.
-    """
-
-    finished = Signal()
-
-    def __init__(self, view, nudge: QWidget, start: int, end: int, apply, parent=None):
-        super().__init__(parent)
-        self._view = view
-        self._nudge = nudge
-        self._start = start
-        self._end = end
-        self._apply = apply
-        self._curve = emphasized()
-        self._t0 = 0.0
-        self._value: int | None = None
-        self._running = False
-        # Frames stop while the window is unexposed (another workspace);
-        # step on a timer then so the slide still lands.
-        self._stall = QTimer(self)
-        self._stall.setSingleShot(True)
-        self._stall.setInterval(50)
-        self._stall.timeout.connect(self._step)
-
-    def start(self) -> None:
-        self._t0 = time.monotonic()
-        self._value = self._start
-        self._running = True
-        self._view.frameSwapped.connect(self._step)
-        self._step()
-
-    def stop(self) -> None:
-        if self._running:
-            self._running = False
-            self._stall.stop()
-            self._view.frameSwapped.disconnect(self._step)
-
-    def _step(self) -> None:
-        if not self._running:
-            return
-        progress = min(1.0, (time.monotonic() - self._t0) * 1000 / theme.SLOW)
-        eased = self._curve.valueForProgress(progress)
-        value = round(self._start + (self._end - self._start) * eased)
-        if progress >= 1.0:
-            self.stop()
-            if value != self._value:
-                self._apply(value)
-            self.finished.emit()
-            return
-        if value != self._value:
-            self._value = value
-            self._apply(value)
-        else:
-            self._nudge.update(QRect(0, 0, 1, 1))
-        self._stall.start()
 
 
 class MainWindow(DesktopFeatures, QMainWindow):
@@ -802,7 +737,7 @@ class MainWindow(DesktopFeatures, QMainWindow):
         # (sidebar toggle, fullscreen) instead of being squeezed or cut.
         self._sidebar_slot = SlideSlot(self.browser_container, Qt.Horizontal)
         self._sidebar_slot.setMinimumWidth(_SIDEBAR_MIN_WIDTH)
-        self._slides: dict[str, QVariantAnimation | _FrameSlide] = {}
+        self._slides: dict[str, FrameAnimation] = {}
         self._slide_pinned = False  # the sidebar's hide slide holds the pin
         self.split.addWidget(self._sidebar_slot)
         self.split.addWidget(main_page)
@@ -834,11 +769,12 @@ class MainWindow(DesktopFeatures, QMainWindow):
         self.playback_settings.hide()
         # Motion: the track card rises and fades in, the settings sheet slides
         # in from the edge, the fullscreen bar slides up from below.
-        self._track_reveal = Reveal(self.track_panel, offset=QPoint(0, 12))
-        self._settings_reveal = Reveal(self.playback_settings, offset=QPoint(48, 0))
+        # All three step on the video's presented frames (FrameAnimation).
+        self._track_reveal = Reveal(self.track_panel, offset=QPoint(0, 12), frames=self._frame_clock)
+        self._settings_reveal = Reveal(self.playback_settings, offset=QPoint(48, 0), frames=self._frame_clock)
         self._controls_reveal = Reveal(
             self.controls_panel, offset=QPoint(0, self.controls_panel.height()), fade=False,
-            show_ms=theme.NORMAL, easing=QEasingCurve(QEasingCurve.OutCubic))
+            show_ms=theme.NORMAL, easing=QEasingCurve(QEasingCurve.OutCubic), frames=self._frame_clock)
         # Installed only now: eventFilter reads the widgets created above, and
         # an exception raised inside a Qt virtual is a native crash.
         self.player.installEventFilter(self)  # reposition overlay on resize
@@ -996,7 +932,7 @@ class MainWindow(DesktopFeatures, QMainWindow):
         self._accent_glide.valueChanged.connect(self._on_accent_step)
         self._accent_glide.finished.connect(self._on_accent_landed)
         self._sample_timer = QTimer(self)
-        self._sample_timer.setInterval(2000)  # each sample costs mpv a frame conversion
+        self._sample_timer.setInterval(1000)  # waits for a restart to land; see below
         self._sample_timer.timeout.connect(self._request_accent_sample)
         if hasattr(self.player, "frame_sampled"):
             self.player.frame_sampled.connect(self._on_frame_sampled)
@@ -1052,15 +988,14 @@ class MainWindow(DesktopFeatures, QMainWindow):
                 self._glide_accent(theme.DEFAULT_ACCENT, theme.ACCENT_FADE)
 
     def _request_accent_sample(self) -> None:
-        if self._awaiting_first_frame or self._pending_seek_s is not None:
-            return
-        # A raw screenshot is free while mpv waits for a frame's time inside
-        # its render call (audio sync). Under display sync it holds mpv's
-        # rendering up ~0.3 s, a visible hitch, so there the picture is
-        # sampled only where one cannot be seen: as playback (re)starts after
-        # opening or seeking, and when paused.
-        display_synced = getattr(self.player, "display_sync_active", lambda: False)()
-        if display_synced and not self._accent_sample_due:
+        # The picture is sampled once as playback (re)starts after opening or
+        # seeking, and when paused (on_play_pause), never periodically. A raw
+        # screenshot of the full frame holds mpv's frame delivery up: sampling
+        # every 2 s put 13-14% of frames a refresh or more off schedule in
+        # fullscreen relay playback (2026-10-07; ~1% without it), and the old
+        # blocking render 22%, though mpv counted no dropped frames.
+        if (not self._accent_sample_due or self._awaiting_first_frame
+                or self._pending_seek_s is not None):
             return
         self._accent_sample_due = False
         self.player.request_frame_sample()
@@ -1069,11 +1004,10 @@ class MainWindow(DesktopFeatures, QMainWindow):
         if self.settings.accent != "auto" or self._session_source is None:
             return
         sample = theme.accent_from_frame(image)
-        if (sample.hslSaturationF() < 0.1
-                and getattr(self.player, "display_sync_active", lambda: False)()):
-            # Under display sync this one sample stands until the next seek
-            # or pause; a colourless frame (a logo, a fade) should not leave
-            # the interface grey for that long.
+        if sample.hslSaturationF() < 0.1:
+            # One sample stands until the next seek or pause; a colourless
+            # frame (a logo, a fade) should not leave the interface grey for
+            # that long.
             sample = QColor(theme.DEFAULT_ACCENT)
         # Blend with the previous samples so quick cuts do not make the UI
         # flicker, but lean on the newest one so it still keeps up.
@@ -1226,7 +1160,7 @@ class MainWindow(DesktopFeatures, QMainWindow):
 
     # -- sliding chrome ---------------------------------------------------------
     # The sidebar, top bar and (around fullscreen) control bar slide rather
-    # than pop, one step per presented frame (_FrameSlide), resizing the video
+    # than pop, one step per presented frame (FrameAnimation), resizing the video
     # widget at each step. Only the sidebar toggle's hide slide pins the video
     # instead, at the size it ends up at, and slides the sidebar off it.
     # Pinning a show slide would re-letterbox the video visibly when it
@@ -1239,24 +1173,38 @@ class MainWindow(DesktopFeatures, QMainWindow):
             running.deleteLater()
 
     def _frame_paced(self) -> bool:
-        """Whether slides can step on the video widget's presented frames.
+        """Whether animations can step on the video widget's presented frames.
         Offscreen/headless runs, the preview player and a window that is not
-        on screen present none; those slides keep Qt's animation timer."""
+        on screen present none; those keep Qt's animation timer."""
         handle = self.windowHandle()
         return (not self.options.headless and hasattr(self.player, "frameSwapped")
                 and self.player.isVisible() and handle is not None and handle.isExposed())
 
+    def _frame_clock(self):
+        """The presented-frame signal animations step on, or None (FrameAnimation).
+        Asked as an animation starts, which can be inside a Qt virtual (an event
+        filter): an exception there is a native crash, so a player already
+        deleted at shutdown simply has no frames."""
+        try:
+            return self.player.frameSwapped if self._frame_paced() else None
+        except RuntimeError:
+            return None
+
     def _slide(self, key: str, start: int, end: int, apply, done, nudge: QWidget) -> None:
         self._stop_slide(key)
-        if self._frame_paced():
-            animation = _FrameSlide(self.player, nudge, start, end, apply, self)
-        else:
-            animation = QVariantAnimation(self)
-            animation.setDuration(theme.SLOW)
-            animation.setEasingCurve(emphasized())
-            animation.setStartValue(float(start))
-            animation.setEndValue(float(end))
-            animation.valueChanged.connect(lambda value: apply(round(float(value))))
+        animation = FrameAnimation(self, frames=self._frame_clock, nudge=nudge)
+        animation.setDuration(theme.SLOW)
+        animation.setEasingCurve(emphasized())
+        animation.setStartValue(start)
+        animation.setEndValue(end)
+        applied = [None]
+
+        def step(value: float) -> None:
+            value = round(value)
+            if value != applied[0]:  # each one is a layout pass
+                applied[0] = value
+                apply(value)
+        animation.valueChanged.connect(step)
 
         def finished() -> None:
             if self._slides.get(key) is animation:
@@ -1331,11 +1279,14 @@ class MainWindow(DesktopFeatures, QMainWindow):
                     lambda: self._apply_toolbar_visible(visible), slot)
 
     # -- display pacing policy ----------------------------------------------------
-    # With the setting on, the display paces video (fluid interface) except
-    # once the window has settled in fullscreen, where mpv's own frame timing
-    # is worth more than a fluid interface and the display pacing costs ~3 W.
-    # The transition itself stays paced by the display in both directions;
-    # mpv switches within ~0.2 s either way without dropping a frame.
+    # With the setting on, the display paces video while the window is not
+    # fullscreen and through fullscreen transitions; settled in fullscreen,
+    # mpv keeps its own (audio) timing. Measured on battery (2026-10-07):
+    # display pacing renders every refresh and costs ~3 W, and a gpu-hq
+    # mpv.conf could not render every 120 Hz refresh at fullscreen size
+    # (~17% missed: ~360 mistimed frames a minute). Audio timing already lands
+    # 24 fps on a 120 Hz cadence 99.6% of the time. mpv switches within
+    # ~0.2 s either way without dropping a frame.
 
     def _apply_display_pacing(self) -> None:
         if not hasattr(self.player, "set_display_rate_reporting"):
@@ -1351,7 +1302,7 @@ class MainWindow(DesktopFeatures, QMainWindow):
         entering = not self.isFullScreen()
         self._pacing_timer.stop()
         self._fullscreen_settled = False
-        self._apply_display_pacing()  # leaving: fluid again before anything moves
+        self._apply_display_pacing()  # leaving: paced by the display again
         if entering:
             self._pacing_timer.start()  # entering: hand timing back once settled
         self.tracks_btn.setChecked(False)

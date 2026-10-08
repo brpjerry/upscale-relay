@@ -55,11 +55,14 @@ class DesktopFeatures:
         # Video timing: how mpv paces frames. The switch is ours; the mode is
         # mpv's own video-sync option and lives in mpv.conf with the defaults.
         timing_form = group("Video timing")
-        self.display_sync_check = FlatSwitch("Fluid interface during playback")
+        self.display_sync_check = FlatSwitch("Sync video to the display while windowed")
         self.display_sync_check.setChecked(self.settings.display_sync)
         self.display_sync_check.setToolTip(
-            "Tell mpv the display's refresh rate so a display synchronization mode can take effect "
-            "while the window is not fullscreen and while entering or leaving fullscreen.")
+            "Tell mpv the display's refresh rate while the window is not fullscreen. It cannot see the "
+            "display from inside this player, so its Display synchronization modes, and Motion "
+            "interpolation, which needs one, only take effect with this on. In fullscreen mpv keeps "
+            "its own timing: pacing by the display renders every refresh, costs about 3 W more on "
+            "battery, and a demanding mpv.conf could not keep up at fullscreen size.")
         self.display_sync_check.toggled.connect(self._set_display_sync)
         timing_form.addRow(self.display_sync_check)
         self.display_sync_hint = QLabel()
@@ -294,9 +297,10 @@ class DesktopFeatures:
         """Say what the switch and the mode add up to; either alone does nothing."""
         mode = self._next_defaults.get("video-sync", "audio")
         display_mode = mode.startswith("display-")
-        if self.settings.display_sync and display_mode:
-            text = ("Video is paced by the display while the window is not fullscreen and through "
-                    "fullscreen transitions; settled in fullscreen, mpv keeps its own frame timing.")
+        paced_by_display = self.settings.display_sync and display_mode
+        if paced_by_display:
+            text = ("Video is paced by the display while the window is not fullscreen; "
+                    "in fullscreen mpv keeps its own timing.")
         elif self.settings.display_sync:
             text = ("No effect yet: Video synchronization is set to audio. "
                     "Choose a Display mode to pace video by the display.")
@@ -304,8 +308,10 @@ class DesktopFeatures:
             text = (f"{mode} is set but inactive: mpv cannot see the display from inside this player. "
                     "Turn the switch on to let it take effect.")
         else:
-            text = ("Video is paced by audio. During playback the interface updates once per video frame. "
-                    "The mode is saved to mpv.conf.")
+            text = "Video is paced by audio, mpv's default. The mode is saved to mpv.conf."
+        if self._next_defaults.get("interpolation") == "yes":
+            text += (" Motion interpolation works only while the window is not fullscreen." if paced_by_display
+                     else " Motion interpolation is on but has no effect until video is paced by the display.")
         self.display_sync_hint.setText(text)
 
     def _set_accent(self, value):

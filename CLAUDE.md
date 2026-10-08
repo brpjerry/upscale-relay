@@ -119,31 +119,45 @@ constructor options).
   stalls frame delivery ~0.3 s (with offset 0 and the blocking call, 15 s of
   sampling once a second dropped nothing).
 - A fluid UI during playback no longer needs display sync. With
-  `video-timing-offset=0` the GUI thread is free between frames: chrome
-  slides step once per presented frame (`_FrameSlide`, on the video widget's
-  `frameSwapped`, with a timer fallback while the window is unexposed;
-  100-120 fps at 1080p, 0 drops) and the splitter resizes live (~110 fps,
-  edge 2-3 px behind the pointer, ~15 ms lag). "Fluid interface during
-  playback" (off by default) still opts into mpv's display sync: it hands
-  timing back to mpv ~0.9 s after entering fullscreen, where display pacing
-  costs +3 W, and mpv switches either way in ~0.2 s with no drop
-  (`_apply_display_pacing`); `MpvPlayerView` reports the screen's refresh
-  rate (`display-fps-override`; the render API cannot see the display), so
-  `video-sync=display-*` renders once per refresh. Display sync still drops
-  some video while the video widget resizes, because mpv counts every extra
-  `render()` as a vsync: 3-12 drops per sidebar show slide, 2-5 for the
-  pinned hide slide, 3-7 per live splitter drag and 2-8 per fullscreen
-  transition (13-18 and 70-77 before the skipped resize render, below).
-  `interpolation` only blends frames. Under display sync `screenshot-raw` holds mpv's rendering
-  up ~0.3 s, so the auto accent samples only at open/seek/pause there
-  (`_request_accent_sample`).
+  `video-timing-offset=0` the GUI thread is free between frames. Chrome
+  slides and the overlays (control bar, track card, settings sheet) step
+  once per presented frame (`widgets.FrameAnimation` on the video widget's
+  `frameSwapped`; a timer while the window is unexposed, and plain
+  QVariantAnimation, capped near 60 steps/s by Qt's 16 ms timer, where no
+  frames are presented, e.g. the tray GUI): 100-120 fps at 1080p on AC
+  (the fullscreen control bar went from ~15 to ~100-116 updates/s), ~80-100
+  on battery's low-power profile. The splitter resizes live (~110 fps,
+  edge 2-3 px behind the pointer, ~15 ms lag). "Sync video to the display
+  while windowed" (off by default; formerly "Fluid interface during
+  playback") opts into mpv's display sync: `MpvPlayerView` reports the
+  screen's refresh rate (`display-fps-override`; the render API cannot see
+  the display), so `video-sync=display-*` renders once per refresh and
+  Motion interpolation, which needs a display mode, can take effect. It
+  hands timing back to mpv ~0.9 s after entering fullscreen
+  (`_apply_display_pacing`); mpv switches either way in ~0.2 s with no
+  drop. Measured on battery 2026-10-07 (1080p24 at 120 Hz, 60 s runs):
+  display pacing costs ~3 W (7.8 -> 10.7 W windowed, 8.6 -> 11.2 W
+  fullscreen), and with a gpu-hq mpv.conf it rendered only ~103 of 120
+  refreshes a second in fullscreen (~360 mistimed and ~620 late frames a
+  minute; mpv's default scalers kept up). Audio timing already lands 24 fps
+  on the 120 Hz cadence 99.6% of the time. Display sync still drops
+  a few frames while the video widget resizes, because mpv counts every
+  extra `render()` as a vsync: 2-4 per slide or fullscreen transition and
+  3-5 per live splitter drag (13-18 and 70-77 before the resize work below).
+  `interpolation` only blends frames.
+- The auto accent samples the picture (`screenshot-raw`) only as playback
+  (re)starts after open or seek, and on pause (`_request_accent_sample`). A
+  screenshot of the full frame holds mpv's frame delivery up: sampling every
+  2 s put 13-14% of frames a refresh or more off schedule in fullscreen relay
+  playback (22% with the old blocking render), against ~1% without it, while
+  mpv counted no dropped frames (2026-10-07, VRR panel, presented frames
+  timed against DRM vblank timestamps). Judge frame pacing by when frames
+  reach the screen, not by mpv's drop counters.
 - No synchronous mpv property reads in periodic GUI-thread code. A read
   waits for mpv's core, which can be waiting for the GUI thread to render:
   two of `_stats_loop`'s reads stalled ~210 ms under display sync. The stats
   tick reads `_OBSERVED_PROPERTIES`, cached by mpv's event thread (they stay
-  live while paused, so `buffer_report` still carries live values). mpv never
-  announces `display-sync-active` changes; `display_sync_active()` reads the
-  observed `vsync-ratio`, which exists exactly while display sync is active.
+  live while paused, so `buffer_report` still carries live values).
 - Under qasync the loop turned ~once per rendered frame (~25/s) while
   `render()` waited out each frame (before `video-timing-offset=0`). Media
   pumps must move batches per loop turn regardless: per-packet
@@ -172,8 +186,9 @@ constructor options).
   chrome slides. Pinning it at its final size (`_pin_player`) used to
   replace 17-23 resizes per transition (100-200 ms stalls, ~12 drops while
   each cost ~80 ms) with one jump of the picture to that size: 28% in scale
-  and 144 px entering, 22% leaving ~0.6 s later. A step now costs ~1 ms:
-  88-103 fps at 1080p, 58-73 at 4K, no step over ~6% (2026-10-07). Hyprland
+  and 144 px entering, 22% leaving ~0.6 s later. With the scaled picture
+  below, transitions run at 107-117 fps for 1080p and 4K sources alike, the
+  picture moving at most ~6% per frame (2026-10-07). Hyprland
   sends one configure for fullscreen and animates the rest itself. The
   control bar slides through a stand-in in the root layout
   (`_controls_dock`) so the video grows into its space; it rides on top and
@@ -181,13 +196,25 @@ constructor options).
   slide still pins the video at the size it lands at (root width x current
   height) and unpins after the slot hides: no resize at the end. Its show
   slide is not pinned: unpinning would visibly re-letterbox the video.
-- `MpvPlayerView.resizeEvent` skips the mpv render QOpenGLWidget makes inside
-  its resize handling and calls `update()` instead: a slide step resized the
-  widget two or three times per frame, each an mpv render at the new size
-  (~4.5 ms at fullscreen sizes). Keep the `update()`: Qt does not always
-  repaint a resized QOpenGLWidget on its own, and without it 116 frames of
-  one fullscreen test were composited from the freshly allocated, unrendered
-  framebuffer.
+- While the video widget is being resized (slides, fullscreen, splitter
+  drags; until 100 ms after the last resize) it does not render mpv at each
+  size. mpv renders into a framebuffer of ours only for a new video frame
+  (re-allocated once the view has grown or shrunk 15%), and each paint blits
+  that picture scaled into the widget, anchored on the letterboxed picture
+  rect so it never stretches (`_paint_scaled`); then one sharp render at the
+  settled size. Rendering at every size cost up to ~5 ms of the 8.3 ms frame
+  (mpv re-creates its targets per size): fullscreen transitions ran at ~90
+  fps (58-73 for 4K), 4K drags at 82-85. Cover mode, zoom/pan/align/rotate
+  and other non-plain geometry render at each size as before. Verified with
+  screen captures of a marker pattern: never blank, upright, unstretched.
+  Any exception in that path disables it and renders directly (an exception
+  escaping `paintGL` is a native crash).
+- `MpvPlayerView.resizeEvent` also skips the mpv render QOpenGLWidget makes
+  inside its resize handling and calls `update()` instead: a slide step
+  resized the widget two or three times per frame. Keep the `update()`: Qt
+  does not always repaint a resized QOpenGLWidget on its own, and without it
+  116 frames of one fullscreen test were composited from the freshly
+  allocated, unrendered framebuffer.
 - Overlays (track card, settings sheet, fullscreen control bar) are children
   of the window's root widget, positioned over the video. A widget re-parented
   onto the `QOpenGLWidget` at runtime was visible to Qt but missing from the
@@ -196,6 +223,8 @@ constructor options).
   `glReadPixels`/`grabFramebuffer` stalled ~150 ms on the Intel laptop, and a
   `glBlitFramebuffer` from it returned black. The auto accent samples through
   mpv's asynchronous `screenshot-raw` instead (`request_frame_sample`).
+  Blitting *into* the widget from a framebuffer of our own works; the scaled
+  resize path does that every frame.
 - For external auxiliary media, load the video-only epoch paused, then issue
   exactly one raw-argument `audio-add` after mpv's `playback-restart`; that
   demuxer contributes both audio and subtitle tracks. Attaching during

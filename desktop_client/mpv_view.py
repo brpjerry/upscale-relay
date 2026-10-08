@@ -23,8 +23,9 @@ import time
 from fractions import Fraction
 from pathlib import Path
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QGuiApplication, QImage, QOpenGLContext, qRgb
+from PySide6.QtOpenGL import QOpenGLFramebufferObject
 from PySide6.QtOpenGLWidgets import QOpenGLWidget
 
 from .options import DesktopOptions
@@ -69,14 +70,39 @@ mpv = _load_mpv()
 CACHE_PAUSE_WAIT_S = 0.5
 
 # Properties the periodic stats read, kept current by mpv's event thread.
-# vsync-ratio stands in for display-sync-active, which mpv never announces a
-# change of: it exists exactly while display sync is active.
 _OBSERVED_PROPERTIES = (
     "time-pos", "duration", "avsync", "frame-drop-count",
     "demuxer-cache-duration", "paused-for-cache", "seeking", "path",
     "volume", "mute", "audio-delay", "sub-delay", "aid", "sid",
-    "hwdec-current", "vsync-ratio",
+    "hwdec-current",
 )
+# Picture geometry for drawing the last rendered picture scaled while the
+# view is being resized. Anything but plain letterboxing renders at each size.
+_GEOMETRY_PROPERTIES = (
+    "dwidth", "dheight", "panscan", "video-zoom", "video-pan-x", "video-pan-y",
+    "video-align-x", "video-align-y", "video-unscaled", "keepaspect", "video-rotate",
+)
+# The picture is re-rendered for a new video frame once the view has grown or
+# shrunk this much since it was last rendered; it is only scaled before that.
+_RESCALE_LIMIT = 1.15
+# The view counts as resizing until this long after its last resize; then the
+# picture is rendered sharp at the size it settled at.
+_RESIZE_SETTLE_MS = 100
+_GL_FRAMEBUFFER = 0x8D40
+_GL_READ_FRAMEBUFFER = 0x8CA8
+_GL_DRAW_FRAMEBUFFER = 0x8CA9
+_GL_COLOR_BUFFER_BIT = 0x4000
+_GL_LINEAR = 0x2601
+_GL_SCISSOR_TEST = 0x0C11
+
+
+def _fit(width: int, height: int, aspect: float) -> tuple[float, float, float, float]:
+    """The rectangle a picture of ``aspect`` letterboxes to in ``width`` x ``height``."""
+    if width / height > aspect:
+        w, h = height * aspect, float(height)
+    else:
+        w, h = float(width), width / aspect
+    return (width - w) / 2, (height - h) / 2, w, h
 
 
 def _render_hwdec_mode(no_hwdec: bool, platform: str | None = None) -> str:
@@ -358,6 +384,19 @@ class MpvPlayerView(QOpenGLWidget):
     def __init__(self, parent=None, options: DesktopOptions | None = None):
         super().__init__(parent)
         self.options = options or DesktopOptions()
+        # Read by resizeEvent/paintGL, so set before anything can resize the view.
+        self._ctx = None  # MpvRenderContext, created in initializeGL
+        self._resizing = False
+        # While the view is being resized (slides, fullscreen, splitter drags)
+        # the last rendered picture is drawn scaled instead; see _paint_scaled.
+        self._scaling = False
+        self._scaling_broken = False
+        self._picture_fbo: QOpenGLFramebufferObject | None = None
+        self._picture_due = False
+        self._settle_timer = QTimer(self)
+        self._settle_timer.setSingleShot(True)
+        self._settle_timer.setInterval(_RESIZE_SETTLE_MS)
+        self._settle_timer.timeout.connect(self._resizes_settled)
         # mpv renders through the libmpv render API into this QOpenGLWidget's
         # framebuffer (initializeGL/paintGL below) — no native child window.
         # The old wid embed needed a real X11 window: on Wayland it forced
@@ -366,8 +405,6 @@ class MpvPlayerView(QOpenGLWidget):
         self.setMinimumSize(480, 270)
         self.setFocusPolicy(Qt.StrongFocus)  # receive keys for mpv forwarding
         self.setMouseTracking(True)  # deliver mouse-move without a pressed button
-        self._ctx = None  # MpvRenderContext, created in initializeGL
-        self._resizing = False
         self._sample_pending = False
         self._sampling_broken = False
         self._screen_watched = False
@@ -548,7 +585,7 @@ class MpvPlayerView(QOpenGLWidget):
         # for this thread to render: under display sync two reads in one stats
         # tick stalled ~210 ms. The GUI thread reads these from the cache.
         self._observed: dict[str, object] = {}
-        for name in _OBSERVED_PROPERTIES:
+        for name in _OBSERVED_PROPERTIES + _GEOMETRY_PROPERTIES:
             self.mpv.observe_property(name, self._on_observed)
 
         self._playback_restarted.connect(self._on_playback_restarted)
@@ -644,11 +681,9 @@ class MpvPlayerView(QOpenGLWidget):
         Through the render API mpv cannot see the display, so its display-sync
         modes (`video-sync=display-*`) silently fall back to audio timing.
         Given the rate, such a mode renders once per refresh instead of once
-        per video frame and no longer waits inside render(); the interface
-        then repaints at the display's rate during playback, for about 3 W
-        more in fullscreen on the laptop. Opt-in for that reason; with it off
-        the rate is left unknown (0), and `video-sync=audio` is unaffected
-        either way.
+        per video frame: about 3 W more on the laptop on battery. Opt-in for
+        that reason; with it off the rate is left unknown (0), and
+        `video-sync=audio` is unaffected either way.
         """
         screen = self.screen()
         rate = screen.refreshRate() if screen is not None and self._report_display else 0.0
@@ -659,13 +694,6 @@ class MpvPlayerView(QOpenGLWidget):
             self._display_rate = rate
         except Exception:
             pass
-
-    def display_sync_active(self) -> bool:
-        """Whether mpv is pacing video by the display (a `display-*` sync mode
-        with a known refresh rate) rather than by audio."""
-        if self.options.headless or self._reloading:
-            return False
-        return self._observed.get("vsync-ratio") is not None
 
     def request_frame_sample(self) -> None:
         """Ask for a thumbnail of the current picture (``frame_sampled``).
@@ -702,6 +730,7 @@ class MpvPlayerView(QOpenGLWidget):
     def _free_render_ctx(self) -> None:
         if self._ctx is not None:
             self.makeCurrent()
+            self._picture_fbo = None  # its GL objects go with this context
             self._ctx.free()
             self._ctx = None
             self.doneCurrent()
@@ -715,6 +744,11 @@ class MpvPlayerView(QOpenGLWidget):
         # framebuffer before the window is next composited. Qt does not always
         # repaint the widget after a resize on its own: without the request,
         # frames were composited from the unrendered framebuffer.
+        if not self._scaling and self._picture_aspect() is not None:
+            self._scaling = True
+            self._picture_due = True  # the current frame, into our framebuffer
+        if self._scaling:
+            self._settle_timer.start()
         self._resizing = True
         try:
             super().resizeEvent(event)
@@ -722,19 +756,96 @@ class MpvPlayerView(QOpenGLWidget):
             self._resizing = False
         self.update()
 
+    def _resizes_settled(self) -> None:
+        self._scaling = False
+        self.update()  # one sharp render at the size it settled at
+
+    def _picture_aspect(self) -> float | None:
+        """The picture's display aspect, when mpv simply letterboxes it."""
+        if self._ctx is None or self._scaling_broken:
+            return None
+        observed = self._observed
+        plain = (
+            not observed.get("panscan") and not observed.get("video-zoom")
+            and not observed.get("video-pan-x") and not observed.get("video-pan-y")
+            and not observed.get("video-align-x") and not observed.get("video-align-y")
+            and not observed.get("video-unscaled") and not observed.get("video-rotate")
+            and observed.get("keepaspect") is not False
+        )
+        width, height = observed.get("dwidth"), observed.get("dheight")
+        if not plain or not width or not height:
+            return None
+        return width / height
+
     def paintGL(self) -> None:
         if self._ctx is None or self._resizing:
             return
         # QOpenGLWidget's backing FBO is in physical pixels (HiDPI-scaled).
         dpr = self.devicePixelRatioF()
+        width, height = round(self.width() * dpr), round(self.height() * dpr)
+        if self._scaling:
+            try:
+                if self._paint_scaled(width, height):
+                    return
+            except Exception as error:  # noqa: BLE001 - see below
+                # An exception escaping a Qt virtual is a native crash, not a
+                # traceback. Render at every size from now on instead.
+                self._scaling_broken = True
+                self._scaling = False
+                self.log_message.emit("error", "relay", f"scaled resize disabled: {error!r}")
+        else:
+            self._picture_fbo = None  # free it with this context current
         self._ctx.render(
             flip_y=True,
-            opengl_fbo={
-                "fbo": self.defaultFramebufferObject(),
-                "w": round(self.width() * dpr),
-                "h": round(self.height() * dpr),
-            },
+            opengl_fbo={"fbo": self.defaultFramebufferObject(), "w": width, "h": height},
         )
+
+    def _paint_scaled(self, width: int, height: int) -> bool:
+        """Draw the last rendered picture scaled to this size; re-render it
+        only for a new video frame, at this size once it has grown or shrunk
+        past _RESCALE_LIMIT.
+
+        Rendering at every size of a slide cost up to ~5 ms of the 8.3 ms
+        frame (mpv re-creates its targets at each new size), which held
+        fullscreen transitions to ~90 fps and 4K ones to ~65. A scaled copy
+        is a GPU blit. The scale is anchored on the picture so it never
+        stretches when the view's aspect changes; letterbox margins (and any
+        subtitles in them) scale with it.
+        """
+        aspect = self._picture_aspect()
+        if aspect is None:
+            return False
+        fbo = self._picture_fbo
+        new_frame = self._ctx.update()
+        if fbo is None or self._picture_due or new_frame:
+            if fbo is None or not (
+                    1 / _RESCALE_LIMIT <= width / fbo.width() <= _RESCALE_LIMIT
+                    and 1 / _RESCALE_LIMIT <= height / fbo.height() <= _RESCALE_LIMIT):
+                fbo = self._picture_fbo = QOpenGLFramebufferObject(QSize(width, height))
+            self._ctx.render(
+                flip_y=True,
+                opengl_fbo={"fbo": fbo.handle(), "w": fbo.width(), "h": fbo.height()},
+            )
+            self._picture_due = False
+        src_x, src_y, src_w, _src_h = _fit(fbo.width(), fbo.height(), aspect)
+        dst_x, dst_y, dst_w, _dst_h = _fit(width, height, aspect)
+        scale = dst_w / src_w
+        left, bottom = dst_x - src_x * scale, dst_y - src_y * scale
+        gl = QOpenGLContext.currentContext().extraFunctions()
+        target = self.defaultFramebufferObject()
+        gl.glBindFramebuffer(_GL_READ_FRAMEBUFFER, fbo.handle())
+        gl.glBindFramebuffer(_GL_DRAW_FRAMEBUFFER, target)
+        gl.glDisable(_GL_SCISSOR_TEST)
+        gl.glClearColor(0.0, 0.0, 0.0, 1.0)
+        gl.glClear(_GL_COLOR_BUFFER_BIT)
+        gl.glBlitFramebuffer(
+            0, 0, fbo.width(), fbo.height(),
+            round(left), round(bottom),
+            round(left + fbo.width() * scale), round(bottom + fbo.height() * scale),
+            _GL_COLOR_BUFFER_BIT, _GL_LINEAR,
+        )
+        gl.glBindFramebuffer(_GL_FRAMEBUFFER, target)
+        return True
 
     def _on_frame_ready(self) -> None:
         if self._ctx is None:
