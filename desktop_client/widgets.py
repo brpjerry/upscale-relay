@@ -7,6 +7,8 @@ driving them the usual way; only painting and hover/press motion are ours.
 
 from __future__ import annotations
 
+import time
+
 from PySide6.QtCore import (
     QEasingCurve,
     QEvent,
@@ -552,6 +554,100 @@ def emphasized() -> QEasingCurve:
     return curve
 
 
+class FrameAnimation(QObject):
+    """A number eased from a start to an end value over a duration: the part
+    of QVariantAnimation used here, stepped once per frame the window presents.
+
+    QVariantAnimation steps on Qt's 16 ms animation timer: at most 60 steps a
+    second on a 120 Hz display, at moments unrelated to when frames reach the
+    screen. (QAnimationDriver, which would move it onto the frame clock, is not
+    exposed by PySide6.) ``frames`` is asked at each start for a signal emitted
+    after every presented frame (a QOpenGLWidget's ``frameSwapped``), or None
+    when there is none to follow; then this is QVariantAnimation, timer and
+    all. Each step repaints one pixel of ``nudge`` so the next frame comes even
+    when the value moves nothing on screen: frameSwapped follows any repaint of
+    the window, and that one costs no video render. Frames stop while the
+    window is unexposed (another workspace); a timer then steps instead, so
+    the animation still lands.
+    """
+
+    valueChanged = Signal(float)
+    finished = Signal()
+
+    def __init__(self, parent=None, *, frames=None, nudge: QWidget | None = None):
+        super().__init__(parent)
+        self._frames = frames
+        self._nudge = nudge
+        self._duration = 250
+        self._curve = QEasingCurve()
+        self._start = self._end = 0.0
+        self._signal = None
+        self._t0 = 0.0
+        self._timed = QVariantAnimation(self)
+        self._timed.valueChanged.connect(lambda value: self.valueChanged.emit(float(value)))
+        self._timed.finished.connect(self.finished)
+        self._stall = QTimer(self)
+        self._stall.setSingleShot(True)
+        self._stall.setInterval(50)
+        self._stall.timeout.connect(self._step)
+
+    @property
+    def frame_paced(self) -> bool:
+        return self._signal is not None
+
+    def setDuration(self, ms: int) -> None:
+        self._duration = max(1, int(ms))
+
+    def setEasingCurve(self, curve) -> None:
+        self._curve = QEasingCurve(curve)
+
+    def setStartValue(self, value) -> None:
+        self._start = float(value)
+
+    def setEndValue(self, value) -> None:
+        self._end = float(value)
+
+    def endValue(self) -> float:
+        return self._end
+
+    def start(self) -> None:
+        self.stop()
+        signal = self._frames() if self._frames is not None else None
+        if signal is None:
+            timed = self._timed
+            timed.setDuration(self._duration)
+            timed.setEasingCurve(self._curve)
+            timed.setStartValue(self._start)
+            timed.setEndValue(self._end)
+            timed.start()
+            return
+        self._signal = signal
+        self._t0 = time.monotonic()
+        signal.connect(self._step)
+        self._step()
+
+    def stop(self) -> None:
+        self._timed.stop()
+        self._stall.stop()
+        if self._signal is not None:
+            signal, self._signal = self._signal, None
+            signal.disconnect(self._step)
+
+    def _step(self) -> None:
+        if self._signal is None:
+            return
+        progress = min(1.0, (time.monotonic() - self._t0) * 1000 / self._duration)
+        if progress >= 1.0:
+            self.stop()
+            self.valueChanged.emit(self._end)
+            self.finished.emit()
+            return
+        self.valueChanged.emit(self._start + (self._end - self._start) * self._curve.valueForProgress(progress))
+        if self._nudge is not None and self._nudge.isVisible():
+            self._nudge.update(QRect(0, 0, 1, 1))
+        self._stall.start()
+
+
 class Reveal(QObject):
     """Animated show/hide for a child panel that floats over the window.
 
@@ -562,7 +658,7 @@ class Reveal(QObject):
     """
 
     def __init__(self, widget: QWidget, *, offset: QPoint = QPoint(0, 10), fade: bool = True,
-                 show_ms: int = theme.SLOW, hide_ms: int = theme.FAST, easing=None):
+                 show_ms: int = theme.SLOW, hide_ms: int = theme.FAST, easing=None, frames=None):
         super().__init__(widget)
         self._widget = widget
         self._offset = offset
@@ -572,7 +668,8 @@ class Reveal(QObject):
         self._geometry = widget.geometry()
         self._t = 0.0
         self._target = 0.0
-        self._animation = QVariantAnimation(self)
+        # Steps on presented frames when ``frames`` provides them (FrameAnimation).
+        self._animation = FrameAnimation(self, frames=frames, nudge=widget)
         self._animation.valueChanged.connect(self._apply)
         self._animation.finished.connect(self._finished)
 
@@ -583,6 +680,18 @@ class Reveal(QObject):
 
     def retarget(self, geometry: QRect) -> None:
         self._geometry = QRect(geometry)
+        self._place()
+
+    def reanchor(self, geometry: QRect) -> None:
+        """Make ``geometry`` the shown place without moving the panel: how far
+        it sits from there now becomes how far it is revealed, so ``show``
+        continues from where something else left it."""
+        self._animation.stop()
+        here = self._widget.pos() - geometry.topLeft()
+        span = QPoint.dotProduct(self._offset, self._offset)
+        away = QPoint.dotProduct(here, self._offset) / span if span else 0.0
+        self._geometry = QRect(geometry)
+        self._t = self._target = min(1.0, max(0.0, 1.0 - away))
         self._place()
 
     def show(self, geometry: QRect) -> None:
