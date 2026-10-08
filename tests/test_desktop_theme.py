@@ -7,7 +7,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 pytest.importorskip("PySide6")
 pytest.importorskip("qasync")
 
-from PySide6.QtCore import QObject, QPoint, QPointF, QSettings, QSize, Qt, QTimer, Signal
+from PySide6.QtCore import QObject, QPoint, QPointF, QRect, QSettings, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QImage, QPalette, QWheelEvent
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QWidget
@@ -341,23 +341,48 @@ def test_display_rate_is_reported_only_when_enabled():
     assert sent == {"display-fps-override": 0.0}        # back to unknown
 
 
-def test_video_is_pinned_through_a_fullscreen_transition(window):
+def test_video_follows_the_chrome_through_a_fullscreen_transition(window):
     window.resize(1100, 600)
     window.show()
     QApplication.instance().processEvents()
     layout = window._player_layout
-    assert layout.indexOf(window.player) >= 0
+    bar = window.controls_panel
+    height = bar.height()
     window.toggle_fullscreen()
-    # Out of the layout, at the screen's size, held at the window's origin.
-    assert layout.indexOf(window.player) < 0
-    assert window.player.size() == window.screen().size()
-    assert window.player.mapTo(window._root, QPoint(0, 0)) == QPoint(0, 0)
-    assert wait_until(lambda: layout.indexOf(window.player) >= 0)  # one resize at the end
+    # Never pinned: pinning made the picture jump to its final size at once.
+    assert layout.indexOf(window.player) >= 0 and not window._player_pinned
+    # The bar left the layout but rides on its stand-in, which the video
+    # grows into as it shrinks.
+    assert window._controls_dock.isVisible() and window._controls_dock.height() == height
+    assert bar.isVisible() and bar.geometry().top() == window._root.height() - height
+    sizes = []
+    assert wait_until(lambda: sizes.append(window.player.height()) or not window._controls_dock.isVisible())
+    assert len(set(sizes)) > 2  # grew step by step
+    assert not bar.isVisible()  # hidden in its overlay place until the pointer calls it
+    assert window._controls_layout.indexOf(bar) < 0
     window.toggle_fullscreen()
-    assert layout.indexOf(window.player) < 0
-    assert wait_until(lambda: layout.indexOf(window.player) >= 0
+    assert window._controls_dock.isVisible() and bar.isVisible()
+    assert bar.geometry().top() >= window._root.height() - 1  # rises from the bottom
+    assert wait_until(lambda: not window._controls_dock.isVisible()
                       and window._toolbar_slot.isVisible() and window._sidebar_slot.isVisible())
+    assert window._controls_layout.indexOf(bar) == 1  # docked below the video again
+    QApplication.instance().processEvents()
+    assert bar.geometry().bottom() == window._root.height() - 1
     assert window.player.geometry().topLeft() == QPoint(0, 64)  # back in its place under the top bar
+
+
+def test_reversing_fullscreen_midway_continues_the_control_bar_from_where_it_is(window):
+    window.resize(1100, 600)
+    window.show()
+    QApplication.instance().processEvents()
+    window.toggle_fullscreen()
+    QTest.qWait(theme.SLOW // 3)
+    midway = window._controls_dock_h
+    assert midway is not None
+    window.toggle_fullscreen()
+    assert window._controls_dock_h == midway  # no jump back to either end
+    assert wait_until(lambda: window._controls_layout.indexOf(window.controls_panel) == 1)
+    assert window.controls_panel.isVisible() and not window._controls_dock.isVisible()
 
 
 def test_display_sync_state_follows_the_observed_vsync_ratio():
@@ -406,20 +431,17 @@ def test_showing_the_sidebar_mid_hide_releases_the_pin(window):
     assert window.split.sizes()[0] == width and not window._player_pinned
 
 
-def test_fullscreen_takes_over_a_sidebar_slide_pin(window):
+def test_fullscreen_releases_a_sidebar_slide_pin(window):
     window.resize(1100, 600)
     window.show()
     QApplication.instance().processEvents()
     window.browser_toggle.setChecked(False)
+    assert window._player_pinned
     window.toggle_fullscreen()
     try:
-        # Held at the screen's size now, and released by fullscreen's timer,
-        # not by the end of the sidebar slide it interrupted.
-        assert window._player_pinned and not window._slide_pinned
-        assert window.player.size() == window.screen().size()
-        assert wait_until(lambda: "sidebar" not in window._slides)
-        assert window._player_pinned
-        assert wait_until(lambda: not window._player_pinned)
+        # The fullscreen slide resizes the video at each step instead.
+        assert not window._player_pinned and not window._slide_pinned
+        assert window._player_layout.indexOf(window.player) >= 0
     finally:
         window.toggle_fullscreen()
     assert wait_until(lambda: not window._player_pinned and window._toolbar_slot.isVisible())
@@ -492,3 +514,74 @@ def test_window_slides_step_on_the_video_frames_when_it_presents_them(window, mo
     assert isinstance(window._slides["sidebar"], _FrameSlide)
     assert wait_until(lambda: window._sidebar_slot.isVisible() and window.split.sizes()[0] == width)
     frames.stop()
+
+
+def test_resize_skips_the_render_qt_would_discard_and_requests_one_that_shows():
+    pytest.importorskip("mpv")
+    from types import SimpleNamespace
+    from desktop_client.mpv_view import MpvPlayerView
+    renders = []
+    player = SimpleNamespace(
+        _ctx=SimpleNamespace(render=lambda **kw: renders.append(kw)), _resizing=True,
+        devicePixelRatioF=lambda: 1.0, defaultFramebufferObject=lambda: 1,
+        width=lambda: 64, height=lambda: 36,
+    )
+    MpvPlayerView.paintGL(player)  # inside QOpenGLWidget's resizeEvent
+    assert renders == []
+    player._resizing = False
+    MpvPlayerView.paintGL(player)  # the repaint that is composited
+    assert len(renders) == 1
+
+
+def test_resized_player_always_schedules_a_repaint():
+    pytest.importorskip("mpv")
+    from desktop_client.mpv_view import MpvPlayerView
+    QApplication.instance() or QApplication([])
+    player = MpvPlayerView(options=DesktopOptions(headless=True, settings_scope=SCOPE))
+    try:
+        updates = []
+        player.update = lambda *args: updates.append(args)
+        player.resize(320, 180)
+        player.show()
+        player.resize(400, 200)
+        QApplication.instance().processEvents()
+        # Qt does not always repaint a resized QOpenGLWidget on its own; one
+        # composited from its fresh framebuffer would show a blank frame.
+        assert updates and not player._resizing
+    finally:
+        player.close()
+        player.mpv.terminate()
+
+
+def test_reveal_reanchor_continues_from_where_the_panel_is():
+    from desktop_client.widgets import Reveal
+    QApplication.instance() or QApplication([])
+    parent = QWidget()
+    parent.resize(400, 300)
+    panel = QWidget(parent)
+    panel.setGeometry(0, 270, 400, 60)  # 30 of its 60 px showing
+    reveal = Reveal(panel, offset=QPoint(0, 60), fade=False, show_ms=100)
+    shown_at = QRect(0, 240, 400, 60)
+    reveal.reanchor(shown_at)
+    assert panel.geometry().topLeft() == QPoint(0, 270)  # not moved
+    assert reveal._t == pytest.approx(0.5)  # half revealed
+    reveal.show(shown_at)
+    assert wait_until(lambda: panel.geometry() == shown_at, timeout_ms=1000)
+
+
+def test_pointer_calls_the_bar_back_while_it_slides_away(window):
+    window.resize(900, 600)
+    window.show()
+    QApplication.instance().processEvents()
+    window.toggle_fullscreen()
+    try:
+        QTest.qWait(theme.SLOW // 2)
+        assert window._controls_dock.isVisible()  # still sliding off
+        window._reveal_controls()
+        assert wait_until(lambda: not window._controls_dock.isVisible())
+        QTest.qWait(theme.NORMAL + 50)
+        bar = window.controls_panel
+        assert bar.isVisible() and bar.geometry().bottom() == window._root.height() - 1
+    finally:
+        window.toggle_fullscreen()
+    assert wait_until(lambda: window._controls_layout.indexOf(window.controls_panel) == 1)

@@ -111,10 +111,6 @@ _SIDEBAR_MIN_WIDTH = 220
 # Chrome slides for theme.SLOW ms; give the compositor's own fullscreen motion
 # and the last repaints a moment more before handing frame timing back to mpv.
 _FULLSCREEN_SETTLE_MS = 900
-# How long the video widget stays pinned through a fullscreen transition: the
-# chrome slides for theme.SLOW ms and the compositor's own motion takes
-# 400-470 ms (measured on Hyprland); both run at once.
-_FS_PIN_MS = 600
 _TOP_BAR_HEIGHT = 64
 
 
@@ -589,10 +585,6 @@ class MainWindow(DesktopFeatures, QMainWindow):
         # Display pacing follows a policy (settings x fullscreen state); the
         # fullscreen transition settles before the policy is re-evaluated.
         self._fullscreen_settled = False
-        self._unpin_timer = QTimer(self)
-        self._unpin_timer.setSingleShot(True)
-        self._unpin_timer.setInterval(_FS_PIN_MS)
-        self._unpin_timer.timeout.connect(self._unpin_player)
         self._pacing_timer = QTimer(self)
         self._pacing_timer.setSingleShot(True)
         self._pacing_timer.setInterval(_FULLSCREEN_SETTLE_MS)
@@ -799,11 +791,11 @@ class MainWindow(DesktopFeatures, QMainWindow):
         self.split = QSplitter()
         # Live resizing: every handle move resizes the video widget, which
         # re-allocates its framebuffer and has mpv render at the new size.
-        # That costs ~1 ms (~6 ms for a 4K source) now that mpv hands frames
+        # That costs ~1 ms (a few for a 4K source) now that mpv hands frames
         # over at their display time (video_timing_offset in mpv_view.py).
         # It cost ~80 ms while render() waited out each frame on this thread,
-        # which is why this used to be rubber-banded. Display sync drops
-        # frames during a drag: mpv counts every extra render as a vsync.
+        # which is why this used to be rubber-banded. Display sync drops a
+        # few frames per drag: mpv counts every extra render as a vsync.
         self.split.setOpaqueResize(True)
         self.split.setHandleWidth(1)
         # The sidebar and the top bar sit in slots so they can slide away
@@ -826,6 +818,14 @@ class MainWindow(DesktopFeatures, QMainWindow):
         root_layout.setSpacing(0)
         root_layout.addWidget(self.split, stretch=1)
         root_layout.addWidget(self.controls_panel)
+        # Stands in for the control bar while it slides between the layout and
+        # its fullscreen overlay, so the video grows into (or yields) its space
+        # a step at a time. The bar rides on top of it.
+        self._controls_dock = QWidget()
+        self._controls_dock.hide()
+        root_layout.addWidget(self._controls_dock)
+        self._controls_dock_h: int | None = None  # set while it slides
+        self._controls_dock_floor = 0  # the bar stays this far up meanwhile
         self._controls_layout = root_layout
         self._controls_overlay = False
         self.track_panel.setParent(self._root)
@@ -1225,11 +1225,12 @@ class MainWindow(DesktopFeatures, QMainWindow):
         self._release_slide_pin()  # after the slot: the layout is final now
 
     # -- sliding chrome ---------------------------------------------------------
-    # The sidebar and top bar slide rather than pop, one step per presented
-    # frame (_FrameSlide). Showing the sidebar resizes the video widget at
-    # each step; hiding it pins the video at the size it ends up at and slides
-    # the sidebar off it, as fullscreen does. Pinning the show slide as well
-    # would re-letterbox the video visibly when it unpins.
+    # The sidebar, top bar and (around fullscreen) control bar slide rather
+    # than pop, one step per presented frame (_FrameSlide), resizing the video
+    # widget at each step. Only the sidebar toggle's hide slide pins the video
+    # instead, at the size it ends up at, and slides the sidebar off it.
+    # Pinning a show slide would re-letterbox the video visibly when it
+    # unpins; pinning fullscreen made the picture jump to its final size.
 
     def _stop_slide(self, key: str) -> None:
         running = self._slides.pop(key, None)
@@ -1266,7 +1267,7 @@ class MainWindow(DesktopFeatures, QMainWindow):
         self._slides[key] = animation
         animation.start()
 
-    def _slide_browser(self, visible: bool) -> None:
+    def _slide_browser(self, visible: bool, pin: bool = True) -> None:
         slot = self._sidebar_slot
         if not self.isVisible():
             self._apply_browser_visible(visible)
@@ -1289,8 +1290,8 @@ class MainWindow(DesktopFeatures, QMainWindow):
             self.split.setSizes([width, total - width])
 
         self._stop_slide("sidebar")
-        if visible:
-            self._release_slide_pin()  # reversing a hide: resize from here on
+        if visible or not pin:
+            self._release_slide_pin()  # e.g. reversing a hide: resize from here on
         elif not self._player_pinned:
             # Its final size: the full width, the height it has now.
             self._pin_player(QSize(self._root.width(), self.player.height()))
@@ -1356,16 +1357,10 @@ class MainWindow(DesktopFeatures, QMainWindow):
         self.tracks_btn.setChecked(False)
         self._track_reveal.hide_now()  # the bar it hangs from is about to move
         self.fullscreen_btn.set_icon(Icons.fullscreen_exit if entering else Icons.fullscreen)
-        if self.isVisible():
-            # The chrome slides and the window's size change would each resize
-            # the video widget many times (a framebuffer re-allocation and an
-            # mpv render at every size: measured as 100-200 ms stalls and a
-            # dozen dropped frames per transition). Pin it at its final size
-            # for the whole transition instead: the chrome slides over it and
-            # the window reveals or crops it. One resize at the end.
-            self._pin_player(self.screen().size() if entering else self.player.size())
-            self._slide_pinned = False  # a sidebar slide's pin is now this one
-            self._unpin_timer.start()
+        # The video follows the chrome at every step rather than being pinned
+        # at its final size: pinning made it jump to that size in one frame
+        # (28% in scale and 144 px entering, 22% leaving). Each step resizes
+        # it, ~1 ms now that mpv renders at frame time (~80 ms before).
         if entering:
             self._settings_visible_before_fullscreen = self._settings_reveal.shown \
                 or self.playback_settings.isVisible()
@@ -1374,7 +1369,7 @@ class MainWindow(DesktopFeatures, QMainWindow):
             # The transport bar becomes a pointer-revealed overlay in
             # fullscreen rather than just vanishing; everything else slides away.
             self._slide_toolbar(False)
-            self._slide_browser(False)
+            self._slide_browser(False, pin=False)
             self._enter_overlay_controls()
             self.showFullScreen()
             self._show_player_cursor()
@@ -1439,13 +1434,16 @@ class MainWindow(DesktopFeatures, QMainWindow):
         # Taken out of the layout but left a child of the root, floating over
         # the video like the track card. Re-parenting it onto the QOpenGLWidget
         # left it visible to Qt yet missing from the composited frame.
+        sliding = self._controls_dock_h  # reversing a transition midway
         self._controls_layout.removeWidget(self.controls_panel)
         self.controls_panel.overlay = True
         self._apply_overlay_palette()
         if self.isVisible():
-            # Stays where it was for a moment, then slides off the bottom.
+            # Slides off the bottom from where it was docked as the video
+            # grows into its place.
             self._controls_reveal.show_now(self._overlay_geometry())
-            self._controls_reveal.hide()
+            start = self.controls_panel.height() if sliding is None else sliding
+            self._slide_controls_dock(start, 0, 0, self._controls_slid_away)
         else:
             self._controls_reveal.hide_now()
             self._position_overlay()
@@ -1468,11 +1466,51 @@ class MainWindow(DesktopFeatures, QMainWindow):
         self._controls_timer.stop()
         self._cursor_timer.stop()
         self.player.unsetCursor()
-        self._controls_reveal.hide_now()
+        height = self.controls_panel.height()
+        sliding = self._controls_dock_h  # reversing a transition midway
         self.controls_panel.overlay = False
         self.controls_panel.setPalette(QPalette())
-        self._controls_layout.addWidget(self.controls_panel)  # re-dock below the video
+        if self.isVisible():
+            # Rises from the bottom (or, already revealed, stays put) as the
+            # video yields its space, then docks exactly where it is.
+            revealed = self._controls_reveal.shown and (sliding is None or self._controls_dock_floor)
+            floor = height if revealed else 0
+            self._controls_reveal.show_now(self._overlay_geometry())
+            self._slide_controls_dock(sliding or 0, height, floor, self._dock_controls)
+        else:
+            self._dock_controls()
+
+    def _dock_controls(self) -> None:
+        self._controls_reveal.hide_now()
+        self._controls_layout.insertWidget(1, self.controls_panel)  # below the video
         self.controls_panel.show()
+
+    def _controls_slid_away(self) -> None:
+        if self._controls_dock_floor:  # the pointer called it back meanwhile
+            self._controls_reveal.retarget(self._overlay_geometry())
+            return
+        # Hidden in its overlay place until the pointer nears the bottom.
+        self._controls_reveal.hide_now()
+        self._controls_reveal.retarget(self._overlay_geometry())
+
+    def _slide_controls_dock(self, start: int, end: int, floor: int, done) -> None:
+        dock = self._controls_dock
+
+        def apply(height: int) -> None:
+            self._controls_dock_h = height
+            dock.setFixedHeight(max(1, height))  # 1, not 0: it keeps presenting frames
+            self._controls_reveal.retarget(self._overlay_geometry())
+
+        def landed() -> None:
+            self._controls_dock_h = None
+            dock.hide()
+            done()
+
+        self._stop_slide("controls")
+        self._controls_dock_floor = floor
+        dock.show()
+        apply(start)
+        self._slide("controls", start, end, apply, landed, dock)
 
     def _position_overlay(self) -> None:
         geometry = self._overlay_geometry()
@@ -1483,7 +1521,8 @@ class MainWindow(DesktopFeatures, QMainWindow):
 
     def _overlay_geometry(self) -> QRect:
         h = self.controls_panel.height()  # fixed; the layout's hint is shorter
-        return QRect(0, self._root.height() - h, self._root.width(), h)
+        shown = h if self._controls_dock_h is None else max(self._controls_dock_h, self._controls_dock_floor)
+        return QRect(0, self._root.height() - shown, self._root.width(), h)
 
     def _on_player_mouse_moved(self, x: int, y: int) -> None:
         if not (self._controls_overlay and self.isFullScreen()):
@@ -1513,7 +1552,14 @@ class MainWindow(DesktopFeatures, QMainWindow):
         self.player.setCursor(Qt.BlankCursor)
 
     def _reveal_controls(self) -> None:
-        if not self._controls_reveal.shown:
+        if self._controls_dock_h is not None and not self._controls_dock_floor:
+            # Called back while it slides off: it rises from where it is, over
+            # the video that keeps growing beneath. (The pointer often rests
+            # there, having just pressed the fullscreen button.)
+            self._controls_dock_floor = self.controls_panel.height()
+            self._controls_reveal.reanchor(self._overlay_geometry())
+            self._controls_reveal.show(self._overlay_geometry())
+        elif not self._controls_reveal.shown:
             self._controls_reveal.show(self._overlay_geometry())  # slides up
         self._controls_timer.start()
 
@@ -1541,7 +1587,7 @@ class MainWindow(DesktopFeatures, QMainWindow):
         if obj is self._player_parent and event.type() in (QEvent.Move, QEvent.Resize):
             self._hold_pinned_player()
         if obj is self._root and event.type() == QEvent.Resize:
-            if self._controls_overlay:
+            if self._controls_overlay or self._controls_dock_h is not None:
                 self._position_overlay()
             if self._track_reveal.shown:
                 self._position_track_panel()

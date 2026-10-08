@@ -150,11 +150,12 @@ constructor options).
   costs +3 W, and mpv switches either way in ~0.2 s with no drop
   (`_apply_display_pacing`); `MpvPlayerView` reports the screen's refresh
   rate (`display-fps-override`; the render API cannot see the display), so
-  `video-sync=display-*` renders once per refresh. Display sync drops video
-  whenever the video widget resizes, because mpv counts every extra
-  `render()` as a vsync: 13-18 drops per sidebar show slide (2-3 for the
-  pinned hide slide) and 70-77 per live splitter drag. `interpolation` only
-  blends frames. Under display sync `screenshot-raw` holds mpv's rendering
+  `video-sync=display-*` renders once per refresh. Display sync still drops
+  some video while the video widget resizes, because mpv counts every extra
+  `render()` as a vsync: 3-12 drops per sidebar show slide, 2-5 for the
+  pinned hide slide, 3-7 per live splitter drag and 2-8 per fullscreen
+  transition (13-18 and 70-77 before the skipped resize render, below).
+  `interpolation` only blends frames. Under display sync `screenshot-raw` holds mpv's rendering
   up ~0.3 s, so the auto accent samples only at open/seek/pause there
   (`_request_accent_sample`).
 - No synchronous mpv property reads in periodic GUI-thread code. A read
@@ -196,6 +197,26 @@ constructor options).
   `paintGL → mpv_render_context_render → vaSyncSurface → iHD` when the user's
   `hwdec=vaapi` exposed a retired zero-copy Intel surface. Copy-back retains
   hardware decode; never restore zero-copy VA-API as the default here.
+- Fullscreen transitions resize the video widget at every step of the
+  chrome slides. Pinning it at its final size (`_pin_player`) used to
+  replace 17-23 resizes per transition (100-200 ms stalls, ~12 drops while
+  each cost ~80 ms) with one jump of the picture to that size: 28% in scale
+  and 144 px entering, 22% leaving ~0.6 s later. A step now costs ~1 ms:
+  88-103 fps at 1080p, 58-73 at 4K, no step over ~6% (2026-10-07). Hyprland
+  sends one configure for fullscreen and animates the rest itself. The
+  control bar slides through a stand-in in the root layout
+  (`_controls_dock`) so the video grows into its space; it rides on top and
+  becomes the overlay (or re-docks) where it lands. The sidebar toggle's hide
+  slide still pins the video at the size it lands at (root width x current
+  height) and unpins after the slot hides: no resize at the end. Its show
+  slide is not pinned: unpinning would visibly re-letterbox the video.
+- `MpvPlayerView.resizeEvent` skips the mpv render QOpenGLWidget makes inside
+  its resize handling and calls `update()` instead: a slide step resized the
+  widget two or three times per frame, each an mpv render at the new size
+  (~4.5 ms at fullscreen sizes). Keep the `update()`: Qt does not always
+  repaint a resized QOpenGLWidget on its own, and without it 116 frames of
+  one fullscreen test were composited from the freshly allocated, unrendered
+  framebuffer.
 - For external auxiliary media, load the video-only epoch paused, then issue
   exactly one raw-argument `audio-add` after mpv's `playback-restart`; use
   `sub-add` instead only when source metadata confirms subtitles without audio.

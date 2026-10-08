@@ -367,6 +367,7 @@ class MpvPlayerView(QOpenGLWidget):
         self.setFocusPolicy(Qt.StrongFocus)  # receive keys for mpv forwarding
         self.setMouseTracking(True)  # deliver mouse-move without a pressed button
         self._ctx = None  # MpvRenderContext, created in initializeGL
+        self._resizing = False
         self._sample_pending = False
         self._sampling_broken = False
         self._screen_watched = False
@@ -705,8 +706,24 @@ class MpvPlayerView(QOpenGLWidget):
             self._ctx = None
             self.doneCurrent()
 
+    def resizeEvent(self, event) -> None:
+        # QOpenGLWidget re-allocates its framebuffer here and paints into it at
+        # once; a slide step resized it two or three times per frame, and each
+        # was an mpv render at the new size (~4.5 ms at fullscreen sizes, of a
+        # 8.3 ms frame; under display sync mpv also counts each as a vsync).
+        # Skip those and request one repaint instead, which renders the new
+        # framebuffer before the window is next composited. Qt does not always
+        # repaint the widget after a resize on its own: without the request,
+        # frames were composited from the unrendered framebuffer.
+        self._resizing = True
+        try:
+            super().resizeEvent(event)
+        finally:
+            self._resizing = False
+        self.update()
+
     def paintGL(self) -> None:
-        if self._ctx is None:
+        if self._ctx is None or self._resizing:
             return
         # QOpenGLWidget's backing FBO is in physical pixels (HiDPI-scaled).
         dpr = self.devicePixelRatioF()

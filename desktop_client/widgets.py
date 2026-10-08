@@ -585,6 +585,18 @@ class Reveal(QObject):
         self._geometry = QRect(geometry)
         self._place()
 
+    def reanchor(self, geometry: QRect) -> None:
+        """Make ``geometry`` the shown place without moving the panel: how far
+        it sits from there now becomes how far it is revealed, so ``show``
+        continues from where something else left it."""
+        self._animation.stop()
+        here = self._widget.pos() - geometry.topLeft()
+        span = QPoint.dotProduct(self._offset, self._offset)
+        away = QPoint.dotProduct(here, self._offset) / span if span else 0.0
+        self._geometry = QRect(geometry)
+        self._t = self._target = min(1.0, max(0.0, 1.0 - away))
+        self._place()
+
     def show(self, geometry: QRect) -> None:
         self._geometry = QRect(geometry)
         self._run(1.0, self._show_ms, self._easing)
