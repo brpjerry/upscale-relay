@@ -2693,6 +2693,9 @@ class MainWindow(DesktopFeatures, QMainWindow):
     def _on_player_failed(self, message: str) -> None:
         if self._closing:
             return
+        # A failed read of a local/SMB source ends the downlink: name that
+        # cause rather than its symptom ("downlink closed").
+        message = getattr(self.client, "source_error", None) or message
         self.client_log.record("playback_failure", message=message)
         self._error("Playback failed", message)
         asyncio.ensure_future(self.on_stop())

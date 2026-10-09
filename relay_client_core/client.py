@@ -326,6 +326,9 @@ class RelayClient:
         self._downlink_sample_bytes = 0
         self._downlink_sample_at = time.monotonic()
         self.errors: list[dict] = []
+        # Set, with the downlink queue ended, when reading the local source
+        # failed: the message the consumer should show for the ended stream.
+        self.source_error: str | None = None
         self.buffered_ms = 0  # consumer updates; buffer_report loop sends it
         # Optional UI hooks: called with each session_progress / seek_progress
         # message dict (from the control-reader task, i.e. on the event-loop
@@ -700,6 +703,18 @@ class RelayClient:
             return (epoch == self.epoch and generation == self._uplink_generation
                     and not self._closing)
 
+        async def send(data: bytes) -> bool:
+            try:
+                self._uplink_writer.write(data)
+                await self._uplink_writer.drain()
+            except OSError as err:
+                # The server closed the uplink (its session is ending, which
+                # the control channel reports) or the connection dropped: not
+                # a source failure, whatever errno the socket gave.
+                log.info("uplink closed: %r", err)
+                return False
+            return True
+
         try:
             while True:
                 # One thread hop + one drain per batch: per-packet round-trips
@@ -714,20 +729,33 @@ class RelayClient:
                                                   discontinuity=discontinuity and first)
                     first = False
                     buf += encode_packet(pkt)
-                if buf:
-                    self._uplink_writer.write(bytes(buf))
-                    await self._uplink_writer.drain()
+                if buf and not await send(bytes(buf)):
+                    return
                 if len(batch) < _UPLINK_BATCH:  # iterator exhausted
                     break
             if current():
-                self._uplink_writer.write(
-                    encode_packet(MediaPacket(payload=b"", flags=FLAG_EOS, epoch=epoch))
-                )
-                await self._uplink_writer.drain()
+                await send(encode_packet(MediaPacket(payload=b"", flags=FLAG_EOS, epoch=epoch)))
         except asyncio.CancelledError:
             raise
-        except (ConnectionResetError, BrokenPipeError) as err:
-            log.info("uplink closed: %r", err)
+        except Exception as err:
+            # Reading the source failed (an SMB read, a damaged file). PyAV
+            # raises OSError subclasses, ConnectionResetError among them, so
+            # only the call site tells this apart from a closed uplink. A pump
+            # a seek already replaced stays quiet: its successor reads anew.
+            if current():
+                self._fail_source(err)
+
+    def _fail_source(self, err: Exception) -> None:
+        """End this session's media after reading the local source failed.
+
+        The server would otherwise wait for packets indefinitely. Record why
+        and end the downlink queue (get() returns None, without EOS): its
+        consumer stops playback and the session's owner tears down, as for
+        any ended downlink.
+        """
+        log.warning("source read failed, ending playback: %r", err, exc_info=err)
+        self.source_error = f"Could not read the source file: {str(err) or type(err).__name__}"
+        self._down_q.close()
 
     def _finish_downlink_setup(self, error: Exception | None = None) -> None:
         future = self._downlink_ready
