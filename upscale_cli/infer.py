@@ -24,6 +24,7 @@ from typing import Iterable
 import av
 import numpy as np
 
+from .color import VideoColor
 from .manifest import ModelManifest
 
 
@@ -158,11 +159,13 @@ class OnnxUpscaler:
 
     def __init__(self, model_path: str, ep: str = "auto",
                  tile_size: int | str | None = None, overlap: int = 16):
-        if overlap % 2:
-            raise ValueError("overlap must be even")
+        if overlap < 0 or overlap % 2:
+            raise ValueError("tile overlap must be a non-negative even number of pixels")
+        self.overlap = overlap
+        if isinstance(tile_size, int):
+            self._check_tile(tile_size)
         self.tile_size = tile_size
         self._reformatter = av.video.reformatter.VideoReformatter()
-        self.overlap = overlap
         self.model_path = model_path
         self.manifest = ModelManifest.load(model_path)
         providers = resolve_providers(ep)
@@ -257,6 +260,14 @@ class OnnxUpscaler:
             u8 = u8[::-1]
         return np.ascontiguousarray(u8.transpose(1, 2, 0))  # -> HWC
 
+    def _check_tile(self, tile: int) -> None:
+        """Tiles step forward by ``tile - overlap``; anything smaller cannot
+        cover a frame (a negative step produced an unwritten output)."""
+        if tile <= self.overlap:
+            raise ValueError(
+                f"tile size {tile} must be larger than the tile overlap {self.overlap}"
+            )
+
     def _tile_starts(self, dim: int, tile: int) -> list[int]:
         if dim <= tile:
             return [0]
@@ -266,6 +277,7 @@ class OnnxUpscaler:
         return starts
 
     def infer_array_tiled(self, rgb: np.ndarray, tile: int) -> np.ndarray:
+        self._check_tile(tile)
         h, w = rgb.shape[:2]
         if h <= tile and w <= tile:
             return self.infer_array(rgb)
@@ -339,7 +351,10 @@ class OnnxUpscaler:
     # -- FrameStage API ------------------------------------------------------
 
     def process(self, frame: av.VideoFrame) -> Iterable[av.VideoFrame]:
-        rgb = self._reformatter.reformat(frame, format="rgb24").to_ndarray()
+        # Frames from FrameSource carry their resolved colour tags.
+        rgb = VideoColor.resolve(frame, frame.width, frame.height).to_rgb(
+            self._reformatter, frame,
+        ).to_ndarray()
         up = self._infer_with_fallback(rgb)
         if self.scale_factor is None:
             self.scale_factor = round(up.shape[0] / rgb.shape[0])

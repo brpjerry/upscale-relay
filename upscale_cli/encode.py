@@ -14,6 +14,8 @@ from fractions import Fraction
 
 import av
 
+from .color import VideoColor
+
 EncoderCandidate = tuple[str, str, dict[str, str]]
 
 # The env override lets machines without an NVIDIA GPU (CI, CPU-only
@@ -332,3 +334,37 @@ def select_encoder(
         f"no encoder available for tier '{requested_tier}'{profile_text} "
         f"(tried: {tried}); {detail}"
     ) from (failures[-1][2] if failures else None)
+
+
+def add_video_encoder_stream(
+    container: av.container.OutputContainer,
+    codec: str,
+    *,
+    width: int,
+    height: int,
+    pix_fmt: str,
+    time_base: Fraction,
+    rate: Fraction | None = None,
+    options: dict[str, str] | None = None,
+    color: VideoColor | None = None,
+) -> av.VideoStream:
+    """Add the output video stream shared by relay and offline encoding.
+
+    The encoder's time base is the source's. Left unset, libav derives it from
+    the frame rate and rounds every timestamp onto that grid, which retimes
+    variable-frame-rate sources. ``rate`` stays the encoder's nominal frame
+    rate for rate control. Never set the output *stream* time base: the muxer
+    owns it and rescales packets from the encoder's.
+
+    ``color`` tags the encoder (matrix, range, primaries, transfer); a caller
+    that learns it later must tag the codec context before the first encode
+    or mux, which opens the encoder and writes the container header.
+    """
+    stream = container.add_stream(codec, rate=rate, options=options)
+    stream.width = width
+    stream.height = height
+    stream.pix_fmt = pix_fmt
+    stream.codec_context.time_base = time_base
+    if color is not None:
+        color.tag(stream.codec_context)
+    return stream

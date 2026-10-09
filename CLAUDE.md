@@ -101,6 +101,18 @@ their volume, panscan, tracks and delays.
 - For server-file muxed auxiliary tracks, seek the auxiliary container against
   the video stream's keyframe cues. Matroska audio streams are often not
   indexed; using audio as the seek anchor caused a measured 7-second scan.
+- Set the encoder's time base: `stream.codec_context.time_base = <source
+  time base>` (`upscale_cli.encode.add_video_encoder_stream` does it). PyAV
+  opens an encoder that has no `codec_context.time_base` with 1/rate, and
+  every timestamp is rounded onto that grid: VFR sources were retimed
+  (audit #3). This is the codec context, not the output stream; the
+  stream's time base stays the muxer's (see above).
+- `VideoReformatter.reformat` defaults `src_color_range` to UNSPECIFIED, not
+  the frame's own range (`src_colorspace` does default to the frame's).
+  Pass both ranges explicitly (`upscale_cli.color.VideoColor.to_rgb` /
+  `to_output`), and tag the encoder before its first encode or mux: a muxed
+  audio packet can open the encoder and write the container header before
+  any video frame (audit #16).
 
 **asyncio / Qt (qasync)**
 - **No modal dialogs / exec() / processEvents from coroutine context** — the
@@ -311,6 +323,11 @@ their volume, panscan, tracks and delays.
   laptop client is the intended topology.
 - FFV1 has no hardware decoder anywhere (codec-inherent); lossless-hevc is
   the recommended lossless tier for live playback.
+- Anamorphic uplinks: when a client sends no
+  `open_session.video.sample_aspect_ratio`, the server reads it from the
+  H.264 SPS / HEVC parameter sets in `extradata_b64`
+  (`relay_server/source_aspect.py`); Android sends only what the container
+  declares.
 - `gitignore`d and machine-local: `models/` (onnx + trt cache), `mpv-dev/`
   (Windows libmpv DLL), venvs, `*.mkv` test media. The laptop needs none of
   them (distro libmpv + no models client-side).

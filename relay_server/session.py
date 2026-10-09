@@ -20,6 +20,7 @@ from upscale_cli.fit import DEFAULT_RESIZE_ALGORITHM, RESIZE_ALGORITHMS
 
 from .library import MediaLibrary
 from .pipeline import Pipeline, PipelineConstructionError, VideoConfig
+from .source_aspect import sample_aspect_ratio_from_parameter_sets
 
 log = logging.getLogger("relay.session")
 
@@ -69,6 +70,23 @@ def _sanitize_chapters(raw: Any) -> list[dict]:
         })
     chapters.sort(key=lambda c: c["start_s"])
     return chapters
+
+
+# Pixel shapes outside this range are not real sources; treat them as absent.
+_SAMPLE_ASPECT_RATIO_RANGE = (Fraction(1, 10), Fraction(10))
+
+
+def _sample_aspect_ratio(video: dict) -> Fraction:
+    """open_session.video.sample_aspect_ratio, or 1 when absent or invalid."""
+    raw = video.get("sample_aspect_ratio")
+    if (
+        isinstance(raw, list) and len(raw) == 2
+        and all(type(part) is int and part > 0 for part in raw)
+    ):
+        sar = Fraction(raw[0], raw[1])
+        if _SAMPLE_ASPECT_RATIO_RANGE[0] <= sar <= _SAMPLE_ASPECT_RATIO_RANGE[1]:
+            return sar
+    return Fraction(1)
 
 
 class State(str, Enum):
@@ -409,13 +427,28 @@ class Session:
                 message=str(resize_algorithm), fatal=False,
             )
             return
+        extradata = base64.b64decode(video["extradata_b64"]) if video.get("extradata_b64") else None
+        sample_aspect_ratio = _sample_aspect_ratio(video)
+        if source_kind == "uplink" and video.get("sample_aspect_ratio") is None:
+            # Clients that cannot see a bitstream-only aspect send none; read
+            # it from the parameter sets before the output size is announced.
+            derived = await asyncio.to_thread(
+                sample_aspect_ratio_from_parameter_sets,
+                video["codec"], extradata, video["width"], video["height"],
+            )
+            if derived is not None:
+                sample_aspect_ratio = _sample_aspect_ratio(
+                    {"sample_aspect_ratio": [derived.numerator, derived.denominator]},
+                )
         cfg = VideoConfig(
             codec=video["codec"],
-            extradata=base64.b64decode(video["extradata_b64"]) if video.get("extradata_b64") else None,
+            extradata=extradata,
             width=video["width"],
             height=video["height"],
             time_base=Fraction(*video["time_base"]),
             avg_rate=Fraction(*video["avg_rate"]) if video.get("avg_rate") else None,
+            sample_aspect_ratio=sample_aspect_ratio,
+            color_tags=self.source_track.color_tags if self.source_track is not None else None,
         )
         # Pipeline construction can block for minutes when a model's TensorRT
         # engine is built for the first time; keepalives stop the client's
@@ -594,7 +627,13 @@ class Session:
     async def _server_source_loop(self, from_pts: int | None,
                                   discontinuity: bool, epoch: int) -> None:
         assert self.source_track is not None and self.pipeline is not None
+        # Claim both iterator generations here on the event loop, before any
+        # cancellable worker runs. A cancelled to_thread(next_batch) keeps
+        # running; claiming inside it let a superseded epoch's worker retire
+        # the replacement epoch's auxiliary iterator (its audio and subtitles
+        # stopped while video went on).
         video_iterator = self.source_track.packets(from_pts)
+        aux_generation = self.aux_track.reserve() if self.aux_track is not None else None
         target_s = (
             float(from_pts * self.source_track.time_base) if from_pts is not None else None
         )
@@ -618,7 +657,7 @@ class Session:
                 if target_s - video_start_s > self.pipeline.seek_discard_max_s:
                     aux_target_s = video_start_s
             aux_iterator = (
-                self.aux_track.packets(aux_target_s)
+                self.aux_track.packets(aux_target_s, generation=aux_generation)
                 if self.aux_track is not None else iter(())
             )
             auxiliary = next(aux_iterator, sentinel)

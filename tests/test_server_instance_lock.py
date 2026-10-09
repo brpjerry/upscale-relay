@@ -13,11 +13,12 @@ from relay_server import instance_lock
 from relay_server.instance_lock import AlreadyRunningError, acquire_instance_lock
 
 _HOLDER = textwrap.dedent("""
+    import os
     import sys
     from pathlib import Path
     from relay_server.instance_lock import acquire_instance_lock
     acquire_instance_lock(Path(sys.argv[1]))
-    print("locked", flush=True)
+    print("locked", os.getpid(), flush=True)
     sys.stdin.read()
 """)
 
@@ -29,7 +30,12 @@ def holder(tmp_path):
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
     )
     try:
-        assert proc.stdout.readline().strip() == "locked"
+        status, pid = proc.stdout.readline().split()
+        assert status == "locked"
+        # The process holding the lock reports itself: on Windows a venv's
+        # python.exe is a launcher whose child interpreter owns the lock, so
+        # Popen.pid names the wrong process.
+        proc.lock_pid = int(pid)
         yield proc
     finally:
         proc.kill()
@@ -46,8 +52,8 @@ def _no_held_lock():
 def test_second_process_is_refused_with_holder_pid(tmp_path, holder):
     with pytest.raises(AlreadyRunningError) as caught:
         acquire_instance_lock(tmp_path)
-    assert caught.value.pid == holder.pid
-    assert f"PID {holder.pid}" in str(caught.value)
+    assert caught.value.pid == holder.lock_pid
+    assert f"PID {holder.lock_pid}" in str(caught.value)
 
 
 def test_killed_holder_leaves_no_stale_lock(tmp_path, holder):
@@ -75,4 +81,4 @@ def test_relay_server_cli_exits_nonzero_when_lock_held(tmp_path, holder):
     )
     assert result.returncode == 1
     assert "already running" in result.stderr
-    assert f"PID {holder.pid}" in result.stderr
+    assert f"PID {holder.lock_pid}" in result.stderr

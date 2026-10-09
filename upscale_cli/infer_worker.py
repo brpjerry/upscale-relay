@@ -24,6 +24,7 @@ import sys
 import threading
 from contextlib import suppress
 from multiprocessing import shared_memory
+from typing import Callable
 
 import numpy as np
 
@@ -57,7 +58,30 @@ def is_gpu_provider(name: str | None) -> bool:
     """
     return name in _GPU_PROVIDERS
 
-# Input cap = TRT profile max; output cap covers scale 4x.
+
+def require_gpu_provider(provider: str | None, ep: str) -> None:
+    """Refuse inference that landed on the CPU unless ``--ep cpu`` asked for it.
+
+    Relaying is a realtime job, and CPU inference is roughly two orders of
+    magnitude short of it — a session that falls back does not degrade, it
+    stops being usable.  The check is on the provider a session actually got,
+    because the availability list still reports a TensorRT provider whose
+    native libraries failed to load; the fallback is otherwise silent, and
+    reads as an unexplained slowdown.  A restarted worker is a new session and
+    must pass the same check.
+    """
+    if ep == "cpu" or is_gpu_provider(provider):
+        return
+    raise RuntimeError(
+        f"inference fell back to {provider or 'an unknown provider'} with --ep "
+        f"{ep}; the relay needs GPU inference. Check that the NVIDIA runtime "
+        "installed cleanly (its libraries can be registered but still fail to "
+        "load), or pass --ep cpu to accept CPU speeds deliberately."
+    )
+
+# Default input capacity = TRT profile max; output capacity covers scale 4x.
+# A facade told about a larger source sizes its buffers for that source
+# instead: the worker tiles anything beyond the profile itself.
 _MAX_IN = (1440, 2560)
 _MAX_IN_BYTES = _MAX_IN[0] * _MAX_IN[1] * 3
 _MAX_OUT_BYTES = _MAX_IN_BYTES * 16  # 4x scale in both dims
@@ -162,18 +186,35 @@ class SubprocessUpscaler:
 
     FIRST_FRAME_TIMEOUT = 300.0  # cold TensorRT engine build
     FRAME_TIMEOUT = 60.0
+    _accept_provider: Callable[[str | None], None] | None = None
+    _max_in = _MAX_IN
 
     def __init__(self, model_path: str, ep: str = "tensorrt",
-                 tile_size: int | str | None = None):
+                 tile_size: int | str | None = None, *,
+                 max_input_hw: tuple[int, int] | None = None,
+                 accept_provider: Callable[[str | None], None] | None = None):
+        """``max_input_hw`` is the largest frame the caller will send, when it
+        can exceed the default 2560x1440 capacity.  ``accept_provider`` sees
+        the provider of every worker generation, the initial one and each
+        crash replacement, and raises to refuse it."""
         from upscale_cli.manifest import ModelManifest
 
         self.model_path = model_path
         self.ep = ep
         self.tile_size = tile_size
+        self._accept_provider = accept_provider
         self.manifest = ModelManifest.load(model_path)
         self.scale_factor = self.manifest.scale_factor
         if self.scale_factor is None:
             raise ValueError(f"model {model_path} needs a manifest with scale_factor")
+        self._max_in = _MAX_IN
+        in_bytes, out_bytes = _MAX_IN_BYTES, _MAX_OUT_BYTES
+        if max_input_hw is not None and (
+            max_input_hw[0] > _MAX_IN[0] or max_input_hw[1] > _MAX_IN[1]
+        ):
+            self._max_in = (max(_MAX_IN[0], max_input_hw[0]), max(_MAX_IN[1], max_input_hw[1]))
+            in_bytes = self._max_in[0] * self._max_in[1] * 3
+            out_bytes = in_bytes * self.scale_factor * self.scale_factor
         self._lock = threading.Lock()
         self._shm_in: shared_memory.SharedMemory | None = None
         self._shm_out: shared_memory.SharedMemory | None = None
@@ -182,8 +223,8 @@ class SubprocessUpscaler:
         self._first_frame_done = False
         self.active_provider: str | None = None
         try:
-            self._shm_in = shared_memory.SharedMemory(create=True, size=_MAX_IN_BYTES)
-            self._shm_out = shared_memory.SharedMemory(create=True, size=_MAX_OUT_BYTES)
+            self._shm_in = shared_memory.SharedMemory(create=True, size=in_bytes)
+            self._shm_out = shared_memory.SharedMemory(create=True, size=out_bytes)
             self._start_worker()
         except BaseException:
             with suppress(Exception):
@@ -247,6 +288,12 @@ class SubprocessUpscaler:
             self._kill()
             raise RuntimeError(f"inference worker failed to start: {line!r}")
         self.active_provider = parse_ready_provider(line)
+        if self._accept_provider is not None:
+            try:
+                self._accept_provider(self.active_provider)
+            except BaseException:
+                self._kill()
+                raise
 
     def _read_exact(self, n: int, timeout: float) -> bytes | None:
         """Next framed reply from the persistent reader (n is fixed = header)."""
@@ -301,8 +348,10 @@ class SubprocessUpscaler:
 
     def _infer_with_fallback(self, rgb: np.ndarray) -> np.ndarray:
         h, w = rgb.shape[:2]
-        if h > _MAX_IN[0] or w > _MAX_IN[1]:
-            raise ValueError(f"frame {w}x{h} exceeds worker input cap {_MAX_IN[1]}x{_MAX_IN[0]}")
+        if h > self._max_in[0] or w > self._max_in[1]:
+            raise ValueError(
+                f"frame {w}x{h} exceeds worker input cap {self._max_in[1]}x{self._max_in[0]}"
+            )
         with self._lock:
             timeout = self.FRAME_TIMEOUT if self._first_frame_done else self.FIRST_FRAME_TIMEOUT
             out = self._roundtrip(rgb, timeout)

@@ -83,8 +83,12 @@ class RelayServer:
                  lossless_hevc_profile: str = DEFAULT_LOSSLESS_HEVC_PROFILE,
                  mdns: bool = False,
                  seek_discard_max_s: float | None = None,
-                 library_roots: Iterable[str | Path] | None = None):
+                 library_roots: Iterable[str | Path] | None = None,
+                 server_id: str | None = None):
         self.port = port
+        # Persistent install identity (relay_server.server_id); None omits
+        # capabilities.server_id and clients key by host:port instead.
+        self.server_id = server_id
         self.media_port = port + 1
         self.ep = ep
         self.stats_interval = stats_interval  # seconds; None = no periodic stats
@@ -272,6 +276,7 @@ class RelayServer:
                         "library_sort": (
                             list(LIBRARY_SORT_KEYS) if self.library is not None else []
                         ),
+                        **({"server_id": self.server_id} if self.server_id else {}),
                     }))
                 elif mtype == "open_session":
                     if self.native_teardown_error is not None:
@@ -560,6 +565,9 @@ class RelayServer:
 
 
 async def main_async(args) -> None:
+    from .server_id import load_or_create_server_id
+
+    server_id = await asyncio.to_thread(load_or_create_server_id)
     server = RelayServer(
         args.models_dir, args.port, ep=args.ep,
         stats_interval=2.0 if args.verbose else None,
@@ -568,6 +576,7 @@ async def main_async(args) -> None:
         lossless_hevc_profile=args.lossless_hevc_profile,
         mdns=not args.no_mdns,
         seek_discard_max_s=args.seek_discard_max_s,
+        server_id=server_id,
     )
     await server.start()
     await asyncio.Event().wait()  # run forever

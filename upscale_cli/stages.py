@@ -14,6 +14,9 @@ from typing import Iterable, Iterator, Protocol
 import av
 from av.codec.hwaccel import HWAccel
 
+from .color import VideoColor
+from .encode import add_video_encoder_stream
+
 # Pixel formats that indicate a frame still lives in GPU memory.
 _HW_PIX_FMTS = {"cuda", "d3d11", "d3d11va_vld", "dxva2_vld", "vaapi", "qsv", "videotoolbox"}
 
@@ -84,9 +87,19 @@ class FrameSource:
     def average_rate(self) -> Fraction | None:
         return self._stream.average_rate
 
+    @property
+    def color(self) -> VideoColor:
+        """The source's colour, unspecified tags resolved for its size."""
+        cc = self._stream.codec_context
+        return VideoColor.resolve(cc, cc.width, cc.height)
+
     def __iter__(self) -> Iterator[av.VideoFrame]:
+        color = self.color
         for frame in self._container.decode(self._stream):
-            yield _to_cpu(frame)
+            frame = _to_cpu(frame)
+            # Explicit tags: later stages read the frame as the source means it.
+            color.tag(frame)
+            yield frame
 
     def close(self) -> None:
         self._container.close()
@@ -123,8 +136,12 @@ class FrameSink:
         codec: str = "libx264",
         pix_fmt: str = "yuv420p",
         options: dict[str, str] | None = None,
+        color: VideoColor | None = None,
     ):
+        """``color`` describes the source (``FrameSource.color``); without it
+        the first frame written decides."""
         self.path = path
+        self._color = color
         self._time_base = time_base
         self._rate = rate
         self._codec = codec
@@ -139,17 +156,20 @@ class FrameSink:
     def _init_stream(self, frame: av.VideoFrame) -> av.VideoStream:
         # Note: the muxer picks the output stream time_base (e.g. 1/1000 for MKV);
         # PyAV rescales packets from each frame's own time_base.
-        stream = self._container.add_stream(self._codec, rate=self._rate, options=self._options)
-        stream.width = frame.width
-        stream.height = frame.height
-        stream.pix_fmt = self._pix_fmt
-        return stream
+        if self._color is None:
+            self._color = VideoColor.resolve(frame, frame.width, frame.height)
+        return add_video_encoder_stream(
+            self._container, self._codec,
+            width=frame.width, height=frame.height, pix_fmt=self._pix_fmt,
+            time_base=frame.time_base or self._time_base, rate=self._rate,
+            options=self._options, color=self._color,
+        )
 
     def write(self, frame: av.VideoFrame) -> None:
         if self._stream is None:
             self._stream = self._init_stream(frame)
         if frame.format.name != self._pix_fmt:
-            converted = self._reformatter.reformat(frame, format=self._pix_fmt)
+            converted = self._color.to_output(self._reformatter, frame, pix_fmt=self._pix_fmt)
             converted.pts = frame.pts
             converted.time_base = frame.time_base
             frame = converted

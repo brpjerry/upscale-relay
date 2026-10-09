@@ -54,6 +54,7 @@ from .gui_settings import ServerSettings, available_ep_choices
 from .instance_lock import AlreadyRunningError, acquire_instance_lock
 from .logo import make_icon, paint_logo  # noqa: F401  (re-exported; tests import from here)
 from .server import RelayServer
+from .server_id import load_or_create_server_id
 
 log = logging.getLogger("relay.tray")
 
@@ -407,6 +408,7 @@ class ServerController:
         async with self._lifecycle_lock:
             await self._stop_locked()
             s = self.settings
+            server_id = await asyncio.to_thread(load_or_create_server_id)
             server = RelayServer(
                 s.models_dir,
                 s.port,
@@ -414,6 +416,7 @@ class ServerController:
                 stats_interval=2.0 if s.file_logging else None,
                 library_roots=s.library_dirs or None,
                 mdns=s.mdns,
+                server_id=server_id,
             )
             server.event_callback = self.event_callback
             try:

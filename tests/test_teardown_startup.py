@@ -319,6 +319,7 @@ def test_cached_attachment_negotiation_omits_epoch_attachment_bodies(monkeypatch
             has_audio_tracks = True
             has_auxiliary_tracks = True
             average_rate = Fraction(24, 1)
+            color_tags = (2, 0, 2, 2)  # unspecified, as probed from an untagged file
 
             def __init__(self, _path):
                 pass
@@ -412,7 +413,10 @@ def test_mux_uses_small_nonzero_interleave_bound(monkeypatch):
 
     class Mux:
         def add_stream(self, *_args, **_kwargs):
-            return SimpleNamespace(width=None, height=None, pix_fmt=None)
+            return SimpleNamespace(
+                width=None, height=None, pix_fmt=None,
+                codec_context=SimpleNamespace(time_base=None),
+            )
 
     def fake_open(*_args, **kwargs):
         captured.update(kwargs)
@@ -424,12 +428,13 @@ def test_mux_uses_small_nonzero_interleave_bound(monkeypatch):
     pipeline._sink_buf = object()
     pipeline._enc_options = {}
     pipeline._enc_codec = "fake"
-    pipeline.video = SimpleNamespace(avg_rate=Fraction(24, 1))
+    pipeline.video = SimpleNamespace(avg_rate=Fraction(24, 1), time_base=Fraction(1, 1000))
     pipeline.out_w = 320
     pipeline.out_h = 180
     pipeline._enc_pix_fmt = "yuv420p"
     pipeline._aux_template_container = None
     pipeline._embed_aux_attachments = True
+    pipeline._source_color = None
     pipeline._open_mux()
     assert captured["container_options"]["max_interleave_delta"] == str(
         MUX_MAX_INTERLEAVE_DELTA_US

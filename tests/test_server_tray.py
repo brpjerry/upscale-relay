@@ -52,6 +52,12 @@ def isolated_autostart(monkeypatch):
                 pass
 
 
+@pytest.fixture(autouse=True)
+def isolated_state_dir(monkeypatch, tmp_path):
+    """Keep server starts from creating the user's real server-id file."""
+    monkeypatch.setenv("UPSCALE_RELAY_LOCK_DIR", str(tmp_path / "state"))
+
+
 @pytest.fixture()
 def app():
     return QApplication.instance() or QApplication([])

@@ -69,21 +69,36 @@ class MdnsAdvertiser:
         )
         try:
             zc = AsyncZeroconf(ip_version=IPVersion.V4Only)
-            await zc.async_register_service(info)
         except OSError as error:
             log.warning("mDNS advertisement disabled: %s", error)
             return
+        # Own the instance before registering: its sockets and threads exist
+        # now, and a failed or cancelled registration must still close them.
         self._zeroconf = zc
+        try:
+            await zc.async_register_service(info)
+        except OSError as error:
+            log.warning("mDNS advertisement disabled: %s", error)
+            await self.stop()
+            return
+        except BaseException:
+            await self.stop()
+            raise
         self._info = info
         log.info("mDNS: advertising %s at %s:%d", SERVICE_TYPE, address, self.port)
 
     async def stop(self) -> None:
-        if self._zeroconf is None:
+        zc, info = self._zeroconf, self._info
+        self._zeroconf = self._info = None
+        if zc is None:
             return
         try:
-            await self._zeroconf.async_unregister_service(self._info)
-            await self._zeroconf.async_close()
+            if info is not None:
+                await zc.async_unregister_service(info)
         except OSError:
             pass
-        self._zeroconf = None
-        self._info = None
+        finally:
+            try:
+                await zc.async_close()
+            except OSError:
+                pass

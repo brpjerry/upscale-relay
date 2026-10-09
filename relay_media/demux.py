@@ -120,6 +120,11 @@ class VideoTrack:
         self.has_audio_tracks = bool(self._container.streams.audio)
         self.has_subtitle_tracks = bool(self._container.streams.subtitles)
         self.has_auxiliary_tracks = self.has_audio_tracks or self.has_subtitle_tracks
+        # FFmpeg colour tags (matrix, range, primaries, transfer) as probed.
+        cc = self._stream.codec_context
+        self.color_tags = (
+            int(cc.colorspace), int(cc.color_range), int(cc.color_primaries), int(cc.color_trc),
+        )
         # Serializes native demux/seek calls: a cancelled asyncio task's
         # in-flight to_thread(next, ...) keeps running on its worker thread,
         # and concurrent libav access is a native crash, not an exception.
@@ -142,7 +147,7 @@ class VideoTrack:
         cc = self._stream.codec_context
         extradata = bytes(cc.extradata) if cc.extradata else None
         avg = self._stream.average_rate
-        return {
+        video = {
             "codec": cc.name,
             "extradata_b64": base64.b64encode(extradata).decode() if extradata else None,
             "width": cc.width,
@@ -150,6 +155,14 @@ class VideoTrack:
             "time_base": [self.time_base.numerator, self.time_base.denominator],
             "avg_rate": [avg.numerator, avg.denominator] if avg else None,
         }
+        # Pixel shape of anamorphic sources; unknown (0/1) is left out, which
+        # the server reads as square pixels. The stream's value includes a
+        # container override such as Matroska display dimensions.
+        sar = self._stream.sample_aspect_ratio or cc.sample_aspect_ratio
+        if sar and sar > 0:
+            sar = Fraction(sar.numerator, sar.denominator)
+            video["sample_aspect_ratio"] = [sar.numerator, sar.denominator]
+        return video
 
     def packets(self, from_pts: int | None = None) -> Iterator[PacketInfo]:
         """Iterate packets, optionally seeking to a keyframe before ``from_pts``.
@@ -445,16 +458,34 @@ class AuxiliaryTrack:
         finally:
             self.subtitle_index_progress = None
 
-    def packets(self, target_s: float | None = None) -> Iterator[AuxiliaryPacketInfo]:
+    def reserve(self) -> int:
+        """Claim the next iterator generation without choosing a target yet.
+
+        Claiming invalidates every older iterator, as ``packets()`` does. A
+        caller that only learns its target inside cancellable worker code
+        claims on its own thread first and passes the generation to
+        ``packets()``: a cancelled worker that keeps running then gets an
+        already-retired iterator instead of retiring its replacement's.
+        """
+        with self._generation_lock:
+            self._iter_gen = gen = self._iter_gen + 1
+        return gen
+
+    def packets(
+        self, target_s: float | None = None, *, generation: int | None = None,
+    ) -> Iterator[AuxiliaryPacketInfo]:
         """Iterate original auxiliary packets, optionally from ``target_s``.
 
         A small audio preroll is retained and subtitle packets whose declared
         duration overlaps the target survive. mpv's initial audio sync trims
         samples before the first video PTS; keeping them is safer than starting
         codecs such as Opus/AAC without decoder preroll.
+
+        ``generation`` is one returned by ``reserve()``; without it the call
+        claims a new one. An iterator whose generation is no longer current
+        yields nothing.
         """
-        with self._generation_lock:
-            self._iter_gen = gen = self._iter_gen + 1
+        gen = self.reserve() if generation is None else generation
         return self._packet_iter(gen, target_s)
 
     def _packet_iter(
