@@ -412,7 +412,10 @@ def test_mux_uses_small_nonzero_interleave_bound(monkeypatch):
 
     class Mux:
         def add_stream(self, *_args, **_kwargs):
-            return SimpleNamespace(width=None, height=None, pix_fmt=None)
+            return SimpleNamespace(
+                width=None, height=None, pix_fmt=None,
+                codec_context=SimpleNamespace(time_base=None),
+            )
 
     def fake_open(*_args, **kwargs):
         captured.update(kwargs)
@@ -424,7 +427,7 @@ def test_mux_uses_small_nonzero_interleave_bound(monkeypatch):
     pipeline._sink_buf = object()
     pipeline._enc_options = {}
     pipeline._enc_codec = "fake"
-    pipeline.video = SimpleNamespace(avg_rate=Fraction(24, 1))
+    pipeline.video = SimpleNamespace(avg_rate=Fraction(24, 1), time_base=Fraction(1, 1000))
     pipeline.out_w = 320
     pipeline.out_h = 180
     pipeline._enc_pix_fmt = "yuv420p"
