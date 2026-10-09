@@ -454,15 +454,13 @@ class Pipeline:
                     self.video.codec, "r",
                     hwaccel=HWAccel(device_type="cuda", allow_software_fallback=False),
                 )
-                if self.video.extradata:
-                    ctx.extradata = self.video.extradata
+                self._describe_source(ctx)
                 return ctx
             except Exception:
                 self._hw_decode_failed = True
                 log.info("NVDEC unavailable for %s; using software decode", self.video.codec)
         ctx = av.CodecContext.create(self.video.codec, "r")
-        if self.video.extradata:
-            ctx.extradata = self.video.extradata
+        self._describe_source(ctx)
         # Threaded software decode is OPT-IN (RELAY_DECODE_THREADS=1): with
         # PyAV 18's bundled ffmpeg 8, frame-threaded decode under sustained
         # paced streaming crashes with a heap read-AV inside avcodec-62
@@ -475,6 +473,17 @@ class Pipeline:
             ctx.thread_count = 1
             ctx.thread_type = "NONE"
         return ctx
+
+    def _describe_source(self, ctx: av.CodecContext) -> None:
+        """Give a decoder what a demuxer would: extradata and coded size.
+
+        Codecs such as FFV1 keep their dimensions in the container rather than
+        the bitstream and refuse to open without them.
+        """
+        if self.video.extradata:
+            ctx.extradata = self.video.extradata
+        ctx.width = self.video.width
+        ctx.height = self.video.height
 
     def _safe_put(self, q: queue.Queue, item) -> bool:
         """Bounded-queue put that never deadlocks a closing pipeline: wakes
