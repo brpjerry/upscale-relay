@@ -35,7 +35,11 @@ from relay_protocol import (
     NO_TS,
     MediaPacket,
 )
-from upscale_cli.encode import DEFAULT_LOSSLESS_HEVC_PROFILE, select_encoder
+from upscale_cli.encode import (
+    DEFAULT_LOSSLESS_HEVC_PROFILE,
+    add_video_encoder_stream,
+    select_encoder,
+)
 from upscale_cli.fit import (
     DEFAULT_RESIZE_ALGORITHM,
     aligned_target_dimensions,
@@ -512,12 +516,11 @@ class Pipeline:
                 "max_interleave_delta": str(MUX_MAX_INTERLEAVE_DELTA_US),
             },
         )
-        self._enc_stream = self._mux.add_stream(
-            self._enc_codec, rate=self.video.avg_rate, options=options
+        self._enc_stream = add_video_encoder_stream(
+            self._mux, self._enc_codec,
+            width=self.out_w, height=self.out_h, pix_fmt=self._enc_pix_fmt,
+            time_base=self.video.time_base, rate=self.video.avg_rate, options=options,
         )
-        self._enc_stream.width = self.out_w
-        self._enc_stream.height = self.out_h
-        self._enc_stream.pix_fmt = self._enc_pix_fmt
         self._aux_streams = {}
         if self._aux_template_container is not None:
             for template in self._aux_template_container.streams:

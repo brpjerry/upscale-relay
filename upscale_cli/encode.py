@@ -332,3 +332,30 @@ def select_encoder(
         f"no encoder available for tier '{requested_tier}'{profile_text} "
         f"(tried: {tried}); {detail}"
     ) from (failures[-1][2] if failures else None)
+
+
+def add_video_encoder_stream(
+    container: av.container.OutputContainer,
+    codec: str,
+    *,
+    width: int,
+    height: int,
+    pix_fmt: str,
+    time_base: Fraction,
+    rate: Fraction | None = None,
+    options: dict[str, str] | None = None,
+) -> av.VideoStream:
+    """Add the output video stream shared by relay and offline encoding.
+
+    The encoder's time base is the source's. Left unset, libav derives it from
+    the frame rate and rounds every timestamp onto that grid, which retimes
+    variable-frame-rate sources. ``rate`` stays the encoder's nominal frame
+    rate for rate control. Never set the output *stream* time base: the muxer
+    owns it and rescales packets from the encoder's.
+    """
+    stream = container.add_stream(codec, rate=rate, options=options)
+    stream.width = width
+    stream.height = height
+    stream.pix_fmt = pix_fmt
+    stream.codec_context.time_base = time_base
+    return stream

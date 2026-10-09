@@ -14,6 +14,8 @@ from typing import Iterable, Iterator, Protocol
 import av
 from av.codec.hwaccel import HWAccel
 
+from .encode import add_video_encoder_stream
+
 # Pixel formats that indicate a frame still lives in GPU memory.
 _HW_PIX_FMTS = {"cuda", "d3d11", "d3d11va_vld", "dxva2_vld", "vaapi", "qsv", "videotoolbox"}
 
@@ -139,11 +141,12 @@ class FrameSink:
     def _init_stream(self, frame: av.VideoFrame) -> av.VideoStream:
         # Note: the muxer picks the output stream time_base (e.g. 1/1000 for MKV);
         # PyAV rescales packets from each frame's own time_base.
-        stream = self._container.add_stream(self._codec, rate=self._rate, options=self._options)
-        stream.width = frame.width
-        stream.height = frame.height
-        stream.pix_fmt = self._pix_fmt
-        return stream
+        return add_video_encoder_stream(
+            self._container, self._codec,
+            width=frame.width, height=frame.height, pix_fmt=self._pix_fmt,
+            time_base=frame.time_base or self._time_base, rate=self._rate,
+            options=self._options,
+        )
 
     def write(self, frame: av.VideoFrame) -> None:
         if self._stream is None:

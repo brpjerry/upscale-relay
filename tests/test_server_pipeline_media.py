@@ -88,3 +88,59 @@ def test_ffv1_source_decodes_with_container_dimensions(tmp_path):
         actual = [frame.to_ndarray() for frame in relayed.decode(video=0)]
     assert len(actual) == len(expected)
     assert all(np.array_equal(a, b) for a, b in zip(actual, expected))
+
+
+# Millisecond timestamps that no constant frame rate grid reproduces.
+_VFR_PTS_MS = [0, 33, 83, 117, 167, 200, 250, 283, 333, 367, 417, 450]
+
+
+def _write_vfr_h264(path) -> None:
+    with av.open(str(path), "w") as output:
+        stream = output.add_stream("libx264", rate=24, options={"bf": "0", "tune": "zerolatency"})
+        stream.width = stream.height = 32
+        stream.pix_fmt = "yuv420p"
+        stream.codec_context.time_base = Fraction(1, 1000)
+        for index, pts in enumerate(_VFR_PTS_MS):
+            frame = av.VideoFrame.from_ndarray(
+                np.full((32, 32, 3), index * 20, np.uint8), format="rgb24",
+            )
+            frame.pts, frame.time_base = pts, Fraction(1, 1000)
+            output.mux(stream.encode(frame))
+        output.mux(stream.encode(None))
+
+
+def _video_pts_seconds(source) -> list[float]:
+    with av.open(source) as container:
+        stream = container.streams.video[0]
+        return sorted(
+            round(float(packet.pts * stream.time_base), 3)
+            for packet in container.demux(stream) if packet.pts is not None
+        )
+
+
+def test_variable_frame_rate_timestamps_survive_the_relay(tmp_path):
+    source = tmp_path / "vfr.mkv"
+    _write_vfr_h264(source)
+    expected = [pts / 1000 for pts in _VFR_PTS_MS]
+    assert _video_pts_seconds(str(source)) == expected
+
+    downlink = run_passthrough(source, (32, 32))
+
+    assert _video_pts_seconds(io.BytesIO(downlink)) == expected
+
+
+def test_variable_frame_rate_timestamps_survive_offline_encoding(tmp_path):
+    from upscale_cli.stages import FrameSink, FrameSource
+
+    source = tmp_path / "vfr.mkv"
+    _write_vfr_h264(source)
+    output = tmp_path / "out.mkv"
+    with FrameSource(str(source), hwaccel="none") as frames, FrameSink(
+        str(output), frames.time_base, frames.average_rate, codec="ffv1", options={},
+    ) as sink:
+        for frame in frames:
+            sink.write(frame)
+
+    expected = [pts / 1000 for pts in _VFR_PTS_MS]
+    assert sink.pts_written == expected
+    assert _video_pts_seconds(str(output)) == expected
