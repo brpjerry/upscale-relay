@@ -50,3 +50,24 @@ def test_tile_grid_covers_frame(model_path):
 def test_odd_overlap_rejected(model_path):
     with pytest.raises(ValueError):
         OnnxUpscaler(model_path, ep="cpu", overlap=15)
+
+
+@pytest.mark.parametrize(("tile_size", "overlap"), [(8, 16), (16, 16), (0, 16), (-64, 16), (64, -2)])
+def test_tiles_that_cannot_cover_a_frame_are_rejected_up_front(model_path, tile_size, overlap):
+    # tile 8 / overlap 16 used to step backwards and return an unwritten
+    # np.empty output; tile == overlap failed later with a zero range step.
+    with pytest.raises(ValueError, match="tile"):
+        OnnxUpscaler(model_path, ep="cpu", tile_size=tile_size, overlap=overlap)
+
+
+@pytest.mark.parametrize("tile", [8, 16])
+def test_direct_tiled_inference_rejects_tiles_within_the_overlap(model_path, tile):
+    up = OnnxUpscaler(model_path, ep="cpu")
+    with pytest.raises(ValueError, match="tile"):
+        up.infer_array_tiled(np.full((80, 80, 3), 127, np.uint8), tile)
+
+
+def test_smallest_valid_tile_writes_every_output_pixel(model_path):
+    up = OnnxUpscaler(model_path, ep="cpu", tile_size=18)  # one past the overlap
+    rgb = np.full((80, 80, 3), 127, np.uint8)
+    assert np.array_equal(up._infer_with_fallback(rgb), up.infer_array(rgb))

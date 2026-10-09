@@ -113,13 +113,16 @@ def main(argv: list[str] | None = None) -> int:
         from .infer import OnnxUpscaler
 
         tile: int | str | None
-        if args.tile_size == "auto":
-            tile = "auto"
-        elif args.tile_size in ("none", "0"):
-            tile = None
-        else:
-            tile = int(args.tile_size)
-        stages.append(OnnxUpscaler(args.model, ep=args.ep, tile_size=tile, overlap=args.tile_overlap))
+        try:
+            if args.tile_size == "auto":
+                tile = "auto"
+            elif args.tile_size in ("none", "0"):
+                tile = None
+            else:
+                tile = int(args.tile_size)
+            stages.append(OnnxUpscaler(args.model, ep=args.ep, tile_size=tile, overlap=args.tile_overlap))
+        except ValueError as err:
+            parser.error(str(err))
     if args.fit:
         from .fit import FitStage
 
