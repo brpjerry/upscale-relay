@@ -312,6 +312,9 @@ class RelayClient:
         self._down_q = _ThreadBridgeQueue(self._loop, maxsize=1024)
         self._uplink_writer: asyncio.StreamWriter | None = None
         self._uplink_task: asyncio.Task | None = None
+        # Counts the demux iterators start_uplink has claimed: the newest one
+        # owns the source (see _uplink_loop).
+        self._uplink_generation = 0
         self._reader_task: asyncio.Task | None = None
         self._downlink_socket: socket.socket | None = None
         self._downlink_thread: threading.Thread | None = None
@@ -323,6 +326,9 @@ class RelayClient:
         self._downlink_sample_bytes = 0
         self._downlink_sample_at = time.monotonic()
         self.errors: list[dict] = []
+        # Set, with the downlink queue ended, when reading the local source
+        # failed: the message the consumer should show for the ended stream.
+        self.source_error: str | None = None
         self.buffered_ms = 0  # consumer updates; buffer_report loop sends it
         # Optional UI hooks: called with each session_progress / seek_progress
         # message dict (from the control-reader task, i.e. on the event-loop
@@ -665,30 +671,57 @@ class RelayClient:
         # seek can bump self.epoch before the task is scheduled, and a stale
         # task stamping the new epoch interleaves two streams of one epoch
         # (docs/PROTOCOL.md §4 forbids exactly this).
-        if epoch != self.epoch:
+        if epoch != self.epoch or self.track is None or self._closing:
             return
-        self._uplink_task = asyncio.create_task(self._uplink_loop(from_pts, discontinuity, epoch))
+        # Claim the demux iterator here, on the event loop, never on a worker.
+        # packets() only takes a new iterator generation (the seek and every
+        # read run later, on the pump's worker), but a cancelled to_thread
+        # keeps running: an obsolete pump whose worker claimed its iterator
+        # after this one superseded it, and this epoch's stream ended early.
+        self._uplink_generation += 1
+        iterator = self.track.packets(from_pts)
+        self._uplink_task = asyncio.create_task(
+            self._uplink_loop(iterator, self._uplink_generation, discontinuity, epoch))
 
-    async def _uplink_loop(self, from_pts: int | None, discontinuity: bool, epoch: int) -> None:
+    async def _uplink_loop(self, iterator, generation: int, discontinuity: bool,
+                           epoch: int) -> None:
         assert self.track is not None and self._uplink_writer is not None
         first = True
+
+        def next_batch() -> list:
+            batch = []
+            for info in iterator:
+                batch.append(info)
+                if len(batch) >= _UPLINK_BATCH:
+                    break
+            return batch
+
+        def current() -> bool:
+            # VideoTrack ends a superseded iterator quietly, just as it ends at
+            # the end of the file. Only the newest pump of the current epoch
+            # may take a short batch for the end of the source.
+            return (epoch == self.epoch and generation == self._uplink_generation
+                    and not self._closing)
+
+        async def send(data: bytes) -> bool:
+            try:
+                self._uplink_writer.write(data)
+                await self._uplink_writer.drain()
+            except OSError as err:
+                # The server closed the uplink (its session is ending, which
+                # the control channel reports) or the connection dropped: not
+                # a source failure, whatever errno the socket gave.
+                log.info("uplink closed: %r", err)
+                return False
+            return True
+
         try:
-            iterator = await asyncio.to_thread(self.track.packets, from_pts)
-
-            def next_batch() -> list:
-                batch = []
-                for info in iterator:
-                    batch.append(info)
-                    if len(batch) >= _UPLINK_BATCH:
-                        break
-                return batch
-
             while True:
                 # One thread hop + one drain per batch: per-packet round-trips
                 # need ~2 loop turns each and starve the server when the GUI
                 # loop is slow (see _UPLINK_BATCH above).
                 batch = await asyncio.to_thread(next_batch)
-                if epoch != self.epoch:
+                if not current():
                     return
                 buf = bytearray()
                 for info in batch:
@@ -696,20 +729,33 @@ class RelayClient:
                                                   discontinuity=discontinuity and first)
                     first = False
                     buf += encode_packet(pkt)
-                if buf:
-                    self._uplink_writer.write(bytes(buf))
-                    await self._uplink_writer.drain()
+                if buf and not await send(bytes(buf)):
+                    return
                 if len(batch) < _UPLINK_BATCH:  # iterator exhausted
                     break
-            if epoch == self.epoch:
-                self._uplink_writer.write(
-                    encode_packet(MediaPacket(payload=b"", flags=FLAG_EOS, epoch=epoch))
-                )
-                await self._uplink_writer.drain()
+            if current():
+                await send(encode_packet(MediaPacket(payload=b"", flags=FLAG_EOS, epoch=epoch)))
         except asyncio.CancelledError:
             raise
-        except (ConnectionResetError, BrokenPipeError) as err:
-            log.info("uplink closed: %r", err)
+        except Exception as err:
+            # Reading the source failed (an SMB read, a damaged file). PyAV
+            # raises OSError subclasses, ConnectionResetError among them, so
+            # only the call site tells this apart from a closed uplink. A pump
+            # a seek already replaced stays quiet: its successor reads anew.
+            if current():
+                self._fail_source(err)
+
+    def _fail_source(self, err: Exception) -> None:
+        """End this session's media after reading the local source failed.
+
+        The server would otherwise wait for packets indefinitely. Record why
+        and end the downlink queue (get() returns None, without EOS): its
+        consumer stops playback and the session's owner tears down, as for
+        any ended downlink.
+        """
+        log.warning("source read failed, ending playback: %r", err, exc_info=err)
+        self.source_error = f"Could not read the source file: {str(err) or type(err).__name__}"
+        self._down_q.close()
 
     def _finish_downlink_setup(self, error: Exception | None = None) -> None:
         future = self._downlink_ready

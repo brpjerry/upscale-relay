@@ -210,6 +210,10 @@ async def _run_session(args, client, resources: ExitStack) -> int:
             await mpv_proc.wait()
 
     print(f"downlink packets: {sim.received_packets}, eos: {sim.eos}")
+    source_error = getattr(client, "source_error", None)
+    if source_error:  # the client ended the downlink: reading the file failed
+        print(f"relay-client: {source_error}", file=sys.stderr)
+        return 1
     if epoch_file is not None and epoch_file.tell():
         epoch_file.seek(0)
         decoded_frames = 0

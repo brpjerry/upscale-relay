@@ -311,7 +311,8 @@ class DesktopFeatures:
     def _key_for(self, source, path):
         host = self.client.host if self.client else self.settings.server_host
         port = self.client.port if self.client else self.settings.server_port
-        return source_key(source, path, host, port)
+        server_id = self._server_caps.get("server_id") if self.client else None
+        return source_key(source, path, host, port, server_id)
 
     def _save_history(self, *, completed=False):
         if not self._history_key or (not completed and (
@@ -405,7 +406,9 @@ class DesktopFeatures:
         self._show_position(self._position_s)
 
     async def _next_sibling(self, snapshot, valid):
-        name = PurePosixPath(snapshot.path).name
+        # Local paths are native (a sibling found here comes back with
+        # backslashes on Windows); server paths are always POSIX.
+        name = (Path if snapshot.source == "uplink" else PurePosixPath)(snapshot.path).name
         current = (name.casefold(), name)
         if snapshot.source == "uplink":
             from .main_window import VIDEO_EXTENSIONS

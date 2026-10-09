@@ -1,13 +1,14 @@
 """Feature integration through the retained desktop trees and transport slots."""
 import asyncio
 from fractions import Fraction
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 import pytest
 pytest.importorskip("PySide6")
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QKeyEvent
 
+import desktop_client.features as features
 import desktop_client.main_window as main_window
 from desktop_client.playback_state import PlaybackSnapshot
 from test_server_library_gui import window, FakeSessionClient, FakeLibraryClient
@@ -244,6 +245,26 @@ def test_autoplay_walks_name_pages_skips_watched_and_retains_partial_resume(wind
     asyncio.run(scenario())
 
 
+def test_local_autoplay_follows_native_windows_paths(window, monkeypatch):
+    names = ["01.mkv", "02.mkv", "03.mkv", "notes.txt"]
+    class WindowsPath(PureWindowsPath):
+        def iterdir(self):
+            return [self / name for name in names]
+        def is_file(self):
+            return True
+    monkeypatch.setattr(features, "Path", WindowsPath)
+    async def scenario():
+        # Qt's file dialog and tree hand over forward slashes; the sibling
+        # autoplay returns is native, so the next lookup sees backslashes.
+        snapshot = PlaybackSnapshot("uplink", "C:/shows/01.mkv", 1000, 1000, False)
+        assert await window._next_sibling(snapshot, lambda: True) == r"C:\shows\02.mkv"
+        snapshot.path = r"C:\shows\02.mkv"
+        assert await window._next_sibling(snapshot, lambda: True) == r"C:\shows\03.mkv"
+        snapshot.path = r"C:\shows\03.mkv"
+        assert await window._next_sibling(snapshot, lambda: True) is None
+    asyncio.run(scenario())
+
+
 def test_autoplay_is_cancelled_by_new_user_intent(window, monkeypatch):
     setup_lifecycle(window, monkeypatch)
     async def scenario():
@@ -325,7 +346,7 @@ def test_local_proxy_directories_first_newest_and_index_navigation(window, tmp_p
         window.local_proxy.set_order("mtime")
         assert names() == ["folder", "z.mkv", "A.mkv", "b.mkv"]
         window.on_up_dir()
-        assert window.fs_model.filePath(window.local_proxy.mapToSource(window.tree.rootIndex())) == str(tmp_path.parent)
+        assert Path(window.fs_model.filePath(window.local_proxy.mapToSource(window.tree.rootIndex()))) == tmp_path.parent
     with playback_loop(QApplication.instance()) as loop:
         loop.run_until_complete(scenario())
 
@@ -351,6 +372,28 @@ def test_restore_loads_pages_with_ten_page_cap_and_missing_path_fallback(window)
         await window._adopt_connected_client(client, {"server_name": "test", "models": [{"name": "passthrough"}], "library": True})
         assert len([p for p in client.fetches if p[0] == "Shows"]) == 10
         assert window.server_tree.currentIndex().data(Qt.UserRole) == "Shows"
+    asyncio.run(scenario())
+
+
+def test_server_history_and_browser_state_follow_the_server_id(window):
+    async def scenario():
+        caps = {"server_name": "test", "models": [{"name": "passthrough"}], "server_id": "box-1"}
+        first = FakeLibraryClient()
+        first.host, first.port = "192.168.0.115", 8590
+        await window._adopt_connected_client(first, caps)
+        window.history.save(window._key_for("server_file", "Shows/a.mkv"), 300, 1400)
+        endpoint = window._browser_endpoint
+        # The same server, now reached at another address.
+        moved = FakeLibraryClient()
+        moved.host, moved.port = "relay.local", 9000
+        await window._adopt_connected_client(moved, caps)
+        assert window._browser_endpoint == endpoint == "id:box-1"
+        assert window.history.entries[window._key_for("server_file", "Shows/a.mkv")].resume == 300
+        # A different server at the first address does not inherit it.
+        other = FakeLibraryClient()
+        other.host, other.port = "192.168.0.115", 8590
+        await window._adopt_connected_client(other, {**caps, "server_id": "box-2"})
+        assert window._key_for("server_file", "Shows/a.mkv") not in window.history.entries
     asyncio.run(scenario())
 
 

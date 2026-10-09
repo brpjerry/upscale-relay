@@ -4,6 +4,8 @@ pytest.importorskip("PySide6")  # desktop client is an optional extra
 
 """Desktop command-line option parsing."""
 
+from pathlib import Path
+
 from desktop_client.app import parse_args
 
 
@@ -20,5 +22,5 @@ def test_relay_flags_are_consumed_and_qt_flags_are_preserved():
     assert options.mpv_scripts
     assert options.headless
     assert options.settings_scope == "smoke"
-    assert str(options.input_conf_path) == "/tmp/keys.conf"
+    assert options.input_conf_path == Path("/tmp/keys.conf")
     assert qt_args == ["-platform", "offscreen"]

@@ -54,7 +54,10 @@ def main() -> None:
     if options.debug:
         import faulthandler
 
-        faulthandler.enable()
+        # On Windows faulthandler also fires on LuaJIT's caught SEH exceptions
+        # (mpv's built-in scripts), and dumping every thread while they run
+        # crashed the player itself. Dump only the faulting thread there.
+        faulthandler.enable(all_threads=sys.platform != "win32")
 
     # Preserve unknown arguments for Qt itself (e.g. -platform), while
     # consuming the relay-specific flags above.

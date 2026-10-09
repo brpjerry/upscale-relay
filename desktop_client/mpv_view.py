@@ -380,6 +380,7 @@ class MpvPlayerView(QOpenGLWidget):
     volume_changed = Signal(int, bool)  # volume percent, muted
     rebuffering = Signal(bool)
     pause_requested = Signal()  # keyboard and toolbar share application intent
+    paused_changed = Signal(bool)  # an input.conf binding paused/resumed mpv itself
     seek_requested = Signal(float)  # relative seconds (arrow keys)
     chapter_step_requested = Signal(int)  # +1 next / -1 previous (PgUp/PgDn)
     finished = Signal()
@@ -391,6 +392,7 @@ class MpvPlayerView(QOpenGLWidget):
     _playback_restarted = Signal(int)  # libmpv event thread -> GUI thread
     _external_media_ready = Signal(int)  # attach worker -> GUI thread
     _idle_state_changed = Signal()  # native property observer -> GUI thread
+    _pause_observed = Signal()  # native property observer -> GUI thread
 
     # Bare keys the app reserves: arrows are NOT forwarded (mpv can't seek
     # the live stream — they emit seek_requested for a relay-protocol seek),
@@ -595,6 +597,7 @@ class MpvPlayerView(QOpenGLWidget):
         self._mpv_idle = True
         self._mpv_paused = True
         self._idle_state_changed.connect(self._sync_idle_inhibition, Qt.QueuedConnection)
+        self._pause_observed.connect(self._adopt_native_pause, Qt.QueuedConnection)
 
         @self.mpv.property_observer("idle-active")
         def on_idle(_name, value):
@@ -605,6 +608,7 @@ class MpvPlayerView(QOpenGLWidget):
         def on_pause(_name, value):
             self._mpv_paused = value is not False
             self._idle_state_changed.emit()
+            self._pause_observed.emit()
 
         # A synchronous read waits for mpv's core, which can itself be waiting
         # for this thread to render: under display sync two reads in one stats
@@ -667,6 +671,21 @@ class MpvPlayerView(QOpenGLWidget):
             (self._task is not None or self._local_playback)
             and not self._mpv_idle and not self._mpv_paused
         )
+
+    def _adopt_native_pause(self) -> None:
+        # An input.conf binding (cycle pause, frame-step…) pauses mpv without
+        # the application seeing the command. Make it the caller's intent, or
+        # the next epoch release, restart or fallback undoes it. The player's
+        # own pauses never get here: the load-time hold and the pause value
+        # mpv restores when a file stops arrive while the epoch is held or
+        # retired, and our own writes set _caller_paused first. Reading the
+        # latest observation skips a value superseded before this ran.
+        paused = self._mpv_paused
+        if (not self._epoch_released or self._reloading
+                or paused == self._caller_paused):
+            return
+        self._caller_paused = paused
+        self.paused_changed.emit(paused)
 
     # -- rendering (libmpv render API) ------------------------------------------
 

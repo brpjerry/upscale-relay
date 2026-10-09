@@ -27,27 +27,35 @@ log = logging.getLogger("relay.attachments")
 
 
 class _ViewPublication:
-    """Keep an unpublished lease on its worker through caller cancellation."""
+    """Keep an unpublished lease on its workers through caller cancellation.
 
-    def __init__(self, root: Path, session_id: str, entries: list[dict]):
-        self.args = root, session_id, entries
+    Every disk step on the view runs under ``lock``, so abandoning the view
+    waits for the step a cancelled caller left running on its worker thread.
+    """
+
+    def __init__(self, root: Path, session_id: str):
+        self.root, self.session_id = root, session_id
         self.lock = threading.Lock()
         self.abandoned = False
-        self.view = None
+        self.view: Path | None = None
 
-    def run(self) -> None:
-        view = _materialize_view(*self.args)
+    def open(self) -> None:
         with self.lock:
             if not self.abandoned:
-                self.view = view
-                return
-        _remove_view(view)
+                self.view = _materialize_view(self.root, self.session_id)
 
-    def take(self, *, abandon: bool = False):
+    def step(self, action, *args):
         with self.lock:
-            self.abandoned |= abandon
+            if self.view is None:
+                raise RuntimeError("attachment view was abandoned")
+            return action(self.root, self.view, *args)
+
+    def abandon(self) -> None:
+        with self.lock:
+            self.abandoned = True
             view, self.view = self.view, None
-        return view
+        if view is not None:
+            _remove_view(view)
 
 
 def _observe_cleanup(future: asyncio.Future) -> None:
@@ -157,23 +165,59 @@ def _verified(path: Path, size: int, digest: str) -> bool:
         with path.open("rb") as source:
             for chunk in iter(lambda: source.read(1024 * 1024), b""):
                 hasher.update(chunk)
-        if hasher.hexdigest() != digest:
-            return False
-        os.utime(path, None)
-        return True
+        return hasher.hexdigest() == digest
     except OSError:
         return False
 
 
-def _publish_object(path: Path, data: bytes, digest: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    handle, temp_name = tempfile.mkstemp(prefix=f".{digest}.", dir=path.parent)
+def _link_object(source: Path, target: Path) -> None:
+    try:
+        os.link(source, target)
+    except OSError:
+        shutil.copyfile(source, target)
+
+
+def _acquire_cached(root: Path, view: Path, name: str, entry: dict) -> bool:
+    """Link a cached object into the leased view, then verify the link.
+
+    Evicting an object only removes its name from ``objects``: once linked
+    here its data stays with this open whatever another player evicts, and
+    the hash is checked outside the cache-wide lock.
+    """
+    source, target = root / "objects" / entry["sha256"], view / name
+    with _cache_guard(root):
+        try:
+            _link_object(source, target)
+        except FileNotFoundError:
+            return False
+        try:
+            os.utime(source, None)  # eviction removes least recently used first
+        except OSError:
+            pass
+    if _verified(target, entry["size"], entry["sha256"]):
+        return True
+    target.unlink()
+    return False
+
+
+def _publish_object(
+    root: Path, view: Path, name: str, data: bytes, digest: str, protected: set[str],
+) -> None:
+    # The partial file lives in the leased view: eviction never sees it, and a
+    # crashed writer's file goes with its abandoned view.
+    handle, temp_name = tempfile.mkstemp(prefix=f".{digest}.", dir=view)
     try:
         with os.fdopen(handle, "wb") as target:
             target.write(data)
             target.flush()
             os.fsync(target.fileno())
-        os.replace(temp_name, path)
+        source = root / "objects" / digest
+        with _cache_guard(root):
+            os.replace(temp_name, source)
+            _link_object(source, view / name)
+            # Every addition is bounded at once: an open that fails or is
+            # cancelled later must not leave the store over its limit.
+            _evict(root, protected)
     except BaseException:
         try:
             os.unlink(temp_name)
@@ -182,20 +226,19 @@ def _publish_object(path: Path, data: bytes, digest: str) -> None:
         raise
 
 
-def _materialize_view(root: Path, session_id: str, entries: list[dict]) -> Path:
+def _materialize_view(root: Path, session_id: str) -> Path:
     with _cache_guard(root):
         _prune_abandoned_views(root)
-        return _create_view(root, session_id, entries)
+        return _create_view(root, session_id)
 
 
-def _create_view(root: Path, session_id: str, entries: list[dict]) -> Path:
+def _create_view(root: Path, session_id: str) -> Path:
     safe_session = re.sub(r"[^A-Za-z0-9_-]", "_", session_id)[:64] or "session"
     view = Path(tempfile.mkdtemp(prefix=f"{safe_session}-", dir=root / "sessions"))
     lease = _lease_file(view / ".lease")
     try:
         _lock_file(lease, blocking=False)
         _VIEW_LEASES[view] = lease
-        _populate_view(root, view, entries)
     except BaseException:
         _VIEW_LEASES.pop(view, None)
         lease.close()
@@ -204,7 +247,8 @@ def _create_view(root: Path, session_id: str, entries: list[dict]) -> Path:
     return view
 
 
-def _populate_view(root: Path, view: Path, entries: list[dict]) -> None:
+def _view_names(entries: list[dict]) -> list[str]:
+    names: list[str] = []
     used: set[str] = set()
     for entry in entries:
         name = entry["name"]
@@ -215,12 +259,8 @@ def _populate_view(root: Path, view: Path, entries: list[dict]) -> None:
                 name = f"{stem}-{entry['sha256'][:8]}-{index}{suffix}"
                 index += 1
         used.add(name.casefold())
-        source = root / "objects" / entry["sha256"]
-        target = view / name
-        try:
-            os.link(source, target)
-        except OSError:
-            shutil.copyfile(source, target)
+        names.append(name)
+    return names
 
 
 def _evict(root: Path, protected: set[str]) -> None:
@@ -262,46 +302,45 @@ async def materialize_attachment_cache(
     entries = validate_manifest(manifest)
     objects = cache_root / "objects"
     await asyncio.to_thread(objects.mkdir, parents=True, exist_ok=True)
-    for entry in entries:
-        digest = entry["sha256"]
-        target = objects / digest
-        if await asyncio.to_thread(_verified, target, entry["size"], digest):
-            continue
-        url = f"{base_url.rstrip('/')}/attachments/{digest}"
-        async with http.get(
-            url, headers={"Authorization": f"Bearer {token}"},
-        ) as response:
-            response.raise_for_status()
-            chunks: list[bytes] = []
-            received = 0
-            async for chunk in response.content.iter_chunked(1024 * 1024):
-                received += len(chunk)
-                if received > entry["size"] or received > MAX_ATTACHMENT_BYTES:
-                    raise ValueError("attachment body exceeds declared size")
-                chunks.append(chunk)
-        data = b"".join(chunks)
-        if len(data) != entry["size"] or hashlib.sha256(data).hexdigest() != digest:
-            raise ValueError("attachment size/hash mismatch")
-        await asyncio.to_thread(_publish_object, target, data, digest)
     loop = asyncio.get_running_loop()
-    owner = _ViewPublication(cache_root, session_id, entries)
-    publishing = loop.run_in_executor(None, owner.run)
+    # The leased view exists before the first object is found or fetched and
+    # takes a link to each one at once, so a concurrent open (in this process
+    # or another) evicting near the cache limit never deletes an object this
+    # open has already counted on.
+    owner = _ViewPublication(cache_root, session_id)
+    protected = {entry["sha256"] for entry in entries}
     try:
-        await asyncio.shield(publishing)
-    except asyncio.CancelledError:
-        view = owner.take(abandon=True)
-        publishing.add_done_callback(_observe_cleanup)
-        if view is not None:
-            cleanup = loop.run_in_executor(None, _remove_view, view)
+        await loop.run_in_executor(None, owner.open)
+        for entry, name in zip(entries, _view_names(entries)):
+            if await loop.run_in_executor(None, owner.step, _acquire_cached, name, entry):
+                continue
+            digest = entry["sha256"]
+            url = f"{base_url.rstrip('/')}/attachments/{digest}"
+            async with http.get(
+                url, headers={"Authorization": f"Bearer {token}"},
+            ) as response:
+                response.raise_for_status()
+                chunks: list[bytes] = []
+                received = 0
+                async for chunk in response.content.iter_chunked(1024 * 1024):
+                    received += len(chunk)
+                    if received > entry["size"] or received > MAX_ATTACHMENT_BYTES:
+                        raise ValueError("attachment body exceeds declared size")
+                    chunks.append(chunk)
+            data = b"".join(chunks)
+            if len(data) != entry["size"] or hashlib.sha256(data).hexdigest() != digest:
+                raise ValueError("attachment size/hash mismatch")
+            await loop.run_in_executor(
+                None, owner.step, _publish_object, name, data, digest, protected,
+            )
+    except BaseException as error:
+        cleanup = loop.run_in_executor(None, owner.abandon)
+        if isinstance(error, asyncio.CancelledError):
             cleanup.add_done_callback(_observe_cleanup)
+        else:
+            await cleanup
         raise
-    view = owner.take()
-    try:
-        await asyncio.to_thread(_evict, cache_root, {entry["sha256"] for entry in entries})
-    except BaseException:
-        await remove_attachment_view(view)
-        raise
-    return view
+    return owner.view
 
 
 async def remove_attachment_view(path: Path | None) -> None:

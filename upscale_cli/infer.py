@@ -35,9 +35,15 @@ def _add_nvidia_dll_dirs() -> None:
     The wheels disagree on layout — cuDNN keeps its libraries directly in
     nvidia/cudnn/bin, while the CUDA 13 components nest theirs in
     nvidia/cu13/bin/x86_64 — so select directories that actually hold a DLL
-    rather than directories named "bin"."""
+    rather than directories named "bin".
+
+    Windows only: elsewhere the loader never searches PATH and there is no
+    os.add_dll_directory, which a Linux tensorrt_libs install used to hit
+    before any provider was chosen, even for CPU."""
     import os
 
+    if os.name != "nt":
+        return
     site = Path(np.__file__).resolve().parents[1]
     dirs = []
     nvidia = site / "nvidia"
@@ -45,7 +51,7 @@ def _add_nvidia_dll_dirs() -> None:
         dirs += [str(p) for p in sorted({d.parent for d in nvidia.rglob("*.dll")})]
     dirs += [str(p) for p in site.glob("tensorrt_libs") if p.is_dir()]
     if dirs:
-        os.environ["PATH"] = ";".join(dirs) + ";" + os.environ["PATH"]
+        os.environ["PATH"] = os.pathsep.join([*dirs, os.environ["PATH"]])
         for d in dirs:
             os.add_dll_directory(d)
 

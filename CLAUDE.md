@@ -204,7 +204,13 @@ their volume, panscan, tracks and delays.
   `loadfile` — no synchronous mpv property reads during teardown.
 - mpv OSC (LuaJIT) intermittently crashes mpv's event thread on stream
   reloads → OSC off by default. LuaJIT's caught SEH exception `0xe24c4a02`
-  in faulthandler output is *benign noise*, not a crash.
+  in faulthandler output is *benign noise*, not a crash. mpv's built-in
+  scripts (stats, console, select…) still run on LuaJIT with
+  `load_scripts=no`. But on Windows each such exception makes faulthandler
+  dump every thread while they run, and that dump itself crashed 2 of 8
+  desktop test runs (access violation; 0 of 16 with faulthandler off).
+  `tests/conftest.py` and `relay-desktop --debug` limit Windows dumps to
+  the faulting thread.
 - On Linux's embedded Qt/OpenGL render path, keep `hwdec=auto-copy-safe`.
   A real core landed in
   `paintGL → mpv_render_context_render → vaSyncSurface → iHD` when the user's

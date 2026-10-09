@@ -66,6 +66,30 @@ def test_source_identity_normalizes_paths_and_keeps_endpoints_separate(tmp_path)
     assert source_key("server_file", "b", "::1", 8590) == source_key("server_file", "b", "0:0:0:0:0:0:0:1", 8590)
 
 
+def test_server_id_follows_the_server_across_addresses():
+    key = lambda host, port, server_id: source_key("server_file", "Shows/a.mkv", host, port, server_id)
+    assert key("192.168.0.115", 8590, "abc") == key("relay.local", 9000, "abc")
+    assert key("relay.local", 8590, "abc") != key("relay.local", 8590, "def")
+    # No (or an unusable) id: the address identifies the server, as before.
+    for unusable in (None, "", 7, "a/b", "x" * 65, "caf\u00e9"):
+        assert key("relay.local", 8590, unusable) == key("relay.local", 8590, None)
+    assert key("relay.local", 8590, None) != key("relay.local", 8590, "abc")
+
+
+def test_version_one_history_keeps_local_files_and_drops_server_files():
+    settings = MemorySettings()
+    local = asdict(HistoryEntry("local:/movie.mkv", 120, 1000, False, 1234))
+    server = asdict(HistoryEntry("server:[relay.local]:8590/Shows/a.mkv", 300, 1400, False, 1235))
+    settings.setValue("history/v1", json.dumps({"version": 1, "entries": [local, server]}))
+    history = HistoryStore(settings)
+    assert list(history.entries) == ["local:/movie.mkv"]
+    keyed = source_key("server_file", "Shows/a.mkv", "relay.local", 8590, "abc")
+    history.save(keyed, 300, 1400)
+    reopened = HistoryStore(settings)
+    assert set(reopened.entries) == {"local:/movie.mkv", keyed}
+    assert json.loads(settings.value("history/v2"))["version"] == 2
+
+
 def test_track_matching_remaps_ids_by_type_language_and_title():
     original = {"type": "sub", "id": 1, "lang": "eng", "title": "Signs", "codec": "ass"}
     tracks = [{**original, "id": 9}, {**original, "id": 1, "title": "Dialogue"},
