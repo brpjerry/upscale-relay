@@ -885,6 +885,8 @@ class MainWindow(DesktopFeatures, QMainWindow):
         self.play_btn.clicked.connect(self.on_play_pause)
         if hasattr(self.player, "pause_requested"):
             self.player.pause_requested.connect(self.on_play_pause)
+        if hasattr(self.player, "paused_changed"):
+            self.player.paused_changed.connect(self._on_player_paused)
         self.stop_btn.clicked.connect(self.on_stop)
         self.fallback_btn.clicked.connect(self.on_fallback)
         self.seek_slider.sliderReleased.connect(self.on_seek)
@@ -2439,33 +2441,41 @@ class MainWindow(DesktopFeatures, QMainWindow):
 
     @asyncSlot()
     async def on_play_pause(self) -> None:
+        await self._apply_pause(not self._paused)
+
+    @asyncSlot(bool)
+    async def _on_player_paused(self, paused: bool) -> None:
+        # An input.conf binding paused or resumed mpv itself. The player has
+        # already adopted it; the toolbar, server and the next session follow.
+        if paused != self._paused:
+            await self._apply_pause(paused, player_paused=True)
+
+    async def _apply_pause(self, paused: bool, player_paused: bool = False) -> None:
         if self._transitioning:
-            self._paused = not self._paused
+            self._paused = paused
             if self._restart_snapshot:
                 self._restart_snapshot.paused = self._paused
-            self.player.set_paused(self._paused)
+            if not player_paused:
+                self.player.set_paused(self._paused)
             self.play_btn.set_icon(Icons.play if self._paused else Icons.pause)
             return
         local = self._session_source == "local"
         if not local and (self.client is None or self.client.session is None):
             return
-        self._paused = not self._paused
-        self.player.set_paused(self._paused)
+        self._paused = paused
+        if not player_paused:
+            self.player.set_paused(self._paused)
         self.video_overlay.flash(Icons.pause if self._paused else Icons.play)
         self._sync_accent_sampling()
         if (self._paused and self.settings.accent == "auto"
                 and hasattr(self.player, "request_frame_sample")):
             self.player.request_frame_sample()  # the frame it stopped on
-        if self._paused:
-            if not local:
-                await self.client.pause()
-            self.play_btn.set_icon(Icons.play)
-            self.play_btn.setToolTip("Play (Space)")
-        else:
-            if not local:
-                await self.client.play()
-            self.play_btn.set_icon(Icons.pause)
-            self.play_btn.setToolTip("Pause (Space)")
+        # Show the state before awaiting the server: another pause change can
+        # run meanwhile, and the button must not end on this one's icon.
+        self.play_btn.set_icon(Icons.play if self._paused else Icons.pause)
+        self.play_btn.setToolTip("Play (Space)" if self._paused else "Pause (Space)")
+        if not local:
+            await (self.client.pause() if self._paused else self.client.play())
 
     @asyncSlot()
     async def on_stop(self) -> None:

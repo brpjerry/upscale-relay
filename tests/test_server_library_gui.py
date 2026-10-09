@@ -32,6 +32,7 @@ class FakePlayer(QWidget):
     volume_changed = Signal(int, bool)
     rebuffering = Signal(bool)
     pause_requested = Signal()
+    paused_changed = Signal(bool)
     seek_requested = Signal(float)
     finished = Signal()
     failed = Signal(str)
@@ -360,6 +361,40 @@ def test_keyboard_pause_uses_the_toolbar_and_server_state(window):
         await window.on_play_pause()
         assert not window._paused and not window.player.paused
         assert client.plays == 1
+
+    asyncio.run(scenario())
+
+
+def test_native_pause_updates_toolbar_and_server_without_writing_back(window):
+    class PauseClient(FakeLibraryClient):
+        session = object()
+        pauses = 0
+        plays = 0
+
+        async def pause(self):
+            self.pauses += 1
+
+        async def play(self):
+            self.plays += 1
+
+    async def scenario():
+        client = PauseClient()
+        window.client = client
+        # An input.conf binding paused mpv; the player has adopted it already.
+        window.player.paused_changed.emit(True)
+        await asyncio.sleep(0)
+        assert window._paused and client.pauses == 1
+        assert not hasattr(window.player, "paused")  # never written back
+        assert window.play_btn.toolTip() == "Play (Space)"
+        window.player.paused_changed.emit(True)
+        await asyncio.sleep(0)
+        assert client.pauses == 1
+        window.player.paused_changed.emit(False)
+        await asyncio.sleep(0)
+        assert not window._paused and client.plays == 1
+        assert window.play_btn.toolTip() == "Pause (Space)"
+        await window.on_play_pause()  # Space toggles from the adopted state
+        assert window._paused and window.player.paused and client.pauses == 2
 
     asyncio.run(scenario())
 
