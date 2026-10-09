@@ -10,10 +10,12 @@ from __future__ import annotations
 import base64
 import io
 import threading
+import time
 from fractions import Fraction
 
 import av
 import numpy as np
+import pytest
 
 from relay_media import VideoTrack
 from relay_protocol import FLAG_EOS, MediaPacket
@@ -144,3 +146,91 @@ def test_variable_frame_rate_timestamps_survive_offline_encoding(tmp_path):
     expected = [pts / 1000 for pts in _VFR_PTS_MS]
     assert sink.pts_written == expected
     assert _video_pts_seconds(str(output)) == expected
+
+
+def _wait_until_stable(read, timeout=5.0):
+    deadline = time.monotonic() + timeout
+    last = read()
+    while time.monotonic() < deadline:
+        time.sleep(0.2)
+        current = read()
+        if current == last:
+            return current
+        last = current
+    return last
+
+
+def test_muxed_audio_after_the_last_video_frame_streams_before_eos(tmp_path):
+    from relay_media import AuxiliaryTrack
+    from relay_protocol import FLAG_DISCONTINUITY, FLAG_KEYFRAME, NO_TS
+
+    source = tmp_path / "audio-tail.mkv"
+    with av.open(str(source), "w") as output:
+        video = output.add_stream("libx264", rate=24, options={"bf": "0", "tune": "zerolatency"})
+        video.width = video.height = 32
+        video.pix_fmt = "yuv420p"
+        audio = output.add_stream("pcm_s16le", rate=48000)
+        audio.layout = "stereo"
+        for index in range(12):  # 0.5 s of video
+            frame = av.VideoFrame.from_ndarray(np.zeros((32, 32, 3), np.uint8), format="rgb24")
+            frame.pts, frame.time_base = index, Fraction(1, 24)
+            output.mux(video.encode(frame))
+        output.mux(video.encode(None))
+        for index in range(120):  # 5.12 s of audio
+            frame = av.AudioFrame.from_ndarray(
+                np.zeros((1, 4096), np.int16), format="s16", layout="stereo",
+            )
+            frame.sample_rate = 48000
+            frame.pts, frame.time_base = index * 2048, Fraction(1, 48000)
+            output.mux(audio.encode(frame))
+        output.mux(audio.encode(None))
+
+    track = VideoTrack(str(source))
+    auxiliary = AuxiliaryTrack(str(source))
+    emitted: list[MediaPacket] = []
+    done = threading.Event()
+
+    def emit(packet):
+        emitted.append(packet)
+        if packet.eos:
+            done.set()
+
+    pipeline = Pipeline(
+        _config(track.open_session_video_dict()), None, "lossless-ffv1", (32, 32),
+        emit, lambda message: pytest.fail(message), ep="cpu", aux_source_path=str(source),
+    )
+    try:
+        merged = sorted(
+            [(float((i.dts if i.dts != NO_TS else i.pts) * track.time_base), 0, i)
+             for i in track.packets()]
+            + [(i.order_s, 1, i) for i in auxiliary.packets()],
+            key=lambda item: (item[0], item[1]),
+        )
+        for _stamp, kind, info in merged:
+            if kind == 0:
+                pipeline.feed(track.media_packet(info, 0))
+            else:
+                pipeline.feed_aux(info, 0)
+        tail = _wait_until_stable(lambda: sum(len(p.payload) for p in emitted))
+        first_video_chunk = emitted[0]
+        undrained = sum(len(chunk) for chunk in pipeline._sink_buf._chunks)
+        pipeline.feed(MediaPacket(payload=b"", flags=FLAG_EOS, epoch=0))
+        assert done.wait(10)
+    finally:
+        pipeline.close()
+        auxiliary.close()
+        track.close()
+
+    total = sum(len(p.payload) for p in emitted)
+    # The audio after the last frame streamed out under backpressure instead
+    # of waiting in the mux buffer for end of stream.
+    assert undrained < 64 * 1024
+    assert tail > 0.9 * total
+    # The epoch still opens on the first video chunk, which alone is marked.
+    assert first_video_chunk.flags == FLAG_DISCONTINUITY | FLAG_KEYFRAME
+    assert first_video_chunk.pts == 0
+    assert sum(bool(p.flags & FLAG_DISCONTINUITY) for p in emitted) == 1
+    # Audio-only chunks name no video frame.
+    assert any(p.pts == NO_TS and not p.eos for p in emitted)
+    with av.open(io.BytesIO(b"".join(p.payload for p in emitted))) as relayed:
+        assert sum(f.samples for f in relayed.decode(audio=0)) == 120 * 2048

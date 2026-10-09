@@ -1026,6 +1026,13 @@ class Pipeline:
                 packet = item.info.packet
                 packet.stream = stream
                 self._mux.mux(packet)
+                if not self._need_discontinuity:
+                    # Audio after the last video frame, or across a long gap
+                    # in it, must not wait in the sink for the next frame or
+                    # EOS. Until the epoch's first video chunk has gone out it
+                    # does wait: that chunk opens the epoch (discontinuity +
+                    # keyframe) and ends the seek's progress narration.
+                    self._flush_chunk(item.epoch, None, keyframe=False)
                 continue
 
             t0 = time.perf_counter()
