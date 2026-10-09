@@ -331,7 +331,7 @@ def _style_sheet(t: Theme, a: dict[str, str]) -> str:
 QWidget {{ font-size: 13px; }}
 QToolTip {{ background: {t.pressed}; color: {t.text}; border: 0; padding: 5px 8px; font-size: 12px; }}
 #sidebar {{ background: {t.surface}; }}
-#trackPanel {{ background: {t.raised}; border: 1px solid {t.line}; border-radius: {RADIUS}px; }}
+#trackPanel, #infoPanel {{ background: {t.raised}; border: 1px solid {t.line}; border-radius: {RADIUS}px; }}
 #sidebarFooter {{ border-top: 1px solid {t.line}; }}
 QLabel#wordmark {{ font-size: 16px; font-weight: 600; }}
 QLabel#heading {{ font-size: 17px; font-weight: 600; }}

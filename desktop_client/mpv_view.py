@@ -23,7 +23,7 @@ import time
 from fractions import Fraction
 from pathlib import Path
 
-from PySide6.QtCore import QSize, Qt, QTimer, Signal
+from PySide6.QtCore import QSize, QStandardPaths, Qt, QTimer, Signal
 from PySide6.QtGui import QGuiApplication, QImage, QOpenGLContext, qRgb
 from PySide6.QtOpenGL import QOpenGLFramebufferObject
 from PySide6.QtOpenGLWidgets import QOpenGLWidget
@@ -118,6 +118,37 @@ def _render_hwdec_mode(no_hwdec: bool, platform: str | None = None) -> str:
         return "no"
     platform = platform or sys.platform
     return "auto-copy-safe" if platform.startswith("linux") else "auto-safe"
+
+
+def _mpv_config_dirs(environ=None, platform: str | None = None) -> list[Path]:
+    """mpv's user configuration folders, highest priority first.
+
+    libmpv runs here without its configuration (mpv.conf is not read), and
+    without it mpv no longer resolves these folders itself, so they are found
+    the way mpv finds them.
+    """
+    environ = os.environ if environ is None else environ
+    platform = platform or sys.platform
+    if environ.get("MPV_HOME"):
+        return [Path(environ["MPV_HOME"])]
+    if platform.startswith("win"):
+        return [Path(environ["APPDATA"]) / "mpv"] if environ.get("APPDATA") else []
+    config = Path(environ["XDG_CONFIG_HOME"]) if environ.get("XDG_CONFIG_HOME") else Path.home() / ".config"
+    return [config / "mpv", Path.home() / ".mpv"]
+
+
+def user_input_conf(environ=None, platform: str | None = None) -> Path | None:
+    """The input.conf mpv itself would load for this user, if there is one."""
+    return next((folder / "input.conf" for folder in _mpv_config_dirs(environ, platform)
+                 if (folder / "input.conf").is_file()), None)
+
+
+def _user_scripts(environ=None, platform: str | None = None) -> list[Path]:
+    """The scripts in mpv's scripts folder (--mpv-scripts)."""
+    for folder in _mpv_config_dirs(environ, platform):
+        if (folder / "scripts").is_dir():
+            return sorted(p for p in (folder / "scripts").iterdir() if not p.name.startswith("."))
+    return []
 
 
 def _native_display_params(app=None) -> dict[str, c_void_p]:
@@ -436,13 +467,16 @@ class MpvPlayerView(QOpenGLWidget):
             # side. Let mpv itself hold 15s (sized for ~200 Mbps lossless).
             extra = {
                 "vo": "libmpv",  # render API drives output; no mpv-owned window
-                # Respect the user's mpv.conf/input.conf (libmpv loads no
-                # config by default). The config file is parsed during init
-                # and OVERRIDES constructor options — everything the relay
-                # depends on is re-asserted post-init below. User scripts
-                # stay off: LuaJIT scripts hit the same stream-reload
+                # No mpv.conf: libmpv loads no configuration by default, and
+                # the mpv options this player offers are its own settings
+                # (AppSettings.mpv_defaults, set at runtime). Only the key
+                # bindings are the user's, from input.conf (below). User
+                # scripts stay off: LuaJIT scripts hit the same stream-reload
                 # instability as the stock OSC (--mpv-scripts opts in).
-                "config": "yes",
+                "load_scripts": "no",
+                # Screenshots (s, S) as lossless PNG in the Pictures folder;
+                # mpv's own defaults are JPEG in the working directory.
+                "screenshot_format": "png",
                 # Standard mpv keys (m mute, 9/0 volume, i stats, s
                 # screenshot…) — off by default in libmpv; keys reach mpv
                 # via keyPressEvent forwarding below.
@@ -467,10 +501,14 @@ class MpvPlayerView(QOpenGLWidget):
                 # 83-85% with the default). Display sync ignores this option.
                 "video_timing_offset": 0,
             }
+            pictures = QStandardPaths.writableLocation(QStandardPaths.PicturesLocation)
+            if pictures:
+                extra["screenshot_dir"] = pictures
             # Hardware decode for the HEVC tiers; FFV1 has no hw decoder and
             # mpv falls back silently. Linux uses copy-back: an actual core
             # captured Intel iHD crashing in vaSyncSurface from paintGL when a
-            # user's mpv.conf forced zero-copy hwdec=vaapi. --no-hwdec disables.
+            # user's mpv.conf (read back then) forced zero-copy hwdec=vaapi.
+            # --no-hwdec disables.
             extra["hwdec"] = _render_hwdec_mode(self.options.no_hwdec)
             # OSC is OFF by default: it's a LuaJIT script that re-initializes
             # on every stream reload (seek), and that path intermittently
@@ -479,8 +517,6 @@ class MpvPlayerView(QOpenGLWidget):
             # ground. --mpv-osc re-enables it for anyone who wants the
             # native overlay and rarely seeks. NB: on the render-API path mpv
             # has no window, so the OSC is display-only (no mouse input).
-            if not self.options.mpv_scripts:
-                extra["load_scripts"] = "no"
             if self.options.mpv_osc:
                 extra["osc"] = "yes"
                 extra.update({
@@ -488,44 +524,33 @@ class MpvPlayerView(QOpenGLWidget):
                     "input_vo_keyboard": "yes",
                     "input_cursor": "yes",
                 })
-        if self.options.mpv_config_path is not None:
-            config_path = Path(self.options.mpv_config_path)
-            extra["config"] = "no"
-            # Explicit config files keep test runs independent of system/user
-            # configuration and still exercise the actual native parser.
-            if config_path.exists():
-                extra["include"] = str(config_path)
+        # Isolated runs (tests, settings scopes) name their own file.
+        input_conf = self.options.input_conf_path or user_input_conf()
+        if input_conf is not None and Path(input_conf).is_file():
+            extra["input_conf"] = str(input_conf)
         self.mpv = mpv.MPV(
             log_handler=lambda level, prefix, message: self.log_message.emit(level, prefix, message),
             loglevel="warn",
             keep_open="no",
             idle="yes",
+            # The player keeps its own history. With mpv's resume, opening a
+            # local file read standalone mpv's watch-later entry for it: the
+            # entry was deleted and its volume, panscan, tracks and delays
+            # applied here (only the position was overridden, by start=).
+            resume_playback="no",
             **extra,
         )
         self._default_sub_fonts_dir = getattr(self.mpv, "sub_fonts_dir", "")
-        if not self.options.headless:
-            # mpv.conf won over any constructor option it named; re-assert
-            # the plumbing the relay breaks without (runtime sets beat the
-            # config file). User prefs — shaders, volume, subtitle style,
-            # screenshots — stand. hwdec is relay plumbing on the embedded
-            # Linux render path: zero-copy VA-API can expose retired surfaces
-            # to Qt's paintGL, so reassert the safe copy-back mode below.
-            self.mpv.vo = "libmpv"  # render API; a conf vo= would pop a window
-            self.mpv.rebase_start_time = False  # docs/PROTOCOL.md PTS semantics
-            self.mpv.video_timing_offset = 0  # GUI thread free between frames
-            self.mpv.keep_open = False
-            self.mpv.idle = True
-            self.mpv.cache = True  # live-stream buffering, sized for the
-            self.mpv.cache_pause = True
-            self.mpv.cache_pause_wait = CACHE_PAUSE_WAIT_S
-            self.mpv.demuxer_readahead_secs = 15  # ~200 Mbps lossless tiers
-            self.mpv.demuxer_max_bytes = "768MiB"
-            self.mpv.demuxer_max_back_bytes = 0
-            self.mpv.hwdec = _render_hwdec_mode(self.options.no_hwdec)
-            if not self.options.mpv_osc:
-                self.mpv.osc = False
-        # Apply after mpv.conf so player messages stay legible over bright
-        # video. OSD styling is separate from the source's subtitle styling.
+        if self.options.mpv_scripts:
+            # Without its configuration mpv finds no scripts folder: load the
+            # scripts by path. Their script-opts files are not read.
+            for script in _user_scripts():
+                try:
+                    self.mpv.command("load-script", str(script))
+                except Exception as err:  # noqa: BLE001 - one bad script
+                    self.log_message.emit("error", "relay", f"mpv script {script.name}: {err!r}")
+        # Player messages stay legible over bright video. OSD styling is
+        # separate from the source's subtitle styling.
         self.mpv.osd_shadow_color = "#FF000000"
         self.mpv.osd_shadow_offset = 2
         self._buffer: _LoopbackStream | None = None
@@ -684,9 +709,17 @@ class MpvPlayerView(QOpenGLWidget):
         per video frame: about 3 W more on the laptop on battery. Opt-in for
         that reason; with it off the rate is left unknown (0), and
         `video-sync=audio` is unaffected either way.
+
+        Reported only while the window is presenting. Display sync takes each
+        render call as one refresh, and a hidden window has none: its frames
+        are acknowledged at once (_on_frame_ready), so mpv ran the video as
+        fast as it could decode (~3x realtime from the server, 4,000
+        acknowledgements a second), drained the relay buffer, and on return
+        held the picture at ~2 fps while audio caught up a minute later.
         """
         screen = self.screen()
-        rate = screen.refreshRate() if screen is not None and self._report_display else 0.0
+        rate = (screen.refreshRate() if screen is not None and self._report_display and self._presenting()
+                else 0.0)
         if self.options.headless or rate < 0 or rate == self._display_rate:
             return
         try:
@@ -847,11 +880,19 @@ class MpvPlayerView(QOpenGLWidget):
         gl.glBindFramebuffer(_GL_FRAMEBUFFER, target)
         return True
 
+    def _presenting(self) -> bool:
+        window = self.window().windowHandle()
+        return self.isVisible() and window is not None and window.isExposed()
+
     def _on_frame_ready(self) -> None:
         if self._ctx is None:
             return
-        window = self.window().windowHandle()
-        if self.isVisible() and window is not None and window.isExposed():
+        presenting = self._presenting()
+        if self._report_display and presenting != (self._display_rate > 0):
+            # Hidden or back: timing goes to audio and returns to the display
+            # (see _report_display_rate). mpv switches in ~0.2 s either way.
+            self._report_display_rate()
+        if presenting:
             self.update()
             return
         # Wayland stops delivering paints on another workspace. Acknowledge

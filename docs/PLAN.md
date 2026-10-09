@@ -21,7 +21,7 @@ contract and [SERVER_LIBRARY.md](SERVER_LIBRARY.md) for server-hosted media.
 | Server-side media library | **Implemented** | Repeatable `--library`, sandboxed single/multi-root listing and Range compatibility delivery, server demux/seek, capability-driven Server tab, negotiated in-band audio/subtitles, and cached subtitle fonts |
 | Server-side framing and resize filters | **Implemented** | Fit preserves the full frame; Cover center-crops before encode; the final post-ONNX downscale is selectable per server or session |
 | Shared-mount path mapping | **Planned** | Negotiated clients use muxed tracks; mapping one relative path to different client/server mount roots for legacy/external or direct-access workflows is not implemented |
-| Polish phase | **Partial** | model discovery/picker, metrics, manual/discovered hosts, history/resume, autoplay, library sorting/restoration, shared mpv defaults, optional diagnostics/logging, mounted shares, and fallback exist; pairing, hot model reload, and automatic reconnect remain |
+| Polish phase | **Partial** | model discovery/picker, metrics, manual/discovered hosts, history/resume, autoplay, library sorting/restoration, subtitle/sync defaults, optional diagnostics/logging, mounted shares, and fallback exist; pairing, hot model reload, and automatic reconnect remain |
 | Android client | **Phase 5.5 and muxed auxiliary tracks implemented** | Server/local playback, recovery, discovery, adaptive UI, background media, and system controls; negotiated muxed audio/subtitles and verified font caching are implemented, with external compatibility fallback |
 
 ## Architecture
@@ -162,9 +162,9 @@ decode was fast enough for the measured pipeline.
 - Versioned history (50 entries by default, adjustable 1–1,000), stable progress
   saves every five seconds, automatic eligible resume before the first stream
   load, watched actions, and alphabetical next-unwatched-sibling autoplay.
-- Shared `mpv.conf` subtitle/language, sync, and interpolation controls with
-  atomic merges and external-edit watching; current-file track choices remain
-  session-only. These edits also affect standalone mpv.
+- Subtitle/language, sync, and interpolation controls kept as player settings
+  (the player reads only mpv's `input.conf`, never `mpv.conf`); current-file
+  track choices remain session-only.
 - Independent opt-in diagnostic display and bounded client logging to Documents.
   See [desktop preferences](DESKTOP_FEATURES.md) for defaults and exact policy.
 - Model, quality, fit/cover, resize filter, play/pause, seek, audio/subtitle

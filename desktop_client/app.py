@@ -22,13 +22,13 @@ def parse_args(argv: list[str] | None = None) -> tuple[DesktopOptions, list[str]
     parser.add_argument("--trace", action="store_true", help="trace relay/mpv packet feeding")
     parser.add_argument("--mpv-osc", action="store_true", help="enable mpv's OSC overlay")
     parser.add_argument("--no-hwdec", action="store_true", help="force software video decoding")
-    parser.add_argument("--mpv-scripts", action="store_true", help="load user mpv scripts")
+    parser.add_argument("--mpv-scripts", action="store_true", help="load the scripts in mpv's scripts folder")
     parser.add_argument("--headless", action="store_true", help="use null mpv audio/video outputs")
     parser.add_argument(
         "--settings-scope", metavar="NAME",
         help="use an isolated QSettings application name (primarily for tests)",
     )
-    parser.add_argument("--mpv-config-path", type=Path, help="override mpv.conf (for isolated tests)")
+    parser.add_argument("--input-conf", type=Path, help="key bindings file instead of mpv's input.conf")
     parser.add_argument("--log-root", type=Path, help="override client log directory")
     parser.add_argument("--no-discovery", action="store_true", help="disable nearby server discovery")
     args, qt_args = parser.parse_known_args(argv)
@@ -40,7 +40,7 @@ def parse_args(argv: list[str] | None = None) -> tuple[DesktopOptions, list[str]
         mpv_scripts=args.mpv_scripts,
         headless=args.headless,
         settings_scope=args.settings_scope,
-        mpv_config_path=args.mpv_config_path,
+        input_conf_path=args.input_conf,
         log_root=args.log_root,
         discovery=False if args.no_discovery else None,
     ), qt_args

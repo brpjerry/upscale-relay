@@ -171,8 +171,7 @@ def window(monkeypatch, tmp_path):
     from PySide6.QtCore import QSettings
     QSettings("upscale-relay", "test-server-library-gui").clear()
     result = main_window.MainWindow(options=DesktopOptions(
-        headless=True, settings_scope="test-server-library-gui",
-        mpv_config_path=tmp_path / "mpv.conf", log_root=tmp_path / "logs",
+        headless=True, settings_scope="test-server-library-gui", log_root=tmp_path / "logs",
     ))
     yield result
     result.client = None

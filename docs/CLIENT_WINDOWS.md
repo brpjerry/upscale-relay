@@ -64,9 +64,9 @@ The Local/Server trees retain sorting and server navigation context. Saved
 progress resumes automatically; alphabetical next-video autoplay defaults on.
 Watched markers and the history limit are available in the browser/settings.
 
-The settings dock displays the `mpv.conf` location resolved by libmpv (including
-portable/config-directory selection). **Subtitle defaults/languages and video
-sync/interpolation changes there also affect standalone mpv.** Current-video
+Subtitle defaults/languages and video sync/interpolation in the settings dock
+are the player's own settings; it does not read `mpv.conf`. Key bindings come
+from mpv's `input.conf` (`%APPDATA%\mpv\input.conf`, or `MPV_HOME`). Current-video
 track selections remain session-only. Application preferences and versioned
 history/browser records use QSettings under `upscale-relay/desktop-client`.
 Client diagnostics and logging default off. Enabled client logs use timestamped

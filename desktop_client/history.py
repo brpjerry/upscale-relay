@@ -43,6 +43,13 @@ class HistoryEntry:
         return self.position
 
     @property
+    def progress(self) -> str:
+        """Short form for the file browser: a check once watched, else a percentage."""
+        if self.watched:
+            return "\u2713"
+        return f"{min(99, int(self.position / self.duration * 100))}%" if self.duration else ""
+
+    @property
     def description(self) -> str:
         progress = "Watched" if self.watched else (
             f"{min(100, int(self.position / self.duration * 100))}%" if self.duration else "In progress"

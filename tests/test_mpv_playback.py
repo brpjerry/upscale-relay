@@ -112,9 +112,118 @@ def test_frame_notifications_acknowledge_unpresented_frames(monkeypatch, visible
         makeCurrent=lambda: calls.append("current"),
         doneCurrent=lambda: calls.append("done"),
         context=lambda: context,
+        _report_display=False,
     )
+    player._presenting = lambda: MpvPlayerView._presenting(player)
     MpvPlayerView._on_frame_ready(player)
     assert calls == (["current", {"skip_rendering": True}, "done"] if expect_skip else ["paint"])
+
+
+def test_display_sync_hands_timing_to_audio_while_the_window_is_hidden(monkeypatch):
+    """Display sync takes every render call as one refresh. Hidden frames are
+    acknowledged at once, so with the rate still reported mpv ran the video
+    ~3x realtime off-screen and froze it near 2 fps for a minute on return."""
+    from desktop_client import mpv_view
+    context = object()
+    monkeypatch.setattr(mpv_view, "QOpenGLContext", SimpleNamespace(currentContext=lambda: context))
+    exposed = [True]
+    sent = []
+    player = SimpleNamespace(
+        _ctx=SimpleNamespace(update=lambda: True, render=lambda **kw: None),
+        isVisible=lambda: True,
+        window=lambda: SimpleNamespace(windowHandle=lambda: SimpleNamespace(isExposed=lambda: exposed[0])),
+        update=lambda: None, makeCurrent=lambda: None, doneCurrent=lambda: None, context=lambda: context,
+        options=SimpleNamespace(headless=False), _display_rate=0.0, _report_display=False,
+        screen=lambda: SimpleNamespace(refreshRate=lambda: 120.0),
+    )
+    player.mpv = type("Props", (), {"__setitem__": lambda _self, key, value: sent.append(value)})()
+    player._presenting = lambda: MpvPlayerView._presenting(player)
+    player._report_display_rate = lambda: MpvPlayerView._report_display_rate(player)
+    MpvPlayerView.set_display_rate_reporting(player, True)
+    MpvPlayerView._on_frame_ready(player)
+    assert sent == [120.0]
+    exposed[0] = False                                  # another workspace
+    for _ in range(3):
+        MpvPlayerView._on_frame_ready(player)
+    assert sent == [120.0, 0.0]                         # audio timing, told once
+    exposed[0] = True
+    MpvPlayerView._on_frame_ready(player)
+    assert sent == [120.0, 0.0, 120.0]                  # paced by the display again
+
+
+def test_player_loads_input_conf_bindings_but_never_mpv_conf(tmp_path, monkeypatch):
+    """The player's mpv options are its own settings; only key bindings come
+    from mpv's folder. An mpv.conf beside input.conf changes nothing."""
+    folder = tmp_path / "mpv"
+    folder.mkdir()
+    (folder / "mpv.conf").write_text("volume=37\nvideo-sync=display-resample\nscreenshot-format=jpg\n")
+    (folder / "input.conf").write_text("C add panscan 1.0\n")
+    monkeypatch.setenv("MPV_HOME", str(folder))
+    QApplication.instance() or QApplication([])
+    player = MpvPlayerView(options=DesktopOptions(
+        headless=True, settings_scope="test-mpv-config-free", input_conf_path=folder / "input.conf",
+    ))
+    try:
+        bindings = {(b["key"], b["cmd"]) for b in player.mpv.input_bindings}
+        assert ("C", "add panscan 1.0") in bindings
+        assert player.mpv.volume == 100
+        assert player.mpv.video_sync == "audio"
+        assert player.mpv.resume_playback is False
+    finally:
+        player.stop()
+        player.mpv.terminate()
+        player.close()
+
+
+def test_user_input_conf_is_found_where_mpv_looks(tmp_path):
+    from desktop_client.mpv_view import user_input_conf
+    home = tmp_path / "home"
+    (home / "mpv").mkdir(parents=True)
+    (home / "mpv" / "input.conf").write_text("")
+    assert user_input_conf({"MPV_HOME": str(home / "mpv")}, "linux") == home / "mpv" / "input.conf"
+    assert user_input_conf({"XDG_CONFIG_HOME": str(home)}, "linux") == home / "mpv" / "input.conf"
+    assert user_input_conf({"APPDATA": str(home)}, "win32") == home / "mpv" / "input.conf"
+    assert user_input_conf({"MPV_HOME": str(tmp_path / "missing")}, "linux") is None
+
+
+def test_local_playback_ignores_standalone_mpv_resume_entries(tmp_path):
+    """mpv's own resume read standalone mpv's watch-later entry for a local
+    file: it deleted the entry and applied its volume, panscan and delays."""
+    import hashlib
+    from qt_helpers import playback_loop
+    from upscale_cli.sample import make_sample
+
+    path = tmp_path / "original.mkv"
+    make_sample(str(path), frames=48, width=64, height=64, fps=24)
+    watch_later = tmp_path / "watch_later"
+    watch_later.mkdir()
+    entry = watch_later / hashlib.md5(str(path).encode()).hexdigest().upper()
+    entry.write_text("start=1.000000\nvolume=37\npanscan=0.400000\nsub-delay=1.500000\n")
+    QApplication.instance() or QApplication([])
+    player = MpvPlayerView(options=DesktopOptions(
+        headless=True, settings_scope="test-mpv-resume",
+    ))
+    player.mpv["watch-later-dir"] = str(watch_later)
+    volume = player.mpv.volume
+
+    async def scenario():
+        try:
+            await player.play_local(str(path), paused=True)
+            assert player.mpv.volume == volume
+            assert player.mpv.panscan == 0
+            assert player.mpv.sub_delay == 0
+            assert player.mpv.time_pos < 0.5
+            assert entry.exists()  # standalone mpv keeps its resume point
+        finally:
+            player.stop()
+            await asyncio.sleep(0)
+
+    try:
+        with playback_loop(QApplication.instance()) as loop:
+            loop.run_until_complete(scenario())
+    finally:
+        player.mpv.terminate()
+        player.close()
 
 
 def test_local_playback_reports_tracks_position_and_accepts_transport(tmp_path):

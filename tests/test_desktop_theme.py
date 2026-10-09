@@ -27,8 +27,7 @@ def window(monkeypatch, tmp_path):
     monkeypatch.setattr(main_window, "PlayerView", FakePlayer)
     QSettings("upscale-relay", SCOPE).clear()
     result = main_window.MainWindow(options=DesktopOptions(
-        headless=True, settings_scope=SCOPE,
-        mpv_config_path=tmp_path / "mpv.conf", log_root=tmp_path / "logs",
+        headless=True, settings_scope=SCOPE, log_root=tmp_path / "logs",
     ))
     yield result
     result.client = None
@@ -311,25 +310,32 @@ def test_video_timing_hint_explains_switch_and_mode_together(window):
     sync = window.mpv_controls["video-sync"]
     assert sync.itemData(sync.findText("Audio (default)")) == "audio"
     assert sync.findData("display-resample") >= 0 and sync.findData("display-vdrop") >= 0
-    values = dict(window._next_defaults)
-    window._refresh_mpv_controls({**values, "video-sync": "audio"})
     assert "paced by audio" in window.display_sync_hint.text()
-    window._refresh_mpv_controls({**values, "video-sync": "display-resample"})
+    window._edit_mpv_default("video-sync", "display-resample")
     assert sync.currentData() == "display-resample"
     assert "set but inactive" in window.display_sync_hint.text()
     window.display_sync_check.setChecked(True)
     assert "while the window is not fullscreen" in window.display_sync_hint.text()
-    window._refresh_mpv_controls({**values, "video-sync": "display-resample", "interpolation": "yes"})
+    window._edit_mpv_default("interpolation", "yes")
     assert "Motion interpolation works only while the window is not fullscreen" in window.display_sync_hint.text()
-    window._refresh_mpv_controls({**values, "video-sync": "audio", "interpolation": "yes"})
+    window._edit_mpv_default("video-sync", "audio")
     assert "No effect yet" in window.display_sync_hint.text()
     assert "Motion interpolation is on but has no effect" in window.display_sync_hint.text()
     window.display_sync_check.setChecked(False)
-    window._refresh_mpv_controls({**values, "video-sync": "audio", "interpolation": "no"})
-    assert window.display_sync_hint.text() == "Video is paced by audio, mpv's default. The mode is saved to mpv.conf."
-    window._refresh_mpv_controls({**values, "video-sync": "audio"})
-    window._refresh_mpv_controls({**values, "video-sync": "display-tempo"})  # from mpv.conf, not offered
-    assert sync.currentData() == "display-tempo" and sync.currentText() == "Configured: display-tempo"
+    window._edit_mpv_default("interpolation", "no")
+    assert window.display_sync_hint.text() == "Video is paced by audio, mpv's default."
+
+
+def test_mpv_settings_outside_the_offered_choices_read_as_defaults(window):
+    qs = window.settings._qs
+    qs.setValue("mpv/video-sync", "display-tempo")      # not offered
+    qs.setValue("mpv/tscale", "mitchell")
+    assert window.settings.mpv_defaults["video-sync"] == "audio"
+    assert window.settings.mpv_defaults["tscale"] == "mitchell"
+    with pytest.raises(ValueError):
+        window.settings.set_mpv_default("video-sync", "display-tempo")
+    with pytest.raises(KeyError):
+        window.settings.set_mpv_default("scale", "ewa_lanczossharp")
 
 
 def test_display_rate_is_reported_only_when_enabled():
@@ -339,7 +345,7 @@ def test_display_rate_is_reported_only_when_enabled():
     sent = {}
     player = SimpleNamespace(
         options=SimpleNamespace(headless=False), _display_rate=0.0, _report_display=False,
-        screen=lambda: SimpleNamespace(refreshRate=lambda: 120.0), mpv=sent,
+        screen=lambda: SimpleNamespace(refreshRate=lambda: 120.0), mpv=sent, _presenting=lambda: True,
     )
     player._report_display_rate = lambda: MpvPlayerView._report_display_rate(player)
     MpvPlayerView._report_display_rate(player)
@@ -359,7 +365,7 @@ def test_video_follows_the_chrome_through_a_fullscreen_transition(window):
     height = bar.height()
     window.toggle_fullscreen()
     # Never pinned: pinning made the picture jump to its final size at once.
-    assert layout.indexOf(window.player) >= 0 and not window._player_pinned
+    assert layout.indexOf(window.player) >= 0
     # The bar left the layout but rides on its stand-in, which the video
     # grows into as it shrinks.
     assert window._controls_dock.isVisible() and window._controls_dock.height() == height
@@ -394,52 +400,20 @@ def test_reversing_fullscreen_midway_continues_the_control_bar_from_where_it_is(
     assert window.controls_panel.isVisible() and not window._controls_dock.isVisible()
 
 
-def test_sidebar_hide_pins_the_video_at_the_size_it_lands_at(window):
+def test_sidebar_collapses_and_expands_the_same_way(window):
+    # Both directions resize the video at each step; the hide slide used to pin
+    # it at its final size instead, so the two looked different.
     window.resize(1100, 600)
     window.show()
     QApplication.instance().processEvents()
     layout = window._player_layout
-    final = QSize(window._root.width(), window.player.height())
-    window.browser_toggle.setChecked(False)
-    # The sidebar slides off a video already at its final size...
-    assert layout.indexOf(window.player) < 0
-    assert window.player.size() == final
-    assert window.player.mapTo(window._root, QPoint(0, 0)).x() == 0
-    assert wait_until(lambda: not window._sidebar_slot.isVisible())
-    # ...which rejoins the layout exactly where it is.
-    assert layout.indexOf(window.player) >= 0
-    QApplication.instance().processEvents()
-    assert window.player.size() == final
-    assert window.player.mapTo(window._root, QPoint(0, 0)).x() == 0
-
-
-def test_showing_the_sidebar_mid_hide_releases_the_pin(window):
-    window.resize(1100, 600)
-    window.show()
-    QApplication.instance().processEvents()
-    width = window.split.sizes()[0]
-    window.browser_toggle.setChecked(False)
-    assert window._player_pinned
-    window.browser_toggle.setChecked(True)  # the show slide resizes the video
-    assert not window._player_pinned
-    assert wait_until(lambda: "sidebar" not in window._slides)
-    assert window.split.sizes()[0] == width and not window._player_pinned
-
-
-def test_fullscreen_releases_a_sidebar_slide_pin(window):
-    window.resize(1100, 600)
-    window.show()
-    QApplication.instance().processEvents()
-    window.browser_toggle.setChecked(False)
-    assert window._player_pinned
-    window.toggle_fullscreen()
-    try:
-        # The fullscreen slide resizes the video at each step instead.
-        assert not window._player_pinned and not window._slide_pinned
-        assert window._player_layout.indexOf(window.player) >= 0
-    finally:
-        window.toggle_fullscreen()
-    assert wait_until(lambda: not window._player_pinned and window._toolbar_slot.isVisible())
+    for visible in (False, True):
+        widths = []
+        window.browser_toggle.setChecked(visible)
+        assert wait_until(lambda: widths.append(window.player.width()) or "sidebar" not in window._slides)
+        assert layout.indexOf(window.player) >= 0
+        assert len(set(widths)) > 2  # stepped, not jumped
+        assert widths == sorted(widths, reverse=visible)
 
 
 class _FrameSource(QObject):
@@ -746,3 +720,109 @@ def test_overlays_step_on_the_video_frames_when_it_presents_them(window, monkeyp
     window.tracks_btn.setChecked(False)
     assert wait_until(lambda: not window.track_panel.isVisible())
     frames.stop()
+
+
+def test_seek_bar_presses_anywhere_on_its_height_and_drags_by_its_own_mapping(window):
+    window.resize(1100, 600)
+    window.show()
+    QApplication.instance().processEvents()
+    slider = window.seek_slider
+    slider.setEnabled(True)
+    assert slider.height() == 26  # 30% taller than the other sliders
+    events = []
+    slider.sliderPressed.connect(lambda: events.append("pressed"))
+    slider.sliderReleased.connect(lambda: events.append("released"))
+    slider.sliderMoved.connect(lambda value: events.append(value))
+    from PySide6.QtWidgets import QStyle
+    width = slider.width()
+    def under(x):
+        return QStyle.sliderValueFromPosition(slider.minimum(), slider.maximum(), x, width)
+    QTest.mousePress(slider, Qt.LeftButton, Qt.NoModifier, QPoint(width // 4, 1))  # near the top edge
+    assert events[:2] == ["pressed", under(width // 4)]
+    QTest.mouseMove(slider, QPoint(width // 10, slider.height() - 2))
+    assert slider.sliderPosition() == under(width // 10)  # under the pointer, dragging left
+    QTest.mouseRelease(slider, Qt.LeftButton, Qt.NoModifier, QPoint(width // 10, slider.height() - 2))
+    assert events[-1] == "released" and not slider.isSliderDown()
+
+
+def test_scrubbing_does_not_resize_the_seek_bar(window):
+    window.resize(1100, 600)
+    window.show()
+    QApplication.instance().processEvents()
+    window._duration_s = 7200.0
+    window._position_s = 3600.0
+    width = window.seek_slider.width()
+    for value in (0, 499, 500, 1000):
+        window._scrub_preview(value)  # "60:00 (-3600.0s)" and the like
+        QApplication.instance().processEvents()
+        assert window.seek_slider.width() == width
+    window._cancel_scrub()
+
+
+def test_seek_tip_sits_beside_the_pointer_and_lets_the_mouse_through(window):
+    from desktop_client.widgets import SliderTip
+    window.resize(1100, 600)
+    window.show()
+    QApplication.instance().processEvents()
+    slider = window.seek_slider
+    slider.setEnabled(True)
+    window._duration_s = 600.0
+    QTest.mouseMove(slider, QPoint(slider.width() // 2, slider.height() // 2))
+    tip = slider._tip
+    assert isinstance(tip, SliderTip) and tip.isVisible()
+    assert tip.testAttribute(Qt.WA_TransparentForMouseEvents)
+    pointer = slider.mapTo(window, QPoint(slider.width() // 2, 0)).x()
+    assert tip.geometry().left() > pointer and tip._caret_left  # to the right, caret pointing back
+    QTest.mouseMove(slider, QPoint(slider.width() - 1, slider.height() // 2))
+    end = slider.mapTo(window, QPoint(slider.width() - 1, 0)).x()
+    assert not tip._caret_left and tip.geometry().right() < end  # flipped: not over the time readout
+    window._duration_s = None
+
+
+def test_now_playing_corner_opens_its_full_text_in_a_card(window):
+    window.resize(1100, 600)
+    window.show()
+    QApplication.instance().processEvents()
+    corner = window._now_playing
+    QTest.mouseClick(corner, Qt.LeftButton)
+    assert not window._info_reveal.shown  # nothing playing: nothing to show
+    long_name = "[SubsPlease] A Very Long Episode Title That Will Not Fit In The Corner - 01 (1080p) [ABCDEF12].mkv"
+    window._show_now_playing(long_name, "model · quality · 2880×1620",
+                             [("File", "data4/Unwatched/" + long_name), ("Upscale model", "2x_Model_fp16")])
+    QTest.mouseClick(corner, Qt.LeftButton)
+    assert window._info_reveal.shown
+    assert window.info_title.text() == long_name
+    assert window.info_rows.rowCount() == 2
+    assert window.now_title._highlighted
+    card = window._info_geometry()
+    assert card.left() == window._CONTROL_MARGINS[0] and card.bottom() < window._controls_top()
+    QTest.keyClick(window, Qt.Key_Escape)
+    assert not window._info_reveal.shown
+    QTest.mouseClick(corner, Qt.LeftButton)
+    window.tracks_btn.setChecked(True)  # one card at a time
+    assert not window._info_reveal.shown
+    window.tracks_btn.setChecked(False)
+    window._show_now_playing(None)
+    assert not window._info_reveal.shown and not window.info_panel.isVisible()
+
+
+def test_settings_sheet_close_button_slides_it_out(window):
+    from desktop_client.widgets import IconButton
+    window.resize(1100, 600)
+    window.show()
+    QApplication.instance().processEvents()
+    window.playback_settings_toggle.setChecked(True)
+    assert wait_until(lambda: window._settings_reveal._t == 1.0)
+    close = next(b for b in window.playback_settings.findChildren(IconButton) if b.toolTip() == "Close")
+    close.click()
+    assert window.playback_settings.isVisible() and not window._settings_reveal.shown  # sliding out
+    assert wait_until(lambda: not window.playback_settings.isVisible())
+    assert not window.playback_settings_toggle.isChecked()
+
+
+def test_browser_shows_watch_progress_beside_the_icon():
+    from desktop_client.history import HistoryEntry
+    assert HistoryEntry("k", 600.0, 1200.0).progress == "50%"
+    assert HistoryEntry("k", 1199.0, 1200.0).progress == "99%"
+    assert HistoryEntry("k", 10.0, 1200.0, watched=True).progress == "\u2713"
+    assert HistoryEntry("k", 10.0, None).progress == ""
