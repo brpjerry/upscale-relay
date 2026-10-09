@@ -92,7 +92,7 @@ from .widgets import (
 )
 from .features import DesktopFeatures
 from .browser_state import PROGRESS_ROLE, BrowserTree, LocalLibraryProxy, restore_server_tree
-from .history import endpoint_key
+from .history import server_identity
 from .options import DesktopOptions
 
 try:
@@ -1750,7 +1750,7 @@ class MainWindow(DesktopFeatures, QMainWindow):
     async def _adopt_connected_client(self, client: RelayClient, caps: dict) -> None:
         """Install a connected control client and reflect its capabilities."""
         self._capture_browser()
-        self._browser_endpoint = endpoint_key(client.host, client.port)
+        self._browser_endpoint = server_identity(client.host, client.port, caps.get("server_id"))
         self.client = client
         self._server_caps = dict(caps)
         client.on_progress = self._on_open_progress

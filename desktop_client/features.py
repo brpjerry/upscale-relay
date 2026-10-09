@@ -311,7 +311,8 @@ class DesktopFeatures:
     def _key_for(self, source, path):
         host = self.client.host if self.client else self.settings.server_host
         port = self.client.port if self.client else self.settings.server_port
-        return source_key(source, path, host, port)
+        server_id = self._server_caps.get("server_id") if self.client else None
+        return source_key(source, path, host, port, server_id)
 
     def _save_history(self, *, completed=False):
         if not self._history_key or (not completed and (

@@ -375,6 +375,28 @@ def test_restore_loads_pages_with_ten_page_cap_and_missing_path_fallback(window)
     asyncio.run(scenario())
 
 
+def test_server_history_and_browser_state_follow_the_server_id(window):
+    async def scenario():
+        caps = {"server_name": "test", "models": [{"name": "passthrough"}], "server_id": "box-1"}
+        first = FakeLibraryClient()
+        first.host, first.port = "192.168.0.115", 8590
+        await window._adopt_connected_client(first, caps)
+        window.history.save(window._key_for("server_file", "Shows/a.mkv"), 300, 1400)
+        endpoint = window._browser_endpoint
+        # The same server, now reached at another address.
+        moved = FakeLibraryClient()
+        moved.host, moved.port = "relay.local", 9000
+        await window._adopt_connected_client(moved, caps)
+        assert window._browser_endpoint == endpoint == "id:box-1"
+        assert window.history.entries[window._key_for("server_file", "Shows/a.mkv")].resume == 300
+        # A different server at the first address does not inherit it.
+        other = FakeLibraryClient()
+        other.host, other.port = "192.168.0.115", 8590
+        await window._adopt_connected_client(other, {**caps, "server_id": "box-2"})
+        assert window._key_for("server_file", "Shows/a.mkv") not in window.history.entries
+    asyncio.run(scenario())
+
+
 def test_shared_sort_control_has_height_with_local_only_browser(window):
     from PySide6.QtWidgets import QApplication
     window._apply_browser_visible(True)
