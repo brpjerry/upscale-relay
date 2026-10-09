@@ -177,3 +177,27 @@ def test_failed_constructor_rollback_latches_server_restart(monkeypatch):
         assert ws.closed
 
     asyncio.run(scenario())
+
+
+def test_tensorrt_pipeline_checks_the_provider_of_every_worker_generation(monkeypatch):
+    seen = {}
+
+    def upscaler(*_args, **kwargs):
+        seen.update(kwargs)
+        return _Owner()
+
+    monkeypatch.setitem(sys.modules, "onnxruntime", SimpleNamespace(
+        get_available_providers=lambda: ["TensorrtExecutionProvider"],
+    ))
+    monkeypatch.setattr(worker_mod, "SubprocessUpscaler", upscaler)
+    pipeline = Pipeline(
+        VideoConfig("h264", None, 32, 32, Fraction(1, 1000)), "model.onnx",
+        "lossless-ffv1", (64, 64), lambda _: None, lambda _: None, ep="auto",
+    )
+    try:
+        accept = seen["accept_provider"]
+        accept("TensorrtExecutionProvider")
+        with pytest.raises(RuntimeError, match="needs GPU inference"):
+            accept("CPUExecutionProvider")
+    finally:
+        pipeline.close()

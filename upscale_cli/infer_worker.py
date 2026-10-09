@@ -24,6 +24,7 @@ import sys
 import threading
 from contextlib import suppress
 from multiprocessing import shared_memory
+from typing import Callable
 
 import numpy as np
 
@@ -56,6 +57,27 @@ def is_gpu_provider(name: str | None) -> bool:
     need real GPU execution must check the provider a session ended up with.
     """
     return name in _GPU_PROVIDERS
+
+
+def require_gpu_provider(provider: str | None, ep: str) -> None:
+    """Refuse inference that landed on the CPU unless ``--ep cpu`` asked for it.
+
+    Relaying is a realtime job, and CPU inference is roughly two orders of
+    magnitude short of it — a session that falls back does not degrade, it
+    stops being usable.  The check is on the provider a session actually got,
+    because the availability list still reports a TensorRT provider whose
+    native libraries failed to load; the fallback is otherwise silent, and
+    reads as an unexplained slowdown.  A restarted worker is a new session and
+    must pass the same check.
+    """
+    if ep == "cpu" or is_gpu_provider(provider):
+        return
+    raise RuntimeError(
+        f"inference fell back to {provider or 'an unknown provider'} with --ep "
+        f"{ep}; the relay needs GPU inference. Check that the NVIDIA runtime "
+        "installed cleanly (its libraries can be registered but still fail to "
+        "load), or pass --ep cpu to accept CPU speeds deliberately."
+    )
 
 # Input cap = TRT profile max; output cap covers scale 4x.
 _MAX_IN = (1440, 2560)
@@ -162,14 +184,19 @@ class SubprocessUpscaler:
 
     FIRST_FRAME_TIMEOUT = 300.0  # cold TensorRT engine build
     FRAME_TIMEOUT = 60.0
+    _accept_provider: Callable[[str | None], None] | None = None
 
     def __init__(self, model_path: str, ep: str = "tensorrt",
-                 tile_size: int | str | None = None):
+                 tile_size: int | str | None = None, *,
+                 accept_provider: Callable[[str | None], None] | None = None):
+        """``accept_provider`` sees the provider of every worker generation,
+        the initial one and each crash replacement, and raises to refuse it."""
         from upscale_cli.manifest import ModelManifest
 
         self.model_path = model_path
         self.ep = ep
         self.tile_size = tile_size
+        self._accept_provider = accept_provider
         self.manifest = ModelManifest.load(model_path)
         self.scale_factor = self.manifest.scale_factor
         if self.scale_factor is None:
@@ -247,6 +274,12 @@ class SubprocessUpscaler:
             self._kill()
             raise RuntimeError(f"inference worker failed to start: {line!r}")
         self.active_provider = parse_ready_provider(line)
+        if self._accept_provider is not None:
+            try:
+                self._accept_provider(self.active_provider)
+            except BaseException:
+                self._kill()
+                raise
 
     def _read_exact(self, n: int, timeout: float) -> bytes | None:
         """Next framed reply from the persistent reader (n is fixed = header)."""

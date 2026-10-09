@@ -14,6 +14,7 @@ dropped at every stage boundary.
 
 from __future__ import annotations
 
+import functools
 import logging
 import os
 import queue
@@ -83,28 +84,13 @@ def _should_use_tensorrt(ep: str, available_providers: set[str]) -> bool:
 def _require_gpu_session(upscaler, ep: str) -> None:
     """Refuse to stream from a session that landed on the CPU provider.
 
-    Relaying is a realtime job, and CPU inference is roughly two orders of
-    magnitude short of it — a session that falls back does not degrade, it
-    stops being usable.  The check is on the provider the session actually
-    got, because the availability list that `_should_use_tensorrt` consults
-    still reports a TensorRT provider whose native libraries failed to load;
-    the fallback is otherwise silent, and reads as an unexplained slowdown.
-
-    `--ep cpu` stays an explicit opt-in for offline experimentation.
+    `--ep cpu` stays an explicit opt-in for offline experimentation. See
+    `upscale_cli.infer_worker.require_gpu_provider`, which a TensorRT worker
+    facade also applies to every replacement worker it starts.
     """
-    from upscale_cli.infer_worker import is_gpu_provider
+    from upscale_cli.infer_worker import require_gpu_provider
 
-    if ep == "cpu":
-        return
-    provider = getattr(upscaler, "active_provider", None)
-    if is_gpu_provider(provider):
-        return
-    raise RuntimeError(
-        f"inference fell back to {provider or 'an unknown provider'} with --ep "
-        f"{ep}; the relay needs GPU inference. Check that the NVIDIA runtime "
-        "installed cleanly (its libraries can be registered but still fail to "
-        "load), or pass --ep cpu to accept CPU speeds deliberately."
-    )
+    require_gpu_provider(getattr(upscaler, "active_provider", None), ep)
 
 
 @dataclass
@@ -305,9 +291,14 @@ class Pipeline:
                 if use_trt:
                     # The ORT TensorRT EP corrupts the process heap on this stack
                     # (see upscale_cli/infer_worker.py) — run it out-of-process.
-                    from upscale_cli.infer_worker import SubprocessUpscaler
+                    from upscale_cli.infer_worker import SubprocessUpscaler, require_gpu_provider
 
-                    self.upscaler = SubprocessUpscaler(model_path, ep="tensorrt", tile_size=tile)
+                    # A worker that crashed is replaced mid-stream; the
+                    # replacement must meet the same GPU requirement.
+                    self.upscaler = SubprocessUpscaler(
+                        model_path, ep="tensorrt", tile_size=tile,
+                        accept_provider=functools.partial(require_gpu_provider, ep=ep),
+                    )
                 else:
                     from upscale_cli.infer import OnnxUpscaler
 
