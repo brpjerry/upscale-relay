@@ -1,13 +1,14 @@
 """Feature integration through the retained desktop trees and transport slots."""
 import asyncio
 from fractions import Fraction
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 import pytest
 pytest.importorskip("PySide6")
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QKeyEvent
 
+import desktop_client.features as features
 import desktop_client.main_window as main_window
 from desktop_client.playback_state import PlaybackSnapshot
 from test_server_library_gui import window, FakeSessionClient, FakeLibraryClient
@@ -240,6 +241,26 @@ def test_autoplay_walks_name_pages_skips_watched_and_retains_partial_resume(wind
         assert window.client.fetches == [("Shows", None, "name"), ("Shows", "next", "name")]
         assert window.history.entries[window._key_for("server_file", "Shows/c.mkv")].resume == 80
         snapshot.path = "Shows/c.mkv"
+        assert await window._next_sibling(snapshot, lambda: True) is None
+    asyncio.run(scenario())
+
+
+def test_local_autoplay_follows_native_windows_paths(window, monkeypatch):
+    names = ["01.mkv", "02.mkv", "03.mkv", "notes.txt"]
+    class WindowsPath(PureWindowsPath):
+        def iterdir(self):
+            return [self / name for name in names]
+        def is_file(self):
+            return True
+    monkeypatch.setattr(features, "Path", WindowsPath)
+    async def scenario():
+        # Qt's file dialog and tree hand over forward slashes; the sibling
+        # autoplay returns is native, so the next lookup sees backslashes.
+        snapshot = PlaybackSnapshot("uplink", "C:/shows/01.mkv", 1000, 1000, False)
+        assert await window._next_sibling(snapshot, lambda: True) == r"C:\shows\02.mkv"
+        snapshot.path = r"C:\shows\02.mkv"
+        assert await window._next_sibling(snapshot, lambda: True) == r"C:\shows\03.mkv"
+        snapshot.path = r"C:\shows\03.mkv"
         assert await window._next_sibling(snapshot, lambda: True) is None
     asyncio.run(scenario())
 
