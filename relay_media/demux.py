@@ -205,7 +205,7 @@ class VideoTrack:
         chapters = []
         for chapter in raw:
             time_base = chapter.get("time_base")
-            if time_base is None:
+            if not time_base:  # PyAV 19+ reads a missing time base as 0/1, not None
                 continue
             start_s = float(chapter["start"] * time_base)
             end = chapter.get("end")
@@ -384,7 +384,7 @@ class AuxiliaryTrack:
         if (contiguous and self._seek_stream is not None
                 and packet.stream.index == self._seek_stream.index):
             stamp = packet.dts if packet.dts is not None else packet.pts
-            if stamp is not None and packet.time_base is not None:
+            if stamp is not None and packet.time_base:
                 self._index_covered_s = max(self._index_covered_s, float(stamp * packet.time_base))
 
     def _catch_up_subtitles(self, target_s: float, gen: int) -> bool:
@@ -413,7 +413,7 @@ class AuxiliaryTrack:
             # reuse its native owner for catchup. A fourth input container
             # would duplicate large embedded font bundles in memory.
             anchor = self._seek_stream
-            if anchor is not None and anchor.time_base is not None:
+            if anchor is not None and anchor.time_base:
                 self._container.seek(
                     int(scan_from / float(anchor.time_base)),
                     stream=anchor, backward=True, any_frame=False,
@@ -436,7 +436,7 @@ class AuxiliaryTrack:
                 self._remember_subtitle_progress(packet, contiguous=contiguous)
                 if anchor is not None and packet.stream.index == anchor.index:
                     stamp = packet.dts if packet.dts is not None else packet.pts
-                    if stamp is not None and packet.time_base is not None:
+                    if stamp is not None and packet.time_base:
                         scanned_s = max(scanned_s, float(stamp * packet.time_base))
                 self.subtitle_index_progress = (target_s, scanned_s)
             if not contiguous and gen == self._iter_gen:
@@ -475,7 +475,7 @@ class AuxiliaryTrack:
                 # libav choose a sparse subtitle index, while naming audio is
                 # also slow for Matroska files whose cues index video only.
                 anchor = self._seek_stream
-                if anchor is not None and anchor.time_base is not None:
+                if anchor is not None and anchor.time_base:
                     self._container.seek(
                         max(0, int(target_s / float(anchor.time_base))),
                         stream=anchor,
@@ -534,7 +534,7 @@ class AuxiliaryTrack:
             time_base = packet.time_base or packet.stream.time_base
             stamp = packet.dts if packet.dts is not None else packet.pts
             order_s = float(stamp * time_base) if stamp is not None and time_base else float("inf")
-            if target_s is not None and packet.pts is not None and time_base is not None:
+            if target_s is not None and packet.pts is not None and time_base:
                 start_s = float(packet.pts * time_base)
                 duration_s = float((packet.duration or 0) * time_base)
                 end_s = start_s + duration_s

@@ -2234,7 +2234,7 @@ class MainWindow(DesktopFeatures, QMainWindow):
         time_base = track.time_base if track is not None else session.time_base
         avg_rate = track.average_rate if track is not None else session.avg_rate
         duration_s = track.duration_seconds() if track is not None else session.duration_s
-        if time_base is None:
+        if not time_base:  # a local track's unset time base reads 0/1 on PyAV 19+
             self._error("Session failed", "Server did not provide the source time base.")
             await self._teardown_session()
             return
