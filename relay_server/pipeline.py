@@ -58,6 +58,11 @@ HIGH_WATERMARK_MS = 10_000
 RESUME_WATERMARK_MS = 9_500
 
 _QUEUE_DEPTH = 4  # frames buffered between stages
+# Compressed input waiting for the decode stage. A wire packet may carry up to
+# MAX_PAYLOAD_BYTES, so the packet count alone allowed 256 x 64 MiB per
+# session while decoding was paused or behind. Mirrors the downlink budget.
+_INPUT_QUEUE_PACKETS = 256
+_INPUT_QUEUE_MAX_BYTES = 128 * 1024 * 1024
 PIPELINE_CLOSE_TIMEOUT_S = 15.0
 MUX_MAX_INTERLEAVE_DELTA_US = 100_000
 
@@ -174,6 +179,64 @@ class _AuxPacket:
     info: AuxiliaryPacketInfo
 
 
+class _ByteBudgetQueue(queue.Queue):
+    """Thread queue bounding queued payload bytes as well as item count.
+
+    A put waits until the item fits both limits. An item larger than the
+    whole budget is still accepted into a queue holding no payload, so one
+    maximum-size packet can always make progress.
+    """
+
+    def __init__(self, maxsize: int, max_bytes: int):
+        super().__init__(maxsize)
+        self.max_bytes = max_bytes
+        self.payload_bytes = 0
+
+    @staticmethod
+    def _payload_size(item) -> int:
+        if isinstance(item, MediaPacket):
+            return len(item.payload)
+        if isinstance(item, _AuxPacket):
+            return item.info.packet.size
+        return 0  # commands and the stop sentinel
+
+    def _fits(self, size: int) -> bool:
+        if 0 < self.maxsize <= self._qsize():
+            return False
+        return self.payload_bytes == 0 or self.payload_bytes + size <= self.max_bytes
+
+    def put(self, item, block: bool = True, timeout: float | None = None) -> None:
+        size = self._payload_size(item)
+        with self.not_full:
+            if not block:
+                if not self._fits(size):
+                    raise queue.Full
+            elif timeout is None:
+                while not self._fits(size):
+                    self.not_full.wait()
+            else:
+                deadline = time.monotonic() + max(0.0, timeout)
+                while not self._fits(size):
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise queue.Full
+                    self.not_full.wait(remaining)
+            self._put(item)
+            self.unfinished_tasks += 1
+            self.not_empty.notify()
+
+    def _put(self, item) -> None:
+        super()._put(item)
+        self.payload_bytes += self._payload_size(item)
+
+    def _get(self):
+        item = super()._get()
+        self.payload_bytes -= self._payload_size(item)
+        # Freed bytes may admit more than the one waiter Queue.get notifies.
+        self.not_full.notify_all()
+        return item
+
+
 class _SinkBuffer:
     """Write target for the output muxer. Deliberately has no seek/tell so
     the Matroska muxer runs in streaming (non-seekable) mode."""
@@ -279,7 +342,7 @@ class Pipeline:
             self.emit = emit
             self.on_error = on_error
             self.stats = PipelineStats()
-            self.in_q: queue.Queue = queue.Queue(maxsize=256)
+            self.in_q = _ByteBudgetQueue(_INPUT_QUEUE_PACKETS, _INPUT_QUEUE_MAX_BYTES)
             self._q_dec: queue.Queue = queue.Queue(maxsize=_QUEUE_DEPTH)
             self._q_up: queue.Queue = queue.Queue(maxsize=_QUEUE_DEPTH)
 
@@ -543,12 +606,16 @@ class Pipeline:
     # -- public API (called from asyncio thread) ------------------------------
 
     def feed(self, pkt: MediaPacket) -> None:
-        """Blocking put -- caller runs it in an executor for natural backpressure."""
-        self.in_q.put(pkt)
+        """Blocking put -- caller runs it in an executor for natural backpressure.
+
+        Returns without queueing once the pipeline is closed: nothing drains
+        the input queue after that.
+        """
+        self._safe_put(self.in_q, pkt)
 
     def feed_aux(self, info: AuxiliaryPacketInfo, epoch: int) -> None:
         """Queue one original audio/subtitle packet for stream-copy muxing."""
-        self.in_q.put(_AuxPacket(epoch=epoch, info=info))
+        self._safe_put(self.in_q, _AuxPacket(epoch=epoch, info=info))
 
     def note_buffer_report(self, buffered_ms: int) -> None:
         self.client_buffered_ms = buffered_ms
