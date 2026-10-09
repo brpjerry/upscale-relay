@@ -594,7 +594,13 @@ class Session:
     async def _server_source_loop(self, from_pts: int | None,
                                   discontinuity: bool, epoch: int) -> None:
         assert self.source_track is not None and self.pipeline is not None
+        # Claim both iterator generations here on the event loop, before any
+        # cancellable worker runs. A cancelled to_thread(next_batch) keeps
+        # running; claiming inside it let a superseded epoch's worker retire
+        # the replacement epoch's auxiliary iterator (its audio and subtitles
+        # stopped while video went on).
         video_iterator = self.source_track.packets(from_pts)
+        aux_generation = self.aux_track.reserve() if self.aux_track is not None else None
         target_s = (
             float(from_pts * self.source_track.time_base) if from_pts is not None else None
         )
@@ -618,7 +624,7 @@ class Session:
                 if target_s - video_start_s > self.pipeline.seek_discard_max_s:
                     aux_target_s = video_start_s
             aux_iterator = (
-                self.aux_track.packets(aux_target_s)
+                self.aux_track.packets(aux_target_s, generation=aux_generation)
                 if self.aux_track is not None else iter(())
             )
             auxiliary = next(aux_iterator, sentinel)

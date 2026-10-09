@@ -445,16 +445,34 @@ class AuxiliaryTrack:
         finally:
             self.subtitle_index_progress = None
 
-    def packets(self, target_s: float | None = None) -> Iterator[AuxiliaryPacketInfo]:
+    def reserve(self) -> int:
+        """Claim the next iterator generation without choosing a target yet.
+
+        Claiming invalidates every older iterator, as ``packets()`` does. A
+        caller that only learns its target inside cancellable worker code
+        claims on its own thread first and passes the generation to
+        ``packets()``: a cancelled worker that keeps running then gets an
+        already-retired iterator instead of retiring its replacement's.
+        """
+        with self._generation_lock:
+            self._iter_gen = gen = self._iter_gen + 1
+        return gen
+
+    def packets(
+        self, target_s: float | None = None, *, generation: int | None = None,
+    ) -> Iterator[AuxiliaryPacketInfo]:
         """Iterate original auxiliary packets, optionally from ``target_s``.
 
         A small audio preroll is retained and subtitle packets whose declared
         duration overlaps the target survive. mpv's initial audio sync trims
         samples before the first video PTS; keeping them is safer than starting
         codecs such as Opus/AAC without decoder preroll.
+
+        ``generation`` is one returned by ``reserve()``; without it the call
+        claims a new one. An iterator whose generation is no longer current
+        yields nothing.
         """
-        with self._generation_lock:
-            self._iter_gen = gen = self._iter_gen + 1
+        gen = self.reserve() if generation is None else generation
         return self._packet_iter(gen, target_s)
 
     def _packet_iter(
