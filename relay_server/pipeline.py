@@ -293,10 +293,12 @@ class Pipeline:
                     # (see upscale_cli/infer_worker.py) — run it out-of-process.
                     from upscale_cli.infer_worker import SubprocessUpscaler, require_gpu_provider
 
-                    # A worker that crashed is replaced mid-stream; the
+                    # Whole source frames cross into the worker, which tiles
+                    # them. A worker that crashed is replaced mid-stream; the
                     # replacement must meet the same GPU requirement.
                     self.upscaler = SubprocessUpscaler(
                         model_path, ep="tensorrt", tile_size=tile,
+                        max_input_hw=(video.height, video.width),
                         accept_provider=functools.partial(require_gpu_provider, ep=ep),
                     )
                 else:

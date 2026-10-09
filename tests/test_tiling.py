@@ -71,3 +71,20 @@ def test_smallest_valid_tile_writes_every_output_pixel(model_path):
     up = OnnxUpscaler(model_path, ep="cpu", tile_size=18)  # one past the overlap
     rgb = np.full((80, 80, 3), 127, np.uint8)
     assert np.array_equal(up._infer_with_fallback(rgb), up.infer_array(rgb))
+
+
+def test_worker_facade_accepts_sources_beyond_the_tensorrt_profile(model_path):
+    # The pipeline tiles sources larger than 2560x1440 inside the worker; the
+    # shared-memory handoff in front of it must not reject them first.
+    from upscale_cli.infer_worker import SubprocessUpscaler
+
+    rng = np.random.default_rng(4)
+    rgb = rng.integers(0, 256, size=(160, 2600, 3), dtype=np.uint8)
+    reference = OnnxUpscaler(model_path, ep="cpu", tile_size=1024)._infer_with_fallback(rgb)
+    worker = SubprocessUpscaler(model_path, ep="cpu", tile_size=1024, max_input_hw=rgb.shape[:2])
+    try:
+        assert np.array_equal(worker.infer_array(rgb), reference)
+        with pytest.raises(ValueError, match="exceeds"):
+            worker.infer_array(np.zeros((160, 2601, 3), np.uint8))
+    finally:
+        worker.close()
