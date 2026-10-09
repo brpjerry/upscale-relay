@@ -29,7 +29,7 @@ RUNTIME_INSTALL_SMOKE_ARG = "--smoke-nvidia-runtime-installer"
 RUNTIME_VALIDATE_ARG = "--validate-nvidia-runtime"
 SOURCE_VALIDATE_ARG = "--validate-source-runtime"
 RUNTIME_STACK_ID = (
-    f"ort1.28.0-trt10.16.1-cuda13.3-"
+    f"ort1.31.0-trt10.16.1-cuda13.4-"
     f"py{sys.version_info.major}{sys.version_info.minor}-v1"
 )
 
@@ -39,19 +39,21 @@ RUNTIME_STACK_ID = (
 #
 # CUDA 13 dropped the "-cu12" suffix from the NVIDIA component wheels, so most
 # names here changed rather than just their versions.  TensorRT stays on 10.x:
-# ONNX Runtime 1.28.0's provider imports nvinfer_10.dll / nvonnxparser_10.dll,
-# so the cu13 build of TensorRT 10 is the only one it can load.
+# ONNX Runtime 1.31.0's provider still imports nvinfer_10.dll /
+# nvonnxparser_10.dll (checked in the wheel; upstream microsoft/onnxruntime
+# #32278 tracks TensorRT 11), so the cu13 build of TensorRT 10, whose last
+# release is 10.16.1, is the only one it can load.
 NVIDIA_RUNTIME_PACKAGES = (
-    "onnx==1.22.0",
-    "onnxruntime-gpu==1.28.0",
+    "onnx==1.23.2",
+    "onnxruntime-gpu==1.31.0",
     "tensorrt-cu13-libs==10.16.1.11",
-    "cuda-toolkit==13.3.1",
-    "nvidia-cublas==13.6.0.2",
-    "nvidia-cuda-nvrtc==13.3.33",
-    "nvidia-cuda-runtime==13.3.29",
-    "nvidia-cudnn-cu13==9.24.0.43",
-    "nvidia-cufft==12.3.0.29",
-    "nvidia-nvjitlink==13.3.33",
+    "cuda-toolkit==13.4.2",
+    "nvidia-cublas==13.8.0.4",
+    "nvidia-cuda-nvrtc==13.4.92",
+    "nvidia-cuda-runtime==13.4.92",
+    "nvidia-cudnn-cu13==9.27.0.42",
+    "nvidia-cufft==12.4.0.43",
+    "nvidia-nvjitlink==13.4.92",
 )
 
 # TensorRT's soname major, which its Windows DLLs carry in their file names.
