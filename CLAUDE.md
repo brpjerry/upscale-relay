@@ -209,8 +209,8 @@ their volume, panscan, tracks and delays.
   `load_scripts=no`. But on Windows each such exception makes faulthandler
   dump every thread while they run, and that dump itself crashed 2 of 8
   desktop test runs (access violation; 0 of 16 with faulthandler off).
-  `tests/conftest.py` limits Windows test dumps to the faulting thread;
-  `relay-desktop --debug` on Windows still dumps all threads.
+  `tests/conftest.py` and `relay-desktop --debug` limit Windows dumps to
+  the faulting thread.
 - On Linux's embedded Qt/OpenGL render path, keep `hwdec=auto-copy-safe`.
   A real core landed in
   `paintGL → mpv_render_context_render → vaSyncSurface → iHD` when the user's
