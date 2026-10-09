@@ -27,21 +27,21 @@ gui = [
 server-gui = [
     "PySide6-Essentials>=6.6",
     "qasync>=0.27",
-    "onnx==1.22.0",
+    "onnx==1.23.2",
 ]
 # Optional source installation of the same exact stack that the small Windows
 # release installs into its per-user runtime on first launch.
 nvidia = [
-    "onnx==1.22.0",
-    "onnxruntime-gpu==1.28.0",
+    "onnx==1.23.2",
+    "onnxruntime-gpu==1.31.0",
     "tensorrt-cu13-libs==10.16.1.11",
-    "cuda-toolkit==13.3.1",
-    "nvidia-cublas==13.6.0.2",
-    "nvidia-cuda-nvrtc==13.3.33",
-    "nvidia-cuda-runtime==13.3.29",
-    "nvidia-cudnn-cu13==9.24.0.43",
-    "nvidia-cufft==12.3.0.29",
-    "nvidia-nvjitlink==13.3.33",
+    "cuda-toolkit==13.4.2",
+    "nvidia-cublas==13.8.0.4",
+    "nvidia-cuda-nvrtc==13.4.92",
+    "nvidia-cuda-runtime==13.4.92",
+    "nvidia-cudnn-cu13==9.27.0.42",
+    "nvidia-cufft==12.4.0.43",
+    "nvidia-nvjitlink==13.4.92",
 ]
 
 [project.scripts]
