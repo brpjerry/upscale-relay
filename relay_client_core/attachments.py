@@ -200,7 +200,9 @@ def _acquire_cached(root: Path, view: Path, name: str, entry: dict) -> bool:
     return False
 
 
-def _publish_object(root: Path, view: Path, name: str, data: bytes, digest: str) -> None:
+def _publish_object(
+    root: Path, view: Path, name: str, data: bytes, digest: str, protected: set[str],
+) -> None:
     # The partial file lives in the leased view: eviction never sees it, and a
     # crashed writer's file goes with its abandoned view.
     handle, temp_name = tempfile.mkstemp(prefix=f".{digest}.", dir=view)
@@ -213,6 +215,9 @@ def _publish_object(root: Path, view: Path, name: str, data: bytes, digest: str)
         with _cache_guard(root):
             os.replace(temp_name, source)
             _link_object(source, view / name)
+            # Every addition is bounded at once: an open that fails or is
+            # cancelled later must not leave the store over its limit.
+            _evict(root, protected)
     except BaseException:
         try:
             os.unlink(temp_name)
@@ -259,11 +264,6 @@ def _view_names(entries: list[dict]) -> list[str]:
 
 
 def _evict(root: Path, protected: set[str]) -> None:
-    with _cache_guard(root):
-        _evict_objects(root, protected)
-
-
-def _evict_objects(root: Path, protected: set[str]) -> None:
     objects = root / "objects"
     try:
         files = [path for path in objects.iterdir() if path.is_file()]
@@ -308,6 +308,7 @@ async def materialize_attachment_cache(
     # or another) evicting near the cache limit never deletes an object this
     # open has already counted on.
     owner = _ViewPublication(cache_root, session_id)
+    protected = {entry["sha256"] for entry in entries}
     try:
         await loop.run_in_executor(None, owner.open)
         for entry, name in zip(entries, _view_names(entries)):
@@ -330,9 +331,8 @@ async def materialize_attachment_cache(
             if len(data) != entry["size"] or hashlib.sha256(data).hexdigest() != digest:
                 raise ValueError("attachment size/hash mismatch")
             await loop.run_in_executor(
-                None, owner.step, _publish_object, name, data, digest,
+                None, owner.step, _publish_object, name, data, digest, protected,
             )
-        await asyncio.to_thread(_evict, cache_root, {entry["sha256"] for entry in entries})
     except BaseException as error:
         cleanup = loop.run_in_executor(None, owner.abandon)
         if isinstance(error, asyncio.CancelledError):

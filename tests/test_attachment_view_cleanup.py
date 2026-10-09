@@ -208,3 +208,35 @@ def test_corrupt_cached_object_is_fetched_again_and_replaced(tmp_path):
 
     asyncio.run(scenario())
     assert (tmp_path / "objects" / entry["sha256"]).read_bytes() == b"font"
+
+
+@pytest.mark.parametrize("interruption", ["failure", "cancellation"])
+def test_interrupted_opens_keep_the_object_store_within_its_budget(
+    tmp_path, monkeypatch, interruption,
+):
+    monkeypatch.setattr(cache, "MAX_CACHE_BYTES", 10)
+
+    async def scenario():
+        for index in range(4):
+            font, missing = f"font-{index}".encode(), f"gone-{index}".encode()
+            manifest = [_font(font), _font(missing, "missing.ttf")]
+            server = _FontServer(font)
+            if interruption == "failure":
+                with pytest.raises(ConnectionError):
+                    await cache.materialize_attachment_cache(
+                        server, "http://server", f"s{index}", manifest, "token", tmp_path)
+                continue
+            server.bodies[manifest[1]["sha256"]] = missing
+            server.gates[manifest[1]["sha256"]] = asyncio.Event()
+            opening = asyncio.create_task(cache.materialize_attachment_cache(
+                server, "http://server", f"s{index}", manifest, "token", tmp_path))
+            await server.waiting.wait()
+            opening.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await opening
+
+    asyncio.run(scenario())  # also waits out abandoned cleanup workers
+    stored = sum(path.stat().st_size for path in (tmp_path / "objects").iterdir())
+    assert stored <= 10
+    assert list((tmp_path / "sessions").glob("*")) == []
+    assert not any(path.is_relative_to(tmp_path) for path in cache._VIEW_LEASES)
