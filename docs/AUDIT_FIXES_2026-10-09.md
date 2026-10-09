@@ -92,7 +92,7 @@ repository; commits are on its `fix/audit-android-2026-10-09`.
 | F08 | Settings shows connection errors and marks invalid host/port fields (TalkBack live region). | `614b0dc` |
 | F09 | Player controls stay up while the seek bar is dragged. | `d80c159` |
 | F10 | "Play original" after a failed first relay open keeps progress, resume and end-of-file handling. | `38ea270` |
-| Finding 7 | Local files send `sample_aspect_ratio` (MP4 via MediaExtractor, MKV display sizes via a Matroska reader); bitstream-only aspect is left to the server. | `2655f3a`, `ca45724` |
+| Finding 7 | Local files send `sample_aspect_ratio` (MP4 via MediaExtractor, MKV display sizes via a Matroska reader), omitting ratios outside the documented 1/10..10 range; bitstream-only aspect is left to the server. | `2655f3a`, `ca45724`, `b7b78b3` |
 
 Against the server branch on `:8690`, Android verified `server_id`-scoped
 history, three anamorphic clips at 4:3 (one with bitstream-only aspect) and SD
