@@ -319,6 +319,7 @@ def test_cached_attachment_negotiation_omits_epoch_attachment_bodies(monkeypatch
             has_audio_tracks = True
             has_auxiliary_tracks = True
             average_rate = Fraction(24, 1)
+            color_tags = (2, 0, 2, 2)  # unspecified, as probed from an untagged file
 
             def __init__(self, _path):
                 pass
@@ -433,6 +434,7 @@ def test_mux_uses_small_nonzero_interleave_bound(monkeypatch):
     pipeline._enc_pix_fmt = "yuv420p"
     pipeline._aux_template_container = None
     pipeline._embed_aux_attachments = True
+    pipeline._source_color = None
     pipeline._open_mux()
     assert captured["container_options"]["max_interleave_delta"] == str(
         MUX_MAX_INTERLEAVE_DELTA_US

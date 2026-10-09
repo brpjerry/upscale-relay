@@ -434,6 +434,7 @@ class Session:
             time_base=Fraction(*video["time_base"]),
             avg_rate=Fraction(*video["avg_rate"]) if video.get("avg_rate") else None,
             sample_aspect_ratio=_sample_aspect_ratio(video),
+            color_tags=self.source_track.color_tags if self.source_track is not None else None,
         )
         # Pipeline construction can block for minutes when a model's TensorRT
         # engine is built for the first time; keepalives stop the client's

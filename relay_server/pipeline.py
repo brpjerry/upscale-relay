@@ -35,6 +35,7 @@ from relay_protocol import (
     NO_TS,
     MediaPacket,
 )
+from upscale_cli.color import VideoColor
 from upscale_cli.encode import (
     DEFAULT_LOSSLESS_HEVC_PROFILE,
     add_video_encoder_stream,
@@ -267,6 +268,10 @@ class VideoConfig:
     # Stored pixel width over height (open_session.video.sample_aspect_ratio);
     # 1 for square pixels and for clients that do not send it.
     sample_aspect_ratio: Fraction = Fraction(1)
+    # FFmpeg colour tags (matrix, range, primaries, transfer) of a server-side
+    # source, known before any media flows. None: take them from the first
+    # decoded frame (uplink sessions, which carry no muxed auxiliary tracks).
+    color_tags: tuple[int, int, int, int] | None = None
 
 
 @dataclass
@@ -342,6 +347,12 @@ class Pipeline:
             if fit_mode not in ("fit", "cover"):
                 raise ValueError(f"unknown fit mode {fit_mode!r}")
             self.video = video
+            # One colour description per session drives every YUV<->RGB
+            # conversion and the encoder tags (upscale_cli.color).
+            self._source_color: VideoColor | None = (
+                VideoColor.resolve_values(*video.color_tags, video.width, video.height)
+                if video.color_tags is not None else None
+            )
             self.emit = emit
             self.on_error = on_error
             self.stats = PipelineStats()
@@ -591,7 +602,10 @@ class Pipeline:
             self._mux, self._enc_codec,
             width=self.out_w, height=self.out_h, pix_fmt=self._enc_pix_fmt,
             time_base=self.video.time_base, rate=self.video.avg_rate, options=options,
+            color=self._source_color,
         )
+        # Tags must be on the encoder before it opens (first encode or mux).
+        self._enc_tagged = self._source_color is not None
         self._aux_streams = {}
         if self._aux_template_container is not None:
             for template in self._aux_template_container.streams:
@@ -968,6 +982,9 @@ class Pipeline:
         if trace is not None and trace.first_frame_ms is None:
             trace.first_frame_ms = (time.perf_counter() - trace.requested_at) * 1000.0
             trace.first_frame_pts = frame.pts
+        if self._source_color is None:
+            # Published before the frame is queued, so later stages see it.
+            self._source_color = VideoColor.resolve(frame, self.video.width, self.video.height)
         if frame.format.name in self._HW_PIX_FMTS:
             # Download NVDEC frames on the decode thread (parallel with infer).
             cpu = frame.reformat(format="nv12")
@@ -991,11 +1008,9 @@ class Pipeline:
                 continue
             if self.upscaler is not None:
                 t0 = time.perf_counter()
-                frame = item.frame
-                if frame.format.name != "rgb24":
-                    # Cached swscale context; frame.to_ndarray would rebuild
-                    # one per frame (ruinous for 10-bit sources).
-                    frame = self._in_reformatter.reformat(frame, format="rgb24")
+                # Cached swscale context; frame.to_ndarray would rebuild one
+                # per frame (ruinous for 10-bit sources).
+                frame = self._source_color.to_rgb(self._in_reformatter, item.frame)
                 rgb = frame.to_ndarray(format="rgb24")
                 item.rgb = self.upscaler._infer_with_fallback(rgb)
                 item.frame = None
@@ -1050,9 +1065,7 @@ class Pipeline:
                 # Inferred frames are already RGB. Passthrough+cover needs one
                 # conversion before the array crop; keep its swscale context
                 # separate from the final scale/format conversion.
-                crop_source = item.frame
-                if crop_source.format.name != "rgb24":
-                    crop_source = self._crop_reformatter.reformat(crop_source, format="rgb24")
+                crop_source = self._source_color.to_rgb(self._crop_reformatter, item.frame)
                 rgb = crop_source.to_ndarray(format="rgb24")
             else:
                 rgb = None
@@ -1065,14 +1078,17 @@ class Pipeline:
                 out = item.frame
             if (out.width, out.height, out.format.name) != (self.out_w, self.out_h, self._enc_pix_fmt):
                 # Single swscale pass: scale + pixel format together.
-                out = self._reformatter.reformat(
-                    out, width=self.out_w, height=self.out_h,
-                    format=self._enc_pix_fmt, interpolation=self._interpolation,
+                out = self._source_color.to_output(
+                    self._reformatter, out, width=self.out_w, height=self.out_h,
+                    pix_fmt=self._enc_pix_fmt, interpolation=self._interpolation,
                 )
             out.pts = item.pts
             out.time_base = self.video.time_base
             t1 = time.perf_counter()
             self.stats.add_stage_time("fit", (t1 - t0) * 1000)
+            if not self._enc_tagged:
+                self._source_color.tag(self._enc_stream.codec_context)
+                self._enc_tagged = True
             keyframe = False
             for av_pkt in self._enc_stream.encode(out):
                 keyframe = keyframe or bool(av_pkt.is_keyframe)

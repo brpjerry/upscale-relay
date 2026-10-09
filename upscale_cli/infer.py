@@ -24,6 +24,7 @@ from typing import Iterable
 import av
 import numpy as np
 
+from .color import VideoColor
 from .manifest import ModelManifest
 
 
@@ -344,7 +345,10 @@ class OnnxUpscaler:
     # -- FrameStage API ------------------------------------------------------
 
     def process(self, frame: av.VideoFrame) -> Iterable[av.VideoFrame]:
-        rgb = self._reformatter.reformat(frame, format="rgb24").to_ndarray()
+        # Frames from FrameSource carry their resolved colour tags.
+        rgb = VideoColor.resolve(frame, frame.width, frame.height).to_rgb(
+            self._reformatter, frame,
+        ).to_ndarray()
         up = self._infer_with_fallback(rgb)
         if self.scale_factor is None:
             self.scale_factor = round(up.shape[0] / rgb.shape[0])

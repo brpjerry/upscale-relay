@@ -148,6 +148,7 @@ def main(argv: list[str] | None = None) -> int:
             codec=codec,
             pix_fmt=pix_fmt,
             options=enc_options,
+            color=source.color,
         ) as sink:
             decoded = run_pipeline(source, sink, stages=stages)
             pts_written = sink.pts_written

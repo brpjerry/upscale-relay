@@ -177,6 +177,10 @@ offset size  field
   demuxer-based player consumes it directly; the packet-header `pts` field
   identifies the video frame that triggered that chunk's flush (buffer
   accounting only, and `INT64_MIN` for header/trailer-only flushes).
+  The video stream always carries explicit colour tags (matrix, range,
+  primaries, transfer): the source's own, with any it leaves unspecified
+  resolved as mpv resolves them for the source's size, so a player shows
+  the upscaled picture in the colours of the original.
   A negotiated server-file session may also contain stream-copied original
   audio/subtitle tracks. Attachments are either embedded in every epoch or,
   when explicitly negotiated as cached, omitted and supplied through the

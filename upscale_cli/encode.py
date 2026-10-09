@@ -14,6 +14,8 @@ from fractions import Fraction
 
 import av
 
+from .color import VideoColor
+
 EncoderCandidate = tuple[str, str, dict[str, str]]
 
 # The env override lets machines without an NVIDIA GPU (CI, CPU-only
@@ -344,6 +346,7 @@ def add_video_encoder_stream(
     time_base: Fraction,
     rate: Fraction | None = None,
     options: dict[str, str] | None = None,
+    color: VideoColor | None = None,
 ) -> av.VideoStream:
     """Add the output video stream shared by relay and offline encoding.
 
@@ -352,10 +355,16 @@ def add_video_encoder_stream(
     variable-frame-rate sources. ``rate`` stays the encoder's nominal frame
     rate for rate control. Never set the output *stream* time base: the muxer
     owns it and rescales packets from the encoder's.
+
+    ``color`` tags the encoder (matrix, range, primaries, transfer); a caller
+    that learns it later must tag the codec context before the first encode
+    or mux, which opens the encoder and writes the container header.
     """
     stream = container.add_stream(codec, rate=rate, options=options)
     stream.width = width
     stream.height = height
     stream.pix_fmt = pix_fmt
     stream.codec_context.time_base = time_base
+    if color is not None:
+        color.tag(stream.codec_context)
     return stream

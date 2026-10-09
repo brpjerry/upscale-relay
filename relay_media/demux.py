@@ -120,6 +120,11 @@ class VideoTrack:
         self.has_audio_tracks = bool(self._container.streams.audio)
         self.has_subtitle_tracks = bool(self._container.streams.subtitles)
         self.has_auxiliary_tracks = self.has_audio_tracks or self.has_subtitle_tracks
+        # FFmpeg colour tags (matrix, range, primaries, transfer) as probed.
+        cc = self._stream.codec_context
+        self.color_tags = (
+            int(cc.colorspace), int(cc.color_range), int(cc.color_primaries), int(cc.color_trc),
+        )
         # Serializes native demux/seek calls: a cancelled asyncio task's
         # in-flight to_thread(next, ...) keeps running on its worker thread,
         # and concurrent libav access is a native crash, not an exception.
