@@ -20,6 +20,7 @@ from upscale_cli.fit import DEFAULT_RESIZE_ALGORITHM, RESIZE_ALGORITHMS
 
 from .library import MediaLibrary
 from .pipeline import Pipeline, PipelineConstructionError, VideoConfig
+from .source_aspect import sample_aspect_ratio_from_parameter_sets
 
 log = logging.getLogger("relay.session")
 
@@ -426,14 +427,27 @@ class Session:
                 message=str(resize_algorithm), fatal=False,
             )
             return
+        extradata = base64.b64decode(video["extradata_b64"]) if video.get("extradata_b64") else None
+        sample_aspect_ratio = _sample_aspect_ratio(video)
+        if source_kind == "uplink" and video.get("sample_aspect_ratio") is None:
+            # Clients that cannot see a bitstream-only aspect send none; read
+            # it from the parameter sets before the output size is announced.
+            derived = await asyncio.to_thread(
+                sample_aspect_ratio_from_parameter_sets,
+                video["codec"], extradata, video["width"], video["height"],
+            )
+            if derived is not None:
+                sample_aspect_ratio = _sample_aspect_ratio(
+                    {"sample_aspect_ratio": [derived.numerator, derived.denominator]},
+                )
         cfg = VideoConfig(
             codec=video["codec"],
-            extradata=base64.b64decode(video["extradata_b64"]) if video.get("extradata_b64") else None,
+            extradata=extradata,
             width=video["width"],
             height=video["height"],
             time_base=Fraction(*video["time_base"]),
             avg_rate=Fraction(*video["avg_rate"]) if video.get("avg_rate") else None,
-            sample_aspect_ratio=_sample_aspect_ratio(video),
+            sample_aspect_ratio=sample_aspect_ratio,
             color_tags=self.source_track.color_tags if self.source_track is not None else None,
         )
         # Pipeline construction can block for minutes when a model's TensorRT
