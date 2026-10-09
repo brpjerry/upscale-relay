@@ -11,6 +11,19 @@ FAST_FORWARD_DEFAULT_S = 85  # 1:25, a typical opening sequence
 FAST_FORWARD_MAX_S = 3600
 
 
+# The mpv options the settings sheet offers, at mpv's own defaults. The player
+# keeps them itself (it does not read mpv.conf) and sets them on mpv at runtime.
+MPV_DEFAULTS = {"sid": "auto", "slang": "", "video-sync": "audio",
+                "interpolation": "no", "tscale": "oversample"}
+# Values each choice may take; a stored value outside them reads as the default.
+MPV_CHOICES = {
+    "sid": ("auto", "no"),
+    "video-sync": ("audio", "display-resample", "display-vdrop"),
+    "interpolation": ("no", "yes"),
+    "tscale": ("oversample", "linear", "catmull_rom", "mitchell"),
+}
+
+
 def _clamp_fast_forward(value: int) -> int:
     return max(1, min(FAST_FORWARD_MAX_S, int(value)))
 
@@ -116,6 +129,23 @@ class AppSettings:
         self._qs.setValue("playback/display_sync", bool(v))
 
     @property
+    def mpv_defaults(self) -> dict[str, str]:
+        """The mpv options from the settings sheet (see MPV_DEFAULTS)."""
+        values = {}
+        for name, default in MPV_DEFAULTS.items():
+            value = str(self._qs.value(f"mpv/{name}", default))
+            values[name] = value if value in MPV_CHOICES.get(name, (value,)) else default
+        return values
+
+    def set_mpv_default(self, name: str, value: str) -> None:
+        if name not in MPV_DEFAULTS:
+            raise KeyError(name)
+        value = str(value).strip()
+        if value not in MPV_CHOICES.get(name, (value,)):
+            raise ValueError(f"{name}={value}")
+        self._qs.setValue(f"mpv/{name}", value)
+
+    @property
     def fast_forward_s(self) -> int:
         return _clamp_fast_forward(self._qs.value("playback/fast_forward_s", FAST_FORWARD_DEFAULT_S, type=int))
 
@@ -165,6 +195,15 @@ class AppSettings:
     @history_limit.setter
     def history_limit(self, value: int):
         self._qs.setValue("library/history_limit", max(1, min(1000, value)))
+
+    @property
+    def simplify_names(self) -> bool:
+        """Show video file names in their readable form (naming.display_name)."""
+        return self._qs.value("library/simplify_names", False, type=bool)
+
+    @simplify_names.setter
+    def simplify_names(self, value: bool):
+        self._qs.setValue("library/simplify_names", bool(value))
 
     @property
     def browser_sort(self) -> str:

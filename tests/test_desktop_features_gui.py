@@ -168,24 +168,46 @@ def test_scrub_release_seeks_once_cancel_sends_nothing_and_short_seeks_bound(win
     asyncio.run(scenario())
 
 
-def test_settings_open_never_writes_and_external_changes_defer(window, monkeypatch):
-    path = window.options.mpv_config_path
+def test_mpv_settings_are_kept_by_the_player_and_applied_between_transitions(window, monkeypatch):
     applied = []
     monkeypatch.setattr(window.player, "apply_defaults", lambda values: applied.append(dict(values)), raising=False)
-    assert not path.exists()
-    window.playback_settings.show()
-    assert not path.exists()
-    path.write_text("slang=ja,en\ntscale=custom-value\n")
-    window.config_watcher.refresh()
-    assert window.mpv_controls["tscale"].currentData() == "custom-value"
-    assert not applied
     window._transitioning = True
     window._edit_mpv_default("interpolation", "yes")
-    assert not applied
-    assert "slang=ja,en" in path.read_text()
+    window.mpv_controls["slang"].setText(" ja,en ")
+    window.mpv_controls["slang"].editingFinished.emit()
+    assert not applied                                  # not into a stream reload
+    assert window.settings.mpv_defaults["interpolation"] == "yes"
+    assert window.settings.mpv_defaults["slang"] == "ja,en"
     window._transitioning = False
     window._apply_pending_defaults()
-    assert applied == [{"interpolation": "yes"}]
+    assert applied == [{"interpolation": "yes", "slang": "ja,en"}]
+    window._edit_mpv_default("interpolation", "yes")    # unchanged: nothing to apply
+    window._apply_pending_defaults()
+    assert len(applied) == 1
+
+
+def test_stored_mpv_settings_are_shown_and_applied_at_startup(monkeypatch, tmp_path):
+    from PySide6.QtCore import QSettings
+    from desktop_client.options import DesktopOptions
+    import test_server_library_gui as gui
+    scope = "test-mpv-settings-startup"
+    QSettings("upscale-relay", scope).clear()
+    stored = QSettings("upscale-relay", scope)
+    stored.setValue("mpv/video-sync", "display-resample")
+    stored.setValue("mpv/sid", "no")
+    stored.sync()
+    applied = []
+    monkeypatch.setattr(main_window, "PlayerView", gui.FakePlayer)
+    monkeypatch.setattr(gui.FakePlayer, "apply_defaults", lambda self, values: applied.append(dict(values)), raising=False)
+    window = main_window.MainWindow(options=DesktopOptions(
+        headless=True, settings_scope=scope, log_root=tmp_path / "logs"))
+    try:
+        assert window.mpv_controls["video-sync"].currentData() == "display-resample"
+        assert window.mpv_controls["sid"].currentData() == "no"
+        assert applied and applied[0]["video-sync"] == "display-resample" and applied[0]["sid"] == "no"
+    finally:
+        window.close()
+        QSettings("upscale-relay", scope).clear()
 
 
 def test_nearby_selection_is_explicit_and_does_not_connect(window):

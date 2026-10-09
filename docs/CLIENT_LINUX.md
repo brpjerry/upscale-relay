@@ -71,8 +71,8 @@ recognize the `V_FFV1` tag emitted by newer FFmpeg. This per-stream override
 preserves absolute timestamps and does not change ordinary local playback.
 
 The embedded Qt/OpenGL player uses mpv's safe copy-back hardware decode mode on
-Linux. In particular, it overrides `hwdec=vaapi` from a user's `mpv.conf` with
-`auto-copy-safe`: a captured Intel iHD crash landed in
+Linux (`auto-copy-safe`; the player does not read `mpv.conf`, so a user's
+`hwdec=vaapi` there no longer applies): a captured Intel iHD crash landed in
 `paintGL → mpv_render_context_render → vaSyncSurface` when the zero-copy VA-API
 surface was retired during live playback. Decode still runs on the GPU; only
 the decoded frame is copied before Qt renders it. Use `--no-hwdec` to disable
@@ -119,9 +119,10 @@ relay-desktop
 - Application settings and history persist in `~/.config/upscale-relay/`.
 - Saved progress resumes automatically; next-video autoplay defaults on.
   Both trees retain Name/Newest sorting and show watched/last-played information.
-- The scrollable settings dock edits subtitle defaults/languages and video
-  sync/interpolation in the resolved user `mpv.conf`. **Changes also affect
-  standalone mpv.** Current-video track choices remain session-only.
+- The scrollable settings dock keeps subtitle defaults/languages and video
+  sync/interpolation as the player's own settings. The player does not read
+  `mpv.conf`; key bindings come from mpv's `~/.config/mpv/input.conf`.
+  Current-video track choices remain session-only.
 - Diagnostics and client file logging default off. Enabled logs use timestamped
   files in the Qt-resolved Documents directory, retaining ten files; the dock
   shows the actual path. See [desktop preferences](DESKTOP_FEATURES.md) for
@@ -161,7 +162,8 @@ Then verify from the laptop: `curl http://<windows-box-ip>:8590/status`
 | `relay-desktop --mpv-osc` | re-enable mpv's native OSC overlay (known to destabilize seeks) |
 | `relay-desktop --no-hwdec` | force software video decode |
 | `relay-desktop --trace` | verbose consume-loop tracing to stderr |
-| `relay-desktop --mpv-scripts` | load user mpv scripts (off by default) |
+| `relay-desktop --mpv-scripts` | load the scripts in mpv's scripts folder (off by default; their script-opts are not read) |
+| `relay-desktop --input-conf FILE` | key bindings file instead of mpv's `input.conf` |
 
 Run `relay-desktop --help` for all client options, including the headless and
 isolated-settings flags used by smoke tests.

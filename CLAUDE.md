@@ -34,6 +34,8 @@ load-bearing), `docs/CLIENT_LINUX.md` (Linux setup), and
   the fullscreen overlay re-palettes its labels — and accent colours in the
   style sheet are `palette(...)` references, so an accent change is a palette
   change (~2 ms) rather than a new style sheet (~70 ms re-polish, a video hitch).
+  `naming.py` makes the optional readable file names (display only: sorting,
+  history keys and playback keep the real names).
 - `upscale_cli/` — offline pipeline, ONNX/EP handling, uint8 graph wrapper,
   `upscale-cli` (run/info/sample/bench subcommands).
 
@@ -57,17 +59,22 @@ first stop for any *seek latency* question (`docs/SEEK_LATENCY_PLAN.md`).
 
 Client flags: `--debug` (faulthandler), `--trace` (consume-loop trace),
 `--mpv-osc` (mpv OSC overlay — known to destabilize seeks), `--no-hwdec`
-(force sw decode), `--mpv-scripts` (load user mpv scripts — off by default),
+(force sw decode), `--mpv-scripts` (load mpv's scripts folder — off by default),
 `--headless` (null vo/ao), and `--settings-scope <name>` (isolate QSettings —
 tests MUST set this option or pass the equivalent `DesktopOptions`). Server
 flags: `--seek-discard-max-s S` (seeks land keyframe-accurate rather than
 decoding a keyframe-to-target span longer than S — off by default, see
 `docs/SEEK_LATENCY_PLAN.md`). Server env flag: `RELAY_NVDEC=1` (server hw
 source decode — crashed with NVENC concurrently, off by default). The desktop client loads the user's
-`mpv.conf`/`input.conf`
-(prefs pass through; relay plumbing like `vo`/`rebase-start-time` is
-re-asserted post-init in `mpv_view.py` because the config file overrides
-constructor options).
+`input.conf`
+for key bindings only and never reads `mpv.conf`: libmpv runs without its
+configuration, the mpv options the settings sheet offers are QSettings
+(`AppSettings.mpv_defaults`) set on mpv at runtime, and the input.conf path
+is found the way mpv finds it (`user_input_conf`: `MPV_HOME`, XDG, `~/.mpv`,
+`%APPDATA%`). Screenshots default to PNG in the Pictures folder.
+`resume-playback` is off: the player keeps its own history, and mpv's resume
+made local playback consume standalone mpv's watch-later entries and inherit
+their volume, panscan, tracks and delays.
 
 ## Hard rules (each one is a native crash or deadlock we actually hit)
 
@@ -100,8 +107,8 @@ constructor options).
 - Client must send `buffer_report` on a timer with *live* values; reporting
   only on packet arrival deadlocks the server's watermark pause/resume.
 - Keep mpv's render call blocking (`block_for_target_time`, the default)
-  and keep `video-timing-offset=0` (set in `mpv_view.py`, re-asserted after
-  `mpv.conf`). With mpv's default offset (0.05 s) a frame is announced ~one
+  and keep `video-timing-offset=0` (set in `mpv_view.py`). With mpv's
+  default offset (0.05 s) a frame is announced ~one
   period early and `render()` waits the difference out on the GUI thread
   (~40 of every 42 ms at 24 fps): sidebar slides ran at 12-14 fps, a live
   splitter drag at 9 fps (230 ms behind the pointer), and only 83-85% of
@@ -127,17 +134,32 @@ constructor options).
   frames are presented, e.g. the tray GUI): 100-120 fps at 1080p on AC
   (the fullscreen control bar went from ~15 to ~100-116 updates/s), ~80-100
   on battery's low-power profile. The splitter resizes live (~110 fps,
-  edge 2-3 px behind the pointer, ~15 ms lag). "Sync video to the display
+  edge 2-3 px behind the pointer, ~15 ms lag). Measured and rejected on
+  2026-10-08 (battery, low-power profile): sliding the settings sheet as a
+  cached picture and marking it `WA_OpaquePaintEvent` cut its GUI-thread
+  cost from ~15 to ~10 ms a frame without a visible difference. A window
+  that holds a QOpenGLWidget pays ~6 ms of CPU per composited frame however
+  little changed (a minimal PySide6 window with an empty QOpenGLWidget
+  measures the same; without one, ~0.2 ms), so overlay motion over the
+  video stays near 80-90 fps on battery whatever the overlay does.
+  `WA_OpaquePaintEvent` also stops Qt painting a style sheet background:
+  the widget must paint it itself. "Sync video to the display
   while windowed" (off by default; formerly "Fluid interface during
   playback") opts into mpv's display sync: `MpvPlayerView` reports the
   screen's refresh rate (`display-fps-override`; the render API cannot see
   the display), so `video-sync=display-*` renders once per refresh and
   Motion interpolation, which needs a display mode, can take effect. It
   hands timing back to mpv ~0.9 s after entering fullscreen
-  (`_apply_display_pacing`); mpv switches either way in ~0.2 s with no
-  drop. Measured on battery 2026-10-07 (1080p24 at 120 Hz, 60 s runs):
-  display pacing costs ~3 W (7.8 -> 10.7 W windowed, 8.6 -> 11.2 W
-  fullscreen), and with a gpu-hq mpv.conf it rendered only ~103 of 120
+  (`_apply_display_pacing`) and while the window is not presenting
+  (`_report_display_rate`); mpv switches either way in ~0.2 s with no
+  drop. Display sync takes each render call as one refresh, and a hidden
+  window's frames are acknowledged at once: with the rate still reported
+  on another workspace, mpv ran the video ~3x realtime off-screen (as fast
+  as it decoded, draining the relay buffer) and on return held it near
+  2 fps until audio caught up, a minute after 30 s away. Measured on
+  battery 2026-10-07 (1080p24 at 120 Hz, 60 s runs): display pacing costs
+  ~3 W (7.8 -> 10.7 W windowed, 8.6 -> 11.2 W fullscreen), and with gpu-hq
+  scalers (then from mpv.conf) it rendered only ~103 of 120
   refreshes a second in fullscreen (~360 mistimed and ~620 late frames a
   minute; mpv's default scalers kept up). Audio timing already lands 24 fps
   on the 120 Hz cadence 99.6% of the time. Display sync still drops
@@ -177,11 +199,12 @@ constructor options).
 - mpv OSC (LuaJIT) intermittently crashes mpv's event thread on stream
   reloads → OSC off by default. LuaJIT's caught SEH exception `0xe24c4a02`
   in faulthandler output is *benign noise*, not a crash.
-- On Linux's embedded Qt/OpenGL render path, re-assert `hwdec=auto-copy-safe`
-  after loading `mpv.conf`. A real core landed in
+- On Linux's embedded Qt/OpenGL render path, keep `hwdec=auto-copy-safe`.
+  A real core landed in
   `paintGL → mpv_render_context_render → vaSyncSurface → iHD` when the user's
-  `hwdec=vaapi` exposed a retired zero-copy Intel surface. Copy-back retains
-  hardware decode; never restore zero-copy VA-API as the default here.
+  `hwdec=vaapi` (from `mpv.conf`, read back then) exposed a retired
+  zero-copy Intel surface. Copy-back retains hardware decode; never
+  restore zero-copy VA-API as the default here.
 - Fullscreen transitions resize the video widget at every step of the
   chrome slides. Pinning it at its final size (`_pin_player`) used to
   replace 17-23 resizes per transition (100-200 ms stalls, ~12 drops while
@@ -192,10 +215,9 @@ constructor options).
   sends one configure for fullscreen and animates the rest itself. The
   control bar slides through a stand-in in the root layout
   (`_controls_dock`) so the video grows into its space; it rides on top and
-  becomes the overlay (or re-docks) where it lands. The sidebar toggle's hide
-  slide still pins the video at the size it lands at (root width x current
-  height) and unpins after the slot hides: no resize at the end. Its show
-  slide is not pinned: unpinning would visibly re-letterbox the video.
+  becomes the overlay (or re-docks) where it lands. The sidebar slides
+  resize the video the same way in both directions; its hide slide used to
+  pin the video instead, which made collapsing look unlike expanding.
 - While the video widget is being resized (slides, fullscreen, splitter
   drags; until 100 ms after the last resize) it does not render mpv at each
   size. mpv renders into a framebuffer of ours only for a new video frame

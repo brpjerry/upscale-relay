@@ -37,15 +37,15 @@ def test_passthrough_resume_restart_seek_reopen_and_autoplay(tmp_path, monkeypat
     app = QApplication.instance() or QApplication([])
     scope = f"test-parity-playback-{source}-{demuxer}"
     QSettings("upscale-relay", scope).clear()
+    window = MainWindow(options=DesktopOptions(
+        headless=os.environ.get("RELAY_TEST_WAYLAND") != "1", no_hwdec=True,
+        settings_scope=scope, log_root=tmp_path / "logs", discovery=False,
+    ))
     if demuxer == "lavf":
         # Exercise the old-mpv FFV1 compatibility path on modern libmpv too;
         # absolute PTS and pause/seek behavior must agree across demuxers.
-        (tmp_path / "mpv.conf").write_text("demuxer=lavf\ndemuxer-lavf-format=matroska\n")
-    window = MainWindow(options=DesktopOptions(
-        headless=os.environ.get("RELAY_TEST_WAYLAND") != "1", no_hwdec=True,
-        settings_scope=scope, mpv_config_path=tmp_path / "mpv.conf",
-        log_root=tmp_path / "logs", discovery=False,
-    ))
+        window.player.mpv["demuxer"] = "lavf"
+        window.player.mpv["demuxer-lavf-format"] = "matroska"
     monkeypatch.setattr(window, "screen", lambda: SimpleNamespace(size=lambda: QSize(64, 64), devicePixelRatio=lambda: 1))
     errors = []
     # Preserve native decoder/demuxer warnings in pytest's captured log. A

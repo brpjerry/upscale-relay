@@ -54,48 +54,41 @@ loads ancestors before descendants and at most ten pages per directory. Removed
 paths fall back to the nearest available ancestor. Without library capability,
 Local remains usable. The local root directory continues to be remembered.
 
-## Playback settings and shared mpv configuration
+## Playback settings and mpv options
 
-The scrollable settings dock separates Streaming, mpv defaults, Library, and
-Diagnostics. Model, stream quality, framing, and resize-filter changes restart
+The scrollable settings dock separates Streaming, Video timing, Subtitles,
+Controls, Library, Appearance, and Diagnostics. Model, stream quality, framing, and resize-filter changes restart
 at the cached playback position while preserving pause intent, audio/subtitle
 choices (including subtitles off), and delays. Rapid changes coalesce; new user
 actions supersede older startup work. Track choices are remapped using type,
 language, title, codec, channel/default/forced metadata, and duplicate occurrence
 rather than relying on old numeric IDs.
 
-The **mpv defaults** controls edit these global options:
+These controls set mpv options; the player keeps their values itself
+(`AppSettings.mpv_defaults` in QSettings) and sets them on mpv at startup, at
+each session start, and after an edit once playback is stable:
 
 | Control | mpv option |
 |---|---|
-| Default subtitle selection: Auto, Off, or an existing configured ID | `sid` |
+| Default subtitle selection: Auto or Off | `sid` |
 | Ordered preferred subtitle languages, e.g. `en,ja` | `slang` |
-| Video synchronization | `video-sync` |
+| Video synchronization: audio, display-resample, display-vdrop | `video-sync` |
 | Motion interpolation | `interpolation` |
 | Interpolation scaler | `tscale` |
 
-**These settings modify mpv.conf and also affect standalone mpv.** The dock shows
-the file resolved by libmpv's `expand-path ~~home/mpv.conf`, honoring its platform
-configuration-directory selection. Language preferences use native mpv semantics;
-there is intentionally no additional persistent subtitle-title preference.
-The current-video track picker is session-only and takes precedence for that
-session. These five defaults are not duplicated in QSettings.
+**The player does not read or write `mpv.conf`.** libmpv runs without its
+configuration, so standalone mpv settings (scalers, profiles, `hwdec`, screenshot
+options) do not reach the player and its settings do not reach standalone mpv.
+Key bindings are the exception: the user's `input.conf` is loaded from the folder
+mpv itself uses (`MPV_HOME`, `$XDG_CONFIG_HOME/mpv` or `~/.config/mpv`, `~/.mpv`,
+`%APPDATA%\mpv`). Screenshots (`s`, `S`) are PNG files in the Pictures folder.
+mpv's resume (`resume-playback`) is off: the player keeps its own history.
 
-Opening settings never writes the file. Edits reread it and atomically add only
-the requested global assignment, preserving comments, unrelated options, named
-profiles, newline style, and symlinks. Ordered includes and aliases are read;
-configured custom values stay visible. Applied profile values are distinguished
-from editable global defaults. Conditional profiles remain managed by mpv.
-Unsupported or unreadable configuration is reported without rewriting it.
-
-The file, included files, and their directories are watched, including atomic
-replacements. External edits refresh controls and apply at the next newly opened
-playback session. GUI changes apply only exposed properties when the player is
-stable, or wait until its transition finishes. The application never reloads
-the entire configuration into an active stream. Relay-owned options such as
-absolute timestamps, buffering, stream timeout, and safe Linux copy-back decode
-remain application-controlled. See the [mpv configuration reference](https://mpv.io/manual/stable/#configuration-files)
-for native syntax, profiles, and language selection.
+Language preferences use native mpv semantics; there is intentionally no
+additional persistent subtitle-title preference. The current-video track picker
+is session-only and takes precedence for that session. Relay-owned options such
+as absolute timestamps, buffering, stream timeout, and safe Linux copy-back
+decode are application-controlled.
 
 Scrubbing displays the proposed timestamp and signed delta. Release commits one
 seek; Escape or loss of slider focus cancels it. The **−10 s / +10 s** buttons,
@@ -123,11 +116,11 @@ Server logs remain separate and retain their own defaults.
 
 ## Verification and test isolation
 
-Tests must pass an isolated `settings_scope`. `DesktopOptions.mpv_config_path`
-and `log_root` (also `--mpv-config-path` / `--log-root`) override filesystem
-locations. An isolated scope or headless mode supplies temporary config/log paths
-when overrides are omitted; real discovery is disabled by default in those
-modes. Tests never use the user's mpv defaults or production history.
+Tests must pass an isolated `settings_scope`. `DesktopOptions.input_conf_path`
+and `log_root` (also `--input-conf` / `--log-root`) override filesystem
+locations. An isolated scope or headless mode supplies temporary input.conf/log
+paths when overrides are omitted; real discovery is disabled by default in those
+modes. Tests never use the user's mpv key bindings or production history.
 
 The feature tests cover history policy, configuration merging/watchers, discovery,
 sorting/restoration, startup cancellation, pause/track continuity, autoplay,

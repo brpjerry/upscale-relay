@@ -13,7 +13,6 @@ from PySide6.QtCore import (
     QEvent,
     QPoint,
     QRect,
-    QSize,
     QStandardPaths,
     Qt,
     QTimer,
@@ -23,6 +22,7 @@ from PySide6.QtCore import (
 from PySide6.QtGui import (
     QColor,
     QCursor,
+    QFont,
     QPalette,
     QStandardItem,
     QStandardItemModel,
@@ -85,12 +85,13 @@ from .widgets import (
     StatusDot,
     VolumeSlider,
     WheelGuard,
+    WrapText,
     emphasized,
-    show_slider_tip,
+    SliderTip,
     tabular,
 )
 from .features import DesktopFeatures
-from .browser_state import LocalLibraryProxy, restore_server_tree
+from .browser_state import PROGRESS_ROLE, BrowserTree, LocalLibraryProxy, restore_server_tree
 from .history import endpoint_key
 from .options import DesktopOptions
 
@@ -160,24 +161,28 @@ def _parse_server_address(address: str) -> tuple[str, int]:
 
 
 class SeekSlider(FlatSlider):
-    """Seek bar whose groove clicks jump straight to the clicked position.
+    """Seek bar: a press anywhere on it jumps there and drags from there.
 
-    Stock QSlider treats a groove click as one page-step. Moving the handle
-    under the cursor before the default press handling means the click both
-    jumps to the timestamp and starts a drag from there.
+    It handles press, drag and release itself. Stock QSlider took a groove
+    press as a page step, and its drag placed the handle by the style's own
+    pixel mapping, not the one the bar is painted with, so the dot slid away
+    from the pointer. The hit area is 30% taller than the other sliders', so a
+    press just above or below the track counts.
 
     Chapter starts (as 0..1 fractions) are painted as tick marks over the
     groove so chapter boundaries are visible while scrubbing, and the time
-    under the pointer is shown above the bar.
+    under the pointer is shown beside it (SliderTip).
     """
 
     cancelled = Signal()
 
     def __init__(self, *args) -> None:
         super().__init__(*args)
+        self.setFixedHeight(26)
         self._cancelled = False
         self._chapter_fractions: list[float] = []
         self._hover_text = None
+        self._tip: SliderTip | None = None
 
     def set_chapter_marks(self, fractions: list[float]) -> None:
         self._chapter_fractions = fractions
@@ -188,25 +193,55 @@ class SeekSlider(FlatSlider):
         """``formatter(fraction) -> str | None`` labels the pointer position."""
         self._hover_text = formatter
 
+    def _drag_to(self, x: float) -> None:
+        self.setSliderPosition(QStyle.sliderValueFromPosition(
+            self.minimum(), self.maximum(), round(x), self.width()))
+
+    def _show_tip(self, x: float) -> None:
+        if self._hover_text is None or not self.isEnabled() or self.width() <= 0:
+            return
+        text = self._hover_text(max(0.0, min(1.0, x / self.width())))
+        if not text:
+            self._hide_tip()
+            return
+        if self._tip is None or self._tip.parentWidget() is not self.window():
+            self._tip = SliderTip(self.window())
+        self._tip.show_at(self, max(0.0, min(float(self.width()), x)), text)
+
+    def _hide_tip(self) -> None:
+        if self._tip is not None:
+            self._tip.hide()
+
     def mousePressEvent(self, event) -> None:
-        if event.button() == Qt.LeftButton:
-            self._cancelled = False
-            value = QStyle.sliderValueFromPosition(
-                self.minimum(), self.maximum(),
-                round(event.position().x()), self.width(),
-            )
-            self.setSliderPosition(value)
-        super().mousePressEvent(event)
-        if event.button() == Qt.LeftButton:
-            self.sliderMoved.emit(self.sliderPosition())
+        if event.button() != Qt.LeftButton or not self.isEnabled():
+            super().mousePressEvent(event)
+            return
+        self._cancelled = False
+        self.setSliderDown(True)
+        self._drag_to(event.position().x())
+        self.sliderMoved.emit(self.sliderPosition())
+        event.accept()
 
     def mouseMoveEvent(self, event) -> None:
-        super().mouseMoveEvent(event)
-        if self._hover_text is not None and self.isEnabled() and self.width() > 0:
-            x = event.position().x()
-            text = self._hover_text(max(0.0, min(1.0, x / self.width())))
-            if text:
-                show_slider_tip(self, x, text)
+        x = event.position().x()
+        if self.isSliderDown():
+            self._drag_to(x)
+        self._show_tip(x)
+        event.accept()
+
+    def leaveEvent(self, event) -> None:
+        if not self.isSliderDown():
+            self._hide_tip()
+        super().leaveEvent(event)
+
+    def hideEvent(self, event) -> None:
+        self._hide_tip()
+        super().hideEvent(event)
+
+    def changeEvent(self, event) -> None:
+        if event.type() == QEvent.EnabledChange and not self.isEnabled():
+            self._hide_tip()
+        super().changeEvent(event)
 
     def _cancel_drag(self):
         self._cancelled = True
@@ -230,6 +265,12 @@ class SeekSlider(FlatSlider):
     def mouseReleaseEvent(self, event) -> None:
         if self._cancelled:
             self._cancelled = False
+            event.accept()
+            return
+        if event.button() == Qt.LeftButton and self.isSliderDown():
+            self.setSliderDown(False)  # sliderReleased: the seek
+            if not self.rect().contains(event.position().toPoint()):
+                self._hide_tip()
             event.accept()
             return
         super().mouseReleaseEvent(event)
@@ -369,7 +410,7 @@ class MainWindow(DesktopFeatures, QMainWindow):
         title_label.setObjectName("panelTitle")
         settings_close = IconButton(Icons.close)
         settings_close.setToolTip("Close")
-        settings_close.clicked.connect(self.playback_settings.hide)
+        settings_close.clicked.connect(lambda: self._set_settings_visible(False))
         title_row.addWidget(title_label, stretch=1)
         title_row.addWidget(settings_close)
         settings_page = _styled(QWidget(), "settingsPage")
@@ -422,8 +463,9 @@ class MainWindow(DesktopFeatures, QMainWindow):
         self.fs_model.setRootPath(QDir.rootPath())
         self.fs_model.setNameFilters(VIDEO_EXTENSIONS)
         self.fs_model.setNameFilterDisables(False)
-        self.tree = QTreeView()
+        self.tree = BrowserTree()
         self.local_proxy = LocalLibraryProxy(self.history, self)
+        self.local_proxy.simplify_names = self.settings.simplify_names
         self.local_proxy.setSourceModel(self.fs_model)
         self.local_proxy.set_order(self.settings.browser_sort)
         self.tree.setModel(self.local_proxy)
@@ -570,7 +612,12 @@ class MainWindow(DesktopFeatures, QMainWindow):
         self.pos_label = ElideLabel("--:-- / --:--", dim=0.62)
         self.pos_label.setFont(tabular(self.pos_label.font()))
         self.pos_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        self.pos_label.setMinimumWidth(104)
+        # One width for every text it shows: while scrubbing it reads e.g.
+        # "05:23 (-12.3s)", and growing with that squeezed the seek bar
+        # beside it, so the dot jumped under the pointer.
+        metrics = self.pos_label.fontMetrics()
+        self.pos_label.setFixedWidth(max(
+            metrics.horizontalAdvance(sample) for sample in ("000:00 / 000:00", "000:00 (-0000.0s)")) + 4)
         seek_row = QHBoxLayout()
         seek_row.setSpacing(12)
         seek_row.addWidget(self.seek_slider, stretch=1)
@@ -653,6 +700,9 @@ class MainWindow(DesktopFeatures, QMainWindow):
         now_layout.addWidget(self.now_detail)
         now_layout.addWidget(self.player_status)
         now_layout.addStretch(1)
+        self._now_playing = now_playing  # a click opens the info card (_toggle_info_panel)
+        self._now_info: tuple[str, list[tuple[str, str]]] | None = None
+        self._now_raw: tuple = (None, "", None)
         tools = QWidget()
         tools_layout = QHBoxLayout(tools)
         tools_layout.setContentsMargins(0, 0, 0, 0)
@@ -700,6 +750,26 @@ class MainWindow(DesktopFeatures, QMainWindow):
         tracks.addWidget(self.chapter_combo, 2, 1, 1, 2)
         tracks.setColumnStretch(1, 1)
 
+        # The now-playing corner elides its lines; a click there opens them in
+        # full in a card above it, as MV Player does.
+        self.info_panel = QFrame()
+        self.info_panel.setObjectName("infoPanel")
+        self.info_panel.setCursor(Qt.ArrowCursor)
+        info = QVBoxLayout(self.info_panel)
+        info.setContentsMargins(18, 14, 18, 16)
+        info.setSpacing(12)
+        self.info_title = WrapText()
+        title_font = QFont(self.info_title.font())
+        title_font.setPixelSize(14)
+        title_font.setWeight(QFont.DemiBold)
+        self.info_title.setFont(title_font)
+        self.info_rows = QFormLayout()
+        self.info_rows.setHorizontalSpacing(14)
+        self.info_rows.setVerticalSpacing(8)
+        self.info_rows.setLabelAlignment(Qt.AlignLeft | Qt.AlignTop)
+        info.addWidget(self.info_title)
+        info.addLayout(self.info_rows)
+
         main_page = QWidget()
         pv = QVBoxLayout(main_page)
         pv.setContentsMargins(0, 0, 0, 0)
@@ -709,9 +779,6 @@ class MainWindow(DesktopFeatures, QMainWindow):
         pv.addWidget(self._toolbar_slot)
         pv.addWidget(self.player, stretch=1)
         self._player_layout = pv
-        self._player_parent = main_page
-        self._player_pinned = False
-        self._pinned_size = None
 
         self.controls_panel.setCursor(Qt.ArrowCursor)
         self._controls_timer = QTimer(self)
@@ -738,7 +805,6 @@ class MainWindow(DesktopFeatures, QMainWindow):
         self._sidebar_slot = SlideSlot(self.browser_container, Qt.Horizontal)
         self._sidebar_slot.setMinimumWidth(_SIDEBAR_MIN_WIDTH)
         self._slides: dict[str, FrameAnimation] = {}
-        self._slide_pinned = False  # the sidebar's hide slide holds the pin
         self.split.addWidget(self._sidebar_slot)
         self.split.addWidget(main_page)
         self.split.setStretchFactor(1, 1)
@@ -765,12 +831,15 @@ class MainWindow(DesktopFeatures, QMainWindow):
         self._controls_overlay = False
         self.track_panel.setParent(self._root)
         self.track_panel.hide()
+        self.info_panel.setParent(self._root)
+        self.info_panel.hide()
         self.playback_settings.setParent(self._root)
         self.playback_settings.hide()
-        # Motion: the track card rises and fades in, the settings sheet slides
-        # in from the edge, the fullscreen bar slides up from below.
-        # All three step on the video's presented frames (FrameAnimation).
+        # Motion: the track and info cards rise and fade in, the settings sheet
+        # slides in from the edge, the fullscreen bar slides up from below.
+        # All of them step on the video's presented frames (FrameAnimation).
         self._track_reveal = Reveal(self.track_panel, offset=QPoint(0, 12), frames=self._frame_clock)
+        self._info_reveal = Reveal(self.info_panel, offset=QPoint(0, 12), frames=self._frame_clock)
         self._settings_reveal = Reveal(self.playback_settings, offset=QPoint(48, 0), frames=self._frame_clock)
         self._controls_reveal = Reveal(
             self.controls_panel, offset=QPoint(0, self.controls_panel.height()), fade=False,
@@ -779,7 +848,7 @@ class MainWindow(DesktopFeatures, QMainWindow):
         # an exception raised inside a Qt virtual is a native crash.
         self.player.installEventFilter(self)  # reposition overlay on resize
         self._root.installEventFilter(self)  # keep the track card anchored
-        self._player_parent.installEventFilter(self)  # hold a pinned video still
+        self._now_playing.installEventFilter(self)  # hover and click open the info card
         self.setCentralWidget(self._root)
         status_bar = QStatusBar()
         status_bar.setSizeGripEnabled(False)
@@ -895,11 +964,60 @@ class MainWindow(DesktopFeatures, QMainWindow):
         self.connect_btn.style().unpolish(self.connect_btn)
         self.connect_btn.style().polish(self.connect_btn)
 
-    def _show_now_playing(self, title: str | None, detail: str = "") -> None:
+    def _show_now_playing(self, title: str | None, detail: str = "",
+                          info: list[tuple[str, str]] | None = None) -> None:
+        """``info`` rows (label, value) fill the card the corner opens. ``title``
+        is a file name, shown simplified when that setting is on."""
+        self._now_raw = (title, detail, info)
+        title = self._shown_name(title) if title else title
         self.heading.setText(title or "Nothing playing")
         self.now_title.setText(title or "")
         self.now_detail.setText(detail if title else "")
         self.setWindowTitle(f"{title} — Upscale Relay" if title else "Upscale Relay")
+        self._now_info = (title, info or []) if title else None
+        if self._now_info is None:
+            self._now_playing.unsetCursor()
+            self._hide_info_panel(now=True)
+        else:
+            self._now_playing.setCursor(Qt.PointingHandCursor)
+            if self._info_reveal.shown:
+                self._fill_info_panel()
+                self._info_reveal.retarget(self._info_geometry())
+
+    # -- info card ---------------------------------------------------------------
+
+    def _fill_info_panel(self) -> None:
+        title, rows = self._now_info
+        self.info_title.setText(title)
+        while self.info_rows.rowCount():
+            self.info_rows.removeRow(0)
+        if self.player_status.isVisible() and self.player_status.text():
+            rows = [*rows, ("Status", self.player_status.text())]
+        for label, value in rows:
+            self.info_rows.addRow(_hint_label(label, "dim"), WrapText(value))
+
+    def _info_geometry(self) -> QRect:
+        """The info card floats above the left end of the control bar."""
+        left = self._CONTROL_MARGINS[0]
+        width = max(0, min(440, self._root.width() - 2 * left))
+        height = max(self.info_panel.minimumSizeHint().height(), self.info_panel.heightForWidth(width))
+        return QRect(left, max(8, self._controls_top() - height - 10), width, height)
+
+    def _toggle_info_panel(self) -> None:
+        if self._info_reveal.shown:
+            self._hide_info_panel()
+        elif self._now_info is not None:
+            self.tracks_btn.setChecked(False)
+            self._fill_info_panel()
+            self._info_reveal.show(self._info_geometry())
+            self.now_title.set_highlighted(True)
+
+    def _hide_info_panel(self, now: bool = False) -> None:
+        if now:
+            self._info_reveal.hide_now()
+        else:
+            self._info_reveal.hide()
+        self.now_title.set_highlighted(self._now_playing.underMouse() and self._now_info is not None)
 
     def _on_status_message(self, message: str) -> None:
         if not message:
@@ -1065,6 +1183,8 @@ class MainWindow(DesktopFeatures, QMainWindow):
 
     def _set_track_panel_visible(self, visible: bool) -> None:
         if visible:
+            if self._info_reveal.shown:
+                self._hide_info_panel()
             self._track_reveal.show(self._track_geometry())
         else:
             self._track_reveal.hide()
@@ -1156,15 +1276,14 @@ class MainWindow(DesktopFeatures, QMainWindow):
             if slot.isVisible() and sizes and sizes[0] >= _SIDEBAR_MIN_WIDTH:
                 self._browser_sizes = sizes  # never a collapsed or mid-slide width
             slot.setVisible(False)
-        self._release_slide_pin()  # after the slot: the layout is final now
 
     # -- sliding chrome ---------------------------------------------------------
     # The sidebar, top bar and (around fullscreen) control bar slide rather
-    # than pop, one step per presented frame (FrameAnimation), resizing the video
-    # widget at each step. Only the sidebar toggle's hide slide pins the video
-    # instead, at the size it ends up at, and slides the sidebar off it.
-    # Pinning a show slide would re-letterbox the video visibly when it
-    # unpins; pinning fullscreen made the picture jump to its final size.
+    # than pop, one step per presented frame (FrameAnimation), resizing the
+    # video widget at each step, the same way in both directions. (Pinning
+    # the video at its final size instead made the picture jump to that size
+    # in one frame; while the pane resizes, MpvPlayerView draws the last
+    # picture scaled.)
 
     def _stop_slide(self, key: str) -> None:
         running = self._slides.pop(key, None)
@@ -1215,7 +1334,7 @@ class MainWindow(DesktopFeatures, QMainWindow):
         self._slides[key] = animation
         animation.start()
 
-    def _slide_browser(self, visible: bool, pin: bool = True) -> None:
+    def _slide_browser(self, visible: bool) -> None:
         slot = self._sidebar_slot
         if not self.isVisible():
             self._apply_browser_visible(visible)
@@ -1238,22 +1357,11 @@ class MainWindow(DesktopFeatures, QMainWindow):
             self.split.setSizes([width, total - width])
 
         self._stop_slide("sidebar")
-        if visible or not pin:
-            self._release_slide_pin()  # e.g. reversing a hide: resize from here on
-        elif not self._player_pinned:
-            # Its final size: the full width, the height it has now.
-            self._pin_player(QSize(self._root.width(), self.player.height()))
-            self._slide_pinned = True
         slot.hold(max(current, self._browser_sizes[0]))
         slot.setMinimumWidth(0)
         slot.setVisible(True)
         apply(max(1, current))
         self._slide("sidebar", current, target, apply, lambda: self._apply_browser_visible(visible), slot)
-
-    def _release_slide_pin(self) -> None:
-        if self._slide_pinned:
-            self._slide_pinned = False
-            self._unpin_player()
 
     def _apply_toolbar_visible(self, visible: bool) -> None:
         self._stop_slide("toolbar")
@@ -1282,8 +1390,9 @@ class MainWindow(DesktopFeatures, QMainWindow):
     # With the setting on, the display paces video while the window is not
     # fullscreen and through fullscreen transitions; settled in fullscreen,
     # mpv keeps its own (audio) timing. Measured on battery (2026-10-07):
-    # display pacing renders every refresh and costs ~3 W, and a gpu-hq
-    # mpv.conf could not render every 120 Hz refresh at fullscreen size
+    # display pacing renders every refresh and costs ~3 W, and with gpu-hq
+    # scalers (from mpv.conf, then read) mpv could not render every 120 Hz
+    # refresh at fullscreen size
     # (~17% missed: ~360 mistimed frames a minute). Audio timing already lands
     # 24 fps on a 120 Hz cadence 99.6% of the time. mpv switches within
     # ~0.2 s either way without dropping a frame.
@@ -1306,7 +1415,8 @@ class MainWindow(DesktopFeatures, QMainWindow):
         if entering:
             self._pacing_timer.start()  # entering: hand timing back once settled
         self.tracks_btn.setChecked(False)
-        self._track_reveal.hide_now()  # the bar it hangs from is about to move
+        self._track_reveal.hide_now()  # the bar they hang from is about to move
+        self._hide_info_panel(now=True)
         self.fullscreen_btn.set_icon(Icons.fullscreen_exit if entering else Icons.fullscreen)
         # The video follows the chrome at every step rather than being pinned
         # at its final size: pinning made it jump to that size in one frame
@@ -1320,7 +1430,7 @@ class MainWindow(DesktopFeatures, QMainWindow):
             # The transport bar becomes a pointer-revealed overlay in
             # fullscreen rather than just vanishing; everything else slides away.
             self._slide_toolbar(False)
-            self._slide_browser(False, pin=False)
+            self._slide_browser(False)
             self._enter_overlay_controls()
             self.showFullScreen()
             self._show_player_cursor()
@@ -1335,39 +1445,19 @@ class MainWindow(DesktopFeatures, QMainWindow):
             self._slide_toolbar(True)
             self._slide_browser(self.browser_toggle.isChecked())
 
-    def _pin_player(self, size) -> None:
-        """Take the video widget out of the layout at ``size`` until
-        ``_unpin_player``; see toggle_fullscreen. Pinning it again only
-        changes the size it is held at."""
-        self._pinned_size = size
-        if not self._player_pinned:
-            self._player_pinned = True
-            self._player_layout.removeWidget(self.player)
-        self._hold_pinned_player()
-
-    def _hold_pinned_player(self) -> None:
-        """Keep the pinned video at the window's top-left whatever its parent
-        does (the sidebar sliding moves the parent): moved, never resized."""
-        if self._player_pinned:
-            origin = self.player.parentWidget().mapFrom(self._root, QPoint(0, 0))
-            self.player.setGeometry(QRect(origin, self._pinned_size))
-
-    def _unpin_player(self) -> None:
-        if not self._player_pinned:
-            return
-        self._player_pinned = False
-        self._player_layout.addWidget(self.player, stretch=1)
-
-
     def keyPressEvent(self, event) -> None:
         # Unhandled keys from the player view propagate up to here.
         if event.key() == Qt.Key_Escape:
-            # Innermost first: the track card, the settings sheet, fullscreen.
+            # Innermost first: the track card, the info card, the settings sheet,
+            # fullscreen.
             if self.tracks_btn.isChecked():
                 self.tracks_btn.setChecked(False)
                 return
+            if self._info_reveal.shown:
+                self._hide_info_panel()
+                return
             if self.playback_settings.isVisible():
-                self.playback_settings.hide()
+                self._set_settings_visible(False)
                 return
             if self.isFullScreen():
                 self.toggle_fullscreen()
@@ -1533,15 +1623,25 @@ class MainWindow(DesktopFeatures, QMainWindow):
             self.player.unsetCursor()
         if obj is self.player and event.type() == QEvent.MouseButtonPress:
             self.tracks_btn.setChecked(False)
+            if self._info_reveal.shown:
+                self._hide_info_panel()
+        if obj is self._now_playing:
+            kind = event.type()
+            if kind == QEvent.Enter:
+                self.now_title.set_highlighted(self._now_info is not None)
+            elif kind == QEvent.Leave:
+                self.now_title.set_highlighted(self._info_reveal.shown)
+            elif kind == QEvent.MouseButtonRelease and event.button() == Qt.LeftButton:
+                self._toggle_info_panel()
         if obj is self.player and event.type() == QEvent.Resize:
             self._position_idle_guidance()
-        if obj is self._player_parent and event.type() in (QEvent.Move, QEvent.Resize):
-            self._hold_pinned_player()
         if obj is self._root and event.type() == QEvent.Resize:
             if self._controls_overlay or self._controls_dock_h is not None:
                 self._position_overlay()
             if self._track_reveal.shown:
                 self._position_track_panel()
+            if self._info_reveal.shown:
+                self._info_reveal.retarget(self._info_geometry())
             if self.playback_settings.isVisible():
                 self._position_settings_panel()
         return super().eventFilter(obj, event)
@@ -1710,7 +1810,7 @@ class MainWindow(DesktopFeatures, QMainWindow):
         placeholder = _hint_label("Loading server library…")
         placeholder.setAlignment(Qt.AlignCenter)
         placeholder.setWordWrap(True)
-        tree = QTreeView()
+        tree = BrowserTree()
         model = QStandardItemModel(tree)
         tree.setModel(model)
         tree.setHeaderHidden(True)
@@ -1763,11 +1863,12 @@ class MainWindow(DesktopFeatures, QMainWindow):
         is_dir = node.get("type") == "directory"
         icon = theme.icon(Icons.folder if is_dir else Icons.movie)
         label = node.get("name", "")
+        item = QStandardItem(icon, label if is_dir else self._shown_name(label))
         if not is_dir:
             entry = self.history.entries.get(self._key_for("server_file", node.get("path", "")))
+            item.setToolTip(f"{label}  —  {entry.description}" if entry else label)
             if entry:
-                label += f"  —  {entry.description}"
-        item = QStandardItem(icon, label)
+                item.setData(entry.progress, PROGRESS_ROLE)
         item.setEditable(False)
         item.setData(node.get("path", ""), Qt.UserRole)
         item.setData(node.get("type"), _SERVER_TYPE_ROLE)
@@ -2159,18 +2260,12 @@ class MainWindow(DesktopFeatures, QMainWindow):
         self._stable_position = False
         self._position_s = resume_s or 0.0
         self.client_log.record("session_start", source=source, path=path, position=resume_s, paused=self._paused)
-        if self.mpv_config:
-            try:
-                self._refresh_mpv_controls(self.mpv_config.read())
-            except Exception as err:
-                self._error("mpv configuration", str(err))
         if hasattr(self.player, "apply_defaults"):
             try:
-                defaults = self.mpv_config.effective_values if self.mpv_config else self._next_defaults
-                self.player.apply_defaults(defaults)
+                self.player.apply_defaults(self.settings.mpv_defaults)
                 self._pending_defaults.clear()
             except Exception as err:
-                self._error("Could not apply mpv defaults", str(err))
+                self._error("Could not apply mpv settings", str(err))
         self._session_time_base = time_base
         self.player.client = self.client
         self.player.start(
@@ -2229,10 +2324,18 @@ class MainWindow(DesktopFeatures, QMainWindow):
         self.player.setFocus()  # keys (Space/F/arrows) go to the video
         # A paused player still needs initial packets to establish its first
         # frame. The live buffer report applies the usual server watermark.
+        output = f"{session.downlink_width}×{session.downlink_height}"
         self._show_now_playing(
             Path(path).name,
-            f"{cfg.model} · {self.tier_combo.currentText()} · "
-            f"{session.downlink_width}×{session.downlink_height}",
+            f"{cfg.model} · {self.tier_combo.currentText()} · {output}",
+            [
+                ("File", path),
+                ("Source", "Server library" if source == "server_file" else "Uploaded from this computer"),
+                ("Upscale model", cfg.model),
+                ("Stream quality", self.tier_combo.currentText()),
+                ("Output", f"{output} {session.downlink_codec}"),
+                ("Server", _server_address(self.client.host, self.client.port)),
+            ],
         )
         self.statusBar().showMessage(
             f"{Path(path).name} -> {session.downlink_codec} "
@@ -2287,8 +2390,8 @@ class MainWindow(DesktopFeatures, QMainWindow):
         return self.tier_combo.currentData() or self.tier_combo.currentText()
 
     def _apply_panscan(self) -> None:
-        # Cover is already cropped server-side. Reassert zero so a user's
-        # mpv.conf cannot apply a second client-side crop.
+        # Cover is already cropped server-side. Reassert zero so a crop left by
+        # a panscan key binding (input.conf) is not applied a second time.
         self.player.set_panscan(0.0)
 
     async def _restart_for_playback_setting(self) -> None:
@@ -2449,7 +2552,8 @@ class MainWindow(DesktopFeatures, QMainWindow):
             return
         if self._session_source != "local":
             return
-        self._show_now_playing(Path(path).name, "Playing locally · upscaler off")
+        self._show_now_playing(Path(path).name, "Playing locally · upscaler off",
+                               [("File", str(path)), ("Upscaling", "Off: playing the original file locally")])
         self.statusBar().showMessage(f"playing locally from {pos:.1f}s (upscaler off)")
 
     def on_sub_selected(self, index: int) -> None:
@@ -2682,8 +2786,6 @@ class MainWindow(DesktopFeatures, QMainWindow):
     def closeEvent(self, event) -> None:
         self._feature_timer.stop()
         self._browser_save_timer.stop()
-        if hasattr(self, "config_watcher"):
-            self.config_watcher.close()
         if self._close_ready:
             event.accept()
             return

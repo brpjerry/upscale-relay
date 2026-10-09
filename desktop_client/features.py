@@ -9,13 +9,13 @@ import time
 from PySide6.QtCore import QStandardPaths, Qt, QTimer
 from PySide6.QtWidgets import QComboBox, QFormLayout, QGroupBox, QLabel, QLineEdit, QMenu, QSpinBox
 
-from .browser_state import BrowserStore
+from .browser_state import PROGRESS_ROLE, BrowserStore
+from .naming import display_name
 from .diagnostics import ClientLog
 from .discovery import ServerDiscovery
 from .history import HistoryStore, source_key
-from .mpv_config import ConfigWatcher, DEFAULTS, MpvConfig
 from .playback_state import PlaybackSnapshot, Transitions
-from .settings import FAST_FORWARD_MAX_S
+from .settings import FAST_FORWARD_MAX_S, MPV_DEFAULTS
 from .theme import style_menu
 from .widgets import AccentPicker, FlatSwitch, SegmentedSwitch
 
@@ -36,7 +36,6 @@ class DesktopFeatures:
         self._stable_position = False
         self._closing = False
         self._close_ready = False
-        self._next_defaults = dict(DEFAULTS)
         self._pending_defaults = {}
         log_root = self.options.log_root or Path(QStandardPaths.writableLocation(QStandardPaths.DocumentsLocation))
         self.client_log = ClientLog(log_root)
@@ -52,8 +51,10 @@ class DesktopFeatures:
             form.setRowWrapPolicy(QFormLayout.WrapAllRows)
             layout.addWidget(box)
             return form
-        # Video timing: how mpv paces frames. The switch is ours; the mode is
-        # mpv's own video-sync option and lives in mpv.conf with the defaults.
+        # Video timing: how mpv paces frames. The switch tells mpv the display's
+        # refresh rate; the mode and interpolation are mpv options. Those and
+        # the subtitle defaults are the player's own settings, set on mpv at
+        # runtime (mpv.conf is not read).
         timing_form = group("Video timing")
         self.display_sync_check = FlatSwitch("Sync video to the display while windowed")
         self.display_sync_check.setChecked(self.settings.display_sync)
@@ -61,30 +62,17 @@ class DesktopFeatures:
             "Tell mpv the display's refresh rate while the window is not fullscreen. It cannot see the "
             "display from inside this player, so its Display synchronization modes, and Motion "
             "interpolation, which needs one, only take effect with this on. In fullscreen mpv keeps "
-            "its own timing: pacing by the display renders every refresh, costs about 3 W more on "
-            "battery, and a demanding mpv.conf could not keep up at fullscreen size.")
+            "its own timing: pacing by the display renders every refresh and costs about 3 W more on "
+            "battery.")
         self.display_sync_check.toggled.connect(self._set_display_sync)
         timing_form.addRow(self.display_sync_check)
         self.display_sync_hint = QLabel()
         self.display_sync_hint.setWordWrap(True)
         self.display_sync_hint.setProperty("role", "faint")
-        form = group("mpv defaults")
-        self.mpv_defaults_notice = QLabel("These settings modify mpv.conf and also affect standalone mpv.")
-        self.mpv_defaults_notice.setWordWrap(True)
-        self.mpv_defaults_notice.setProperty("role", "faint")
-        form.addRow(self.mpv_defaults_notice)
-        self.mpv_config_label = QLabel()
-        self.mpv_config_label.setWordWrap(True)
-        self.mpv_config_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        form.addRow(self.mpv_config_label)
-        self.mpv_profile_label = QLabel()
-        self.mpv_profile_label.setWordWrap(True)
-        form.addRow(self.mpv_profile_label)
+        subtitle_form = group("Subtitles")
         self.mpv_controls = {}
         choices = {
             "sid": [("Auto", "auto"), ("Off", "no")],
-            # The two display modes worth choosing; any other value found in
-            # mpv.conf is still shown and kept ("Configured: ...").
             "video-sync": [
                 ("Audio (default)", "audio"),
                 ("Display, resample audio to match (display-resample)", "display-resample"),
@@ -95,7 +83,7 @@ class DesktopFeatures:
         }
         titles = {"sid": "Default subtitle selection", "slang": "Preferred subtitle languages (in order)",
                   "video-sync": "Video synchronization", "interpolation": "Motion interpolation", "tscale": "Interpolation scaler"}
-        for name in DEFAULTS:
+        for name in MPV_DEFAULTS:
             if name == "slang":
                 widget = QLineEdit()
                 widget.setPlaceholderText("e.g. en,ja")
@@ -106,28 +94,14 @@ class DesktopFeatures:
                     widget.addItem(label, value)
                 widget.activated.connect(lambda _index, key=name: self._edit_mpv_default(key, self.mpv_controls[key].currentData()))
             self.mpv_controls[name] = widget
-            (timing_form if name == "video-sync" else form).addRow(titles[name], widget)
+            (subtitle_form if name in ("sid", "slang") else timing_form).addRow(titles[name], widget)
         timing_form.addRow(self.display_sync_hint)
-        self.mpv_config = None
-        try:
-            native = getattr(self.player, "mpv", None)
-            path = self.options.mpv_config_path
-            if path is None and native is not None:
-                path = Path(native.command("expand-path", "~~home/mpv.conf"))
-            if path is None:
-                raise RuntimeError("The mpv configuration path is unavailable without libmpv.")
-            self.mpv_config = MpvConfig(path, expand=(lambda p: native.command("expand-path", p)) if native else None)
-            self.mpv_config_label.setText(str(path))
-            self._refresh_mpv_controls(self.mpv_config.read())
-        except Exception as err:
-            self.mpv_config_label.setText(str(err))
-            for control in self.mpv_controls.values():
-                control.setEnabled(False)
-        self._show_display_sync_hint()
-        if self.mpv_config is not None:
-            self.config_watcher = ConfigWatcher(self.mpv_config, self)
-            self.config_watcher.changed.connect(self._refresh_mpv_controls)
-            self.config_watcher.failed.connect(lambda message: self._error("mpv configuration", message))
+        self._show_mpv_defaults()
+        if hasattr(self.player, "apply_defaults"):
+            try:
+                self.player.apply_defaults(self.settings.mpv_defaults)
+            except Exception as err:
+                self._error("Could not apply mpv settings", str(err))
         form = group("Controls")
         self.fast_forward_spin = QSpinBox()
         self.fast_forward_spin.setRange(1, FAST_FORWARD_MAX_S)
@@ -146,6 +120,13 @@ class DesktopFeatures:
         self.history_limit_spin.setValue(self.settings.history_limit)
         self.history_limit_spin.valueChanged.connect(self._set_history_limit)
         form.addRow("History entries", self.history_limit_spin)
+        self.simplify_names_check = FlatSwitch("Simplify file names")
+        self.simplify_names_check.setChecked(self.settings.simplify_names)
+        self.simplify_names_check.setToolTip(
+            "Show video files without the extension or the release details in brackets and "
+            "parentheses, with the episode number first. The full name stays in the tooltip.")
+        self.simplify_names_check.toggled.connect(self._set_simplify_names)
+        form.addRow(self.simplify_names_check)
         form = group("Appearance")
         self.theme_switch = SegmentedSwitch([("Auto", "auto"), ("Dark", "dark"), ("Light", "light")])
         self.theme_switch.set_current(self.settings.theme_mode)
@@ -214,51 +195,25 @@ class DesktopFeatures:
             action = self.nearby_menu.addAction(f"{server.name} — {server.address}")
             action.triggered.connect(lambda checked=False, address=server.address: self.host_edit.setText(address))
 
-    def _refresh_mpv_controls(self, values):
-        self._next_defaults = dict(values)
-        self._pending_defaults = {key: value for key, value in self._pending_defaults.items()
-                                  if values.get(key) == value}
-        if self.mpv_config:
-            self.mpv_config_label.setText(str(self.mpv_config.path))
-        for name, value in values.items():
+    def _show_mpv_defaults(self):
+        for name, value in self.settings.mpv_defaults.items():
             control = self.mpv_controls[name]
-            control.setEnabled(True)
             control.blockSignals(True)
             if isinstance(control, QLineEdit):
                 control.setText(value)
             else:
-                for i in reversed(range(control.count())):
-                    if control.itemText(i).startswith("Configured: "):
-                        control.removeItem(i)
-                index = control.findData(value)
-                if index < 0:
-                    control.addItem(f"Configured: {value}", value)
-                    index = control.count() - 1
-                control.setCurrentIndex(index)
+                control.setCurrentIndex(max(0, control.findData(value)))
             control.blockSignals(False)
         self._show_display_sync_hint()
-        if self.mpv_config:
-            overrides = [f"{key}={value}" for key, value in self.mpv_config.effective_values.items()
-                         if value != values[key]]
-            message = ("Global defaults shown. Named or active profiles can override them; profile settings are preserved."
-                       if self.mpv_config.profile_options else "External edits apply to the next opened playback session.")
-            if overrides:
-                message += " Applied profile values: " + ", ".join(overrides)
-            self.mpv_profile_label.setText(message)
 
     def _edit_mpv_default(self, name, value):
-        if not self.mpv_config or value == self._next_defaults.get(name):
+        value = str(value).strip()
+        if value == self.settings.mpv_defaults[name]:
             return
-        try:
-            values = self.mpv_config.write(name, str(value))
-        except Exception as err:
-            self._error("Could not save mpv.conf", str(err))
-            if hasattr(self, "config_watcher"):
-                self.config_watcher.refresh()
-            self._refresh_mpv_controls(self._next_defaults)
-            return
-        self._refresh_mpv_controls(values)
-        self._pending_defaults[name] = str(value)
+        self.settings.set_mpv_default(name, value)
+        self._show_mpv_defaults()
+        # Applied once no stream transition is in flight (_apply_pending_defaults).
+        self._pending_defaults[name] = value
         self._apply_pending_defaults()
 
     def _apply_pending_defaults(self):
@@ -272,7 +227,7 @@ class DesktopFeatures:
                 self._pending_defaults.clear()
             except Exception as err:
                 self._pending_defaults.clear()
-                self._error("Could not apply mpv defaults", str(err))
+                self._error("Could not apply mpv settings", str(err))
 
     def _set_history_limit(self, value):
         self.settings.history_limit = value
@@ -295,7 +250,8 @@ class DesktopFeatures:
 
     def _show_display_sync_hint(self):
         """Say what the switch and the mode add up to; either alone does nothing."""
-        mode = self._next_defaults.get("video-sync", "audio")
+        defaults = self.settings.mpv_defaults
+        mode = defaults["video-sync"]
         display_mode = mode.startswith("display-")
         paced_by_display = self.settings.display_sync and display_mode
         if paced_by_display:
@@ -308,8 +264,8 @@ class DesktopFeatures:
             text = (f"{mode} is set but inactive: mpv cannot see the display from inside this player. "
                     "Turn the switch on to let it take effect.")
         else:
-            text = "Video is paced by audio, mpv's default. The mode is saved to mpv.conf."
-        if self._next_defaults.get("interpolation") == "yes":
+            text = "Video is paced by audio, mpv's default."
+        if defaults["interpolation"] == "yes":
             text += (" Motion interpolation works only while the window is not fullscreen." if paced_by_display
                      else " Motion interpolation is on but has no effect until video is paced by the display.")
         self.display_sync_hint.setText(text)
@@ -376,6 +332,15 @@ class DesktopFeatures:
         return PlaybackSnapshot(self._session_source, self._session_path, self._position_s,
                                 self._duration_s, self._paused, tracks, audio_delay, sub_delay)
 
+    def _set_simplify_names(self, value):
+        self.settings.simplify_names = value
+        self.local_proxy.simplify_names = value
+        self._refresh_history_labels()
+        self._show_now_playing(*self._now_raw)
+
+    def _shown_name(self, name: str) -> str:
+        return display_name(name) if self.settings.simplify_names else name
+
     def _refresh_history_labels(self):
         self.local_proxy.invalidate()
         if self.server_model is None:
@@ -386,7 +351,10 @@ class DesktopFeatures:
                 path = item.data(Qt.UserRole)
                 if path and item.data(Qt.UserRole + 1) == "file":
                     entry = self.history.entries.get(self._key_for("server_file", path))
-                    item.setText(PurePosixPath(path).name + (f"  —  {entry.description}" if entry else ""))
+                    name = PurePosixPath(path).name
+                    item.setText(self._shown_name(name))
+                    item.setData(entry.progress if entry else None, PROGRESS_ROLE)
+                    item.setToolTip(f"{name}  —  {entry.description}" if entry else name)
                 visit(item)
         visit(self.server_model.invisibleRootItem())
 

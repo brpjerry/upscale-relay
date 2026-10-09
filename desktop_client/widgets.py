@@ -7,6 +7,7 @@ driving them the usual way; only painting and hover/press motion are ours.
 
 from __future__ import annotations
 
+import math
 import time
 
 from PySide6.QtCore import (
@@ -23,7 +24,7 @@ from PySide6.QtCore import (
     QVariantAnimation,
     Signal,
 )
-from PySide6.QtGui import QColor, QFont, QFontMetricsF, QLinearGradient, QPainter, QPalette, QPen
+from PySide6.QtGui import QColor, QFont, QFontMetricsF, QLinearGradient, QPainter, QPalette, QPen, QTextLayout, QTextOption
 from PySide6.QtWidgets import (
     QAbstractButton,
     QAbstractSpinBox,
@@ -36,7 +37,6 @@ from PySide6.QtWidgets import (
     QPushButton,
     QSlider,
     QStyle,
-    QToolTip,
     QWidget,
 )
 
@@ -352,18 +352,83 @@ class ElideLabel(QLabel):
         super().__init__(text, parent)
         self._dim = dim
         self._elide = elide
+        self._highlighted = False
+
+    def set_highlighted(self, highlighted: bool) -> None:
+        """Paint in the accent text colour (the palette's Link), e.g. on hover."""
+        if highlighted != self._highlighted:
+            self._highlighted = highlighted
+            self.update()
 
     def minimumSizeHint(self) -> QSize:
         return QSize(0, super().minimumSizeHint().height())
 
     def paintEvent(self, _event) -> None:
         painter = QPainter(self)
-        color = QColor(self.palette().color(QPalette.WindowText))
+        role = QPalette.Link if self._highlighted else QPalette.WindowText
+        color = QColor(self.palette().color(role))
         color.setAlphaF(color.alphaF() * self._dim)
         painter.setPen(color)
         rect = self.contentsRect()
         text = self.fontMetrics().elidedText(self.text(), self._elide, rect.width())
         painter.drawText(rect, int(self.alignment()) | Qt.TextSingleLine, text)
+        painter.end()
+
+
+class WrapText(QWidget):
+    """Plain text that wraps at word boundaries, and anywhere inside a word
+    too long for a line (a path, a model name). QLabel wraps only at word
+    boundaries and clips such a word."""
+
+    def __init__(self, text: str = "", parent=None):
+        super().__init__(parent)
+        self._text = text
+        policy = self.sizePolicy()
+        policy.setHeightForWidth(True)
+        self.setSizePolicy(policy)
+
+    def text(self) -> str:
+        return self._text
+
+    def setText(self, text: str) -> None:
+        self._text = text
+        self.updateGeometry()
+        self.update()
+
+    def _layout(self, width: int) -> QTextLayout:
+        layout = QTextLayout(self._text, self.font())
+        option = QTextOption()
+        option.setWrapMode(QTextOption.WrapAtWordBoundaryOrAnywhere)
+        layout.setTextOption(option)
+        layout.beginLayout()
+        y = 0.0
+        while True:
+            line = layout.createLine()
+            if not line.isValid():
+                break
+            line.setLineWidth(max(1, width))
+            line.setPosition(QPointF(0, y))
+            y += line.height()
+        layout.endLayout()
+        return layout
+
+    def hasHeightForWidth(self) -> bool:
+        return True
+
+    def heightForWidth(self, width: int) -> int:
+        return math.ceil(self._layout(width).boundingRect().height())
+
+    def sizeHint(self) -> QSize:
+        width = min(self.fontMetrics().horizontalAdvance(self._text), 320)
+        return QSize(width, self.heightForWidth(width))
+
+    def minimumSizeHint(self) -> QSize:
+        return QSize(0, self.fontMetrics().height())
+
+    def paintEvent(self, _event) -> None:
+        painter = QPainter(self)
+        painter.setPen(self.palette().color(QPalette.WindowText))
+        self._layout(self.width()).draw(painter, QPointF(0, 0))
         painter.end()
 
 
@@ -542,9 +607,69 @@ class IdleHint(QWidget):
         painter.end()
 
 
-def show_slider_tip(slider: QSlider, x: float, text: str) -> None:
-    """Small time bubble above a slider at pointer position ``x``."""
-    QToolTip.showText(slider.mapToGlobal(QPointF(x, -34).toPoint()), text, slider)
+class SliderTip(QWidget):
+    """Time bubble beside the pointer over a slider, out of the pointer's way.
+
+    A QToolTip is a window of its own, placed just below and right of the
+    point it is given: over the slider beside the pointer. Moving right, the
+    pointer ran into it and left the slider, so the tip hid and came back,
+    skipping along. This is a child of the window that the mouse passes
+    through, a little right of the pointer (left of it near the slider's
+    right end), with a caret pointing back at it. It is the inverse of the theme
+    (text colour behind surface colour): in the track's own colour it, and
+    its caret, merged into the bar it sits on.
+    """
+
+    _GAP = 16     # pointer to caret tip, clear of the pointing-hand cursor
+    _CARET = 5    # caret depth
+    _PAD_X, _PAD_Y = 6, 2
+
+    def __init__(self, parent: QWidget):
+        super().__init__(parent)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self.setFocusPolicy(Qt.NoFocus)
+        font = tabular(QFont(self.font()))
+        font.setPixelSize(11)
+        font.setWeight(QFont.DemiBold)
+        self.setFont(font)
+        self._text = ""
+        self._caret_left = True
+        self.hide()
+
+    def show_at(self, slider: QWidget, x: float, text: str) -> None:
+        """Point at ``x`` (slider coordinates) on the slider's centre line."""
+        window = self.parentWidget()
+        metrics = self.fontMetrics()
+        body_w = metrics.horizontalAdvance(text) + 2 * self._PAD_X
+        height = metrics.height() + 2 * self._PAD_Y
+        width = body_w + self._CARET
+        anchor = slider.mapTo(window, QPoint(round(x), slider.height() // 2))
+        # Flip left of the pointer before running past the end of the slider
+        # (over whatever sits beside it, such as the time readout).
+        end = slider.mapTo(window, QPoint(slider.width(), 0)).x()
+        self._caret_left = anchor.x() + self._GAP + width <= end
+        left = anchor.x() + self._GAP if self._caret_left else anchor.x() - self._GAP - width
+        self._text = text
+        self.setGeometry(left, anchor.y() - height // 2, width, height)
+        self.update()
+        self.show()
+        self.raise_()
+
+    def paintEvent(self, _event) -> None:
+        t = theme.current()
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor(t.text))
+        caret, h = self._CARET, self.height()
+        body = QRectF(caret if self._caret_left else 0, 0, self.width() - caret, h)
+        painter.drawRoundedRect(body, 4, 4)
+        tip_x = 0.0 if self._caret_left else float(self.width())
+        base_x = body.left() + 0.5 if self._caret_left else body.right() - 0.5
+        painter.drawPolygon([QPointF(tip_x, h / 2), QPointF(base_x, h / 2 - caret), QPointF(base_x, h / 2 + caret)])
+        painter.setPen(QColor(t.surface))
+        painter.drawText(body, Qt.AlignCenter, self._text)
+        painter.end()
 
 
 def emphasized() -> QEasingCurve:

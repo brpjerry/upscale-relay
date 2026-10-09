@@ -11,7 +11,7 @@ def test_relay_flags_are_consumed_and_qt_flags_are_preserved():
     options, qt_args = parse_args([
         "--debug", "--trace", "--mpv-osc", "--no-hwdec",
         "--mpv-scripts", "--headless", "--settings-scope", "smoke",
-        "-platform", "offscreen",
+        "--input-conf", "/tmp/keys.conf", "-platform", "offscreen",
     ])
     assert options.debug
     assert options.trace
@@ -20,4 +20,5 @@ def test_relay_flags_are_consumed_and_qt_flags_are_preserved():
     assert options.mpv_scripts
     assert options.headless
     assert options.settings_scope == "smoke"
+    assert str(options.input_conf_path) == "/tmp/keys.conf"
     assert qt_args == ["-platform", "offscreen"]
