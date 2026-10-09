@@ -205,6 +205,75 @@ def test_server_tab_appears_populates_and_disappears(window):
     asyncio.run(scenario())
 
 
+def test_playback_started_during_initial_listing_keeps_the_server_browser(window, monkeypatch):
+    async def scenario():
+        listing, release = asyncio.Event(), asyncio.Event()
+        clients = []
+
+        class SlowLibraryClient(FakeLibraryClient):
+            def __init__(self, host, port):
+                super().__init__()
+                clients.append(self)
+
+            async def connect(self):
+                return {"server_name": "test", "models": [{"name": "passthrough"}], "library": True}
+
+            async def fetch_library_page(self, path="", *, cursor=None, limit=100):
+                listing.set()
+                await release.wait()
+                return await super().fetch_library_page(path, cursor=cursor, limit=limit)
+
+        opened = []
+
+        async def open_local(path, source="uplink", resume_s=None, snapshot=None):
+            opened.append((path, source))
+
+        monkeypatch.setattr(main_window, "RelayClient", SlowLibraryClient)
+        monkeypatch.setattr(window, "_open_session", open_local)
+        window.host_edit.setText("media-server:8590")
+        connecting = window.on_connect()
+        await listing.wait()
+        # A local video started now supersedes the connection's transition.
+        await window._start_session("/videos/local.mkv", source="uplink")
+        await connecting
+        assert opened == [("/videos/local.mkv", "uplink")]
+        release.set()
+        async with asyncio.timeout(5):
+            while window.server_model.rowCount() == 0:
+                await asyncio.sleep(0.01)
+        assert window.server_model.item(0).text() == "Shows"
+        assert window.server_placeholder.isHidden() and not window.server_tree.isHidden()
+        assert not window._restoring_browser  # browser state persists again
+        assert clients[0].fetches == [("", None, 100)]  # finished, not restarted
+
+    asyncio.run(scenario())
+
+
+def test_cancelled_library_listing_leaves_a_refreshable_browser(window):
+    async def scenario():
+        listing = asyncio.Event()
+
+        class StalledLibraryClient(FakeLibraryClient):
+            async def fetch_library_page(self, path="", *, cursor=None, limit=100):
+                listing.set()
+                await asyncio.Event().wait()
+
+        window.client = StalledLibraryClient()
+        window._ensure_server_tab()
+        refresh = window.on_refresh_server_library()
+        await listing.wait()
+        refresh.cancel()
+        await asyncio.gather(refresh, return_exceptions=True)
+        assert not window._restoring_browser
+        assert window.server_placeholder.text() != "Loading server library…"
+        window.client = FakeLibraryClient()
+        await window.on_refresh_server_library()
+        assert window.server_model.rowCount() == 1
+        assert window.server_placeholder.isHidden()
+
+    asyncio.run(scenario())
+
+
 def test_server_load_more_appends_without_reloading(window):
     async def scenario():
         client = FakePagedLibraryClient()

@@ -1791,7 +1791,11 @@ class MainWindow(DesktopFeatures, QMainWindow):
             self.statusBar().showMessage("Choose a video from the file browser.")
         if caps.get("library"):
             self._ensure_server_tab()
-            await self.on_refresh_server_library()
+            # Connecting runs as a playback transition, which starting a video
+            # cancels. The listing is the browser's, not the transition's: let
+            # it finish (the slot runs it as its own task) rather than strand
+            # the Server tab on its loading placeholder.
+            await asyncio.shield(self.on_refresh_server_library())
         else:
             self._remove_server_tab()
 
@@ -1952,6 +1956,14 @@ class MainWindow(DesktopFeatures, QMainWindow):
         self.server_tree.setVisible(False)
         try:
             page = await client.fetch_library_page(limit=_SERVER_PAGE_SIZE, **self._server_sort_kwargs())
+        except asyncio.CancelledError:
+            # CancelledError is no Exception: without this the tab kept saying
+            # it was loading and browser state was never saved again.
+            if generation == self._listing_generation:
+                if self.server_placeholder is not None:
+                    self.server_placeholder.setText("Server library not loaded. Refresh to load it.")
+                self._restoring_browser = False
+            raise
         except Exception as err:
             if client is self.client and self.server_placeholder is not None and generation == self._listing_generation:
                 self.server_placeholder.setText(f"Could not load server library:\n{err}")
