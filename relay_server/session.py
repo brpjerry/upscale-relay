@@ -71,6 +71,23 @@ def _sanitize_chapters(raw: Any) -> list[dict]:
     return chapters
 
 
+# Pixel shapes outside this range are not real sources; treat them as absent.
+_SAMPLE_ASPECT_RATIO_RANGE = (Fraction(1, 10), Fraction(10))
+
+
+def _sample_aspect_ratio(video: dict) -> Fraction:
+    """open_session.video.sample_aspect_ratio, or 1 when absent or invalid."""
+    raw = video.get("sample_aspect_ratio")
+    if (
+        isinstance(raw, list) and len(raw) == 2
+        and all(type(part) is int and part > 0 for part in raw)
+    ):
+        sar = Fraction(raw[0], raw[1])
+        if _SAMPLE_ASPECT_RATIO_RANGE[0] <= sar <= _SAMPLE_ASPECT_RATIO_RANGE[1]:
+            return sar
+    return Fraction(1)
+
+
 class State(str, Enum):
     OPEN = "open"
     PLAYING = "playing"
@@ -416,6 +433,7 @@ class Session:
             height=video["height"],
             time_base=Fraction(*video["time_base"]),
             avg_rate=Fraction(*video["avg_rate"]) if video.get("avg_rate") else None,
+            sample_aspect_ratio=_sample_aspect_ratio(video),
         )
         # Pipeline construction can block for minutes when a model's TensorRT
         # engine is built for the first time; keepalives stop the client's

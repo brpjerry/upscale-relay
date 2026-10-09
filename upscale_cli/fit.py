@@ -14,6 +14,7 @@ CPU swscale for now. In the streaming server, frames should stay on the GPU
 from __future__ import annotations
 
 import sys
+from fractions import Fraction
 from typing import Iterable
 
 import av
@@ -51,24 +52,28 @@ def aligned_target_dimensions(target_w: int, target_h: int, align: int = 2) -> t
 
 def cover_crop_box(
     w: int, h: int, target_w: int, target_h: int, align: int = 2,
+    sample_aspect_ratio: Fraction = Fraction(1),
 ) -> tuple[int, int, int, int]:
     """Centered, aligned source rectangle with the target aspect ratio.
 
     The returned ``(x, y, width, height)`` is suitable for cropping before a
     single resize to :func:`aligned_target_dimensions`. This avoids encoding
     the off-screen overflow that client-side cover/panscan used to require.
+    The rectangle is in stored pixels; ``sample_aspect_ratio`` (pixel width
+    over height) makes it match the target as the source is displayed.
     """
     if w <= 0 or h <= 0:
         raise ValueError("source dimensions must be positive")
     tw, th = aligned_target_dimensions(target_w, target_h, align)
+    sar = Fraction(sample_aspect_ratio)
     aw = max(align, w // align * align)
     ah = max(align, h // align * align)
-    if aw * th > ah * tw:
+    if aw * sar * th > ah * tw:
         crop_h = ah
-        crop_w = max(align, int(crop_h * tw / th) // align * align)
+        crop_w = max(align, int(crop_h * tw / (th * sar)) // align * align)
     else:
         crop_w = aw
-        crop_h = max(align, int(crop_w * th / tw) // align * align)
+        crop_h = max(align, int(crop_w * sar * th / tw) // align * align)
     crop_w = min(crop_w, aw)
     crop_h = min(crop_h, ah)
     x = max(0, ((w - crop_w) // (2 * align)) * align)
@@ -76,8 +81,17 @@ def cover_crop_box(
     return x, y, crop_w, crop_h
 
 
-def fit_dimensions(w: int, h: int, target_w: int, target_h: int, align: int = 2) -> tuple[int, int]:
-    """Largest align-rounded (w, h) with the same aspect that fits inside target."""
+def fit_dimensions(
+    w: int, h: int, target_w: int, target_h: int, align: int = 2,
+    sample_aspect_ratio: Fraction = Fraction(1),
+) -> tuple[int, int]:
+    """Largest align-rounded (w, h) with the same aspect that fits inside target.
+
+    The result has square pixels: a source whose pixels are
+    ``sample_aspect_ratio`` wide (pixel width over height) is fitted by the
+    shape it is displayed at, not by its stored pixel count.
+    """
+    w = w * float(sample_aspect_ratio)
     scale = min(target_w / w, target_h / h)
     fw = max(align, round(w * scale / align) * align)
     fh = max(align, round(h * scale / align) * align)

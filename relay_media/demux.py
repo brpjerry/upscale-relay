@@ -142,7 +142,7 @@ class VideoTrack:
         cc = self._stream.codec_context
         extradata = bytes(cc.extradata) if cc.extradata else None
         avg = self._stream.average_rate
-        return {
+        video = {
             "codec": cc.name,
             "extradata_b64": base64.b64encode(extradata).decode() if extradata else None,
             "width": cc.width,
@@ -150,6 +150,14 @@ class VideoTrack:
             "time_base": [self.time_base.numerator, self.time_base.denominator],
             "avg_rate": [avg.numerator, avg.denominator] if avg else None,
         }
+        # Pixel shape of anamorphic sources; unknown (0/1) is left out, which
+        # the server reads as square pixels. The stream's value includes a
+        # container override such as Matroska display dimensions.
+        sar = self._stream.sample_aspect_ratio or cc.sample_aspect_ratio
+        if sar and sar > 0:
+            sar = Fraction(sar.numerator, sar.denominator)
+            video["sample_aspect_ratio"] = [sar.numerator, sar.denominator]
+        return video
 
     def packets(self, from_pts: int | None = None) -> Iterator[PacketInfo]:
         """Iterate packets, optionally seeking to a keyframe before ``from_pts``.

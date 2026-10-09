@@ -264,6 +264,9 @@ class VideoConfig:
     height: int
     time_base: Fraction
     avg_rate: Fraction | None = None
+    # Stored pixel width over height (open_session.video.sample_aspect_ratio);
+    # 1 for square pixels and for clients that do not send it.
+    sample_aspect_ratio: Fraction = Fraction(1)
 
 
 @dataclass
@@ -379,6 +382,9 @@ class Pipeline:
 
             # "fit" preserves the full image inside the display. "cover" crops the
             # post-ONNX frame centrally before resizing to the display dimensions.
+            # Both work in the source's displayed shape: the model sees stored
+            # (possibly anamorphic) pixels, and the final resize produces square
+            # ones, so the encoder needs no aspect signalling.
             if fit_mode not in ("fit", "cover"):
                 raise ValueError(f"unknown fit mode {fit_mode!r}")
             self.fit_mode = fit_mode
@@ -389,10 +395,12 @@ class Pipeline:
                 self.out_w, self.out_h = aligned_target_dimensions(*display)
                 self._crop_box = cover_crop_box(
                     processed_w, processed_h, self.out_w, self.out_h,
+                    sample_aspect_ratio=video.sample_aspect_ratio,
                 )
             else:
                 self.out_w, self.out_h = fit_dimensions(
-                    processed_w, processed_h, display[0], display[1]
+                    processed_w, processed_h, display[0], display[1],
+                    sample_aspect_ratio=video.sample_aspect_ratio,
                 )
                 self._crop_box = None
 
