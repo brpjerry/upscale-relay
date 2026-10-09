@@ -9,7 +9,11 @@ related tests. Three subagents reviewed the server/protocol, desktop, and
 client core; the primary reviewer covered the remaining areas and
 cross-checked findings.
 
-There are **14 actionable findings**, ranked below. **P1 = high priority;
+The Windows/NVIDIA continuation reviewed the same application baseline and
+added findings 15–19, native corroboration of finding 12, and the reuse and
+consistency opportunities below. The original Linux evidence is retained.
+
+There are **19 actionable application findings**. **P1 = high priority;
 P2 = medium priority.** All findings remain open; this report does not
 implement fixes. Source line references refer to the reviewed baseline.
 
@@ -261,7 +265,179 @@ advertiser's start and stop constructed one instance and closed none.
 **Fix direction:** Retain ownership immediately, close unsuccessful startup
 allocations, and guarantee closing through `finally` during shutdown.
 
-## Validation and limitations
+### 15. [P2] Cancelling an uplink iterator worker can prematurely end the replacement seek
+
+Location: [relay_client_core/client.py:676](../relay_client_core/client.py#L676).
+False completion: [client.py:702](../relay_client_core/client.py#L702).
+
+The client acquires its `VideoTrack` iterator inside `asyncio.to_thread`.
+Cancelling the task cannot stop a worker that has already started. If that
+obsolete worker acquires its iterator after the replacement seek's iterator,
+it advances the shared generation and invalidates the replacement. The new
+pump mistakes that iterator exhaustion for natural completion and sends EOS
+for the current epoch. This is the video-uplink counterpart of finding 2's
+server-side auxiliary race; it can truncate the entire playback epoch.
+
+**Evidence:** A controlled Windows reproduction used a real generated H.264
+source, real `VideoTrack`, and the actual `RelayClient.start_uplink` and
+`_uplink_loop`. A scheduling barrier delayed the obsolete worker immediately
+before iterator acquisition until the replacement sent its first batch.
+The replacement emitted only **16 of 120 video packets**, then EOS for epoch
+1, without an exception. The source itself was complete and readable.
+
+**Fix direction:** Acquire the cheap generation-owning iterator before
+cancellable worker execution, and offload only its native advancement. The
+server video path already does this at
+[session.py:596](../relay_server/session.py#L596). Apply the same ownership
+rule to that path, client video, and server auxiliary iterators.
+
+### 16. [P2] Streaming and offline encoding lose color signaling and change colors
+
+Locations: [relay_server/pipeline.py:513](../relay_server/pipeline.py#L513)
+and [upscale_cli/stages.py:139](../upscale_cli/stages.py#L139).
+Source description: [relay_media/demux.py:141](../relay_media/demux.py#L141).
+
+The source description and reconstructed output streams omit color matrix,
+range, primaries, and transfer information. Pixel-format conversion alone
+does not establish the correct interpretation of the encoded output. Even
+passthrough with a lossless codec can therefore produce different displayed
+colors, independently of model behavior or compression quality.
+
+**Evidence:** A real full-range BT.709 H.264 fixture passed through the CPU
+passthrough FFV1 pipeline lost its matrix/range/primaries/transfer values:
+`(1, 2, 1, 1)` became unspecified `(2, 0, 2, 2)`. Decoding the same constant
+region to RGB changed `[178, 95, 128]` to `[178, 79, 129]`. Offline `FrameSink`
+reproduced the metadata loss and the pixel change. This proves a concrete SDR
+case; HDR conversion and tone mapping were not validated by this fixture.
+
+**Fix direction:** Define the conversion and output color semantics explicitly;
+carry source signaling when appropriate and configure both conversion and
+encoder metadata consistently. Share that setup between streaming and offline
+encoding. Add decoded-output checks instead of checking metadata alone.
+
+### 17. [P2] Muxed audio tails accumulate outside backpressure until EOS
+
+Location: [relay_server/pipeline.py:950](../relay_server/pipeline.py#L950).
+Storage: [pipeline.py:187](../relay_server/pipeline.py#L187).
+
+The finish worker muxes auxiliary packets and immediately continues without
+draining available container bytes. `_SinkBuffer` appends without a byte
+limit; normal drains occur after video frames or final EOS. Consequently,
+audio after the final video frame, or across long video gaps, accumulates
+outside the bounded queues. A slow source can withhold playable audio until
+the entire tail has been read, and longer tails increase memory consumption.
+
+**Evidence:** A real H.264/PCM MKV contained 0.5 seconds of video and 25.6
+seconds of audio. Feeding it in the server's timestamp merge order produced
+600 audio packets, including 589 after the video. Once those packets traversed
+the otherwise empty stage queues, emitted output remained **5 packets /
+71,907 bytes**, while `_SinkBuffer` retained **4,811,479 bytes**. Only EOS
+released the remainder, for 4,932,631 total container bytes. No error occurred.
+
+**Fix direction:** Drain available mux bytes after auxiliary packets as well,
+preserving bounded downstream backpressure and the first discontinuity. Use
+`NO_TS` when a chunk has no associated video timestamp; do not invent video
+PTS for audio-only output.
+
+### 18. [P2] Invalid tile sizes can return an unwritten output image
+
+Locations: [upscale_cli/infer.py:155](../upscale_cli/infer.py#L155),
+[infer.py:254](../upscale_cli/infer.py#L254), and
+[infer.py:277](../upscale_cli/infer.py#L277).
+
+The constructor validates overlap parity but not the relationship between
+tile size and overlap. With the public `--tile-size 8` and default overlap
+16, the negative stepping produces an incomplete tile grid, and the crop
+assignments write no pixels into the `np.empty` output. The operation returns
+success with uninitialized image data. Tile size 16 instead fails with a
+zero-step `range` error.
+
+**Evidence:** Real CPU ONNX execution of the synthetic bilinear2x model on
+an 80×80 image, with tile size 8 and overlap 16, generated starts `[72]`.
+All **76,800 elements** of the returned 160×160×3 output retained an allocation
+sentinel inserted to measure unwritten memory. The untiled reference was
+uniformly 127. The sentinel instrumentation does not change tiling or copying.
+
+**Fix direction:** Reject nonpositive tile sizes, negative overlap, and
+`tile <= overlap` before model execution or output allocation. Validate the
+same contract for constructor settings and direct tiled-inference calls.
+
+### 19. [P2] Worker recovery can silently abandon the server's GPU requirement
+
+Locations: [upscale_cli/infer_worker.py:249](../upscale_cli/infer_worker.py#L249)
+and [infer_worker.py:312](../upscale_cli/infer_worker.py#L312).
+Initial check: [relay_server/pipeline.py:317](../relay_server/pipeline.py#L317).
+
+Pipeline construction rejects an inference session that falls back to CPU
+when GPU inference was requested. Worker recovery replaces `active_provider`
+from the new READY message, then retries the frame without repeating that
+check. A GPU worker crash followed by provider initialization failure can
+therefore leave playback on CPU, contrary to the original acceptance policy,
+with severe starvation instead of the actionable error used at startup.
+
+**Evidence:** Controlled real child processes exercised the actual
+`SubprocessUpscaler` lifecycle. The first announced TensorRT and exited on its
+first frame request. The replacement announced CPU and returned an 8×8 frame;
+the facade accepted it without error. Running the existing server provider
+check against that replacement correctly rejected it. This reproduces the
+policy gap, not a claim that this machine's installed GPU naturally fell back.
+
+**Fix direction:** Apply a shared provider-acceptance policy after every READY,
+including recovery, and clean up rejected replacements. Preserve deliberate
+CPU execution where explicitly requested.
+
+## Reuse, simplification, and consistency opportunities
+
+These are implementation directions, separate from the reproduced defects.
+They should preserve the native thread/process ownership rules rather than
+merge components merely because their code looks similar.
+
+1. **Share encoder configuration and a complete video description.**
+   `Pipeline._open_mux` and `FrameSink._init_stream` repeat stream setup and
+   share the timestamp/color omissions in findings 3 and 16. A dependency-light
+   description of geometry, time base, sample aspect ratio, and color semantics
+   plus common encoder configuration would let both paths use one correction.
+   Keep mux ownership and cleanup local to each existing thread. Never set the
+   output stream time base; configure the codec context where appropriate.
+2. **Use one iterator-ownership rule across local and server sources.**
+   Acquire generation ownership before entering cancellable work, then perform
+   serialized native demux on the worker. The server video path already offers
+   the pattern missing from client video and server auxiliary paths (2 and 15).
+3. **Share byte-budget and retirement invariants across queue boundaries.**
+   Server `_DownlinkQueue` and client `_ThreadBridgeQueue` account for bytes,
+   while pipeline input and mux buffers do not (1 and 17). Reuse accounting
+   policy and contract tests across synchronous and asynchronous adapters;
+   retaining separate synchronization mechanisms is appropriate.
+4. **Extract the abandoned-worker result handoff.**
+   `_SourceOpening` in `relay_client_core/client.py:59` and `_ViewPublication`
+   in `attachments.py:29` duplicate lock-protected publication, abandonment,
+   and cleanup-future observation. A small shared helper with resource-specific
+   cleanup callbacks could reduce cancellation drift. Preserve the tests for
+   late completion and repeated cancellation.
+5. **Centralize source-aware paths and playable suffixes.**
+   Use native `Path` for local media and POSIX paths for server-relative media.
+   Align basename selection and name ordering in `features.py`,
+   `browser_state.py`, and `relay_server/library.py`. Move the duplicated
+   playable-extension set out of `main_window.py` and `library.py` into a
+   dependency-light shared module; autoplay currently imports the window
+   module just to obtain it. This directly supports finding 12's correction.
+6. **Unify NVIDIA activation, validation, and inference selection policy.**
+   `infer.py` and `runtime_bootstrap.py` duplicate DLL discovery with different
+   platform and handle-lifetime behavior. Source runtime validation runs a
+   tiny model; managed-runtime validation checks provider registration and
+   native library loading. Share the platform-aware activation and execution
+   checks, including CUDA fallback. Reuse inference selection/ownership policy
+   across streaming, offline CLI, and benchmarks, while retaining TensorRT
+   process isolation and checking recovered workers (9 and 19).
+7. **Make observed native playback state the common UI synchronization path.**
+   Finding 8 shows pause intent diverging between input bindings and toolbar
+   state. The same review should cover track choices: periodic observations
+   update remembered descriptors, while dropdown publication mostly occurs
+   at initial enumeration. Consolidate user-originated state updates while
+   excluding internal loading holds. The track case remains a static review
+   opportunity, not an additional reproduced defect.
+
+## Original Linux validation and limitations
 
 The full CPU/offscreen suite completed with **443 passed, 4 skipped** in
 100.22 seconds, using:
@@ -284,3 +460,144 @@ libmpv, isolated settings, and temporary media/configuration.
 No application code was changed during the review. Existing documented
 native GPU crashes remain unverified; this report does not claim a cause or
 fix for them.
+
+## Windows/NVIDIA continuation — 2026-10-09
+
+Application baseline remains `ae8dec4`; this continuation started from report
+commit `3222b42` on the same audit branch. Only this document is changed.
+Reproduction scripts, generated media, logs, XML results, and binary-build
+evidence are retained locally under the ignored `build/audit-2026-10-09/`
+directory; they are not committed artifacts or portable links in this report.
+
+### Native Windows suite
+
+The source environment was Python **3.14.6**, PyAV **18.0.0**, NumPy **2.5.1**,
+PySide6 **6.11.1**, ONNX **1.22.0**, and ONNX Runtime GPU **1.28.0**, with the
+repository's Windows libmpv DLL present. The GPU was an **RTX 5090**, driver
+**616.56**, observed at 0–1% utilization before the bounded GPU checks.
+
+The complete suite finished with **438 passed, 6 failed, 2 skipped** in
+**200.18 seconds**, without overriding the default NVIDIA encoder profile:
+
+```powershell
+$env:QT_QPA_PLATFORM = 'offscreen'
+$env:PYTHONFAULTHANDLER = '1'
+.\.venv-cuda\Scripts\python.exe -u -m pytest tests -vv -ra `
+  -o faulthandler_timeout=60 `
+  --junitxml=build/audit-2026-10-09/windows-suite.xml
+```
+
+The successful completion required ordinary local networking outside the
+restricted tool sandbox. The initial sandboxed attempt stalled before its
+first result and was interrupted; it is not counted as application evidence.
+The completed run also reported a 60-second traceback during the tray theme
+test; that test subsequently passed. Caught LuaJIT SEH `0xe24c4a02` diagnostics
+appeared during native mpv tests and did not terminate the process.
+
+| Failure | Classification and evidence |
+| --- | --- |
+| Desktop parity, `default-uplink` and `lavf-uplink` | Application finding **12**. Both timed out at `tests/test_desktop_parity_playback.py:105` awaiting next-file autoplay. Resume, pause, restart, delay/track preservation, seek, and reopen assertions had already passed. Both server-file variants passed. |
+| Local proxy/navigation | Test portability: `tests/test_desktop_features_gui.py:328` compares Qt's forward-slash path with the equivalent native backslash path after successful parent navigation. Compare `Path` values. |
+| Desktop argument parsing | Test portability: `tests/test_desktop_options.py:23` compares native `\tmp\keys.conf` with `/tmp/keys.conf`. Argument parsing produced the correct `Path`. |
+| Two instance-lock PID assertions | Test portability: the virtualenv launcher PID differs from its Python child PID. The lock and CLI correctly name the child that owns the lock. Make the fixture publish its actual `os.getpid()` instead of asserting against `Popen.pid`. |
+
+A separate native Windows filesystem reproduction of finding 12 advanced
+`C:/.../01.mkv` to `C:\...\02.mkv`, then returned no next sibling. The lock
+reproduction observed launcher PID 63972 and direct child PID 61132; the lock
+recorded 61132, the CLI rejected a second instance with exit 1 and that same
+PID, and reacquisition succeeded after the holder shut down.
+
+The skips were the Linux D-Bus dependency and a symlink fixture requiring a
+Windows privilege unavailable to the process. Optional CPU ONNX tests and
+Windows registry/autostart tests executed here, closing those Linux coverage
+gaps. The full suite is **not green**; four failed assertions need portable
+test expectations, and the two autoplay failures require the application fix.
+
+### Actual NVIDIA execution and relay checks
+
+Isolated source-runtime probes successfully executed a tiny ONNX graph under
+each explicitly requested **CPU, CUDA, and TensorRT** provider, all exit 0.
+An initialized TensorRT worker with `tile_size=1024` also confirmed finding 4:
+a 3840×2160 input was rejected with
+`frame 3840x2160 exceeds worker input cap 2560x1440`. Working 4K **output**
+does not establish support for a 4K **source**.
+
+The real client core and server ran on a private loopback port pair, using
+passthrough first and then the installed
+`2x_AnimeJaNai_HD_V3Sharp1_Compact` model. Every collected epoch was demuxed
+and decoded, compared with source timestamps at the fixture's millisecond
+time base, and checked for exactly one initial discontinuity and terminal
+EOS. Every session returned the teardown acknowledgement, emptied the server
+session registry, and left no native teardown error.
+
+| Case | Verified result |
+| --- | --- |
+| 320×180/30 fps uplink → 640×360, passthrough, all eight public quality tiers | 120 frames per tier with exact source PTS and decoded frame counts. Seven HEVC choices used `hevc_nvenc`; FFV1 used `ffv1`. |
+| Same uplink, default lossless HEVC, post-EOS seeks to 2 s then 1 s | Complete new epochs of 60 and 90 frames, exact source PTS, fresh discontinuities and EOS. |
+| 1920×1080/24 fps server-file → 3840×2160, passthrough lossless HEVC | All 120 frames decoded with exact source PTS. |
+| Same server-file geometry, AnimeJaNai model and lossless HEVC | Confirmed `TensorrtExecutionProvider`, uint8-wrapped model, `hevc_nvenc`, and `nvenc-p4-low-delay`. Initial 120 frames and post-EOS seek epochs of 72 and 96 frames all decoded with exact source PTS. |
+
+The model session took 56.63 seconds including initialization, collection,
+three decoded epochs, and verification; its accumulated inference stage
+averaged 28.7 ms/frame. This is a functional check, not a sustained playback
+or throughput benchmark: the consumer drained as quickly as possible and
+reported zero buffered media. It does not validate Wi-Fi capacity, audible
+synchronization, visible OpenGL presentation, VFR timing (finding 3 remains
+open), or long-duration NVIDIA stability. These bounded runs did not reproduce
+the historically reported intermittent native GPU crash and establish no fix
+for it.
+
+The exact local commands for the additional hardware probes were:
+
+```powershell
+.\.venv-cuda\Scripts\python.exe -u build/audit-2026-10-09/gpu_acceptance.py
+.\.venv-cuda\Scripts\python.exe -u build/audit-2026-10-09/provider_checks.py
+```
+
+### Frozen Windows executable checks
+
+Both console and tray-GUI executables were freshly built from this checkout
+using the release workflow's PyInstaller options and an isolated lightweight
+environment. The build resolved Python **3.14.6**, PyInstaller **6.22.3**,
+PySide6 Essentials **6.12.0**, PyAV **19.0.1**, NumPy **2.5.3**, and ONNX
+**1.22.0**. It contained no ONNX Runtime or multi-GB NVIDIA extra.
+
+All **10 smoke checks passed**: console `--help`, GUI `--check`, and each
+executable's worker dispatch, packaged-ONNX import, installer-dispatch check,
+and real installation of the small `humanfriendly==10.0` smoke dependency
+into an isolated destination. These ran from a separate working directory.
+They validate frozen imports and pip dispatch; they do not establish a fresh
+managed NVIDIA installation or GPU playback inside a frozen executable.
+
+The first GUI bundle failed to import Qt with "The specified procedure could
+not be found." This was reproduced outside the sandbox and traced to build
+environment contamination: PyInstaller collected Codex's unrelated Poppler
+`icuuc.dll`, whose version-suffixed exports did not satisfy Qt's 20 unversioned
+ICU imports. Rebuilding with PATH limited to the audit virtualenv, Python,
+and Windows directories resolved the failure without changing source. The
+clean GUI `--check` then exited 0 in 1.56 seconds. This is an environment
+qualification, not an additional repository defect or an unverified pass.
+
+Build commands, dependency versions, executable SHA-256 values, and smoke
+outputs are retained in `frozen-build-provenance-clean.json`,
+`frozen-smoke-offline-clean.json`, and `frozen-smoke-network-clean.json` under
+the local audit directory. The clean bundles are in `frozen-dist-clean/`.
+An archive extraction/relocation round trip and visible tray interaction
+were not part of these checks.
+
+### Reproduction evidence for the new findings
+
+All five additions have focused reproductions beyond the existing suite.
+The generation races and provider-recovery failure use controlled scheduling
+or controlled child processes; the color, audio-tail, and tiling fixtures run
+real demux/encode or CPU ONNX paths. They do not depend on GPU contention.
+
+| Finding | Local reproduction under `build/audit-2026-10-09/` |
+| --- | --- |
+| 15, premature uplink EOS | `desktop/uplink_iterator_race.py` |
+| 16, color metadata/pixel change | `server/probe_color.py` |
+| 17, auxiliary tail buffering | `server/probe_aux_tail.py` |
+| 18, unwritten tiled output | `runtime/repro_tiling.py`, `runtime/repro_tiling.json` |
+| 19, recovered worker provider | `runtime/repro_restart_provider.py`, `runtime/repro_restart_provider.json` |
+
+No fixes are implemented by this continuation. Each new finding remains open.
