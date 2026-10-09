@@ -153,7 +153,7 @@ class FrameSink:
             converted.pts = frame.pts
             converted.time_base = frame.time_base
             frame = converted
-        if frame.time_base is None:
+        if not frame.time_base:  # None when unset; 0/1 for PyAV 19+ rationals
             frame.time_base = self._time_base
         if frame.pts is not None:
             self.pts_written.append(float(frame.pts * frame.time_base))

@@ -92,6 +92,12 @@ their volume, panscan, tracks and delays.
 - `frame.reformat()` / `to_ndarray()` rebuild a swscale context per call —
   ruinous at 4K (90 ms/frame). Use a cached `VideoReformatter`, one per thread.
 - Report bitstream codec names to peers ("hevc"), not encoder names ("hevc_nvenc").
+- Test time bases and rates for truthiness, not `is None`. From PyAV 19,
+  packet, stream and codec-context rationals are `av.AVRational` and never
+  `None`: unset reads as 0/1 (falsy), which an `is None` guard lets through
+  to a division or a 0 s timestamp. Frames still read `None` when unset.
+  `AVRational` does Fraction arithmetic but is not a `Fraction` and is not
+  JSON-serializable; send `[numerator, denominator]`.
 - For server-file muxed auxiliary tracks, seek the auxiliary container against
   the video stream's keyframe cues. Matroska audio streams are often not
   indexed; using audio as the seek anchor caused a measured 7-second scan.
