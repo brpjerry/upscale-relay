@@ -346,7 +346,7 @@ def test_local_proxy_directories_first_newest_and_index_navigation(window, tmp_p
         window.local_proxy.set_order("mtime")
         assert names() == ["folder", "z.mkv", "A.mkv", "b.mkv"]
         window.on_up_dir()
-        assert window.fs_model.filePath(window.local_proxy.mapToSource(window.tree.rootIndex())) == str(tmp_path.parent)
+        assert Path(window.fs_model.filePath(window.local_proxy.mapToSource(window.tree.rootIndex()))) == tmp_path.parent
     with playback_loop(QApplication.instance()) as loop:
         loop.run_until_complete(scenario())
 
