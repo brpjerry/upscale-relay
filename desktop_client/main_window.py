@@ -108,6 +108,13 @@ _SERVER_LOADED_ROLE = Qt.UserRole + 2
 _SERVER_CURSOR_ROLE = Qt.UserRole + 3
 _SERVER_PAGE_SIZE = 100
 _RECONNECT_DELAYS_S = (0.0, 2.0, 5.0)
+_RELEASE_WAIT_NOTE = "Waiting for the server to release the previous session…"
+# The reconnect after a teardown the server never acknowledged runs inside the
+# uninterruptible teardown: bound each attempt like one /status request.
+_UNCONFIRMED_RECONNECT_TIMEOUT_S = 10.0
+# How long a live session may outlast its control connection before it is
+# ended: long enough for the downlink to end by itself and say why.
+_CONTROL_LOSS_GRACE_S = 3.0
 _SIDEBAR_MIN_WIDTH = 220
 # Chrome slides for theme.SLOW ms; give the compositor's own fullscreen motion
 # and the last repaints a moment more before handing frame timing back to mpv.
@@ -307,6 +314,10 @@ class MainWindow(DesktopFeatures, QMainWindow):
         if hasattr(app.styleHints(), "colorSchemeChanged"):
             app.styleHints().colorSchemeChanged.connect(self._on_color_scheme_changed)
         self.client: RelayClient | None = None
+        # (session id, host, port) of a session whose teardown the server never
+        # acknowledged; no session opens until /status reports it released
+        # (_confirm_previous_release). In memory only, one at a time.
+        self._unreleased_session: tuple[str, str, int] | None = None
         self._server_caps: dict = {}
         self._init_feature_state()
 
@@ -2023,13 +2034,26 @@ class MainWindow(DesktopFeatures, QMainWindow):
         """The control connection ended on its own (server restart, suspend,
         network drop). With nothing playing, replace it quietly so the next
         play does not fail on a connection that only looked alive. A live
-        session is left to its own failure path: its downlink ends too."""
-        if lost is not self.client or self._closing or self._transitioning:
+        session normally fails by itself, because its downlink ends too."""
+        if lost is not self.client or self._closing:
             return
-        if self._session_source is not None:
+        if self._session_source not in (None, "local"):
+            # The server ends a session with its control connection. After a
+            # suspend or a silent network drop the media sockets can stay
+            # half-open instead, and playback would buffer forever.
+            asyncio.get_running_loop().call_later(
+                _CONTROL_LOSS_GRACE_S, self._fail_orphaned_session, lost)
+            return
+        if self._transitioning or self._session_source is not None:
             return
         self.client_log.record("control_lost", host=lost.host, port=lost.port)
         asyncio.ensure_future(self._run_transition(lambda: self._replace_lost_client(lost)))
+
+    def _fail_orphaned_session(self, lost) -> None:
+        if (lost is not self.client or self._closing
+                or self._session_source in (None, "local")):
+            return  # it failed or was stopped by itself meanwhile
+        self._on_player_failed("The connection to the server was lost")
 
     async def _replace_lost_client(self, lost) -> None:
         if lost is not self.client:
@@ -2149,6 +2173,85 @@ class MainWindow(DesktopFeatures, QMainWindow):
                     self.stop_btn.setEnabled(False)
         return await self.transitions.run(run)
 
+    def _remember_unreleased(self, err: TeardownNotConfirmedError, host: str, port: int) -> bool:
+        """Note the session an unacknowledged teardown named, if it named one."""
+        session_id = getattr(err, "session_id", None)
+        if session_id is None:
+            return False
+        self._unreleased_session = (session_id, host, port)
+        self.client_log.record("teardown_unconfirmed", session=session_id, host=host, port=port)
+        return True
+
+    def _stop_unconfirmed(self, reason: str) -> None:
+        """The hard stop: a replacement session could overlap a wedged NVENC owner."""
+        self.client = None
+        self._remove_server_tab()
+        self._show_connection("server teardown unconfirmed", connected=False, warn=True)
+        self._error("Server cleanup not confirmed", reason)
+
+    async def _confirm_previous_release(self) -> bool:
+        """The gate in front of every open_session: False if none may open.
+
+        A server that never acknowledged a teardown may still own that
+        session's encoder and inference natively, and a replacement session
+        could overlap it. Its /status lists the session until the native close
+        has returned, so the connection in hand asks until it is gone. The
+        answer clears the question only when it comes from the server that
+        held the session; another server is still asked (one machine can have
+        two names), and the question stays for the first.
+        """
+        pending, client = self._unreleased_session, self.client
+        if pending is None:
+            return True
+        session_id, host, port = pending
+        self.client_log.record("release_wait", session=session_id, host=client.host, port=client.port)
+        self.statusBar().showMessage(_RELEASE_WAIT_NOTE)
+        try:
+            await client.wait_session_released(session_id)
+        except TeardownNotConfirmedError as err:
+            # Still held, restart required, or /status cannot say. A manual
+            # Connect clears this stop, not the question: the next open asks again.
+            if self.client is client:
+                self._stop_unconfirmed(str(err))
+                self._update_idle_guidance()
+            await client.close()
+            return False
+        except asyncio.CancelledError:
+            # Unanswered, so still asked before the next open.
+            if self.statusBar().currentMessage() == _RELEASE_WAIT_NOTE:
+                self.statusBar().clearMessage()
+            raise
+        except Exception as err:
+            # The request failed, which is no verdict: an ordinary lost
+            # connection, and the next one asks again.
+            if self.client is client:
+                self.client = None
+                self._remove_server_tab()
+                self._show_connection("disconnected", connected=False)
+                self._update_idle_guidance()
+                self._error("Connection failed", f"Could not reach {client.host}:{client.port}\n{err}")
+            await client.close()
+            return False
+        if (client.host, client.port) == (host, port) and self._unreleased_session is pending:
+            self._unreleased_session = None
+        self.client_log.record("release_confirmed", session=session_id, host=client.host, port=client.port)
+        if self.statusBar().currentMessage() == _RELEASE_WAIT_NOTE:
+            self.statusBar().clearMessage()
+        return True
+
+    async def _stop_session(self) -> None:
+        """Tear the session down and leave a connection the next play can use."""
+        await self._teardown_session()
+        # Ask now rather than at the next open, so the connection shown is one
+        # that can be used. Only here: cleanup after a cancelled or failed
+        # transition, a disconnect and closing the window must not wait.
+        if self._unreleased_session is None or self.client is None or self._closing:
+            return
+        if await self._confirm_previous_release() and not getattr(self.client, "connected", True):
+            # A control connection lost during a transition is not replaced
+            # (_on_control_lost), and this one can last a minute.
+            await self._replace_lost_client(self.client)
+
     async def _start_session(self, path: str, source: str = "uplink",
                              resume_s: float | None = None, snapshot=None) -> None:
         self._restart_snapshot = snapshot
@@ -2168,6 +2271,16 @@ class MainWindow(DesktopFeatures, QMainWindow):
             resume_s = snapshot.position if snapshot else (entry.resume if entry else 0.0)
         self._paused = snapshot.paused if snapshot else False
         await self._teardown_session()
+        if self.client is not None and self._unreleased_session is not None:
+            # Before the liveness check: the wait can outlast the connection,
+            # and it asks over HTTP, which a dead control socket does not stop.
+            self._set_opening(True, _RELEASE_WAIT_NOTE)
+            try:
+                released = await self._confirm_previous_release()
+            finally:
+                self._set_opening(False)
+            if not released:
+                return
         if self.client is not None and not getattr(self.client, "connected", True):
             # Nothing was allocated on a dead idle connection; open on a fresh one.
             await self._replace_lost_client(self.client)
@@ -2492,7 +2605,7 @@ class MainWindow(DesktopFeatures, QMainWindow):
     @asyncSlot()
     async def on_stop(self) -> None:
         self._restart_snapshot = None
-        await self._run_transition(self._teardown_session)
+        await self._run_transition(self._stop_session)
 
     @asyncSlot()
     async def on_seek(self) -> None:
@@ -2557,7 +2670,12 @@ class MainWindow(DesktopFeatures, QMainWindow):
             except TeardownNotConfirmedError as err:
                 # Local playback allocates no replacement GPU session. It can
                 # proceed while the failed server cleanup remains visible.
-                self._error("Server cleanup not confirmed", str(err))
+                remembered = self._remember_unreleased(err, self.client.host, self.client.port)
+                self._error("Server cleanup not confirmed", (
+                    "The server did not confirm that it released the upscaling session. "
+                    "Playback continues locally; the next upscaled session waits until "
+                    "the server reports the old one released."
+                ) if remembered else str(err))
             self.client = None
             self._remove_server_tab()
             self._show_connection("disconnected", connected=False)
@@ -2726,7 +2844,7 @@ class MainWindow(DesktopFeatures, QMainWindow):
                     self.client_log.record("autoplay", path=next_path)
                     await self._open_session(next_path, snapshot.source)
                 else:
-                    await self._teardown_session()
+                    await self._stop_session()
                     self.statusBar().showMessage(reason, 5000)
             await self._run_transition(advance)
         asyncio.ensure_future(complete())
@@ -2785,28 +2903,49 @@ class MainWindow(DesktopFeatures, QMainWindow):
             # Close the whole client (server tears the session down with the
             # WS) and reconnect fresh: one session per connection in v1.
             host, port = self.client.host, self.client.port
+            unconfirmed = False
             try:
                 await self.client.teardown()
             except TeardownNotConfirmedError as err:
-                # The local sockets are already closed, but reconnecting could
-                # overlap a wedged NVENC owner. Make the risk visible and stop.
-                self.client = None
-                self._remove_server_tab()
-                self._show_connection("server teardown unconfirmed", connected=False, warn=True)
-                self._error("Server cleanup not confirmed", str(err))
-                return
+                # The local sockets are already closed, but a replacement
+                # session could overlap a wedged NVENC owner. Reconnect only
+                # where the server can be asked about that session, which
+                # _confirm_previous_release does before another one opens;
+                # otherwise make the risk visible and stop.
+                unconfirmed = not self._closing and self._remember_unreleased(err, host, port)
+                if not unconfirmed:
+                    self._stop_unconfirmed(str(err))
+                    return
             if self._closing:
                 self.client = None
                 return
-            client = RelayClient(host, port)
-            try:
-                caps = await client.connect()
-                await self._adopt_connected_client(client, caps)
-            except Exception:
-                await client.close()
-                self.client = None
-                self._remove_server_tab()
-                self._show_connection("disconnected", connected=False)
+            # Whatever killed the control connection may still be in the way
+            # (after a resume the network takes a moment to come back), and
+            # nothing can cancel this task: retry briefly, each attempt bounded.
+            for delay in _RECONNECT_DELAYS_S if unconfirmed else (0.0,):
+                if delay:
+                    await asyncio.sleep(delay)
+                    if self._closing:
+                        self.client = None
+                        return
+                client = RelayClient(host, port)
+                try:
+                    connecting = client.connect()
+                    if unconfirmed:
+                        connecting = asyncio.wait_for(connecting, _UNCONFIRMED_RECONNECT_TIMEOUT_S)
+                    caps = await connecting
+                    await self._adopt_connected_client(client, caps)
+                    return
+                except Exception:
+                    await client.close()
+            self.client = None
+            self._remove_server_tab()
+            self._show_connection("disconnected", connected=False)
+            if unconfirmed:
+                # The dead control connection was the network's doing.
+                self._update_idle_guidance()
+                self.statusBar().showMessage(
+                    "Lost the connection to the server. Connect again to continue.")
 
     def closeEvent(self, event) -> None:
         self._feature_timer.stop()

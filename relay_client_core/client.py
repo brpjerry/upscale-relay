@@ -108,6 +108,15 @@ _DOWNLINK_SOCKET_BUFFER = 4 * 1024 * 1024
 # without keepalives this degrades to the old fixed 240 s timeout.
 OPEN_SESSION_TIMEOUT_S = 240.0
 TEARDOWN_TIMEOUT_S = 30.0
+# After a teardown the server never acknowledged, its /status says when the
+# session is gone (RelayClient.wait_session_released). The server's slowest
+# allowed release is ~30 s to notice a dead control connection (20 s heartbeat
+# plus the pong timeout) and then a 15 s pipeline close, with the session
+# listed throughout: 45 s. The bound is that with a margin, so a client which
+# reconnects at once does not give up just as the release is being reported.
+SESSION_RELEASE_TIMEOUT_S = 60.0
+SESSION_RELEASE_POLL_S = 1.0
+STATUS_REQUEST_TIMEOUT_S = 10.0
 # Client-side ping on the control WebSocket. The server pings too, but a peer
 # that vanished without a FIN (laptop suspend, Wi-Fi drop) leaves this end
 # looking connected until the next request; with a heartbeat aiohttp closes
@@ -116,7 +125,27 @@ CONTROL_HEARTBEAT_S = 20.0
 
 
 class TeardownNotConfirmedError(RuntimeError):
-    """The client closed locally without the server's native-release barrier."""
+    """The client closed locally without the server's native-release barrier.
+
+    ``session_id`` names the server session whose release went unconfirmed,
+    when a later connection can still settle it through
+    ``RelayClient.wait_session_released``. It is None when nothing the server
+    lists can: the session id never arrived, the server said it needs a
+    restart, or a local owner failed to close.
+    """
+
+    def __init__(self, message: str, *, session_id: str | None = None):
+        super().__init__(message)
+        self.session_id = session_id
+
+
+def _unreadable_status(session_id: str, detail: str) -> TeardownNotConfirmedError:
+    return TeardownNotConfirmedError(
+        f"the server's /status could not say whether session {session_id} was "
+        f"released ({detail}); do not open a replacement session until the "
+        "server is checked",
+        session_id=session_id,
+    )
 
 
 def _take_downlink_batch(
@@ -909,6 +938,9 @@ class RelayClient:
         for task in (self._uplink_task, getattr(self, "_report_task", None)):
             if task is not None:
                 task.cancel()
+        # close() forgets the session; an unacknowledged teardown names it.
+        session = getattr(self, "session", None)
+        session_id = session.session_id if session is not None else None
         barrier_error: BaseException | None = None
         if self._has_server_session and self._ws is not None and not self._ws.closed:
             try:
@@ -928,14 +960,110 @@ class RelayClient:
             barrier_error = ConnectionError(
                 "control connection was already closed before teardown"
             )
+        local_close_failed = False
         try:
             await self.close()
+        except BaseException:
+            local_close_failed = True
+            raise
         finally:
             if barrier_error is not None:
+                # /status can report the server's session gone; it cannot
+                # clear a server that asked for a restart, nor vouch for a
+                # local owner that did not close.
+                restart_required = any(
+                    error.get("code") == "server_restart_required"
+                    for error in getattr(self, "errors", ())
+                )
                 raise TeardownNotConfirmedError(
                     "server did not confirm native session resource release; "
-                    "do not open a replacement session until the server is checked"
+                    "do not open a replacement session until the server is checked",
+                    session_id=(
+                        None if local_close_failed or restart_required else session_id
+                    ),
                 ) from barrier_error
+
+    async def wait_session_released(
+        self, session_id: str, *, timeout: float = SESSION_RELEASE_TIMEOUT_S,
+        interval: float = SESSION_RELEASE_POLL_S,
+        request_timeout: float = STATUS_REQUEST_TIMEOUT_S,
+    ) -> None:
+        """Return once the server's /status no longer lists ``session_id``.
+
+        For the connection that replaces one whose teardown went
+        unacknowledged (``TeardownNotConfirmedError.session_id``): nothing may
+        open a session on that server until this has returned. The server
+        lists a session until its native close has returned, and reports a
+        close that failed as ``restart_required``; an absent id with that flag
+        clear therefore means its encoder and inference owners are released.
+
+        The first poll is immediate, later ones ``interval`` apart. Raises
+        TeardownNotConfirmedError when the server says otherwise or cannot
+        say: ``restart_required`` is set (checked first, whichever session
+        failed), the session is still listed ``timeout`` seconds after the
+        first poll, or /status is not a readable answer. Raises
+        ConnectionError when the request itself failed (refused, reset, timed
+        out): that is no verdict, and the question stays open for the next
+        connection.
+        """
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        while True:
+            status = await self._read_status(session_id, request_timeout)
+            restart_required = status.get("restart_required", False)
+            if restart_required is True:
+                raise TeardownNotConfirmedError(
+                    "the server reports a native session teardown that did not "
+                    "complete; restart the relay server before opening another session",
+                    session_id=session_id,
+                )
+            if restart_required is not False:
+                raise _unreadable_status(session_id, "restart_required is not true or false")
+            sessions = status.get("sessions")
+            if not isinstance(sessions, list):
+                raise _unreadable_status(session_id, "it has no session list")
+            listed = False
+            for entry in sessions:
+                if not isinstance(entry, dict) or not isinstance(entry.get("id"), str):
+                    raise _unreadable_status(session_id, "it lists a session without an id")
+                listed = listed or entry["id"] == session_id
+            if not listed:
+                return
+            waited = loop.time() - started
+            if waited >= timeout:
+                raise TeardownNotConfirmedError(
+                    f"the server still lists session {session_id} {waited:.0f} s after its "
+                    "teardown went unacknowledged; do not open a replacement session "
+                    "until the server is checked",
+                    session_id=session_id,
+                )
+            await asyncio.sleep(interval)
+
+    async def _read_status(self, session_id: str, request_timeout: float) -> dict:
+        try:
+            async with self._http.get(
+                f"{self.base_url}/status", allow_redirects=False,
+                timeout=aiohttp.ClientTimeout(total=request_timeout),
+            ) as response:
+                http_status = response.status
+                body = await response.read()
+        except aiohttp.ClientResponseError as err:
+            # Something answered, and not with HTTP a relay server speaks.
+            raise _unreadable_status(session_id, f"malformed response: {err.message}") from err
+        except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as err:
+            raise ConnectionError(
+                f"could not ask the server whether session {session_id} was released: "
+                f"{str(err) or type(err).__name__}"
+            ) from err
+        if not 200 <= http_status < 300:
+            raise _unreadable_status(session_id, f"HTTP {http_status}")
+        try:
+            status = json.loads(body)
+        except ValueError as err:  # not JSON, or not text at all
+            raise _unreadable_status(session_id, "it is not JSON") from err
+        if not isinstance(status, dict):
+            raise _unreadable_status(session_id, "it is not a JSON object")
+        return status
 
     def _begin_close(self) -> asyncio.Task:
         self._closing = True
