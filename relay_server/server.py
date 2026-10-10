@@ -78,9 +78,9 @@ def discover_models(models_dir: str) -> dict[str, dict]:
 
 # Control WebSocket ping interval. aiohttp waits half of it for the pong, so a
 # dead control connection is noticed within 1.5x this. Clients size their
-# GET /status polling from it (docs/PROTOCOL.md 1.1: 45 s covers this plus
-# PIPELINE_CLOSE_TIMEOUT_S); tests/test_server_status_contract.py holds the
-# three numbers together.
+# GET /status polling from it (docs/PROTOCOL.md 1.1: this plus
+# PIPELINE_CLOSE_TIMEOUT_S is the documented 45 s worst case, and clients poll
+# for 60 s); tests/test_server_status_contract.py holds the numbers together.
 CONTROL_HEARTBEAT_S = 20.0
 
 

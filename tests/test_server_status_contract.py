@@ -164,17 +164,20 @@ def test_status_after_an_abrupt_control_drop(sample_file, monkeypatch, fails):
     asyncio.run(scenario())
 
 
-# docs/PROTOCOL.md 1.1: how long clients poll GET /status for a session they
-# could not get `closed` for, before giving up.
-CLIENT_POLL_BOUND_S = 45.0
+# docs/PROTOCOL.md 1.1: the server's documented worst case for releasing an
+# opened session after its control connection died, and how long clients poll
+# GET /status before giving up on a session they got no `closed` for.
+DOCUMENTED_WORST_CASE_S = 45.0
+CLIENT_POLL_BOUND_S = 60.0
 
 
-def test_client_poll_bound_covers_the_servers_timeouts():
+def test_documented_release_time_covers_the_servers_timeouts():
     # aiohttp pings every heartbeat and waits half of it for the pong; then the
     # pipeline close has its own deadline. Raising either past the documented
-    # bound would make healthy clients give up on a session that is closing.
+    # worst case would make healthy clients give up on a session that is closing.
     notice_dead_connection_s = CONTROL_HEARTBEAT_S * 1.5
-    assert notice_dead_connection_s + PIPELINE_CLOSE_TIMEOUT_S <= CLIENT_POLL_BOUND_S
+    assert notice_dead_connection_s + PIPELINE_CLOSE_TIMEOUT_S <= DOCUMENTED_WORST_CASE_S
+    assert DOCUMENTED_WORST_CASE_S < CLIENT_POLL_BOUND_S
 
 
 def test_restart_required_is_derived_from_the_recorded_teardown_error():

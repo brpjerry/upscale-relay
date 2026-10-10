@@ -23,8 +23,8 @@ session's native resources. It may poll `GET /status` instead.
 
 | Field | Meaning |
 |---|---|
-| `sessions[].id` | one entry per session the server still holds; equals `session_opened.session_id` |
-| `restart_required` | `true` once a native session close has failed. The server then answers every `open_session` with the fatal error `server_restart_required` until it is restarted |
+| `sessions[].id` | one entry per session the server still holds; equals `session_opened.session_id`. `sessions` is always present (empty when there are none) and every entry has an `id` |
+| `restart_required` | always present; `true` once a native session close has failed. The server then answers every `open_session` with the fatal error `server_restart_required` until it is restarted |
 | `native_teardown_error` | `null`, or `{session_id, error, restart_required: true}` describing the most recent failed close. Informational: `restart_required` is `true` in every response where this is non-null (it is derived from it), and it is the flag to act on, since the named session is not necessarily the poller's |
 
 Ordering guarantee: a session leaves `sessions` only after its native close
@@ -49,18 +49,19 @@ build) is closed only after that build returns, which can take minutes.
 Recovery procedure both clients implement: a client that did not receive
 `closed` remembers the session id with the server's host and port. On its next
 control connection to that server, before any `open_session`, it polls
-`GET /status` at once and then every second, for at most 45 s:
+`GET /status` at once and then every second, for 60 s:
 
 1. `restart_required: true`: stop; the server must be restarted (checked first).
 2. Its session id absent from `sessions[].id`: released; proceed.
-3. Still listed after 45 s: stop.
+3. Still listed after 60 s: stop.
 4. A non-2xx or malformed answer (no `sessions` array, an entry without `id`):
    stop. A transport failure is not a verdict; keep polling within the bound.
 
-The 45 s bound is the sum of the two server timeouts above
-(`CONTROL_HEARTBEAT_S` x 1.5 and `PIPELINE_CLOSE_TIMEOUT_S`); a server change
-to either must keep it covered, which `tests/test_server_status_contract.py`
-checks.
+The server's worst case for an opened session is 45 s, the sum of the two
+timeouts above (`CONTROL_HEARTBEAT_S` x 1.5 and `PIPELINE_CLOSE_TIMEOUT_S`).
+Clients poll for 60 s so that one which reconnects the moment its connection
+died still sees the release. A server change to either timeout must stay
+within 45 s, which `tests/test_server_status_contract.py` checks.
 
 Design invariants:
 - **Video PTS is never rewritten.** Outer packet timestamps and pipeline video
