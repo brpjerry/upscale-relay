@@ -9,12 +9,58 @@ channels per session:
 | uplink   | TCP, framed packets (§3)   | source video elementary stream, client→server |
 | downlink | TCP, framed packets (§3)   | chunks of an epoch Matroska stream, server→client |
 
-Status/metrics: `GET /status` on the control port returns JSON (not part of
-the session protocol; consumed by GUIs and tests). The server-library HTTP
-surface is documented in [SERVER_LIBRARY.md](SERVER_LIBRARY.md). If a bounded
-native session close fails, `restart_required` is true and
-`native_teardown_error` identifies the failed session; the server rejects new
-sessions until it is restarted.
+Status/metrics: `GET /status` on the control port returns JSON. Most of it is
+diagnostic (pipeline rates, stage times, queue depths; consumed by GUIs and
+tests) and may change without notice. The fields in §1.1 are a stable contract.
+The server-library HTTP surface is documented in
+[SERVER_LIBRARY.md](SERVER_LIBRARY.md).
+
+### 1.1 `GET /status` fields clients may rely on
+
+A client that loses its control connection never receives `closed`, so it
+cannot tell from the session protocol whether the server released its
+session's native resources. It may poll `GET /status` instead.
+
+| Field | Meaning |
+|---|---|
+| `sessions[].id` | one entry per session the server still holds; equals `session_opened.session_id` |
+| `restart_required` | `true` once a native session close has failed. The server then answers every `open_session` with the fatal error `server_restart_required` until it is restarted |
+| `native_teardown_error` | `null`, or `{session_id, error, restart_required: true}` describing the most recent failed close. Informational: `restart_required` is `true` in every response where this is non-null (it is derived from it), and it is the flag to act on, since the named session is not necessarily the poller's |
+
+Ordering guarantee: a session leaves `sessions` only after its native close
+(pipeline workers, encoder/mux and inference owners) has returned, whatever
+ended the session: `teardown`, a dropped control connection, a failed open or
+server shutdown. When that close failed, `restart_required` and
+`native_teardown_error` are set no later than the removal, so no response shows
+the session gone with its failure still unrecorded. A client that polls until
+its session id is absent therefore reads the outcome from that same response:
+`restart_required: false` is equivalent to having received `closed`; `true`
+means it must not open a replacement session until the server is restarted.
+
+Timing: the server notices a dead control connection through its WebSocket
+heartbeat (a ping every 20 s and 10 s for the pong, so within 30 s), and the
+pipeline close that follows is bounded at 15 s, after which it counts as
+failed. A session that had finished opening is therefore gone, or
+`restart_required` is set, within 45 s; it stays listed until then, so a
+listed session means "keep polling", not "stuck". One case takes longer: a
+session whose `open_session` was still running (a first-use TensorRT engine
+build) is closed only after that build returns, which can take minutes.
+
+Recovery procedure both clients implement: a client that did not receive
+`closed` remembers the session id with the server's host and port. On its next
+control connection to that server, before any `open_session`, it polls
+`GET /status` at once and then every second, for at most 45 s:
+
+1. `restart_required: true`: stop; the server must be restarted (checked first).
+2. Its session id absent from `sessions[].id`: released; proceed.
+3. Still listed after 45 s: stop.
+4. A non-2xx or malformed answer (no `sessions` array, an entry without `id`):
+   stop. A transport failure is not a verdict; keep polling within the bound.
+
+The 45 s bound is the sum of the two server timeouts above
+(`CONTROL_HEARTBEAT_S` x 1.5 and `PIPELINE_CLOSE_TIMEOUT_S`); a server change
+to either must keep it covered, which `tests/test_server_status_contract.py`
+checks.
 
 Design invariants:
 - **Video PTS is never rewritten.** Outer packet timestamps and pipeline video

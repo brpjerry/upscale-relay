@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import functools
 import json
 import logging
 import re
@@ -73,6 +74,14 @@ def discover_models(models_dir: str) -> dict[str, dict]:
             continue
         out[path.stem] = {"path": str(path), "scale_factor": manifest.scale_factor}
     return out
+
+
+# Control WebSocket ping interval. aiohttp waits half of it for the pong, so a
+# dead control connection is noticed within 1.5x this. Clients size their
+# GET /status polling from it (docs/PROTOCOL.md 1.1: 45 s covers this plus
+# PIPELINE_CLOSE_TIMEOUT_S); tests/test_server_status_contract.py holds the
+# three numbers together.
+CONTROL_HEARTBEAT_S = 20.0
 
 
 class RelayServer:
@@ -185,29 +194,53 @@ class RelayServer:
             except Exception:
                 log.exception("event callback failed")
 
+    def _retire_session(self, session: Session, closing: asyncio.Future) -> bool:
+        """Take a session out of /status now that its native close has returned.
+
+        GET /status is a client contract (docs/PROTOCOL.md): a failed close is
+        recorded before the session disappears, both in this one synchronous
+        step, so a poller never sees the session gone without
+        ``restart_required`` set. Returns whether the close succeeded.
+        """
+        error = (
+            asyncio.CancelledError("session close was cancelled")
+            if closing.cancelled() else closing.exception()
+        )
+        if error is not None:
+            self.native_teardown_error = {
+                "session_id": session.id,
+                "error": repr(error),
+                "restart_required": True,
+            }
+            log.error(
+                "session %s native teardown did not complete; server restart required",
+                session.id, exc_info=error,
+            )
+        for key in (session.uplink_token, session.downlink_token, session.id):
+            self.sessions.pop(key, None)
+        return error is None
+
     async def _close_control_session(
         self, session: Session, ws: web.WebSocketResponse,
         acknowledge: bool,
     ) -> bool:
         """Release a session and optionally publish the teardown barrier."""
         self._log_session_stats(session, final=True)
-        cleanup_ok = False
+        closing = asyncio.ensure_future(session.close())
         try:
-            await session.close()
-            cleanup_ok = True
-        except Exception as err:
-            self.native_teardown_error = {
-                "session_id": session.id,
-                "error": repr(err),
-                "restart_required": True,
-            }
-            log.exception(
-                "session %s native teardown did not complete; server restart required",
-                session.id,
-            )
-        finally:
-            for key in (session.uplink_token, session.downlink_token, session.id):
-                self.sessions.pop(key, None)
+            await asyncio.shield(closing)
+        except asyncio.CancelledError:
+            # This handler is being cancelled (server shutdown), but the native
+            # close is shielded and may still be running. The session leaves
+            # /status when that close returns, not now.
+            if closing.done():
+                self._retire_session(session, closing)
+            else:
+                closing.add_done_callback(functools.partial(self._retire_session, session))
+            raise
+        except Exception:
+            pass  # read back from the finished close below
+        cleanup_ok = self._retire_session(session, closing)
         if acknowledge and cleanup_ok and not ws.closed:
             try:
                 await ws.send_str(json.dumps({"type": "closed"}))
@@ -223,7 +256,7 @@ class RelayServer:
     # -- control channel -------------------------------------------------------
 
     async def handle_control(self, request: web.Request) -> web.WebSocketResponse:
-        ws = web.WebSocketResponse(heartbeat=20)
+        ws = web.WebSocketResponse(heartbeat=CONTROL_HEARTBEAT_S)
         await ws.prepare(request)
         self._control_sockets.add(ws)
         peer_ip = request.remote or "unknown"

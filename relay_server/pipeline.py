@@ -64,6 +64,7 @@ _QUEUE_DEPTH = 4  # frames buffered between stages
 # session while decoding was paused or behind. Mirrors the downlink budget.
 _INPUT_QUEUE_PACKETS = 256
 _INPUT_QUEUE_MAX_BYTES = 128 * 1024 * 1024
+# Part of the client-visible GET /status timing (docs/PROTOCOL.md 1.1).
 PIPELINE_CLOSE_TIMEOUT_S = 15.0
 MUX_MAX_INTERLEAVE_DELTA_US = 100_000
 
