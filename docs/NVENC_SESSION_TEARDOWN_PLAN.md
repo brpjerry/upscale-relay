@@ -165,6 +165,12 @@ warning that the server did not confirm resource release. The desktop client
 must not automatically reconnect and open a replacement session after such a
 timeout without making the risk visible.
 
+Since v0.24.0 the clients resolve that case themselves where the server can
+be asked: they remember the unacknowledged session and poll `GET /status`
+before the next `open_session` (docs/PROTOCOL.md §1.1). The stop described
+here remains for a session the server still lists at the bound, a server that
+reports `restart_required`, and a teardown that named no session.
+
 The settings-change path in `desktop_client/main_window.py` already calls
 `_teardown_session()` before reopening. Once `RelayClient.teardown()` waits for
 the barrier, model/tier/fit/resize changes inherit the correct ordering without

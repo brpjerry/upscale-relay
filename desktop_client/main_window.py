@@ -110,8 +110,11 @@ _SERVER_PAGE_SIZE = 100
 _RECONNECT_DELAYS_S = (0.0, 2.0, 5.0)
 _RELEASE_WAIT_NOTE = "Waiting for the server to release the previous session…"
 # The reconnect after a teardown the server never acknowledged runs inside the
-# uninterruptible teardown: bound it like one /status request.
+# uninterruptible teardown: bound each attempt like one /status request.
 _UNCONFIRMED_RECONNECT_TIMEOUT_S = 10.0
+# How long a live session may outlast its control connection before it is
+# ended: long enough for the downlink to end by itself and say why.
+_CONTROL_LOSS_GRACE_S = 3.0
 _SIDEBAR_MIN_WIDTH = 220
 # Chrome slides for theme.SLOW ms; give the compositor's own fullscreen motion
 # and the last repaints a moment more before handing frame timing back to mpv.
@@ -2031,13 +2034,26 @@ class MainWindow(DesktopFeatures, QMainWindow):
         """The control connection ended on its own (server restart, suspend,
         network drop). With nothing playing, replace it quietly so the next
         play does not fail on a connection that only looked alive. A live
-        session is left to its own failure path: its downlink ends too."""
-        if lost is not self.client or self._closing or self._transitioning:
+        session normally fails by itself, because its downlink ends too."""
+        if lost is not self.client or self._closing:
             return
-        if self._session_source is not None:
+        if self._session_source not in (None, "local"):
+            # The server ends a session with its control connection. After a
+            # suspend or a silent network drop the media sockets can stay
+            # half-open instead, and playback would buffer forever.
+            asyncio.get_running_loop().call_later(
+                _CONTROL_LOSS_GRACE_S, self._fail_orphaned_session, lost)
+            return
+        if self._transitioning or self._session_source is not None:
             return
         self.client_log.record("control_lost", host=lost.host, port=lost.port)
         asyncio.ensure_future(self._run_transition(lambda: self._replace_lost_client(lost)))
+
+    def _fail_orphaned_session(self, lost) -> None:
+        if (lost is not self.client or self._closing
+                or self._session_source in (None, "local")):
+            return  # it failed or was stopped by itself meanwhile
+        self._on_player_failed("The connection to the server was lost")
 
     async def _replace_lost_client(self, lost) -> None:
         if lost is not self.client:
@@ -2903,25 +2919,33 @@ class MainWindow(DesktopFeatures, QMainWindow):
             if self._closing:
                 self.client = None
                 return
-            client = RelayClient(host, port)
-            try:
-                connecting = client.connect()
-                if unconfirmed:
-                    # Whatever killed the control connection may still be in
-                    # the way, and nothing can cancel this task.
-                    connecting = asyncio.wait_for(connecting, _UNCONFIRMED_RECONNECT_TIMEOUT_S)
-                caps = await connecting
-                await self._adopt_connected_client(client, caps)
-            except Exception:
-                await client.close()
-                self.client = None
-                self._remove_server_tab()
-                self._show_connection("disconnected", connected=False)
-                if unconfirmed:
-                    # The dead control connection was the network's doing.
-                    self._update_idle_guidance()
-                    self.statusBar().showMessage(
-                        "Lost the connection to the server. Connect again to continue.")
+            # Whatever killed the control connection may still be in the way
+            # (after a resume the network takes a moment to come back), and
+            # nothing can cancel this task: retry briefly, each attempt bounded.
+            for delay in _RECONNECT_DELAYS_S if unconfirmed else (0.0,):
+                if delay:
+                    await asyncio.sleep(delay)
+                    if self._closing:
+                        self.client = None
+                        return
+                client = RelayClient(host, port)
+                try:
+                    connecting = client.connect()
+                    if unconfirmed:
+                        connecting = asyncio.wait_for(connecting, _UNCONFIRMED_RECONNECT_TIMEOUT_S)
+                    caps = await connecting
+                    await self._adopt_connected_client(client, caps)
+                    return
+                except Exception:
+                    await client.close()
+            self.client = None
+            self._remove_server_tab()
+            self._show_connection("disconnected", connected=False)
+            if unconfirmed:
+                # The dead control connection was the network's doing.
+                self._update_idle_guidance()
+                self.statusBar().showMessage(
+                    "Lost the connection to the server. Connect again to continue.")
 
     def closeEvent(self, event) -> None:
         self._feature_timer.stop()

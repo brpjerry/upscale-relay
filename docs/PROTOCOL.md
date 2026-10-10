@@ -55,7 +55,8 @@ control connection to that server, before any `open_session`, it polls
 2. Its session id absent from `sessions[].id`: released; proceed.
 3. Still listed after 60 s: stop.
 4. A non-2xx or malformed answer (no `sessions` array, an entry without `id`):
-   stop. A transport failure is not a verdict; keep polling within the bound.
+   stop. A request that fails in transport is not an answer: the question
+   stays open and is asked again on the next connection.
 
 The server's worst case for an opened session is 45 s, the sum of the two
 timeouts above (`CONTROL_HEARTBEAT_S` x 1.5 and `PIPELINE_CLOSE_TIMEOUT_S`).

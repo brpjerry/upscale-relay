@@ -289,6 +289,13 @@ their volume, panscan, tracks and delays.
   wrapper's tail must stay `Transpose(float) → Cast(uint8)` (3-5x faster TRT
   engines than NCHW-uint8 output; uint8 only legal at network boundaries).
 - NVDEC decode + NVENC encode concurrently in one process → native AV.
+- Never open a session while an earlier one may still hold its native
+  owners. A teardown the server did not acknowledge (control connection
+  already dead: suspend, network drop) leaves that unknown, so clients
+  remember the session and poll `GET /status` before the next
+  `open_session` (`docs/PROTOCOL.md` §1.1; 60 s against the server's 45 s
+  worst case). On the desktop `_confirm_previous_release` is the one gate,
+  in `_open_session`; do not add an open path around it.
 - TRT builds engines from *live timing measurements*: engines built while the
   GPU is busy (user games on this box) are permanently slow — delete
   `models/.trt_cache` and rebuild with an idle GPU.

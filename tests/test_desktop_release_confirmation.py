@@ -36,6 +36,7 @@ class World:
         self.control_dead = False  # teardown gets no acknowledgement
         self.names_session = True
         self.unreachable = False  # connect() fails
+        self.failing_connects = 0  # connect() fails this many more times
         self.silent = False  # connect() never answers
         self.status_error = None  # what asking /status raises
         self.opened = 0
@@ -61,6 +62,10 @@ class WorldClient(FakeSessionClient):
     async def connect(self):
         if self.world.unreachable:
             raise ConnectionError("unreachable")
+        if self.world.failing_connects:
+            self.world.failing_connects -= 1
+            self.world.events.append(("connect failed",))
+            raise OSError(101, "Network is unreachable")
         if self.world.silent:
             await asyncio.Event().wait()
         self.world.events.append(("connect", self.host, self.port))
@@ -116,6 +121,7 @@ def world(window, monkeypatch):
     monkeypatch.setattr(window, "_error", lambda *args: world.errors.append(args))
     monkeypatch.setattr(main_window, "RelayClient",
                         lambda host, port: WorldClient(world, host, port))
+    monkeypatch.setattr(main_window, "_RECONNECT_DELAYS_S", (0.0, 0.01, 0.01))
     window.client = WorldClient(world)
     return world
 
@@ -325,6 +331,63 @@ def test_failed_reconnect_after_an_unconfirmed_teardown_keeps_the_question(windo
         assert not world.errors and not world.count("wait")
         assert "Lost the connection" in window.statusBar().currentMessage()
         assert window._unreleased_session == ("session-1", *HOME)
+
+    run(scenario)
+
+
+def test_reconnect_is_retried_while_the_network_comes_back(window, world):
+    async def scenario():
+        await window._start_session("show.mkv", "server_file")
+        world.control_dead = True
+        world.failing_connects = 2  # just resumed: the network is not up yet
+        asyncio.get_running_loop().call_later(0.1, world.release)
+        await window.on_stop()
+        assert world.count("connect failed") == 2 and world.count("wait") == 1
+        assert window.client is world.clients[-1] and window.client.connected
+        assert window.conn_label.text() == "connected: test"
+        assert not world.errors and window._unreleased_session is None
+
+    run(scenario)
+
+
+def test_live_session_whose_control_connection_died_is_ended_and_recovers(window, world, monkeypatch):
+    # After a suspend or a silent drop the media sockets can stay half-open:
+    # nothing fails by itself and playback would sit buffering.
+    monkeypatch.setattr(main_window, "_CONTROL_LOSS_GRACE_S", 0.02)
+
+    async def scenario():
+        await window._start_session("show.mkv", "server_file")
+        lost = window.client
+        world.control_dead = True
+        lost.connected = False
+        window._on_control_lost(lost)
+        assert window._session_path == "show.mkv"  # the downlink gets its chance first
+        await until(lambda: world.count("wait") == 1)
+        world.release()
+        await settled(window)
+        assert world.errors == [("Playback failed", "The connection to the server was lost")]
+        assert window._session_path is None and world.count("wait") == 1
+        assert window.client.connected and window._unreleased_session is None
+        assert not world.violations
+
+    run(scenario)
+
+
+def test_session_that_failed_by_itself_is_not_ended_twice(window, world, monkeypatch):
+    monkeypatch.setattr(main_window, "_CONTROL_LOSS_GRACE_S", 0.02)
+
+    async def scenario():
+        await window._start_session("show.mkv", "server_file")
+        lost = window.client
+        world.control_dead = True
+        lost.connected = False
+        window._on_control_lost(lost)
+        window._on_player_failed("downlink closed")  # the usual path wins the race
+        await until(lambda: world.count("wait") == 1)
+        world.release()
+        await settled(window)
+        await asyncio.sleep(0.05)
+        assert world.errors == [("Playback failed", "downlink closed")]
 
     run(scenario)
 
