@@ -127,6 +127,18 @@ their volume, panscan, tracks and delays.
 - For server-file muxed auxiliary tracks, seek the auxiliary container against
   the video stream's keyframe cues. Matroska audio streams are often not
   indexed; using audio as the seek anchor caused a measured 7-second scan.
+- Set the encoder's time base: `stream.codec_context.time_base = <source
+  time base>` (`upscale_cli.encode.add_video_encoder_stream` does it). PyAV
+  opens an encoder that has no `codec_context.time_base` with 1/rate, and
+  every timestamp is rounded onto that grid: VFR sources were retimed
+  (audit #3). This is the codec context, not the output stream; the
+  stream's time base stays the muxer's (see above).
+- `VideoReformatter.reformat` defaults `src_color_range` to UNSPECIFIED, not
+  the frame's own range (`src_colorspace` does default to the frame's).
+  Pass both ranges explicitly (`upscale_cli.color.VideoColor.to_rgb` /
+  `to_output`), and tag the encoder before its first encode or mux: a muxed
+  audio packet can open the encoder and write the container header before
+  any video frame (audit #16).
 
 **asyncio / Qt (qasync)**
 - **No modal dialogs / exec() / processEvents from coroutine context** — the
@@ -235,7 +247,13 @@ their volume, panscan, tracks and delays.
   `loadfile` — no synchronous mpv property reads during teardown.
 - mpv OSC (LuaJIT) intermittently crashes mpv's event thread on stream
   reloads → OSC off by default. LuaJIT's caught SEH exception `0xe24c4a02`
-  in faulthandler output is *benign noise*, not a crash.
+  in faulthandler output is *benign noise*, not a crash. mpv's built-in
+  scripts (stats, console, select…) still run on LuaJIT with
+  `load_scripts=no`. But on Windows each such exception makes faulthandler
+  dump every thread while they run, and that dump itself crashed 2 of 8
+  desktop test runs (access violation; 0 of 16 with faulthandler off).
+  `tests/conftest.py` and `relay-desktop --debug` limit Windows dumps to
+  the faulting thread.
 - On Linux's embedded Qt/OpenGL render path, keep `hwdec=auto-copy-safe`.
   A real core landed in
   `paintGL → mpv_render_context_render → vaSyncSurface → iHD` when the user's
@@ -294,6 +312,13 @@ their volume, panscan, tracks and delays.
   wrapper's tail must stay `Transpose(float) → Cast(uint8)` (3-5x faster TRT
   engines than NCHW-uint8 output; uint8 only legal at network boundaries).
 - NVDEC decode + NVENC encode concurrently in one process → native AV.
+- Never open a session while an earlier one may still hold its native
+  owners. A teardown the server did not acknowledge (control connection
+  already dead: suspend, network drop) leaves that unknown, so clients
+  remember the session and poll `GET /status` before the next
+  `open_session` (`docs/PROTOCOL.md` §1.1; 60 s against the server's 45 s
+  worst case). On the desktop `_confirm_previous_release` is the one gate,
+  in `_open_session`; do not add an open path around it.
 - TRT builds engines from *live timing measurements*: engines built while the
   GPU is busy (user games on this box) are permanently slow — delete
   `models/.trt_cache` and rebuild with an idle GPU.
@@ -322,6 +347,11 @@ their volume, panscan, tracks and delays.
   laptop client is the intended topology.
 - FFV1 has no hardware decoder anywhere (codec-inherent); lossless-hevc is
   the recommended lossless tier for live playback.
+- Anamorphic uplinks: when a client sends no
+  `open_session.video.sample_aspect_ratio`, the server reads it from the
+  H.264 SPS / HEVC parameter sets in `extradata_b64`
+  (`relay_server/source_aspect.py`); Android sends only what the container
+  declares.
 - `gitignore`d and machine-local: `models/` (onnx + trt cache), `mpv-dev/`
   (Windows libmpv DLL), venvs, `*.mkv` test media. The laptop needs none of
   them (distro libmpv + no models client-side).
