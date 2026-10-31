@@ -128,11 +128,16 @@ relay-desktop
   shows the actual path. See [desktop preferences](DESKTOP_FEATURES.md) for
   resume thresholds, endpoint identities, restoration, and log bounds.
 
-During playback, the client asks the desktop's `org.freedesktop.ScreenSaver`
-service (including Hypridle) to keep the screen awake. Pausing, reaching the end,
-stopping, or closing playback releases the request. This works in windowed and
-fullscreen mode and respects mpv key-binding pauses. The Linux GUI dependencies
-include `dbus-next`; headless tests do not inhibit the desktop.
+During playback, the client keeps the screen awake with two inhibitors, because
+idle handlers each honour their own: the desktop's `org.freedesktop.ScreenSaver`
+service (Hypridle, KDE) and a logind idle block lock (`systemd-inhibit --list`
+shows it as `upscale-relay-client`). Hypridle honours both; handlers that see
+only logind's state, such as a shell's own dimmer, need the second. The video
+widget cannot take a Wayland idle inhibitor: Qt and PySide6 do not expose the
+window's surface. Pausing, reaching the end, stopping, or closing playback
+releases both. This works in windowed and fullscreen mode and respects mpv
+key-binding pauses. The Linux GUI dependencies include `dbus-next`; headless
+tests do not inhibit the desktop.
 
 When a capable server-library session confirms muxed auxiliary tracks, the
 desktop client gets audio and subtitles from the relay Matroska stream and does
