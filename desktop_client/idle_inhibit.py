@@ -40,8 +40,10 @@ class IdleInhibitor:
         self._active = active
         if active:
             self._tasks = [
-                asyncio.create_task(self._hold_screensaver()),
-                asyncio.create_task(self._take_logind_lock()),
+                asyncio.create_task(self._run(
+                    self._hold_screensaver, "org.freedesktop.ScreenSaver")),
+                asyncio.create_task(self._run(
+                    self._take_logind_lock, "org.freedesktop.login1")),
             ]
             return
         # Both services drop a caller's inhibitor when it goes away: the
@@ -59,21 +61,37 @@ class IdleInhibitor:
             task.cancel()
         self._tasks.clear()
 
+    async def _run(self, inhibit, service: str) -> None:
+        try:
+            await inhibit()
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            # An unavailable desktop service must not interrupt playback.
+            log.warning("Idle inhibition through %s failed: %s", service, error)
+        finally:
+            task = asyncio.current_task()
+            if task in self._tasks:
+                self._tasks.remove(task)
+
     async def _hold_screensaver(self) -> None:
         from dbus_next import Message
         from dbus_next.aio import MessageBus
 
+        # The constructor already connects: a missing bus raises here.
         bus = MessageBus()
         try:
-            if await self._request(bus, Message(
+            await self._request(bus, Message(
                 destination="org.freedesktop.ScreenSaver",
                 path="/org/freedesktop/ScreenSaver",
                 interface="org.freedesktop.ScreenSaver",
                 member="Inhibit",
                 signature="ss",
                 body=[_WHO, _WHY],
-            )):
-                await bus.wait_for_disconnect()
+            ))
+            # Raises if the bus drops the connection; returns after our own
+            # disconnect.
+            await bus.wait_for_disconnect()
         finally:
             self._drop(bus)
 
@@ -110,29 +128,17 @@ class IdleInhibitor:
             # The descriptor alone holds the lock.
             self._drop(bus)
 
-    async def _request(self, bus, message) -> bool:
+    async def _request(self, bus, message) -> None:
         from dbus_next import MessageType
 
         self._buses.append(bus)
-        try:
-            async with asyncio.timeout(5):
-                await bus.connect()
-                reply = await bus.call(message)
-            if reply.message_type == MessageType.ERROR:
-                raise RuntimeError(f"{reply.error_name}: {reply.body}")
-            return True
-        except asyncio.CancelledError:
-            raise
-        except Exception as error:
-            # An unavailable desktop service must not interrupt playback.
-            log.warning("Could not inhibit screen idle through %s: %s",
-                        message.destination, error)
-            return False
+        async with asyncio.timeout(5):
+            await bus.connect()
+            reply = await bus.call(message)
+        if reply.message_type == MessageType.ERROR:
+            raise RuntimeError(f"{reply.error_name}: {reply.body}")
 
     def _drop(self, bus) -> None:
         bus.disconnect()
         if bus in self._buses:
             self._buses.remove(bus)
-        task = asyncio.current_task()
-        if task in self._tasks:
-            self._tasks.remove(task)

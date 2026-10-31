@@ -25,6 +25,7 @@ class FakeBus:
         self.handlers = []
         self.disconnected = False
         self.closed = asyncio.Event()
+        self.lost = None
         self.pending = None
 
     def add_message_handler(self, handler):
@@ -59,12 +60,25 @@ class FakeBus:
         if self.pending is not None and not self.pending.done():
             self.pending.set_exception(EOFError("connection closed"))
 
+    def lose(self, error):
+        """The bus daemon drops the connection."""
+        self.lost = error
+        self.closed.set()
+
     async def wait_for_disconnect(self):
         await self.closed.wait()
+        if self.lost is not None:
+            raise self.lost
 
 
 class Buses(list):
-    error = False  # every bus created from now on answers with an error
+    """Buses created so far. Kinds ("session", "system") in `missing` cannot
+    open their socket; those in `failing` answer every call with an error."""
+
+    def __init__(self):
+        super().__init__()
+        self.missing = set()
+        self.failing = set()
 
 
 @pytest.fixture
@@ -72,7 +86,11 @@ def buses(monkeypatch):
     created = Buses()
 
     def new_bus(bus_type=BusType.SESSION, negotiate_unix_fd=False):
-        bus = FakeBus(bus_type, negotiate_unix_fd, error=created.error)
+        kind = "system" if bus_type == BusType.SYSTEM else "session"
+        if kind in created.missing:
+            # dbus_next's constructor connects the socket.
+            raise FileNotFoundError(f"no {kind} bus socket")
+        bus = FakeBus(bus_type, negotiate_unix_fd, error=kind in created.failing)
         created.append(bus)
         return bus
 
@@ -86,6 +104,10 @@ def lock_pipe():
     read_end, write_end = os.pipe()
     os.set_blocking(read_end, False)
     yield read_end, write_end
+    # Until the read end sees end-of-file the write end is still open, so its
+    # number cannot have been reused yet.
+    if not lock_released(read_end):
+        os.close(write_end)
     os.close(read_end)
 
 
@@ -200,7 +222,7 @@ def test_release_between_reply_and_resume_still_drops_the_lock(buses, lock_pipe)
 
 
 def test_missing_services_are_nonfatal_and_close_connections(buses, caplog):
-    buses.error = True
+    buses.failing = {"session", "system"}
 
     async def scenario():
         inhibitor = enabled_inhibitor()
@@ -212,6 +234,79 @@ def test_missing_services_are_nonfatal_and_close_connections(buses, caplog):
         assert "through org.freedesktop.ScreenSaver" in caplog.text
         assert "through org.freedesktop.login1" in caplog.text
         inhibitor.set_active(False)
+
+    asyncio.run(scenario())
+
+
+def test_missing_bus_leaves_the_other_inhibitor_working(buses, lock_pipe, caplog):
+    read_end, write_end = lock_pipe
+    buses.missing = {"session"}
+
+    async def scenario():
+        inhibitor = enabled_inhibitor()
+        inhibitor.set_active(True)
+        tasks = list(inhibitor._tasks)
+        await asyncio.sleep(0)
+        (system,) = buses
+        system.deliver(write_end)
+        await asyncio.sleep(0)
+        assert all(task.done() and task.exception() is None for task in tasks)
+        assert inhibitor._tasks == [] and inhibitor._lock_fds == [write_end]
+        assert "through org.freedesktop.ScreenSaver failed: no session bus socket" in caplog.text
+        inhibitor.set_active(False)
+        assert lock_released(read_end)
+
+    asyncio.run(scenario())
+
+
+def test_missing_system_bus_leaves_the_screensaver_inhibitor_held(buses, caplog):
+    buses.missing = {"system"}
+
+    async def scenario():
+        inhibitor = enabled_inhibitor()
+        inhibitor.set_active(True)
+        logind = inhibitor._tasks[1]
+        await asyncio.sleep(0)
+        (session,) = buses
+        session.deliver()
+        await asyncio.sleep(0)
+        assert logind.done() and logind.exception() is None
+        assert "through org.freedesktop.login1 failed: no system bus socket" in caplog.text
+        assert len(inhibitor._tasks) == 1 and not session.disconnected
+        inhibitor.set_active(False)
+        assert session.disconnected
+
+    asyncio.run(scenario())
+
+
+def test_lost_session_bus_is_a_warning(buses, caplog):
+    async def scenario():
+        inhibitor = enabled_inhibitor()
+        inhibitor.set_active(True)
+        screensaver = inhibitor._tasks[0]
+        await asyncio.sleep(0)
+        (session,), (system,) = by_kind(buses)
+        session.deliver()
+        system.deliver()
+        await asyncio.sleep(0)
+        session.lose(EOFError("bus daemon went away"))
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        assert screensaver.done() and screensaver.exception() is None
+        assert "through org.freedesktop.ScreenSaver failed: bus daemon went away" in caplog.text
+        assert inhibitor._tasks == [] and inhibitor._buses == []
+        inhibitor.set_active(False)
+
+    asyncio.run(scenario())
+
+
+def test_release_before_requests_start_never_connects(buses):
+    async def scenario():
+        inhibitor = enabled_inhibitor()
+        inhibitor.set_active(True)
+        inhibitor.set_active(False)
+        await asyncio.sleep(0)
+        assert buses == [] and inhibitor._tasks == [] and inhibitor._buses == []
 
     asyncio.run(scenario())
 
