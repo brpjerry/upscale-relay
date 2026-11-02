@@ -64,7 +64,7 @@ from .chapters import (
     slider_fractions,
     step_target,
 )
-from . import theme
+from . import hdr_output, theme
 from .settings import AppSettings, format_skip
 from .theme import Icons
 from .widgets import (
@@ -386,6 +386,15 @@ class MainWindow(DesktopFeatures, QMainWindow):
             "Smooth visible color steps in gradients during playback."
         )
         self.deband_check.setChecked(self.settings.deband_enabled)
+        self.hdr_output_check = FlatSwitch("Show HDR videos in HDR")
+        self.hdr_output_check.setToolTip(
+            "Play HDR videos as HDR on a display that is in HDR mode. Off, or on an SDR "
+            "display, they are tone-mapped to SDR."
+        )
+        self.hdr_output_check.setChecked(self.settings.hdr_output)
+        self.hdr_output_hint = QLabel()
+        self.hdr_output_hint.setWordWrap(True)
+        self.hdr_output_hint.setProperty("role", "faint")
         self.conn_dot = StatusDot()
         self.conn_label = ElideLabel("disconnected")
         self.conn_label.setProperty("role", "dim")
@@ -469,6 +478,8 @@ class MainWindow(DesktopFeatures, QMainWindow):
         form.insertRow(3, self.ten_bit_sdr_check)  # ... and this the stream quality
         streaming_layout.addLayout(form)
         streaming_layout.addWidget(self.deband_check)
+        streaming_layout.addWidget(self.hdr_output_check)
+        streaming_layout.addWidget(self.hdr_output_hint)
         settings_scroll = QScrollArea()
         settings_scroll.setWidgetResizable(True)
         settings_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
@@ -583,6 +594,8 @@ class MainWindow(DesktopFeatures, QMainWindow):
         self.video_overlay = PlayerOverlay(self.player)
         if hasattr(self.player, "set_deband"):
             self.player.set_deband(self.settings.deband_enabled)
+        if hasattr(self.player, "set_hdr_output_enabled"):
+            self.player.set_hdr_output_enabled(self.settings.hdr_output)
         # Display pacing follows a policy (settings x fullscreen state); the
         # fullscreen transition settles before the policy is re-evaluated.
         self._fullscreen_settled = False
@@ -905,6 +918,10 @@ class MainWindow(DesktopFeatures, QMainWindow):
         self.ten_bit_sdr_check.toggled.connect(self.on_ten_bit_sdr_changed)
         self.tier_combo.activated.connect(self.on_quality_tier_changed)
         self.deband_check.toggled.connect(self.on_deband_changed)
+        self.hdr_output_check.toggled.connect(self.on_hdr_output_changed)
+        if hasattr(self.player, "hdr_surface_stale"):
+            self.player.hdr_surface_stale.connect(self._reload_for_hdr_surface)
+            self.player.hdr_output_changed.connect(self._on_hdr_output_shown)
         self.fullscreen_btn.clicked.connect(self.toggle_fullscreen)
         if hasattr(self.player, "fullscreen_toggled"):
             self.player.fullscreen_toggled.connect(self.toggle_fullscreen)
@@ -969,6 +986,7 @@ class MainWindow(DesktopFeatures, QMainWindow):
         )
         self._apply_browser_visible(self.settings.browser_visible)
         self._update_idle_guidance()
+        self._show_hdr_output_hint()
         self.player.setFocus()
         if self.settings.auto_connect:
             # Fire once the qasync loop starts (on_connect is a coroutine slot).
@@ -2620,6 +2638,48 @@ class MainWindow(DesktopFeatures, QMainWindow):
         if hasattr(self.player, "set_deband"):
             self.player.set_deband(enabled)
 
+    def on_hdr_output_changed(self, enabled: bool) -> None:
+        self.settings.hdr_output = enabled
+        if hasattr(self.player, "set_hdr_output_enabled"):
+            # During an HDR video this asks for the reload that switches.
+            self.player.set_hdr_output_enabled(enabled)
+        self._show_hdr_output_hint()
+
+    def _on_hdr_output_shown(self, hdr: bool) -> None:
+        display = getattr(self.player, "display_hdr", None)
+        self.client_log.record(
+            "hdr_output", hdr=hdr, peak_nits=getattr(display, "peak_nits", None),
+            sdr_white_nits=getattr(display, "sdr_white_nits", None), display=getattr(display, "source", ""))
+        self._show_hdr_output_hint()
+
+    def _show_hdr_output_hint(self) -> None:
+        if getattr(self.player, "hdr_output", False):
+            display = self.player.display_hdr
+            peak = f" (up to {display.peak_nits:.0f} nits)" if display.peak_nits else ""
+            text = f"Playing in HDR{peak}."
+        elif not hdr_output.presentation_supported():
+            text = "HDR output needs a Wayland session with Qt 6.10.2 or later."
+        else:
+            text = "HDR videos play as HDR while the display is in HDR mode."
+        self.hdr_output_hint.setText(text)
+
+    @asyncSlot()
+    async def _reload_for_hdr_surface(self) -> None:
+        """The display's HDR state changed under an HDR video (or the setting
+        did): reload it at the current position on the surface that fits."""
+        if self._transitioning:
+            return
+        position = self._pending_seek_s if self._pending_seek_s is not None else self._position_s
+        self.client_log.record("hdr_surface_reload", position=position)
+        if self._session_source == "local" and self._session_path:
+            try:
+                await self.player.play_local(
+                    self._session_path, position, paused=self._paused, hdr=self.player._source_hdr)
+            except Exception as err:
+                self._error("Local playback failed", str(err))
+            return
+        await self._seek_to_seconds(position, announce=False)
+
     @asyncSlot()
     async def on_play_pause(self) -> None:
         await self._apply_pause(not self._paused)
@@ -2716,6 +2776,8 @@ class MainWindow(DesktopFeatures, QMainWindow):
         self.client_log.record("local_fallback", position=pos)
         if path is None:
             return
+        # The server read the file's colour: an HDR source has an HDR downlink.
+        hdr = bool(getattr(getattr(self.client, "session", None), "downlink_hdr", False))
         # The control teardown closes the old downlink. Stop its consumer first
         # so that normal closure cannot enqueue a stale playback failure while
         # the local file is being loaded.
@@ -2741,7 +2803,7 @@ class MainWindow(DesktopFeatures, QMainWindow):
         self.fallback_btn.setEnabled(False)
         self.player.client = None
         try:
-            await self.player.play_local(path, pos, paused=self._paused)
+            await self.player.play_local(path, pos, paused=self._paused, hdr=hdr)
         except Exception as err:
             self._error("Local playback failed", str(err))
             await self._teardown_session()

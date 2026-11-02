@@ -136,6 +136,16 @@ class AppSettings:
         self._qs.setValue("playback/deband", bool(v))
 
     @property
+    def hdr_output(self) -> bool:
+        """Play HDR videos on the HDR surface while the display is in HDR mode
+        (MpvPlayerView, hdr_view.py); off, mpv tone-maps them to SDR."""
+        return self._qs.value("playback/hdr_output", True, type=bool)
+
+    @hdr_output.setter
+    def hdr_output(self, v: bool) -> None:
+        self._qs.setValue("playback/hdr_output", bool(v))
+
+    @property
     def display_sync(self) -> bool:
         """Tell mpv the display's refresh rate (so its display-sync modes
         work) while the window is not settled in fullscreen."""

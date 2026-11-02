@@ -28,6 +28,8 @@ from PySide6.QtGui import QGuiApplication, QImage, QOpenGLContext, qRgb
 from PySide6.QtOpenGL import QOpenGLFramebufferObject
 from PySide6.QtOpenGLWidgets import QOpenGLWidget
 
+from . import hdr_output
+from .hdr_view import HdrPresenter
 from .options import DesktopOptions
 from .playback_state import PlaybackTelemetry, match_track, track_descriptor
 from .idle_inhibit import IdleInhibitor
@@ -94,6 +96,11 @@ _GL_DRAW_FRAMEBUFFER = 0x8CA9
 _GL_COLOR_BUFFER_BIT = 0x4000
 _GL_LINEAR = 0x2601
 _GL_SCISSOR_TEST = 0x0C11
+# How long the HDR surface may take to appear before a load falls back to
+# the widget, and how often the display's HDR state is read during an HDR
+# video (a Wayland query is four roundtrips; DXGI a fresh factory).
+_HDR_SURFACE_TIMEOUT_S = 3.0
+_HDR_RECHECK_TICKS = 6  # stats ticks (0.5 s)
 
 
 def _fit(width: int, height: int, aspect: float) -> tuple[float, float, float, float]:
@@ -388,6 +395,11 @@ class MpvPlayerView(QOpenGLWidget):
     fullscreen_toggled = Signal()  # F key / double-click; the window fullscreens
     mouse_moved = Signal(int, int)  # cursor x, y in the view; drives fullscreen control reveal
     frame_sampled = Signal(object)  # QImage thumbnail of the picture, on request
+    # The video moved to (True) or from the HDR surface at a load.
+    hdr_output_changed = Signal(bool)
+    # During an HDR video the display's HDR state (or the setting) changed so
+    # that the surface it plays on no longer fits: reload to switch.
+    hdr_surface_stale = Signal()
     _frame_ready = Signal()  # mpv render thread -> queued repaint on GUI thread
     _playback_restarted = Signal(int)  # libmpv event thread -> GUI thread
     _external_media_ready = Signal(int)  # attach worker -> GUI thread
@@ -445,6 +457,17 @@ class MpvPlayerView(QOpenGLWidget):
         self._display_rate = 0.0
         self._get_proc = None  # ctypes callback — must outlive the render ctx
         self._frame_ready.connect(self._on_frame_ready, Qt.QueuedConnection)
+        # HDR output (hdr_view.py): for an HDR video on an HDR display the
+        # render context moves, between loads, to a native PQ surface over
+        # this widget. Everything else (SDR videos, SDR displays) renders
+        # here exactly as before.
+        self._presenter: HdrPresenter | None = None
+        self._on_presenter = False  # the render context lives on the presenter
+        self._presenter_broken = False
+        self._source_hdr = False  # the stream (or file) being played is PQ/HLG
+        self._hdr_enabled = True  # the "Show HDR videos in HDR" setting
+        self._display_hdr = hdr_output.SDR  # as last read
+        self._hdr_stale_reported = False
 
         if self.options.headless:
             extra = {
@@ -692,19 +715,26 @@ class MpvPlayerView(QOpenGLWidget):
     def initializeGL(self) -> None:
         if self.options.headless or self._ctx is not None:
             return
-        self._get_proc = mpv.MpvGlGetProcAddressFn(_get_proc_address)
+        self._ctx = self._create_render_ctx()
+        # The GL context is destroyed before the widget on teardown — free the
+        # render context first, while the GL context is still alive.
+        self.context().aboutToBeDestroyed.connect(self._free_render_ctx)
+
+    def _create_render_ctx(self):
+        """mpv's render context, in the GL context current now (this
+        widget's, or the HDR surface's)."""
+        if self._get_proc is None:
+            self._get_proc = mpv.MpvGlGetProcAddressFn(_get_proc_address)
         render_params = {
             "opengl_init_params": {"get_proc_address": self._get_proc},
             **_native_display_params(),
         }
-        self._ctx = mpv.MpvRenderContext(
+        ctx = mpv.MpvRenderContext(
             self.mpv, "opengl",
             **render_params,
         )
-        self._ctx.update_cb = self._frame_ready.emit
-        # The GL context is destroyed before the widget on teardown — free the
-        # render context first, while the GL context is still alive.
-        self.context().aboutToBeDestroyed.connect(self._free_render_ctx)
+        ctx.update_cb = self._frame_ready.emit
+        return ctx
 
     def showEvent(self, event) -> None:
         super().showEvent(event)
@@ -712,6 +742,7 @@ class MpvPlayerView(QOpenGLWidget):
         if handle is not None and not self._screen_watched:
             self._screen_watched = True
             handle.screenChanged.connect(lambda _screen: self._report_display_rate())
+            handle.screenChanged.connect(lambda _screen: self._check_hdr_surface())
         self._report_display_rate()
 
     def set_display_rate_reporting(self, enabled: bool) -> None:
@@ -780,7 +811,7 @@ class MpvPlayerView(QOpenGLWidget):
             self.frame_sampled.emit(image)
 
     def _free_render_ctx(self) -> None:
-        if self._ctx is not None:
+        if self._ctx is not None and not self._on_presenter:
             self.makeCurrent()
             self._picture_fbo = None  # its GL objects go with this context
             self._ctx.free()
@@ -799,6 +830,8 @@ class MpvPlayerView(QOpenGLWidget):
         if not self._scaling and self._picture_aspect() is not None:
             self._scaling = True
             self._picture_due = True  # the current frame, into our framebuffer
+            if self._on_presenter:
+                self._presenter.picture_due()
         if self._scaling:
             self._settle_timer.start()
         self._resizing = True
@@ -811,6 +844,8 @@ class MpvPlayerView(QOpenGLWidget):
     def _resizes_settled(self) -> None:
         self._scaling = False
         self.update()  # one sharp render at the size it settled at
+        if self._on_presenter:
+            self._presenter.update()
 
     def _picture_aspect(self) -> float | None:
         """The picture's display aspect, when mpv simply letterboxes it."""
@@ -830,6 +865,13 @@ class MpvPlayerView(QOpenGLWidget):
         return width / height
 
     def paintGL(self) -> None:
+        if self._on_presenter:
+            # The HDR surface covers this widget and mpv renders there. Black
+            # is what shows at its edges while it catches up with a resize.
+            gl = QOpenGLContext.currentContext().functions()
+            gl.glClearColor(0.0, 0.0, 0.0, 1.0)
+            gl.glClear(_GL_COLOR_BUFFER_BIT)
+            return
         if self._ctx is None or self._resizing:
             return
         # QOpenGLWidget's backing FBO is in physical pixels (HiDPI-scaled).
@@ -911,6 +953,9 @@ class MpvPlayerView(QOpenGLWidget):
             # Hidden or back: timing goes to audio and returns to the display
             # (see _report_display_rate). mpv switches in ~0.2 s either way.
             self._report_display_rate()
+        if self._on_presenter:
+            self._presenter.frame_ready()
+            return
         if presenting:
             self.update()
             return
@@ -925,6 +970,202 @@ class MpvPlayerView(QOpenGLWidget):
         finally:
             self.doneCurrent()
 
+    # -- HDR output ---------------------------------------------------------------
+    #
+    # mpv's render context is bound to one GL context, and freeing it while a
+    # video plays tears the video down ("Video was forcefully killed"). It
+    # moves between this widget and the HDR surface only in _prepare_surface,
+    # which runs before every loadfile, while mpv is stopped and settled.
+
+    @property
+    def hdr_output(self) -> bool:
+        """Whether the video plays on the PQ surface now."""
+        return self._on_presenter and self._presenter is not None and self._presenter.pq
+
+    @property
+    def display_hdr(self) -> hdr_output.DisplayHdr:
+        """The display's HDR state as read at the last load."""
+        return self._display_hdr
+
+    def set_hdr_output_enabled(self, enabled: bool) -> None:
+        """The "Show HDR videos in HDR" setting. Applies at the next load;
+        during an HDR video hdr_surface_stale asks for one."""
+        self._hdr_enabled = bool(enabled)
+        self._check_hdr_surface()
+
+    def _wanted_surface(self) -> tuple[bool, hdr_output.DisplayHdr]:
+        """(play on the HDR surface?, the display's state). RELAY_HDR_SURFACE=
+        force puts every video there, on any display (testing the surface and
+        its overlays on an SDR screen); =off never does."""
+        mode = os.environ.get("RELAY_HDR_SURFACE", "").lower()
+        if self.options.headless or mode == "off" or self._presenter_broken:
+            return False, hdr_output.SDR
+        if mode != "force" and not (
+                self._hdr_enabled and self._source_hdr and hdr_output.presentation_supported()):
+            return False, hdr_output.SDR
+        display = hdr_output.query(self.window())
+        return (True if mode == "force" else display.hdr), display
+
+    @staticmethod
+    def _pq_for(display: hdr_output.DisplayHdr) -> bool:
+        return display.hdr and hdr_output.presentation_supported()
+
+    async def _prepare_surface(self) -> None:
+        """Put the render context where this video and display call for it."""
+        was = self.hdr_output
+        try:
+            want, display = self._wanted_surface()
+            self._display_hdr = display
+            self._hdr_stale_reported = False
+            if not want or not await self._move_to_presenter(display):
+                self._move_to_widget()
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:  # noqa: BLE001 - play on the widget instead
+            self.log_message.emit("error", "relay", f"HDR surface: {error!r}")
+            self._presenter_broken = True
+            self._move_to_widget()
+        self._apply_output_target()
+        if self.hdr_output != was:
+            self.hdr_output_changed.emit(self.hdr_output)
+
+    async def _move_to_presenter(self, display: hdr_output.DisplayHdr) -> bool:
+        pq = self._pq_for(display)
+        presenter = self._presenter
+        if presenter is not None and presenter.pq != pq:
+            self._move_to_widget()
+            self._discard_presenter()
+            presenter = None
+        top = self.window().windowHandle()
+        if top is None:
+            return False
+        if presenter is None:
+            presenter = self._presenter = HdrPresenter(self, top, pq=pq, sdr_white_nits=display.sdr_white_nits)
+            presenter.failed.connect(self._on_presenter_failed)
+        presenter.sdr_white_nits = display.sdr_white_nits or presenter.sdr_white_nits
+        if self._on_presenter:
+            return True
+        presenter.follow_view()
+        presenter.show()
+        presenter.update()
+        deadline = time.monotonic() + _HDR_SURFACE_TIMEOUT_S
+        while not presenter.initialized:
+            if self._presenter_broken or presenter.broken or time.monotonic() > deadline:
+                presenter.hide()
+                self.log_message.emit("warn", "relay", "HDR surface did not start; playing on the SDR surface")
+                return False
+            await asyncio.sleep(0.02)
+        if self._presenter is not presenter:
+            return False
+        self._release_widget_ctx()
+        presenter.makeCurrent()
+        try:
+            self._ctx = presenter.ctx = self._create_render_ctx()
+        finally:
+            presenter.doneCurrent()
+        self._on_presenter = True
+        self.update()  # black under the surface
+        return True
+
+    def _release_widget_ctx(self) -> None:
+        if self._ctx is None or self._on_presenter:
+            return
+        self.makeCurrent()
+        try:
+            self._picture_fbo = None
+            self._ctx.free()
+            self._ctx = None
+        finally:
+            self.doneCurrent()
+
+    def _move_to_widget(self) -> None:
+        presenter = self._presenter
+        if self._on_presenter and presenter is not None:
+            presenter.release_render_context()
+            self._ctx = None
+            self._on_presenter = False
+        if presenter is not None and presenter.isVisible():
+            presenter.hide()
+        context = self.context()
+        if self._ctx is None and not self.options.headless and context is not None and context.isValid():
+            self.makeCurrent()
+            try:
+                self._ctx = self._create_render_ctx()
+            finally:
+                self.doneCurrent()
+        self.update()
+
+    def _discard_presenter(self) -> None:
+        presenter, self._presenter = self._presenter, None
+        if presenter is not None:
+            presenter.hide()
+            presenter.deleteLater()
+
+    def _render_ctx_lost(self, ctx) -> None:
+        """The HDR surface's GL context went (window teardown) and freed ctx."""
+        if self._ctx is ctx:
+            self._ctx = None
+            self._on_presenter = False
+
+    def _on_presenter_failed(self, message: str) -> None:
+        self.log_message.emit("error", "relay", message)
+        self._presenter_broken = True
+        if self._on_presenter and not self._hdr_stale_reported:
+            self._hdr_stale_reported = True
+            self.hdr_surface_stale.emit()
+
+    def _release_surface_if_idle(self) -> None:
+        # Deferred from stop(): a start or local load that follows at once
+        # keeps the surface for its own decision (_prepare_surface).
+        if self._on_presenter and self._task is None and not self._local_playback:
+            self._move_to_widget()
+            self._apply_output_target()
+            self.hdr_output_changed.emit(False)
+
+    def _apply_output_target(self, *, asynchronous: bool = False) -> None:
+        """mpv's output colour: PQ for the HDR surface, mpv's own otherwise.
+        vo_gpu converts to target-trc/prim and tone-maps to target-peak."""
+        if self.options.headless:
+            return
+        pq = self.hdr_output
+        peak = self._display_hdr.peak_nits if pq else None
+        values = {
+            "target-trc": "pq" if pq else "auto",
+            "target-prim": "bt.2020" if pq else "auto",
+            "target-peak": str(round(peak)) if peak else "auto",
+        }
+        for name, value in values.items():
+            try:
+                if asynchronous:
+                    self.mpv.command_async("set", name, value)
+                else:
+                    self.mpv.command("set", name, value)
+            except Exception as error:  # noqa: BLE001 - leave mpv's own value
+                self.log_message.emit("warn", "relay", f"mpv {name}={value}: {error!r}")
+
+    def _check_hdr_surface(self) -> None:
+        """During playback, report a surface the display no longer fits
+        (HDR switched on or off, the window on another screen, the setting)."""
+        if self.options.headless or self._hdr_stale_reported:
+            return
+        if self._task is None and not self._local_playback:
+            return
+        if not (self._source_hdr or self._on_presenter):
+            return
+        want, display = self._wanted_surface()
+        fits = want == self._on_presenter and (
+            not want or (self._presenter is not None and self._presenter.pq == self._pq_for(display)))
+        if not fits:
+            self._hdr_stale_reported = True
+            self.hdr_surface_stale.emit()
+        elif want and display != self._display_hdr:
+            # Same surface, other luminances (a brightness setting): adopt them.
+            self._display_hdr = display
+            if display.sdr_white_nits:
+                self._presenter.sdr_white_nits = display.sdr_white_nits
+                self._presenter.update()
+            self._apply_output_target(asynchronous=True)
+
     # -- public API -----------------------------------------------------------
 
     def start(self, session, downlink_q: asyncio.Queue, time_base: Fraction,
@@ -937,6 +1178,7 @@ class MpvPlayerView(QOpenGLWidget):
             return
         self._fps = float(avg_rate) if avg_rate else 30.0
         self._downlink_codec = getattr(session, "downlink_codec", None)
+        self._source_hdr = bool(getattr(session, "downlink_hdr", False))
         self._source_path = source_path
         self._source_has_audio = source_has_audio
         self._tracks_reported = False
@@ -969,6 +1211,7 @@ class MpvPlayerView(QOpenGLWidget):
         settle = self._reload_settle_until - time.monotonic()
         if settle > 0:
             await asyncio.sleep(settle)
+        await self._prepare_surface()
         self._relay_eos_epoch = None
         self._buffer = _LoopbackStream()
         self._load_generation += 1
@@ -1132,6 +1375,8 @@ class MpvPlayerView(QOpenGLWidget):
         self._epoch_released = False
         self._caller_paused = False
         self._local_playback = False
+        if self._on_presenter:
+            QTimer.singleShot(0, self._release_surface_if_idle)
 
     def set_paused(self, paused: bool) -> None:
         self._caller_paused = paused
@@ -1276,14 +1521,16 @@ class MpvPlayerView(QOpenGLWidget):
         self.mpv.mute = bool(muted)
 
     async def play_local(
-        self, path: str, position_s: float = 0.0, *, paused: bool = False,
+        self, path: str, position_s: float = 0.0, *, paused: bool = False, hdr: bool = False,
     ) -> None:
         """Return once the original file accepts transport controls.
 
         loadfile only queues a native load. Hold playback until its file-loaded
         event arrives, preserving pause/seek requests made during the load.
+        ``hdr``: the file is PQ or HLG (it may play on the HDR surface).
         """
         self.stop()
+        self._source_hdr = bool(hdr)
         generation = self._load_generation
         loop = asyncio.get_running_loop()
         self._local_load_ready = ready = loop.create_future()
@@ -1307,6 +1554,9 @@ class MpvPlayerView(QOpenGLWidget):
             # The native stop/load settle interval also applies when leaving
             # a relay stream for its original file. No property reads here.
             await asyncio.sleep(0.15)
+            if generation != self._load_generation:
+                return
+            await self._prepare_surface()
             if generation != self._load_generation:
                 return
             entry_id = None
@@ -1432,8 +1682,12 @@ class MpvPlayerView(QOpenGLWidget):
 
     async def _stats_loop(self) -> None:
         was_buffering = False
+        ticks = 0
         while True:
             await asyncio.sleep(0.5)
+            ticks += 1
+            if ticks % _HDR_RECHECK_TICKS == 0:
+                self._check_hdr_surface()
             if self._reloading:
                 if self.client is not None:
                     self.client.buffered_ms = 0
