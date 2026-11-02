@@ -17,7 +17,7 @@ from relay_protocol import DIR_DOWNLINK, DIR_UPLINK, FLAG_EOS, NO_TS, MediaPacke
 from relay_media import AuxiliaryTrack, VideoTrack
 from upscale_cli.encode import DEFAULT_LOSSLESS_HEVC_PROFILE
 from upscale_cli.fit import DEFAULT_RESIZE_ALGORITHM, RESIZE_ALGORITHMS
-from upscale_cli.hdr import DolbyVisionConfig, StaticHdr
+from relay_media.hdr import DolbyVisionConfig, StaticHdr
 
 from .library import MediaLibrary
 from .pipeline import HIGH_BIT_DEPTH_MODES, Pipeline, PipelineConstructionError, VideoConfig

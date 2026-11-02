@@ -101,7 +101,7 @@ their volume, panscan, tracks and delays.
 - PyAV cannot give an encoder HDR metadata: `CodecContext.coded_side_data`
   and `decoded_side_data` are read-only, so NVENC/x265 write no mastering
   display, light level, HDR10+ or Dolby Vision. Deep-colour sessions write it
-  themselves into the encoded Annex B packets (`upscale_cli/hdr.py`, PROTOCOL
+  themselves into the encoded Annex B packets (`relay_media/hdr.py`, PROTOCOL
   §3.5); the Matroska muxer keeps every NAL unit. NVENC takes 10-bit input
   only as `p010le` (it refuses `yuv420p10le`; `encode.deep_pix_fmt`).
 - For server-file muxed auxiliary tracks, seek the auxiliary container against

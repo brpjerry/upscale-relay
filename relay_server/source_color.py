@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import logging
 
-from upscale_cli.color import tags_from_wire
+from relay_media.hdr import tags_from_wire
 
 log = logging.getLogger("relay.session")
 
