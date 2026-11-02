@@ -63,14 +63,27 @@ class Clock(QObject):
         span = b - a
         paints = [p for p in self.paints if a <= p[0] <= b + 0.02]
         durations = sorted(p[1] * 1000 for p in paints)
+
+        def median(values):
+            values = sorted(values)
+            return round(values[len(values) // 2], 2) if values else None
+
+        phases = [p[2] for p in paints if len(p) > 2 and p[2]]
         return {
             "name": name,
             "span_ms": round(span * 1000),
             f"{anchor}_per_s": round(len(anchors) / span, 1),
             "main_frames_per_s": round(len([t for t in self.swaps if a <= t <= b + 0.02]) / span, 1),
             "surface_paints_per_s": round(len(paints) / span, 1),
-            "surface_paint_ms_median": round(durations[len(durations) // 2], 2) if durations else None,
+            "surface_paint_ms_median": median(durations),
             "surface_paint_ms_max": round(durations[-1], 2) if durations else None,
+            # Where the surface's paints went (HdrPresenter.last_phases):
+            # mpv renders, and the medians of each phase.
+            "mpv_renders": sum(1 for p in phases if p.get("rendered")),
+            "video_ms_median": median(p["video_ms"] for p in phases),
+            "video_ms_median_rendering": median(p["video_ms"] for p in phases if p.get("rendered")),
+            "mirror_ms_median": median(p["mirror_ms"] for p in phases),
+            "overlays_ms_median": median(p["overlays_ms"] for p in phases),
         }
 
 
@@ -294,7 +307,10 @@ def main():
         def timed_paint(self):
             started = time.perf_counter()
             paint(self)
-            clock.paints.append((started, time.perf_counter() - started))
+            phases = dict(getattr(self, "last_phases", None) or {})
+            clock.paints.append((started, time.perf_counter() - started, phases))
+            if hasattr(self, "last_phases"):
+                self.last_phases = {}  # each paint's own, not a stale one
         return timed_paint
 
     hdr_view.HdrPresenter.paintGL = timed(hdr_view.HdrPresenter.paintGL)

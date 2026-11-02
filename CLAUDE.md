@@ -299,10 +299,11 @@ their volume, panscan, tracks and delays.
   video, the player reloads at the position instead (`hdr_surface_stale`).
 - On Wayland every geometry change of a native child window (a subsurface)
   makes Qt expose the parent window, which repaints and presents it in full
-  at once. Changing the HDR surface's geometry once per Move/Resize event of
-  the player and its ancestors held slides to 15-57 steps a second (the
-  widget: 110-186). It follows the player once per event-loop turn
-  (`HdrPresenter.place`).
+  at once. An HDR surface that followed the player per Move/Resize event held
+  slides to 15-57 steps a second (the widget: 110-186); following it once per
+  event-loop turn, 62-89 main window frames against 110-129. So on Wayland
+  the surface spans the window and never moves (`HdrPresenter.cover`): the
+  picture moves within it, and the surface is clear around it.
 - `QWidget.render` draws nothing for a widget that carries a graphics effect.
   `RenderFlag.DrawWindowBackground` (the default) first fills the widget with
   its palette's Window colour. The overlay mirror renders with `DrawChildren`

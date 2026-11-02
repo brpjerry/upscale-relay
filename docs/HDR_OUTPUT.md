@@ -17,13 +17,20 @@ included, reaches the screen as SDR.
 
 `desktop_client/hdr_view.py`:
 
-- **HdrPresenter** is a native child window (`QOpenGLWindow`) placed over the
-  player widget and following its geometry. Its format is 10 bits a channel
-  tagged `QColorSpace.Bt2100Pq`. From Qt 6.10.2 the Wayland plugin sends that
-  colour space as a `wp_color_management_surface_v1` image description
-  (bt2020 primaries, st2084_pq), and the compositor shows the surface as HDR.
-  It is transparent for input (`Qt.WindowTransparentForInput`: an empty input
+- **HdrPresenter** is a native child window (`QOpenGLWindow`) over the
+  player widget. Its format is 10 bits a channel tagged
+  `QColorSpace.Bt2100Pq`. From Qt 6.10.2 the Wayland plugin sends that colour
+  space as a `wp_color_management_surface_v1` image description (bt2020
+  primaries, st2084_pq), and the compositor shows the surface as HDR. It is
+  transparent for input (`Qt.WindowTransparentForInput`: an empty input
   region) and takes no focus.
+- **On Wayland it spans the whole window and stays put** ("cover" mode). It
+  is clear everywhere but the player's rectangle, where it draws the picture
+  and the overlays, clipped to it; the window beneath shows through
+  elsewhere. A subsurface that followed the player instead made each layout
+  step re-present the main window in full: Qt exposes the parent window on
+  every geometry change of a subsurface. A Windows child window cannot be
+  clear, so the Windows prototype follows the player's geometry.
 - **The render context moves.** mpv's render context is bound to one GL
   context, and freeing it while a video plays tears the video down. It moves
   between the widget and the surface only between loads
@@ -112,7 +119,14 @@ display's peak) and passes the rest through.
 
 `tools/hdr_desktop_check.py --file hdr.mkv --pacing` plays a clip from
 `upscale-cli sample hdr.mkv --hdr` in the real window and times the CLAUDE.md
-scenarios. `--surface off` measures the widget for comparison.
+scenarios. `--surface off` measures the widget for comparison. Rates are per
+second, measured over the span of the motion. "Main" is the main window's
+presented frames. Resizes and steps are the layout and animation steps that
+reached the player or the overlay.
+
+Laptop, 2026-11-02: Hyprland 0.56.2 with `cm = "hdr"`, Samsung OLED
+2880×1800 at 120 Hz, scale 2, Qt 6.12.0, a 1080p24 HDR10 clip played locally,
+window floated at 1401×860, two runs each.
 
 <!-- MEASUREMENTS -->
 

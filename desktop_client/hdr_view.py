@@ -130,6 +130,7 @@ class _Layer:
 
     widget: QWidget
     image: QImage | None = None
+    source: QRect = field(default_factory=QRect)  # the part of the widget pictured
     dirty: QRegion = field(default_factory=QRegion)  # widget coordinates, still to render
     upload: QRect = field(default_factory=QRect)  # image pixels changed since the last upload
     # The widget's next repaint leaves its picture as it was: it moved, its
@@ -194,14 +195,21 @@ class OverlayMirror(QObject):
                 self._watch(widget)
             if not widget.isVisible() or widget.width() <= 0 or widget.height() <= 0:
                 continue
-            pos = widget.mapTo(top, QPoint(0, 0)) - origin
-            if not area.intersects(QRect(pos, widget.size())):
+            # A widget that paints only part of itself says which (the busy
+            # ring's disc): a clear picture the player's size, rendered and
+            # uploaded again at every step of a resize, cost 1.3-5 ms a frame.
+            mirror_rect = getattr(widget, "mirror_rect", None)
+            source = mirror_rect() & widget.rect() if mirror_rect is not None else widget.rect()
+            if source.isEmpty():
+                continue
+            pos = widget.mapTo(top, QPoint(0, 0)) - origin + source.topLeft()
+            if not area.intersects(QRect(pos, source.size())):
                 continue
             layer = self._layers.get(widget)
             if layer is None:
                 layer = self._layers[widget] = _Layer(widget)
             seen.add(widget)
-            opacity = self._render(layer, dpr)
+            opacity = self._render(layer, dpr, source)
             result.append((layer, pos, opacity))
         for widget in [w for w in self._layers if w not in seen]:
             # Out of view or hidden: its picture is stale by the time it
@@ -214,26 +222,30 @@ class OverlayMirror(QObject):
 
     # -- rendering -------------------------------------------------------------
 
-    def _render(self, layer: _Layer, dpr: float) -> float:
+    def _render(self, layer: _Layer, dpr: float, source: QRect) -> float:
+        """Bring the picture of ``source`` (widget coordinates) up to date."""
         widget = layer.widget
-        size = QSize(round(widget.width() * dpr), round(widget.height() * dpr))
-        if layer.image is None or layer.image.size() != size or layer.image.devicePixelRatio() != dpr:
+        size = QSize(round(source.width() * dpr), round(source.height() * dpr))
+        if (layer.image is None or layer.image.size() != size or layer.image.devicePixelRatio() != dpr
+                or layer.source != source):
             layer.image = QImage(size, QImage.Format_RGBA8888_Premultiplied)
             layer.image.setDevicePixelRatio(dpr)
             layer.image.fill(0)
-            layer.dirty = QRegion(widget.rect())
+            layer.source = QRect(source)
+            layer.dirty = QRegion(source)
         effect = widget.graphicsEffect()
         opacity = 1.0
         if isinstance(effect, QGraphicsOpacityEffect) and effect.isEnabled():
             opacity = effect.opacity()
-        region = layer.dirty & QRegion(widget.rect())
+        region = layer.dirty & QRegion(source)
         layer.dirty = QRegion()
         if region.isEmpty():
             return opacity
+        offset = source.topLeft()
         painter = QPainter(layer.image)
         painter.setCompositionMode(QPainter.CompositionMode_Clear)
         for rect in region:
-            painter.fillRect(rect, Qt.transparent)
+            painter.fillRect(rect.translated(-offset), Qt.transparent)
         painter.end()
         # QWidget.render draws nothing for a widget that carries a graphics
         # effect; the fade's opacity is applied when compositing instead.
@@ -242,16 +254,17 @@ class OverlayMirror(QObject):
         try:
             if disabled:
                 effect.setEnabled(False)
-            bounds = region.boundingRect()
             # DrawChildren only: DrawWindowBackground fills the widget with
             # its palette's Window colour first. Style sheet backgrounds draw
             # either way.
-            widget.render(layer.image, bounds.topLeft(), region, QWidget.RenderFlag.DrawChildren)
+            widget.render(layer.image, region.boundingRect().topLeft() - offset, region,
+                          QWidget.RenderFlag.DrawChildren)
         finally:
             if disabled:
                 effect.setEnabled(True)
                 layer.expect_repaint = True  # the toggle repaints the widget later
             self._rendering = False
+        bounds = region.boundingRect().translated(-offset)
         changed = QRect(
             int(bounds.x() * dpr), int(bounds.y() * dpr),
             int(bounds.width() * dpr) + 2, int(bounds.height() * dpr) + 2,
@@ -301,9 +314,9 @@ class OverlayMirror(QObject):
             return
         layer = self._layer_of(obj)
         if layer is None:
-            # Not shown over the video yet: a Show or Move may bring it there.
-            if kind != QEvent.Paint:
-                self._changed()
+            # Not over the video yet: a Show or a Move may bring it there, and
+            # a paint may give it something to show (mirror_rect).
+            self._changed()
             return
         root = layer.widget
         if kind == QEvent.Paint:
@@ -381,6 +394,8 @@ class HdrPresenter(QOpenGLWindow):
         self.frames = 0  # composed frames, for measurements
         self.renders = 0  # mpv renders
         self.last_paint_ms = 0.0
+        self.last_phases: dict = {}
+        self._rendered_now = False
 
     # -- placement -------------------------------------------------------------
 
@@ -582,14 +597,25 @@ class HdrPresenter(QOpenGLWindow):
             self._clip(gl, video, height)
         gl.glClearColor(0.0, 0.0, 0.0, 1.0)
         gl.glClear(_GL_COLOR_BUFFER_BIT)
+        started = time.perf_counter()
+        self._rendered_now = False
         try:
             if self.ctx is not None:
                 self._paint_video(gl, target, video, height)
+            video_done = time.perf_counter()
             gl.glBindFramebuffer(_GL_FRAMEBUFFER, target)
             layers = self._mirror.layers(dpr)
+            mirror_done = time.perf_counter()
             if layers:
                 self._clip(gl, video, height)
                 self._paint_overlays(gl, layers, dpr, video, width, height)
+            # Where a paint's time went, for measurements (tools/hdr_desktop_check.py).
+            self.last_phases = {
+                "video_ms": (video_done - started) * 1000,
+                "mirror_ms": (mirror_done - video_done) * 1000,
+                "overlays_ms": (time.perf_counter() - mirror_done) * 1000,
+                "rendered": self._rendered_now,
+            }
         finally:
             gl.glDisable(_GL_SCISSOR_TEST)
 
@@ -627,6 +653,7 @@ class HdrPresenter(QOpenGLWindow):
             # attachment (mpv_opengl_fbo.internal_format is ignored).
             fmt.setInternalTextureFormat(_GL_RGB10_A2)
             fbo = self._fbo = QOpenGLFramebufferObject(QSize(width, height), fmt)
+        self._rendered_now = bool(stale or render)
         if stale or render:
             # The window's own framebuffer is bottom-up, as GL draws; unlike
             # the widget's, nothing flips it afterwards.

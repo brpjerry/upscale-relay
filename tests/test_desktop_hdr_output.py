@@ -8,7 +8,7 @@ from types import SimpleNamespace
 import pytest
 pytest.importorskip("PySide6")
 
-from PySide6.QtCore import QPoint
+from PySide6.QtCore import QPoint, QRect
 from PySide6.QtGui import QColor, QPainter
 from PySide6.QtWidgets import QApplication, QFrame, QGraphicsOpacityEffect, QWidget
 
@@ -300,3 +300,16 @@ def test_the_hdr_sample_is_10_bit_pq(tmp_path):
         assert (cc.name, cc.pix_fmt) == ("hevc", "yuv420p10le")
         assert (int(cc.color_primaries), int(cc.color_trc), int(cc.colorspace)) == (9, 16, 9)
         assert stream.average_rate == Fraction(24)
+
+
+def test_a_widget_that_paints_part_of_itself_is_mirrored_in_part(scene):
+    """The busy ring's widget spans the player but draws a disc in the middle:
+    the mirror pictures only what mirror_rect names, and nothing when empty."""
+    hint, part = scene.hint, [QRect(5, 5, 10, 8)]
+    hint.mirror_rect = lambda: part[0]
+    layer, pos, _opacity = next(item for item in scene.mirror.layers(2.0) if item[0].widget is hint)
+    assert (layer.image.width(), layer.image.height()) == (20, 16)  # the part, in device pixels
+    assert pos == QPoint(15, 15)  # the hint's place plus the part's
+    assert layer.image.pixelColor(2, 2).blue() == 255
+    part[0] = QRect()
+    assert hint not in [layer.widget for layer, _pos, _opacity in scene.mirror.layers(2.0)]
