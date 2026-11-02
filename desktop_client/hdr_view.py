@@ -132,8 +132,11 @@ class _Layer:
     image: QImage | None = None
     dirty: QRegion = field(default_factory=QRegion)  # widget coordinates, still to render
     upload: QRect = field(default_factory=QRect)  # image pixels changed since the last upload
-    moved: bool = False  # moved since its last paint
-    skipping: bool = False  # inside the repaint a move caused
+    # The widget's next repaint leaves its picture as it was: it moved, its
+    # fade's opacity changed, or rendering it toggled its effect.
+    expect_repaint: bool = False
+    skipping: bool = False  # inside such a repaint
+    opacity: float | None = None  # its opacity effect's, as last seen
 
 
 class OverlayMirror(QObject):
@@ -145,7 +148,10 @@ class OverlayMirror(QObject):
     and overlaps the view. Each is rendered into an image only where it
     repainted, as the window's own repaint reported it (Paint events); a move
     repaints a translucent widget in full, but leaves its picture as it was,
-    so the repaint that follows a move is not rendered again.
+    so the repaint that follows a move is not rendered again; nor are the
+    repaints of a fade, whose opacity is applied when compositing (QWidget.
+    render draws nothing for a widget with a graphics effect: the effect is
+    switched off around it).
     """
 
     def __init__(self, view: QWidget, changed):
@@ -244,6 +250,7 @@ class OverlayMirror(QObject):
         finally:
             if disabled:
                 effect.setEnabled(True)
+                layer.expect_repaint = True  # the toggle repaints the widget later
             self._rendering = False
         changed = QRect(
             int(bounds.x() * dpr), int(bounds.y() * dpr),
@@ -303,13 +310,21 @@ class OverlayMirror(QObject):
             if self._rendering:
                 return
             if obj is root:
-                if layer.moved:
-                    # The repaint a move causes; the picture has not changed.
+                effect = root.graphicsEffect()
+                opacity = (effect.opacity() if isinstance(effect, QGraphicsOpacityEffect)
+                           and effect.isEnabled() else None)
+                if opacity != layer.opacity:
+                    # A fade step: the composition applies the new opacity.
+                    layer.opacity = opacity
+                    if opacity is not None:
+                        layer.expect_repaint = True
+                if layer.expect_repaint:
                     # Its children repaint in the same pass, which ends
                     # before the next event is processed.
-                    layer.moved = False
+                    layer.expect_repaint = False
                     layer.skipping = True
                     QTimer.singleShot(0, lambda layer=layer: setattr(layer, "skipping", False))
+                    self._changed()
                     return
                 layer.dirty |= event.region()
             else:
@@ -317,7 +332,7 @@ class OverlayMirror(QObject):
                     return
                 layer.dirty |= event.region().translated(obj.mapTo(root, QPoint(0, 0)))
         elif kind == QEvent.Move and obj is root:
-            layer.moved = True
+            layer.expect_repaint = True  # a translucent widget repaints in full where it lands
         else:
             layer.dirty = QRegion(root.rect())
         self._changed()
@@ -355,6 +370,7 @@ class HdrPresenter(QOpenGLWindow):
         self._textures: dict[_Layer, QOpenGLTexture] = {}
         self._mirror = OverlayMirror(view, self._overlays_changed)
         self._followed: list[QWidget] = []
+        self._place_posted = False
         self.frames = 0  # composed frames, for measurements
         self.renders = 0  # mpv renders
         self.last_paint_ms = 0.0
@@ -373,7 +389,7 @@ class HdrPresenter(QOpenGLWindow):
             if widget not in self._followed:
                 widget.installEventFilter(self._tracker)
                 self._followed.append(widget)
-        self.place()
+        self._place_now()
 
     @property
     def _tracker(self) -> QObject:
@@ -383,13 +399,26 @@ class HdrPresenter(QOpenGLWindow):
         return tracker
 
     def place(self) -> None:
+        """Follow the player widget, once per turn of the event loop.
+
+        A layout step moves and resizes the player and its ancestors one
+        after another, each with its own event. On Wayland every geometry
+        change of a subsurface makes Qt expose the parent window, which
+        repaints and presents it in full at once; changing it for each event
+        held the slides to 15-57 steps a second (110-186 on the widget). The
+        layout settles within the turn, before the window's next frame.
+        """
+        if not self._place_posted:
+            self._place_posted = True
+            QTimer.singleShot(0, self._place_now)
+
+    def _place_now(self) -> None:
+        self._place_posted = False
         view = self._view
-        top = view.window()
-        origin = view.mapTo(top, QPoint(0, 0))
-        geometry = QRect(origin, view.size())
+        geometry = QRect(view.mapTo(view.window(), QPoint(0, 0)), view.size())
         if geometry != self.geometry():
             self.setGeometry(geometry)
-        self.update()
+            self.update()
 
     def picture_due(self) -> None:
         """The current frame is to be rendered again (a resize began)."""

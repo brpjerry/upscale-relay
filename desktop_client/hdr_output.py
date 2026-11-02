@@ -197,29 +197,38 @@ def _libwayland():
     return _wayland
 
 
-class _WaylandQuery:
-    """One snapshot of every output's image description."""
+class _WaylandOutputs:
+    """The outputs' image descriptions, on an event queue of our own.
+
+    The registry, the colour manager and the outputs are bound once for the
+    life of the connection: wl_registry has no destroy request, so a registry
+    per query stayed with the compositor (and kept receiving global events)
+    until the client went. A query creates only the image descriptions.
+    """
 
     def __init__(self, display: int):
         self.lib, self.protocol, self.registry_interface, self.output_interface = _libwayland()
         self.display = display
-        self.queue = None
-        self.wrapper = None
-        self.registry = None
-        self.callbacks = []  # ctypes callbacks and listener arrays: must outlive the proxies
-        self.globals: dict[str, list[tuple[int, int]]] = {}
+        self.callbacks = []  # ctypes callbacks and listener arrays of the lasting objects
+        self.query_callbacks = []  # those of the last query's objects
         self.manager = None
-        self.tf_named: set[int] = set()
-        self.outputs: list[dict] = []
+        self.outputs: dict[int, dict] = {}  # by global name
+        self.queue = self.lib.wl_display_create_queue(display)
+        self.wrapper = self.lib.wl_proxy_create_wrapper(display)
+        self.lib.wl_proxy_set_queue(self.wrapper, self.queue)
+        # wl_display.get_registry (opcode 1)
+        self.registry = self.request(self.wrapper, 1, self.registry_interface, ("n", 0))
+        self.listen(self.registry, ["usu", "u"], [self.on_global, self.on_global_remove], self.callbacks)
+        self.roundtrip()  # the globals, binding as they arrive
+        self.roundtrip()  # the outputs' names
 
-    def listen(self, proxy, signatures, handlers):
+    def listen(self, proxy, signatures, handlers, keep):
         functions = []
         for signature, handler in zip(signatures, handlers):
             argtypes = [c_void_p, c_void_p] + [_CTYPE[c] for c in signature if c.isalpha()]
-            fn = CFUNCTYPE(None, *argtypes)(handler)
-            functions.append(fn)
+            functions.append(CFUNCTYPE(None, *argtypes)(handler))
         array = (c_void_p * len(functions))(*[cast(f, c_void_p) for f in functions])
-        self.callbacks += [functions, array]
+        keep += [functions, array]
         self.lib.wl_proxy_add_listener(proxy, array, None)
 
     def request(self, proxy, opcode, interface=None, *args, destroy=False, version=None):
@@ -236,123 +245,111 @@ class _WaylandQuery:
         if self.lib.wl_display_roundtrip_queue(self.display, self.queue) < 0:
             raise OSError("wayland roundtrip failed")
 
-    def run(self) -> list[dict]:
-        lib = self.lib
-        self.queue = lib.wl_display_create_queue(self.display)
-        self.wrapper = lib.wl_proxy_create_wrapper(self.display)
-        lib.wl_proxy_set_queue(self.wrapper, self.queue)
-        try:
-            # wl_display.get_registry (opcode 1)
-            self.registry = self.request(self.wrapper, 1, self.registry_interface, ("n", 0))
-
-            def on_global(_data, _registry, name, interface, version):
-                self.globals.setdefault(interface.decode(), []).append((name, version))
-
-            self.listen(self.registry, ["usu", "u"], [on_global, lambda *_: None])
-            self.roundtrip()
-            managers = self.globals.get("wp_color_manager_v1")
-            if not managers:
-                return []
-            self.manager = self.bind(managers[0][0], self.protocol.manager, 1)
-
-            def on_tf(_data, _proxy, tf):
-                self.tf_named.add(tf)
-
-            ignore = lambda *_: None  # noqa: E731
-            self.listen(self.manager, ["u", "u", "u", "u", ""], [ignore, ignore, on_tf, ignore, ignore])
-            for name, version in self.globals.get("wl_output", []):
-                self.add_output(name, min(version, 4))
-            self.roundtrip()
-            for output in self.outputs:
-                cm_output = self.request(self.manager, 1, self.protocol.output, ("n", 0), ("o", output["proxy"]))
-                output["cm_output"] = cm_output
-                self.listen(cm_output, [""], [ignore])
-                output["description"] = self.request(cm_output, 1, self.protocol.description, ("n", 0))
-                self.listen(output["description"], ["us", "u"], [
-                    lambda _d, _p, cause, msg, output=output: output.update(failed=(msg or b"").decode()),
-                    lambda _d, _p, _identity, output=output: output.update(ready=True),
-                ])
-            self.roundtrip()
-            for output in self.outputs:
-                if output.get("ready"):
-                    self.read_information(output)
-            self.roundtrip()
-            return [{k: v for k, v in o.items() if k not in ("proxy", "cm_output", "description", "info")}
-                    for o in self.outputs]
-        finally:
-            self.close()
-
     def bind(self, name, interface, version):
         # wl_registry.bind (opcode 0, "usun"): the interface name rides along.
         return self.request(self.registry, 0, interface,
                             ("u", name), ("s", interface.name), ("u", version), ("n", 0), version=version)
 
-    def add_output(self, name, version):
-        proxy = self.request(self.registry, 0, self.output_interface,
-                             ("u", name), ("s", b"wl_output"), ("u", version), ("n", 0), version=version)
-        output = {"proxy": proxy, "version": version, "name": None}
-        self.outputs.append(output)
+    def on_global(self, _data, _registry, name, interface, version):
+        interface = interface.decode()
         ignore = lambda *_: None  # noqa: E731
-        signatures = ["iiiiissi", "uiii", "", "i", "s", "s"][:6 if version >= 4 else 4 if version >= 2 else 2]
-        handlers = [ignore, ignore, ignore, ignore,
-                    lambda _d, _p, value: output.update(name=(value or b"").decode()), ignore]
-        self.listen(proxy, signatures, handlers[:len(signatures)])
+        if interface == "wp_color_manager_v1" and self.manager is None:
+            self.manager = self.bind(name, self.protocol.manager, 1)
+            self.listen(self.manager, ["u", "u", "u", "u", ""], [ignore] * 5, self.callbacks)
+            for output in self.outputs.values():
+                self.manage(output)
+        elif interface == "wl_output":
+            version = min(version, 4)
+            proxy = self.bind(name, self.output_interface, version)
+            output = self.outputs[name] = {"proxy": proxy, "version": version, "name": None}
+            signatures = ["iiiiissi", "uiii", "", "i", "s", "s"][:6 if version >= 4 else 4 if version >= 2 else 2]
+            handlers = [ignore, ignore, ignore, ignore,
+                        lambda _d, _p, value: output.update(name=(value or b"").decode()), ignore]
+            self.listen(proxy, signatures, handlers[:len(signatures)], self.callbacks)
+            if self.manager is not None:
+                self.manage(output)
 
-    def read_information(self, output):
-        info = self.request(output["description"], 1, self.protocol.info, ("n", 0))
-        output["info"] = info
+    def manage(self, output):
+        """The output's wp_color_management_output_v1 (get_output, opcode 1)."""
+        output["cm_output"] = self.request(self.manager, 1, self.protocol.output, ("n", 0), ("o", output["proxy"]))
+        self.listen(output["cm_output"], [""], [lambda *_: None], self.callbacks)
+
+    def on_global_remove(self, _data, _registry, name):
+        output = self.outputs.pop(name, None)
+        if output is None:
+            return
+        if output.get("cm_output"):
+            self.request(output["cm_output"], 0, destroy=True)
+        if output["version"] >= 3:
+            self.request(output["proxy"], 0, destroy=True)  # wl_output.release
+        else:
+            self.lib.wl_proxy_destroy(output["proxy"])
+
+    def query(self) -> list[dict]:
+        """Every output's image description, as the compositor reports it now."""
+        self.roundtrip()  # outputs that came or went meanwhile
+        keep = self.query_callbacks = []  # the previous query's objects are gone
+        states = []
+        for output in list(self.outputs.values()):
+            state = {"name": output["name"], "version": output["version"]}
+            states.append(state)
+            if not output.get("cm_output"):
+                continue
+            state["description"] = self.request(output["cm_output"], 1, self.protocol.description, ("n", 0))
+            self.listen(state["description"], ["us", "u"], [
+                lambda _d, _p, _cause, msg, state=state: state.update(failed=(msg or b"").decode()),
+                lambda _d, _p, _identity, state=state: state.update(ready=True),
+            ], keep)
+        try:
+            self.roundtrip()
+            for state in states:
+                if state.get("ready"):
+                    self.read_information(state, keep)
+            self.roundtrip()
+        finally:
+            for state in states:
+                if state.get("info"):
+                    self.lib.wl_proxy_destroy(state.pop("info"))
+                state.pop("info", None)
+                if state.get("description"):
+                    self.request(state.pop("description"), 0, destroy=True)
+        return states
+
+    def read_information(self, state, keep):
+        state["info"] = self.request(state["description"], 1, self.protocol.info, ("n", 0))
 
         def done(_d, proxy):
-            output["complete"] = True
+            state["complete"] = True
             self.lib.wl_proxy_destroy(proxy)  # a destructor event
-            output["info"] = None
+            state["info"] = None
 
         def icc(_d, _p, fd, _size):
             os.close(fd)
 
-        set_ = output.__setitem__
+        set_ = state.__setitem__
         ignore = lambda *_: None  # noqa: E731
-        self.listen(info, ["", "hu", "iiiiiiii", "u", "u", "u", "uuu", "iiiiiiii", "uu", "u", "u"], [
+        self.listen(state["info"], ["", "hu", "iiiiiiii", "u", "u", "u", "uuu", "iiiiiiii", "uu", "u", "u"], [
             done, icc, ignore, lambda _d, _p, v: set_("primaries_named", v), ignore,
             lambda _d, _p, v: set_("tf_named", v),
-            lambda _d, _p, lo, hi, ref: output.update(min_lum=lo / 10000, max_lum=hi, reference_lum=ref),
+            lambda _d, _p, lo, hi, ref: state.update(min_lum=lo / 10000, max_lum=hi, reference_lum=ref),
             ignore,
-            lambda _d, _p, lo, hi: output.update(target_min_lum=lo / 10000, target_max_lum=hi),
+            lambda _d, _p, lo, hi: state.update(target_min_lum=lo / 10000, target_max_lum=hi),
             lambda _d, _p, v: set_("target_max_cll", v), lambda _d, _p, v: set_("target_max_fall", v),
-        ])
+        ], keep)
 
-    def close(self):
-        lib = self.lib
-        for output in self.outputs:
-            if output.get("info"):
-                lib.wl_proxy_destroy(output["info"])
-            if output.get("description"):
-                self.request(output["description"], 0, destroy=True)
-            if output.get("cm_output"):
-                self.request(output["cm_output"], 0, destroy=True)
-            if output["version"] >= 3:
-                self.request(output["proxy"], 0, destroy=True)  # wl_output.release
-            else:
-                lib.wl_proxy_destroy(output["proxy"])
-        if self.manager:
-            self.request(self.manager, 0, destroy=True)
-        if self.registry:
-            lib.wl_proxy_destroy(self.registry)
-        if self.wrapper:
-            lib.wl_proxy_wrapper_destroy(self.wrapper)
-        if self.queue:
-            # Flush the destroys before the queue goes (events still in
-            # flight for these objects are dropped with it).
-            lib.wl_display_roundtrip_queue(self.display, self.queue)
-            lib.wl_event_queue_destroy(self.queue)
+
+_outputs: _WaylandOutputs | None = None
 
 
 def wayland_outputs(display: int | None = None) -> list[dict]:
     """Every output's image description: name, tf_named, luminances."""
+    global _outputs
     if display is None:
         app = QGuiApplication.instance()
         display = int(app.nativeInterface().display())
-    return _WaylandQuery(display).run()
+    if _outputs is None or _outputs.display != display:
+        _outputs = _WaylandOutputs(display)
+    return _outputs.query()
 
 
 def _wayland_query(screen_name: str | None) -> DisplayHdr:

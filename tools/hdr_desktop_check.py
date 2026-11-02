@@ -113,7 +113,7 @@ def surface_state(window):
             state[name] = mpv._get_property(name)
         except Exception as error:  # noqa: BLE001
             state[name] = repr(error)
-    for name in ("video-params", "video-target-params"):
+    for name in ("video-params",):  # video-target-params stays empty under the render API
         try:
             params = mpv._get_property(name) or {}
             state[name] = {k: params.get(k) for k in ("gamma", "primaries", "sig-peak", "max-luma", "w", "h", "pixelformat")}
@@ -307,6 +307,8 @@ def main():
         settings = QSettings("upscale-relay", scope)
         settings.clear()
         settings.sync()
+        if Path(settings.fileName()).is_file():  # Linux: clear() leaves the empty file
+            Path(settings.fileName()).unlink()
 
 
 if __name__ == "__main__":

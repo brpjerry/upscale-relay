@@ -22,7 +22,7 @@ import ctypes
 import time
 from ctypes import POINTER, Structure, byref, c_char_p, c_float, c_int, c_size_t, c_uint, c_uint8, c_void_p
 
-from PySide6.QtCore import QEvent, QObject, QPoint, QRect, Qt, Signal
+from PySide6.QtCore import QEvent, QObject, QPoint, QRect, Qt, QTimer, Signal
 from PySide6.QtGui import QOffscreenSurface, QOpenGLContext, QWindow
 
 from .hdr_output import _GUID, _com, _release
@@ -391,6 +391,7 @@ class D3D11Presenter(QWindow):
         self._textures: dict = {}
         self._picture_due = False
         self._broken = False
+        self._place_posted = False
         self._mirror = OverlayMirror(view, self._overlays_changed)
         self._followed = []
         self._tracker_obj = None
@@ -415,7 +416,21 @@ class D3D11Presenter(QWindow):
         self._gl.doneCurrent()
 
     def update(self) -> None:
+        # Open: while the window grows (entering fullscreen, hiding the
+        # sidebar) Windows delivers no update request to the surface until
+        # the slide ends (WM_TIMER waits for an empty message queue). A queued
+        # paint instead fared worse still; see docs/HDR_OUTPUT.md.
         self.requestUpdate()
+
+    def _paint_now(self) -> None:
+        try:
+            if self._d3d is None and not self._broken and self.isExposed():
+                self._start()
+            if self._d3d is not None and self.isExposed():
+                self._paint()
+        except Exception as error:  # noqa: BLE001 - a native crash otherwise
+            self._broken = True
+            self.failed.emit(f"HDR surface (D3D11): {error!r}")
 
     def picture_due(self) -> None:
         self._picture_due = True
@@ -429,14 +444,21 @@ class D3D11Presenter(QWindow):
                 widget.installEventFilter(self._tracker_obj)
                 self._followed.append(widget)
             widget = widget.parentWidget()
-        self.place()
+        self._place_now()
 
     def place(self) -> None:
+        # Once per turn of the event loop, as HdrPresenter.place.
+        if not self._place_posted:
+            self._place_posted = True
+            QTimer.singleShot(0, self._place_now)
+
+    def _place_now(self) -> None:
+        self._place_posted = False
         view = self._view
         geometry = QRect(view.mapTo(view.window(), QPoint(0, 0)), view.size())
         if geometry != self.geometry():
             self.setGeometry(geometry)
-        self.update()
+            self.update()
 
     def frame_ready(self) -> None:
         if self.ctx is None:
@@ -471,16 +493,8 @@ class D3D11Presenter(QWindow):
     # -- set-up ------------------------------------------------------------------
 
     def event(self, event) -> bool:
-        kind = event.type()
-        if kind in (QEvent.Expose, QEvent.UpdateRequest):
-            try:
-                if self._d3d is None and not self._broken and self.isExposed():
-                    self._start()
-                if self._d3d is not None and self.isExposed():
-                    self._paint()
-            except Exception as error:  # noqa: BLE001 - a native crash otherwise
-                self._broken = True
-                self.failed.emit(f"HDR surface (D3D11): {error!r}")
+        if event.type() in (QEvent.Expose, QEvent.UpdateRequest):
+            self._paint_now()
         return super().event(event)
 
     def _start(self) -> None:
