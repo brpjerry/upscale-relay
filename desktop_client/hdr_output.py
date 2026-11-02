@@ -7,9 +7,13 @@ through libwayland-client (no pywayland). On Windows DXGI reports it
 (IDXGIOutput6::GetDesc1: the colour space is BT.2100 PQ while HDR is on) and
 the display configuration API the SDR white level.
 
-Every query is a fresh snapshot (a DXGI factory caches its outputs; the
-Wayland objects are created and destroyed per query), cheap enough to repeat
+Every query is a fresh snapshot (a DXGI factory caches its outputs; on
+Wayland a query creates only the image descriptions), cheap enough to repeat
 at each load and on a slow timer.
+
+The same Wayland client describes HdrPresenter's surface
+(``describe_pq_surface``): BT.2100 PQ with the display's peak and reference
+white, which Qt's colour space tag cannot carry.
 """
 
 from __future__ import annotations
@@ -109,14 +113,20 @@ class _WlArgument(Union):
 _WL_MARSHAL_FLAG_DESTROY = 1
 _TF_ST2084_PQ = 11
 _TF_HLG = 13
+_PRIMARIES_BT2020 = 6
+_INTENT_PERCEPTUAL = 0
+_FEATURE_PARAMETRIC = 1
+_FEATURE_SET_LUMINANCES = 4
+_FEATURE_SET_MASTERING_DISPLAY_PRIMARIES = 5
+_PQ_MIN_NITS = 0.005  # st2084_pq's default minimum luminance
 # Event argument types for listener callbacks, by signature letter.
 _CTYPE = {"i": c_int32, "u": c_uint32, "f": c_int32, "s": c_char_p, "o": c_void_p,
           "n": c_void_p, "a": c_void_p, "h": c_int32}
 
 
 class _Protocol:
-    """The few color-management-v1 interfaces a query needs, as libwayland
-    interface descriptions. Requests and events must be listed completely
+    """The color-management-v1 interfaces a query and a surface description
+    need, as libwayland interface descriptions. Requests and events must be listed completely
     and in protocol order (they are dispatched by opcode)."""
 
     def __init__(self):
@@ -133,13 +143,23 @@ class _Protocol:
         output = self._interface("wp_color_management_output_v1", 1, [
             ("destroy", ""), ("get_image_description", "n", [description]),
         ], [("image_description_changed", "")])
+        creator = self._interface("wp_image_description_creator_params_v1", 1, [
+            ("create", "n", [description]), ("set_tf_named", "u"), ("set_tf_power", "u"),
+            ("set_primaries_named", "u"), ("set_primaries", "iiiiiiii"), ("set_luminances", "uuu"),
+            ("set_mastering_display_primaries", "iiiiiiii"), ("set_mastering_luminance", "uu"),
+            ("set_max_cll", "u"), ("set_max_fall", "u"),
+        ], [])
+        surface = self._interface("wp_color_management_surface_v1", 1, [
+            ("destroy", ""), ("set_image_description", "ou"), ("unset_image_description", ""),
+        ], [])
         manager = self._interface("wp_color_manager_v1", 1, [
-            ("destroy", ""), ("get_output", "no", [output, None]), ("get_surface", "no"),
+            ("destroy", ""), ("get_output", "no", [output, None]), ("get_surface", "no", [surface, None]),
             ("get_surface_feedback", "no"), ("create_icc_creator", "n"),
-            ("create_parametric_creator", "n"), ("create_windows_scrgb", "n"),
+            ("create_parametric_creator", "n", [creator]), ("create_windows_scrgb", "n"),
         ], [("supported_intent", "u"), ("supported_feature", "u"), ("supported_tf_named", "u"),
             ("supported_primaries_named", "u"), ("done", "")])
         self.info, self.description, self.output, self.manager = info, description, output, manager
+        self.creator, self.surface = creator, surface
 
     def _messages(self, specs):
         array = (_WlMessage * max(1, len(specs)))()
@@ -191,6 +211,12 @@ def _libwayland():
         lib.wl_proxy_get_version.argtypes = [c_void_p]
         lib.wl_display_roundtrip_queue.restype = c_int
         lib.wl_display_roundtrip_queue.argtypes = [c_void_p, c_void_p]
+        lib.wl_display_flush.restype = c_int
+        lib.wl_display_flush.argtypes = [c_void_p]
+        lib.wl_proxy_get_class.restype = c_char_p
+        lib.wl_proxy_get_class.argtypes = [c_void_p]
+        lib.wl_proxy_get_id.restype = c_uint32
+        lib.wl_proxy_get_id.argtypes = [c_void_p]
         _wayland = (lib, _Protocol(),
                     _WlInterface.in_dll(lib, "wl_registry_interface"),
                     _WlInterface.in_dll(lib, "wl_output_interface"))
@@ -212,6 +238,8 @@ class _WaylandOutputs:
         self.callbacks = []  # ctypes callbacks and listener arrays of the lasting objects
         self.query_callbacks = []  # those of the last query's objects
         self.manager = None
+        # What the colour manager supports (its supported_* events).
+        self.intents, self.features, self.tfs, self.primaries = set(), set(), set(), set()
         self.outputs: dict[int, dict] = {}  # by global name
         self.queue = self.lib.wl_display_create_queue(display)
         self.wrapper = self.lib.wl_proxy_create_wrapper(display)
@@ -255,7 +283,13 @@ class _WaylandOutputs:
         ignore = lambda *_: None  # noqa: E731
         if interface == "wp_color_manager_v1" and self.manager is None:
             self.manager = self.bind(name, self.protocol.manager, 1)
-            self.listen(self.manager, ["u", "u", "u", "u", ""], [ignore] * 5, self.callbacks)
+            self.listen(self.manager, ["u", "u", "u", "u", ""], [
+                lambda _d, _p, value: self.intents.add(value),
+                lambda _d, _p, value: self.features.add(value),
+                lambda _d, _p, value: self.tfs.add(value),
+                lambda _d, _p, value: self.primaries.add(value),
+                ignore,
+            ], self.callbacks)
             for output in self.outputs.values():
                 self.manage(output)
         elif interface == "wl_output":
@@ -338,18 +372,104 @@ class _WaylandOutputs:
         ], keep)
 
 
+    def can_describe_pq(self) -> bool:
+        """Whether a surface can be described as BT.2100 PQ with luminances."""
+        return (self.manager is not None
+                and {_FEATURE_PARAMETRIC, _FEATURE_SET_LUMINANCES} <= self.features
+                and _TF_ST2084_PQ in self.tfs and _PRIMARIES_BT2020 in self.primaries
+                and _INTENT_PERCEPTUAL in self.intents)
+
+    def describe_pq(self, surface: int, cm_surface: int | None, peak_nits: int, reference_nits: int) -> int:
+        """Describe ``surface`` (a wl_surface) as BT.2100 PQ for a display
+        that peaks at ``peak_nits`` with SDR white at ``reference_nits``.
+
+        Returns the surface's wp_color_management_surface_v1: ``cm_surface``
+        when given (new luminances), else a new one. The description is
+        double-buffered: the surface's next commit applies it.
+        """
+        if self.lib.wl_proxy_get_class(surface) != b"wl_surface":
+            raise ValueError("not a wl_surface")
+        minimum = round(_PQ_MIN_NITS * 10000)
+        creator = self.request(self.manager, 5, self.protocol.creator, ("n", 0))  # create_parametric_creator
+        self.request(creator, 1, None, ("u", _TF_ST2084_PQ))  # set_tf_named
+        self.request(creator, 3, None, ("u", _PRIMARIES_BT2020))  # set_primaries_named
+        # The primary volume's maximum is what Hyprland compares with the
+        # output's peak to decide whether to tone-map; the protocol takes it
+        # as 10000 nits for PQ, so compositors that follow it read the
+        # mastering luminance (the target volume) instead.
+        self.request(creator, 5, None, ("u", minimum), ("u", peak_nits), ("u", reference_nits))  # set_luminances
+        if _FEATURE_SET_MASTERING_DISPLAY_PRIMARIES in self.features:
+            self.request(creator, 7, None, ("u", minimum), ("u", peak_nits))  # set_mastering_luminance
+        description = self.request(creator, 0, self.protocol.description, ("n", 0), destroy=True)  # create
+        state, keep = {}, []
+        self.listen(description, ["us", "u"], [
+            lambda _d, _p, _cause, msg: state.update(failed=(msg or b"").decode()),
+            lambda _d, _p, _identity: state.update(ready=True),
+        ], keep)
+        try:
+            for _ in range(3):  # 'ready' or 'failed' within a roundtrip or two
+                if state:
+                    break
+                self.roundtrip()
+            if not state.get("ready"):
+                raise RuntimeError(f"image description: {state.get('failed', 'no answer')}")
+            if cm_surface is None:
+                cm_surface = self.request(self.manager, 2, self.protocol.surface, ("n", 0), ("o", surface))
+            # set_image_description (copied: the description can go at once)
+            self.request(cm_surface, 1, None, ("o", description), ("u", _INTENT_PERCEPTUAL))
+        finally:
+            self.request(description, 0, destroy=True)
+            self.lib.wl_display_flush(self.display)
+        return cm_surface
+
+    def release_surface(self, cm_surface: int) -> None:
+        """Drop a surface's description (wp_color_management_surface_v1.destroy)."""
+        self.request(cm_surface, 0, destroy=True)
+        self.lib.wl_display_flush(self.display)
+
+
 _outputs: _WaylandOutputs | None = None
 
 
-def wayland_outputs(display: int | None = None) -> list[dict]:
-    """Every output's image description: name, tf_named, luminances."""
+def _wayland_client(display: int | None = None) -> _WaylandOutputs:
     global _outputs
     if display is None:
         app = QGuiApplication.instance()
         display = int(app.nativeInterface().display())
     if _outputs is None or _outputs.display != display:
         _outputs = _WaylandOutputs(display)
-    return _outputs.query()
+    return _outputs
+
+
+def wayland_outputs(display: int | None = None) -> list[dict]:
+    """Every output's image description: name, tf_named, luminances."""
+    return _wayland_client(display).query()
+
+
+def can_describe_surfaces() -> bool:
+    """Whether a surface can describe itself as BT.2100 PQ with the display's
+    luminances (Wayland, a compositor with parametric descriptions)."""
+    if platform_kind() != "wayland":
+        return False
+    try:
+        return _wayland_client().can_describe_pq()
+    except Exception:  # noqa: BLE001 - Qt's colour space tag instead
+        return False
+
+
+def surface_identity(surface: int) -> tuple[int, int]:
+    """A wl_surface's pointer and protocol id: a surface Qt re-creates can
+    reuse the old one's memory, but not (soon) its id."""
+    return surface, _libwayland()[0].wl_proxy_get_id(surface)
+
+
+def describe_pq_surface(surface: int, cm_surface: int | None, peak_nits: int, reference_nits: int) -> int:
+    """See _WaylandOutputs.describe_pq."""
+    return _wayland_client().describe_pq(surface, cm_surface, peak_nits, reference_nits)
+
+
+def release_surface(cm_surface: int) -> None:
+    _wayland_client().release_surface(cm_surface)
 
 
 def _wayland_query(screen_name: str | None) -> DisplayHdr:

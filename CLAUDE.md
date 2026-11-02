@@ -314,6 +314,15 @@ their volume, panscan, tracks and delays.
   compositing. A widget over the player that paints only part of itself
   names that part (`mirror_rect`). The busy ring spans the player, and
   mirroring all of it at every resize step cost 1.3-5 ms of each frame.
+- Declare the HDR surface's luminances. Hyprland tone-maps a surface whose
+  range exceeds the output's peak, and Qt's `QColorSpace.Bt2100Pq` tag
+  carries no luminances, so it claimed PQ's 10000 nits. mpv had already
+  mapped the video to the 1107-nit panel, and Hyprland compressed it again:
+  white 203 -> 111 nits, highlights 1107 -> 258 (2026-11-02). On Wayland
+  `HdrPresenter` describes itself (`hdr_output.describe_pq_surface`: peak,
+  SDR white) and its format carries no colour space. Never add one back
+  there: Qt would create a second colour management surface for the same
+  `wl_surface`, a protocol error that ends the connection.
 - On Windows `requestUpdate()` (and every Qt timer, so `asyncio.sleep` too)
   arrives on a `WM_TIMER`, which Windows generates only once the message
   queue is empty. A frame-paced animation keeps the queue busy, so a child
@@ -384,7 +393,9 @@ their volume, panscan, tracks and delays.
   - Qt Widgets' backing store is SDR on every platform, QOpenGLWidget
     included. So an HDR video on a screen in HDR mode plays on a native PQ
     surface over the player (Qt >= 6.10.2, wp_color_management_v1), with the
-    overlays mirrored onto it. Everything else stays on the widget unchanged.
+    overlays mirrored onto it. The surface declares the display's peak, so
+    the compositor does not tone-map it again. Everything else stays on the
+    widget unchanged.
   - Hyprland shows it as HDR only with the monitor's `cm = "hdr"`.
   - On the laptop the surface matches the widget for steady playback,
     overlay motion, sidebar slides and splitter drags (2026-11-02, 120 Hz).

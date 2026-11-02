@@ -9,12 +9,12 @@ import pytest
 pytest.importorskip("PySide6")
 
 from PySide6.QtCore import QPoint, QRect
-from PySide6.QtGui import QColor, QPainter
+from PySide6.QtGui import QColor, QColorSpace, QPainter
 from PySide6.QtWidgets import QApplication, QFrame, QGraphicsOpacityEffect, QWidget
 
 from desktop_client import hdr_output
 from desktop_client.hdr_output import DisplayHdr, _Protocol
-from desktop_client.hdr_view import OverlayMirror
+from desktop_client.hdr_view import HdrPresenter, OverlayMirror
 
 HDR_DISPLAY = DisplayHdr(True, 1107.0, 203.0, "test")
 SDR_DISPLAY = DisplayHdr(False, 80.0, 80.0, "test")
@@ -172,6 +172,13 @@ def test_color_management_interfaces_follow_the_protocol():
     assert (protocol.output.method_count, protocol.output.event_count) == (2, 1)
     assert (protocol.description.method_count, protocol.description.event_count) == (2, 2)
     assert (protocol.info.method_count, protocol.info.event_count) == (0, 11)
+    assert (protocol.creator.method_count, protocol.creator.event_count) == (10, 0)
+    assert (protocol.surface.method_count, protocol.surface.event_count) == (3, 0)
+    assert protocol.manager.methods[2].types[0] == ctypes.addressof(protocol.surface)
+    assert protocol.manager.methods[5].types[0] == ctypes.addressof(protocol.creator)
+    assert protocol.creator.methods[0].types[0] == ctypes.addressof(protocol.description)
+    assert [(protocol.creator.methods[i].name, protocol.creator.methods[i].signature) for i in (5, 7)] == [
+        (b"set_luminances", b"uuu"), (b"set_mastering_luminance", b"uu")]
     get_output = protocol.manager.methods[1]
     assert (get_output.name, get_output.signature) == (b"get_output", b"no")
     assert get_output.types[0] == ctypes.addressof(protocol.output) and get_output.types[1] is None
@@ -188,6 +195,122 @@ def test_a_pq_output_reads_as_hdr_with_its_luminances(monkeypatch):
     assert hdr_output._wayland_query("eDP-1") == DisplayHdr(True, 1107.0, 203.0, "wayland eDP-1")
     assert not hdr_output._wayland_query("DP-1").hdr
     assert hdr_output._wayland_query("HDMI-A-1") == hdr_output.SDR  # unknown, and not the only one
+
+
+# -- describing the HDR surface (Wayland) -----------------------------------------------
+
+class FakeWayland:
+    """_WaylandOutputs' request plumbing, recording what it would send."""
+
+    def __init__(self, answer):
+        self.client = client = object.__new__(hdr_output._WaylandOutputs)
+        client.protocol, client.display, client.manager = _Protocol(), 0, 1
+        client.intents, client.features, client.tfs, client.primaries = {0}, {1, 4, 5}, {9, 11}, {1, 6}
+        client.lib = SimpleNamespace(wl_proxy_get_class=lambda _p: b"wl_surface", wl_display_flush=lambda _d: 0)
+        client.request, client.listen, client.roundtrip = self.request, self.listen, self.roundtrip
+        self.sent, self.listeners, self.next_id, self.answer = [], {}, 100, answer
+
+    def request(self, proxy, opcode, interface=None, *args, destroy=False, version=None):
+        self.sent.append((proxy, opcode, tuple(value for _kind, value in args), destroy))
+        if interface is not None:
+            self.next_id += 1
+            return self.next_id
+        return None
+
+    def listen(self, proxy, _signatures, handlers, _keep):
+        self.listeners[proxy] = handlers
+
+    def roundtrip(self):
+        failed, ready = self.listeners[max(self.listeners)]
+        if self.answer == "ready":
+            ready(None, None, 7)
+        else:
+            failed(None, None, 1, b"unsupported")
+
+
+def test_the_surface_declares_the_display_peak_as_its_range():
+    """Hyprland tone-maps a surface whose luminance range exceeds the
+    output's peak: PQ's default 10000 nits put mpv's output (already mapped
+    to the 1107-nit panel) through a second curve, white 203 -> 111 nits."""
+    wayland = FakeWayland("ready")
+    assert wayland.client.can_describe_pq()
+    cm_surface = wayland.client.describe_pq(0xABC000, None, 1107, 203)
+    creator, description = 101, 102
+    assert wayland.sent == [
+        (1, 5, (0,), False),                       # create_parametric_creator
+        (creator, 1, (11,), False),                # set_tf_named st2084_pq
+        (creator, 3, (6,), False),                 # set_primaries_named bt2020
+        (creator, 5, (50, 1107, 203), False),      # set_luminances: 0.005 .. peak, SDR white
+        (creator, 7, (50, 1107), False),           # set_mastering_luminance
+        (creator, 0, (0,), True),                  # create
+        (1, 2, (0, 0xABC000), False),              # get_surface
+        (cm_surface, 1, (description, 0), False),  # set_image_description, perceptual
+        (description, 0, (), True),
+    ]
+    wayland.sent.clear()
+    assert wayland.client.describe_pq(0xABC000, cm_surface, 1107, 250) == cm_surface
+    assert [entry[:2] for entry in wayland.sent if entry[0] == 1] == [(1, 5)]  # no second get_surface
+
+
+def test_a_refused_description_leaves_the_surface_alone():
+    wayland = FakeWayland("failed")
+    with pytest.raises(RuntimeError, match="unsupported"):
+        wayland.client.describe_pq(0xABC000, None, 1107, 203)
+    assert not [entry for entry in wayland.sent if entry[:2] == (1, 2)]  # no colour management surface
+    assert wayland.sent[-1][1:] == (0, (), True)  # the description went
+
+
+def test_without_parametric_luminances_qt_tags_the_surface():
+    wayland = FakeWayland("ready")
+    wayland.client.features = {1}  # parametric, no set_luminances
+    assert not wayland.client.can_describe_pq()
+
+
+@pytest.mark.parametrize(("describes", "color_space"), [
+    (True, QColorSpace()),  # ours: Qt must not create a second colour management surface
+    (False, QColorSpace(QColorSpace.NamedColorSpace.Bt2100Pq)),
+])
+def test_the_hdr_surface_is_tagged_by_qt_only_when_it_cannot_describe_itself(
+        monkeypatch, scene, describes, color_space):
+    monkeypatch.setattr(hdr_output, "can_describe_surfaces", lambda: describes)
+    presenter = HdrPresenter(scene.view, scene.top.windowHandle(), pq=True, cover=True)
+    assert presenter.format().colorSpace() == color_space
+    assert presenter.format().redBufferSize() == 10
+
+
+def test_the_hdr_surface_describes_itself_again_when_the_display_or_its_surface_changes(monkeypatch, scene):
+    monkeypatch.setattr(hdr_output, "can_describe_surfaces", lambda: True)
+    ids = {"surface": 3}
+    calls = []
+    monkeypatch.setattr(hdr_output, "surface_identity", lambda surface: (surface, ids["surface"]))
+
+    def describe(surface, cm_surface, peak, white):
+        calls.append(("describe", surface, cm_surface, peak, white))
+        return cm_surface or len(calls)
+    monkeypatch.setattr(hdr_output, "describe_pq_surface", describe)
+    monkeypatch.setattr(hdr_output, "release_surface", lambda cm: calls.append(("release", cm)))
+    presenter = HdrPresenter(scene.view, scene.top.windowHandle(), pq=True, cover=True,
+                             peak_nits=1107.0, sdr_white_nits=203.0)
+    presenter.winId = lambda: 0x50000000
+    presenter._describe_surface()
+    presenter._describe_surface()  # each frame: nothing new
+    assert calls == [("describe", 0x50000000, None, 1107, 203)]
+    presenter.sdr_white_nits = 250.0  # the brightness setting
+    presenter._describe_surface()
+    assert calls[-1] == ("describe", 0x50000000, 1, 1107, 250)
+    ids["surface"] = 9  # Qt made a new wl_surface in the old one's memory
+    presenter._describe_surface()
+    assert calls[-2:] == [("release", 1), ("describe", 0x50000000, None, 1107, 250)]
+    presenter.release_description()
+    assert calls[-1] == ("release", 4)
+
+
+def test_the_windows_swap_chain_carries_the_display_peak():
+    from desktop_client.hdr_d3d11 import _hdr10_metadata  # noqa: PLC0415
+    metadata = _hdr10_metadata(1107.0)
+    assert [tuple(metadata.RedPrimary), tuple(metadata.GreenPrimary), tuple(metadata.BluePrimary),
+            tuple(metadata.WhitePoint)] == [(35400, 14600), (8500, 39850), (6550, 2300), (15635, 16450)]
+    assert (metadata.MaxMasteringLuminance, metadata.MinMasteringLuminance) == (11070000, 50)
 
 
 @pytest.mark.skipif(not hasattr(ctypes, "WinDLL"), reason="DXGI")

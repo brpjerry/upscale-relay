@@ -1048,9 +1048,10 @@ class MpvPlayerView(QOpenGLWidget):
                 surface = D3D11Presenter
             options = {"cover": hdr_output.platform_kind() == "wayland"} if surface is HdrPresenter else {}
             presenter = self._presenter = surface(
-                self, top, pq=pq, sdr_white_nits=display.sdr_white_nits, **options)
+                self, top, pq=pq, sdr_white_nits=display.sdr_white_nits, peak_nits=display.peak_nits, **options)
             presenter.failed.connect(self._on_presenter_failed)
         presenter.sdr_white_nits = display.sdr_white_nits or presenter.sdr_white_nits
+        presenter.peak_nits = display.peak_nits or presenter.peak_nits
         if self._on_presenter:
             return True
         presenter.follow_view()
@@ -1109,6 +1110,8 @@ class MpvPlayerView(QOpenGLWidget):
             presenter.hide()
             if hasattr(presenter, "destroy_d3d"):
                 presenter.destroy_d3d()
+            if hasattr(presenter, "release_description"):
+                presenter.release_description()
             presenter.deleteLater()
 
     def _render_ctx_lost(self, ctx) -> None:
@@ -1183,7 +1186,9 @@ class MpvPlayerView(QOpenGLWidget):
             self._display_hdr = display
             if display.sdr_white_nits:
                 self._presenter.sdr_white_nits = display.sdr_white_nits
-                self._presenter.update()
+            if display.peak_nits:
+                self._presenter.peak_nits = display.peak_nits
+            self._presenter.update()  # composes, and describes the surface, anew
             self._apply_output_target(asynchronous=True)
 
     # -- public API -----------------------------------------------------------

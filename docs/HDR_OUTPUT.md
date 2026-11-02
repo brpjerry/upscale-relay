@@ -18,12 +18,26 @@ included, reaches the screen as SDR.
 `desktop_client/hdr_view.py`:
 
 - **HdrPresenter** is a native child window (`QOpenGLWindow`) over the
-  player widget. Its format is 10 bits a channel tagged
-  `QColorSpace.Bt2100Pq`. From Qt 6.10.2 the Wayland plugin sends that colour
-  space as a `wp_color_management_surface_v1` image description (bt2020
-  primaries, st2084_pq), and the compositor shows the surface as HDR. It is
-  transparent for input (`Qt.WindowTransparentForInput`: an empty input
-  region) and takes no focus.
+  player widget, 10 bits a channel. It is transparent for input
+  (`Qt.WindowTransparentForInput`: an empty input region) and takes no focus.
+- **On Wayland it describes itself to the compositor**
+  (`hdr_output.describe_pq_surface`, before its first frame and again when
+  the display's luminances change). The `wp_color_management_surface_v1`
+  image description it sets is BT.2020 primaries and st2084_pq, with these
+  luminances:
+  - `set_luminances`: 0.005 nits up to the display's peak, reference white
+    at the display's SDR white.
+  - `set_mastering_luminance`: the same range.
+
+  Qt can tag a surface too (from 6.10.2 it sends a format's `QColorSpace` as
+  an image description), but a colour space carries no luminances. Qt's
+  `Bt2100Pq` tag left the PQ defaults, a 10000-nit range, and Hyprland
+  tone-mapped that into the panel's 1107 nits after mpv already had (see
+  Hyprland below). So the format carries no colour space: Qt creates its own
+  colour management surface only for one that does, and a second one for the
+  same `wl_surface` is a protocol error (`surface_exists`). Qt's
+  `QWindow.winId()` on Wayland is the `wl_surface`. A compositor without
+  parametric descriptions with luminances gets Qt's tag instead.
 - **On Wayland it spans the whole window and stays put** ("cover" mode). It
   is clear everywhere but the player's rectangle, where it draws the picture
   and the overlays, clipped to it; the window beneath shows through
@@ -111,6 +125,36 @@ out keeps HDR on. In HDR mode the eDP panel (Samsung ATNA53JB01-0) reports a
 peak of 1107 nits and an SDR white of 203 nits. In SDR mode it reports 80 and
 80.
 
+**Hyprland tone-maps any surface whose range exceeds the output's.**
+`IHyprRenderer::getCMSettings` (0.56.2) tone-maps when the surface's
+`luminances.max`, scaled by the ratio of the two reference whites, reaches
+1.01 times the output's. The protocol says a PQ description's maximum is
+always 10000 nits whatever `set_luminances` gives; Hyprland takes the value
+given. Compositors that follow the protocol read the target volume instead,
+hence `set_mastering_luminance` as well.
+
+With Qt's tag (the PQ defaults) the laptop session measured what reached the
+panel (2026-11-02, 1107-nit peak, reference 203):
+
+| signal (nits) | 203 | 600 | 1000 | 1107 | 2000 | 4000 | 10000 |
+|---|---|---|---|---|---|---|---|
+| on the panel | 111 | 193 | 246 | 258 | 353 | 546 | 1107 |
+
+mpv had already tone-mapped the video to its 1107-nit `target-peak`, so a
+highlight ended near 258 nits, and the video's white (203) showed at 111
+beside the interface's 203. A 10000-nit test square looked far dimmer than
+the hardware cursor, which skips Hyprland's colour management. Raising the
+monitor's `max_luminance` to 10000, so that nothing was tone-mapped, made the
+square match the cursor. The surface now declares the panel's peak, which
+Hyprland only clamps.
+
+Hyprland also switches a panel in SDR mode to HDR on its own while a
+fullscreen window shows a PQ surface (`render:cm_auto_hdr`, on by default):
+the connector's colorspace became BT2020_RGB with PQ metadata ~1.2 s after
+fullscreen, and the output's image description read PQ with 1107/203. The
+player does not use this yet: it picks the HDR surface only on a screen that
+already reports HDR.
+
 ### What mpv does with the metadata
 
 The render API runs mpv's `gpu` renderer. gpu-next is not available through
@@ -172,7 +216,11 @@ same design with Direct3D 11 for the surface:
 
 - The native child window carries a flip-model DXGI swap chain,
   R10G10B10A2, in the BT.2100 PQ colour space
-  (`DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020`).
+  (`DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020`). Its HDR10 metadata
+  (`IDXGISwapChain4::SetHDRMetaData`) gives BT.2020 primaries and the
+  display's peak as the mastering maximum. DWM composes HDR10 swap chains
+  without tone-mapping them, so nothing on Windows maps the picture a second
+  time. The metadata is for a display that tone-maps by it.
 - mpv still renders through its OpenGL render API, in a WGL context of our
   own, into a D3D11 texture (RGBA16F) shared through `WGL_NV_DX_interop2`.
   Through the interop GL's bottom row is the texture's last, so mpv renders

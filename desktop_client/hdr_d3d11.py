@@ -20,7 +20,9 @@ from __future__ import annotations
 
 import ctypes
 import time
-from ctypes import POINTER, Structure, byref, c_char_p, c_float, c_int, c_size_t, c_uint, c_uint8, c_void_p
+from ctypes import (
+    POINTER, Structure, byref, c_char_p, c_float, c_int, c_size_t, c_uint, c_uint8, c_uint16, c_void_p,
+)
 
 from PySide6.QtCore import QEvent, QObject, QPoint, QRect, Qt, QTimer, Signal
 from PySide6.QtGui import QOffscreenSurface, QOpenGLContext, QWindow
@@ -45,6 +47,8 @@ _WGL_ACCESS_WRITE_DISCARD_NV = 2
 _IID_IDXGIDevice = "54ec77fa-1377-44e6-8c32-88fd5f44c84c"
 _IID_IDXGIFactory2 = "50c83a1c-e072-4c48-87b0-3630fa36a6d0"
 _IID_IDXGISwapChain3 = "94d99bdb-f1f8-4ab0-b236-7da0170edab1"
+_IID_IDXGISwapChain4 = "3d585d5a-bd4a-489e-b1f4-3dbcb6452ffb"
+_DXGI_HDR_METADATA_TYPE_HDR10 = 1
 _IID_ID3D11Texture2D = "6f15aaf2-d208-4e89-9ab4-489535d34f9c"
 
 _HLSL = b"""
@@ -130,6 +134,25 @@ class _SwapChainDesc1(Structure):
                 ("Scaling", c_uint), ("SwapEffect", c_uint), ("AlphaMode", c_uint), ("Flags", c_uint)]
 
 
+class _HdrMetadataHdr10(Structure):
+    """DXGI_HDR_METADATA_HDR10: chromaticities in 0.00002 units, mastering
+    luminances in 0.0001 nits, light levels in nits."""
+    _fields_ = [
+        ("RedPrimary", c_uint16 * 2), ("GreenPrimary", c_uint16 * 2), ("BluePrimary", c_uint16 * 2),
+        ("WhitePoint", c_uint16 * 2), ("MaxMasteringLuminance", c_uint), ("MinMasteringLuminance", c_uint),
+        ("MaxContentLightLevel", c_uint16), ("MaxFrameAverageLightLevel", c_uint16),
+    ]
+
+
+def _hdr10_metadata(peak_nits: float) -> _HdrMetadataHdr10:
+    """BT.2020 primaries, mastered on a display of ``peak_nits``: mpv maps
+    the video into that range, so nothing above it reaches the swap chain."""
+    def xy(x, y):
+        return (c_uint16 * 2)(round(x * 50000), round(y * 50000))
+    return _HdrMetadataHdr10(xy(0.708, 0.292), xy(0.170, 0.797), xy(0.131, 0.046), xy(0.3127, 0.3290),
+                             round(peak_nits * 10000), 50, 0, 0)  # min 0.005 nits; light levels unknown
+
+
 class _Box(Structure):
     _fields_ = [("left", c_uint), ("top", c_uint), ("front", c_uint), ("right", c_uint), ("bottom", c_uint),
                 ("back", c_uint)]
@@ -143,7 +166,7 @@ def _check(hr: int, what: str) -> None:
 class _D3D:
     """The device, the swap chain on one window, and the composing pass."""
 
-    def __init__(self, hwnd: int, width: int, height: int):
+    def __init__(self, hwnd: int, width: int, height: int, peak_nits: float | None = None):
         self.device = c_void_p()
         self.context = c_void_p()
         level = c_uint()
@@ -175,10 +198,27 @@ class _D3D:
             _release(swapchain1)
         _check(_com(self.swapchain, 38, c_int, [c_uint], _DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020),
                "SetColorSpace1(G2084 P2020)")
+        if peak_nits:
+            self._set_hdr_metadata(peak_nits)
         self.size = (width, height)
         self.rtv = c_void_p()
         self._make_rtv()
         self._compile()
+
+    def _set_hdr_metadata(self, peak_nits: float) -> None:
+        """Tell the display the swap chain's range (IDXGISwapChain4::
+        SetHDRMetaData). DWM composes HDR10 without tone-mapping it either way;
+        a display that tone-maps by the metadata sees the real peak."""
+        swapchain4 = c_void_p()
+        if _com(self.swapchain, 0, c_int, [POINTER(_GUID), POINTER(c_void_p)],
+                byref(_GUID.parse(_IID_IDXGISwapChain4)), byref(swapchain4)) != 0:
+            return  # before Windows 10 1709
+        try:
+            metadata = _hdr10_metadata(peak_nits)
+            _check(_com(swapchain4, 40, c_int, [c_uint, c_uint, c_void_p], _DXGI_HDR_METADATA_TYPE_HDR10,
+                        ctypes.sizeof(metadata), byref(metadata)), "SetHDRMetaData")
+        finally:
+            _release(swapchain4)
 
     def _make_rtv(self) -> None:
         backbuffer = c_void_p()
@@ -376,11 +416,13 @@ class D3D11Presenter(QWindow):
     ready = Signal()
     failed = Signal(str)
 
-    def __init__(self, view, parent: QWindow, *, pq: bool = True, sdr_white_nits: float | None = None):
+    def __init__(self, view, parent: QWindow, *, pq: bool = True, sdr_white_nits: float | None = None,
+                 peak_nits: float | None = None):
         super().__init__(parent)
         self._view = view
         self.pq = True
         self.sdr_white_nits = sdr_white_nits or DEFAULT_SDR_WHITE_NITS
+        self.peak_nits = peak_nits
         self.setFlags(self.flags() | Qt.WindowTransparentForInput | Qt.WindowDoesNotAcceptFocus)
         self.ctx = None
         self._d3d: _D3D | None = None
@@ -499,7 +541,7 @@ class D3D11Presenter(QWindow):
 
     def _start(self) -> None:
         width, height = self._pixel_size()
-        self._d3d = _D3D(int(self.winId()), width, height)
+        self._d3d = _D3D(int(self.winId()), width, height, self.peak_nits)
         self._gl = QOpenGLContext()
         if not self._gl.create():
             raise OSError("no OpenGL context for mpv")

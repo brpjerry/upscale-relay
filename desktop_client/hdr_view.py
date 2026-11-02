@@ -3,9 +3,9 @@
 Qt Widgets compose every window in SDR on every platform (QOpenGLWidget
 included), so through the player widget mpv can only tone-map HDR. Real HDR
 needs a surface the platform shows as HDR: a native child window placed over
-the player widget (``HdrPresenter``), PQ-tagged on Wayland (Qt >= 6.10.2 sends
-the format's colour space as a wp_color_management_v1 image description). mpv
-renders into it through the same render API. The player widget underneath
+the player widget (``HdrPresenter``), described to the compositor as BT.2100
+PQ (on Wayland a wp_color_management_v1 image description). mpv renders into
+it through the same render API. The player widget underneath
 keeps everything else: the layout, input (the surface is transparent for
 input), focus and the overlays.
 
@@ -30,13 +30,15 @@ from dataclasses import dataclass, field
 
 from PySide6.QtCore import QEvent, QObject, QPoint, QRect, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import (
-    QColorSpace, QImage, QPainter, QRegion, QSurfaceFormat, QVector4D, QWindow,
+    QColorSpace, QImage, QPainter, QPlatformSurfaceEvent, QRegion, QSurfaceFormat, QVector4D, QWindow,
 )
 from PySide6.QtOpenGL import (
     QOpenGLBuffer, QOpenGLFramebufferObject, QOpenGLFramebufferObjectFormat, QOpenGLShader,
     QOpenGLShaderProgram, QOpenGLTexture, QOpenGLVertexArrayObject, QOpenGLWindow,
 )
 from PySide6.QtWidgets import QGraphicsOpacityEffect, QWidget
+
+from . import hdr_output
 
 _GL_FRAMEBUFFER = 0x8D40
 _GL_READ_FRAMEBUFFER = 0x8CA8
@@ -104,14 +106,16 @@ void main() {
 """
 
 
-def pq_surface_format() -> QSurfaceFormat:
-    """10 bits a channel, tagged BT.2100 PQ (bt2020 primaries, st2084)."""
+def pq_surface_format(tagged: bool = True) -> QSurfaceFormat:
+    """10 bits a channel. ``tagged``: Qt declares it BT.2100 PQ (bt2020
+    primaries, st2084) to the compositor; otherwise it carries no colour
+    space, and Qt leaves the surface's description to us."""
     fmt = QSurfaceFormat.defaultFormat()
     fmt.setRedBufferSize(10)
     fmt.setGreenBufferSize(10)
     fmt.setBlueBufferSize(10)
     fmt.setAlphaBufferSize(2)
-    fmt.setColorSpace(QColorSpace(QColorSpace.NamedColorSpace.Bt2100Pq))
+    fmt.setColorSpace(QColorSpace(QColorSpace.NamedColorSpace.Bt2100Pq) if tagged else QColorSpace())
     return fmt
 
 
@@ -365,14 +369,24 @@ class HdrPresenter(QOpenGLWindow):
     failed = Signal(str)
 
     def __init__(self, view, parent: QWindow, *, pq: bool, sdr_white_nits: float | None = None,
-                 cover: bool = False):
+                 peak_nits: float | None = None, cover: bool = False):
         super().__init__(QOpenGLWindow.NoPartialUpdate, parent)
         self._view = view
         self.pq = pq
         self.cover = cover
         self.sdr_white_nits = sdr_white_nits or DEFAULT_SDR_WHITE_NITS
+        self.peak_nits = peak_nits
+        # On Wayland the surface describes itself (_describe_surface): Qt's
+        # colour space tag carries no luminances, so it claimed the PQ range
+        # (10000 nits), and Hyprland tone-mapped that into the display's peak
+        # after mpv already had: highlights at a quarter of their level,
+        # 203-nit white at 111 (laptop, 1107-nit panel, 2026-11-02).
+        self._describes = pq and hdr_output.can_describe_surfaces()
+        self._cm_surface = None  # our wp_color_management_surface_v1
+        self._described = None  # (surface identity, peak, white) last declared
         if pq:
-            self.setFormat(pq_surface_format())  # 2 bits of alpha: enough to be clear
+            # 2 bits of alpha: enough to be clear
+            self.setFormat(pq_surface_format(tagged=not self._describes))
         elif cover:
             fmt = QSurfaceFormat.defaultFormat()
             fmt.setAlphaBufferSize(8)
@@ -519,6 +533,39 @@ class HdrPresenter(QOpenGLWindow):
     def broken(self) -> bool:
         return self._broken
 
+    def event(self, event) -> bool:
+        if event.type() == QEvent.PlatformSurface:
+            try:
+                if event.surfaceEventType() == QPlatformSurfaceEvent.SurfaceAboutToBeDestroyed:
+                    self.release_description()
+            except Exception:  # noqa: BLE001 - see the module docstring
+                pass
+        return super().event(event)
+
+    def _describe_surface(self) -> None:
+        """Describe this surface as BT.2100 PQ for the display (Wayland):
+        its peak as the most the surface shows, so the compositor passes the
+        picture through rather than tone-mapping it a second time, and its
+        SDR white as the reference the overlays are composed at. Before the
+        first frame, and again when the display's luminances change."""
+        surface = int(self.winId())  # the wl_surface (Qt >= 6.10's Wayland plugin)
+        if surface < 0x10000:
+            raise RuntimeError(f"no wl_surface for the HDR surface (window id {surface})")
+        identity = hdr_output.surface_identity(surface)
+        wanted = (identity, round(self.peak_nits or 10000), round(self.sdr_white_nits))
+        if wanted == self._described:
+            return
+        if self._described is not None and self._described[0] != identity:
+            self.release_description()  # Qt made a new wl_surface: the old one is inert
+        self._cm_surface = hdr_output.describe_pq_surface(surface, self._cm_surface, wanted[1], wanted[2])
+        self._described = wanted
+
+    def release_description(self) -> None:
+        """Drop the surface's description, before its wl_surface goes."""
+        cm_surface, self._cm_surface, self._described = self._cm_surface, None, None
+        if cm_surface is not None:
+            hdr_output.release_surface(cm_surface)
+
     def _release_gl(self) -> None:
         """The context is going: free what lives in it, mpv's state first."""
         self.makeCurrent()
@@ -556,6 +603,8 @@ class HdrPresenter(QOpenGLWindow):
             if self._broken:
                 self._clear()
                 return
+            if self._describes:
+                self._describe_surface()
             self._paint()
             self.frames += 1
         except Exception as error:  # noqa: BLE001 - see the module docstring

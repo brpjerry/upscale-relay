@@ -116,7 +116,10 @@ def surface_state(window):
     presenter = player._presenter
     state = {"hdr_output": player.hdr_output, "on_surface": player._on_presenter}
     if presenter is not None:
+        described = getattr(presenter, "_described", None)  # (surface, peak, white) on Wayland
         state.update(pq=presenter.pq, sdr_white_nits=presenter.sdr_white_nits,
+                     peak_nits=getattr(presenter, "peak_nits", None),
+                     described={"peak": described[1], "white": described[2]} if described else None,
                      color_space=presenter.format().colorSpace().description(),
                      depth=[presenter.format().redBufferSize(), presenter.format().alphaBufferSize()],
                      broken=presenter.broken)
