@@ -203,9 +203,20 @@ rate. Its paints are the longest of any span, probably because the control
 bar re-docks over the shrinking picture and is pictured anew at each width.
 
 The overlays and the window looked identical, pixel for pixel, in screenshots
-of every round. Screenshots in HDR mode are converted to 8 bits, though, so
-nobody has yet judged by eye that the 400-1000-nit patches are brighter than
-SDR white on the panel.
+of every round. The video, though, was upside down on the surface in all of
+them, and nobody noticed until the by-eye check below: mpv rendered unflipped
+into a framebuffer that is blitted bottom-up, as GL counts. It now renders
+with `flip_y`, as the widget does (into FBO 0 that is mpv's own advice). The
+sample clip has its ramp on top, and the screenshots showed the patches on
+top. Check a picture's orientation, not only its alignment, against the
+widget path (`RELAY_HDR_SURFACE=off`).
+
+Judged by eye on the panel (2026-11-02, the user, a peak test card in normal
+playback): "Looks correct". 203 nits matched the interface's white, 10000
+came close to the hardware cursor, 2000-10000 bunched near the top (mpv
+tone-maps above 1107), and 600 and 1000 sat below them. This was after the
+surface declared its luminances (see Hyprland above); before that, the same
+card showed white at about half the interface's.
 
 ## Windows
 
@@ -237,8 +248,8 @@ writing PQ at a 500-nit peak, and the overlays are drawn over it and aligned.
 Steady playback composes at 24-26 frames a second with no drops. The
 overlays move step for step: the fullscreen bar ~240 steps a second, the
 track card 245-270, the settings sheet 190-195 (the widget path: 220-265).
-The picture looked right in SDR screen captures, but its brightness has not
-yet been judged by eye.
+The picture looked right, and upright, in SDR screen captures, but its
+brightness has not yet been judged by eye on this display.
 
 | scenario (rates per second) | surface paints | main window frames | widget path: main window frames |
 |---|---|---|---|

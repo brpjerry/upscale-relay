@@ -305,6 +305,23 @@ def test_the_hdr_surface_describes_itself_again_when_the_display_or_its_surface_
     assert calls[-1] == ("release", 4)
 
 
+def test_mpv_renders_bottom_up_for_the_gl_surface(monkeypatch, scene):
+    """The picture is blitted into the window's framebuffer as GL counts,
+    bottom-up: mpv must render flipped (its FBO 0 case), as the widget does.
+    Unflipped, the laptop showed the picture upside down."""
+    monkeypatch.setattr(hdr_output, "can_describe_surfaces", lambda: False)
+    presenter = HdrPresenter(scene.view, scene.top.windowHandle(), pq=True)
+    presenter._view = SimpleNamespace(_picture_aspect=lambda: None, _scaling=False)
+    presenter._fbo = SimpleNamespace(width=lambda: 300, height=lambda: 180, handle=lambda: 5)
+    renders, blits = [], []
+    presenter.ctx = SimpleNamespace(update=lambda: True, render=lambda **kw: renders.append(kw))
+    gl = SimpleNamespace(glBindFramebuffer=lambda *_: None, glBlitFramebuffer=lambda *a: blits.append(a[:8]),
+                         glEnable=lambda *_: None, glScissor=lambda *_: None)
+    presenter._paint_video(gl, 0, QRect(10, 20, 300, 180), 400)
+    assert renders[0]["flip_y"] is True
+    assert blits == [(0, 0, 300, 180, 10, 200, 310, 380)]  # bottom-left 400 - 20 - 180: not flipped again
+
+
 def test_the_windows_swap_chain_carries_the_display_peak():
     from desktop_client.hdr_d3d11 import _hdr10_metadata  # noqa: PLC0415
     metadata = _hdr10_metadata(1107.0)

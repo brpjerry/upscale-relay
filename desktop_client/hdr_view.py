@@ -704,10 +704,12 @@ class HdrPresenter(QOpenGLWindow):
             fbo = self._fbo = QOpenGLFramebufferObject(QSize(width, height), fmt)
         self._rendered_now = bool(stale or render)
         if stale or render:
-            # The window's own framebuffer is bottom-up, as GL draws; unlike
-            # the widget's, nothing flips it afterwards.
+            # Bottom-up, as GL counts (mpv's flip_y is for exactly that, its
+            # FBO 0 case): the blits below keep GL's orientation into the
+            # window's framebuffer. Unflipped the picture was upside down on
+            # the panel (2026-11-02). Through the D3D interop it is unflipped.
             self.ctx.render(
-                flip_y=False,
+                flip_y=True,
                 opengl_fbo={"fbo": fbo.handle(), "w": fbo.width(), "h": fbo.height()},
             )
             self._picture_due = False

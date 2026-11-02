@@ -403,8 +403,10 @@ their volume, panscan, tracks and delays.
     84-99 leaving (111-112).
   - Windows (`RELAY_HDR_WINDOWS=1`): a D3D11 HDR10 swap chain fed through
     `WGL_NV_DX_interop2`. Its transitions run at 60-85% of the widget's rate.
-  - Nobody has yet judged the HDR picture by eye: screenshots in HDR mode
-    are 8-bit conversions.
+  - Judged by eye on the laptop panel (2026-11-02): white matches the
+    interface's, highlights reach the panel's peak. Screenshots in HDR mode
+    are 8-bit conversions and cannot show that; the Windows prototype's
+    brightness has not been judged by eye.
   - The render API is mpv's `gpu` renderer (gpu-next is not available through
     it), which ignores Dolby Vision and HDR10+.
 - Anamorphic uplinks: when a client sends no
