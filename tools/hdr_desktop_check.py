@@ -250,6 +250,13 @@ async def exercise(window, clock, args):
         await asyncio.sleep(1.0)
         report["surface"] = surface_state(window)
         print(json.dumps({"surface": report["surface"]}), flush=True)
+        if args.hold:
+            # Someone judges the picture: keep playing until the window closes.
+            deadline = time.monotonic() + args.hold
+            while window.isVisible() and time.monotonic() < deadline:
+                await asyncio.sleep(0.5)
+            report["errors"] = errors
+            return report
         await shot(args, "01_playing", window)
         window._set_track_panel_visible(True)
         await asyncio.sleep(0.8)
@@ -292,6 +299,8 @@ def main():
     parser.add_argument("--shots", help="directory for screenshots")
     parser.add_argument("--shot-cmd", default="grim {path}", help="screenshot command ({path} is replaced), or qt for Qt's own grab")
     parser.add_argument("--pacing", action="store_true")
+    parser.add_argument("--hold", type=float, default=0,
+                        help="keep the clip playing this many seconds (or until the window closes), then exit")
     parser.add_argument("--size", default="1400x860", help="window size before fullscreen")
     args = parser.parse_args()
     if args.surface != "auto":

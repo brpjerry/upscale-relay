@@ -403,10 +403,10 @@ their volume, panscan, tracks and delays.
     84-99 leaving (111-112).
   - Windows (`RELAY_HDR_WINDOWS=1`): a D3D11 HDR10 swap chain fed through
     `WGL_NV_DX_interop2`. Its transitions run at 60-85% of the widget's rate.
-  - Judged by eye on the laptop panel (2026-11-02): white matches the
-    interface's, highlights reach the panel's peak. Screenshots in HDR mode
-    are 8-bit conversions and cannot show that; the Windows prototype's
-    brightness has not been judged by eye.
+  - Judged by eye on the laptop panel and on the Windows prototype
+    (2026-11-02): white matches the interface's, highlights reach the
+    display's peak. Screenshots in HDR mode are 8-bit conversions and cannot
+    show that (`tools/hdr_desktop_check.py --hold` keeps a clip up to look at).
   - The render API is mpv's `gpu` renderer (gpu-next is not available through
     it), which ignores Dolby Vision and HDR10+.
 - Anamorphic uplinks: when a client sends no

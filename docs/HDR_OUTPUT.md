@@ -166,7 +166,9 @@ display's peak) and passes the rest through.
 
 `tools/hdr_desktop_check.py --file hdr.mkv --pacing` plays a clip from
 `upscale-cli sample hdr.mkv --hdr` in the real window and times the CLAUDE.md
-scenarios. `--surface off` measures the widget for comparison. Rates are per
+scenarios. `--surface off` measures the widget for comparison. `--hold
+SECONDS` instead keeps the clip playing in the window (looped) for a by-eye
+check, until the window closes. Rates are per
 second, measured over the span of the motion. "Main" is the main window's
 presented frames. Resizes and steps are the layout and animation steps that
 reached the player or the overlay.
@@ -248,8 +250,12 @@ writing PQ at a 500-nit peak, and the overlays are drawn over it and aligned.
 Steady playback composes at 24-26 frames a second with no drops. The
 overlays move step for step: the fullscreen bar ~240 steps a second, the
 track card 245-270, the settings sheet 190-195 (the widget path: 220-265).
-The picture looked right, and upright, in SDR screen captures, but its
-brightness has not yet been judged by eye on this display.
+The picture looked right, and upright, in SDR screen captures. Judged by eye
+on the G80SH (2026-11-02, the user, a card of grey patches at 40-1000 nits
+labelled in 80-nit text): "Looks correct". The 80-nit patch and the text
+matched the white of ordinary windows (Windows' SDR content brightness, 80
+nits here), 120-300 stood clearly above it, and 400-1000 drew together toward
+the display's 500-nit peak, where mpv tone-maps.
 
 | scenario (rates per second) | surface paints | main window frames | widget path: main window frames |
 |---|---|---|---|
