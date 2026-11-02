@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import struct
+from types import SimpleNamespace
 
 import pytest
 
+from relay_media.demux import coded_side_data
 from relay_server.pipeline import output_bit_depth
-from upscale_cli.color import VideoColor
+from upscale_cli.color import VideoColor, fill_unspecified
 from relay_media.hdr import (
     ContentLightLevel,
     DolbyVisionConfig,
@@ -93,10 +95,21 @@ def test_static_metadata_prefers_the_bitstream_and_falls_back_per_half():
     {"mastering_display": {"primaries": [[1, 2], [3, 4], [5, 60000]], "white_point": [1, 2],
                            "max_luminance": 10, "min_luminance": 1}},
     {"content_light_level": {"max_cll": "x", "max_fall": 1}},
+    # JSON's 1e309 parses as inf, which int() refuses with OverflowError.
+    {"mastering_display": {"primaries": [[float("inf"), 2], [3, 4], [5, 6]],
+                           "white_point": [1, 2], "max_luminance": 10, "min_luminance": 1}},
+    {"content_light_level": {"max_cll": float("inf"), "max_fall": 1}},
     "nonsense",
 ])
 def test_malformed_wire_metadata_reads_as_absent(wire):
     assert not StaticHdr.from_wire(wire)
+
+
+def test_malformed_dolby_vision_and_side_data_read_as_absent():
+    assert DolbyVisionConfig.from_wire({"profile": float("inf")}) is None
+    assert DolbyVisionConfig.from_wire({"level": 6}) is None
+    # PyAV releases before CodecContext.coded_side_data.
+    assert coded_side_data(SimpleNamespace()) == {}
 
 
 def test_dolby_vision_record_from_ffmpeg_side_data():
@@ -173,3 +186,13 @@ def test_colour_tags_round_trip_through_the_wire():
     assert tags_from_wire(tags_to_wire((2, 0, 2, 2))) == (2, 0, 2, 2)  # unspecified stays so
     assert tags_from_wire({"primaries": 9, "transfer": 16}) is None
     assert tags_from_wire({"primaries": 900, "transfer": 16, "matrix": 9}) is None
+    assert tags_from_wire({"primaries": float("inf"), "transfer": 16, "matrix": 9}) is None
+    assert tags_from_wire({"primaries": 9, "transfer": 16, "matrix": 9, "range": []}) is None
+    assert tags_from_wire({"primaries": 9, "transfer": 16, "matrix": 9, "range": "tv"}) is None
+
+
+def test_frame_tags_win_where_they_are_specified():
+    # (matrix, range, primaries, transfer); 2 and 0 are unspecified.
+    assert fill_unspecified((2, 0, 2, 2), (9, 1, 9, 16)) == (9, 1, 9, 16)
+    assert fill_unspecified((9, 1, 9, 18), (9, 2, 9, 14)) == (9, 1, 9, 18)
+    assert fill_unspecified((0, 1, 0, 0), (9, 1, 9, 16)) == (0, 1, 9, 16)  # matrix 0 is RGB

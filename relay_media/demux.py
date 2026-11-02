@@ -104,6 +104,13 @@ def sanitize_attachment_name(name: str, fallback: str = "attachment") -> str:
     return basename[:128]
 
 
+def coded_side_data(codec_context) -> dict:
+    """A stream's side data by name; empty on PyAV releases without
+    ``CodecContext.coded_side_data`` (pyproject allows them), where container
+    HDR metadata and Dolby Vision records simply go unread."""
+    return dict(getattr(codec_context, "coded_side_data", None) or {})
+
+
 def _source_identity(path: str) -> tuple[str, int, int]:
     stat = os.stat(path)
     return os.path.abspath(path), stat.st_size, stat.st_mtime_ns
@@ -131,7 +138,7 @@ class VideoTrack:
         # MP4 mdcv/clli) and the Dolby Vision configuration record.
         fmt = cc.format
         self.bit_depth = max((c.bits for c in fmt.components), default=0) if fmt else 0
-        side_data = dict(cc.coded_side_data)
+        side_data = coded_side_data(cc)
         self.hdr_static = StaticHdr.from_side_data(side_data)
         self.dolby_vision = DolbyVisionConfig.from_side_data(side_data.get("dovi_conf", b""))
         # Serializes native demux/seek calls: a cancelled asyncio task's

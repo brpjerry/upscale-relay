@@ -376,15 +376,16 @@ class OnnxUpscaler:
 
     def process(self, frame: av.VideoFrame) -> Iterable[av.VideoFrame]:
         # Frames from FrameSource carry their resolved colour tags.
+        rgb_format = "rgb48le" if self.io_bits == 16 else "rgb24"
         rgb = VideoColor.resolve(frame, frame.width, frame.height).to_rgb(
-            self._reformatter, frame,
-        ).to_ndarray()
+            self._reformatter, frame, rgb_format,
+        ).to_ndarray(format=rgb_format)
         up = self._infer_with_fallback(rgb)
         if self.scale_factor is None:
             self.scale_factor = round(up.shape[0] / rgb.shape[0])
             print(f"model: inferred scale factor x{self.scale_factor}", file=sys.stderr)
 
-        out = av.VideoFrame.from_ndarray(up, format="rgb24")
+        out = av.VideoFrame.from_ndarray(up, format=rgb_format)
         out.pts = frame.pts
         out.time_base = frame.time_base
         yield out

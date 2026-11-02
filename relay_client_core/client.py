@@ -30,6 +30,7 @@ from urllib.parse import quote
 import aiohttp
 import av
 
+from relay_media.hdr import HDR_TRANSFERS
 from relay_protocol import (
     DIR_DOWNLINK,
     DIR_UPLINK,
@@ -368,8 +369,8 @@ class SessionInfo:
     @property
     def downlink_hdr(self) -> bool:
         """PQ or HLG downlink."""
-        color = self.downlink_color or {}
-        return color.get("transfer") in (16, 18)
+        transfer = (self.downlink_color or {}).get("transfer")
+        return type(transfer) is int and transfer in HDR_TRANSFERS
 
 
 class RelayClient:
