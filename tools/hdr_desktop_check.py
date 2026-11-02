@@ -205,10 +205,15 @@ async def exercise(window, clock, args):
                 "color": window.client.session.downlink_color,
             }
         else:
+            import av  # noqa: PLC0415
+
+            with av.open(args.file) as container:
+                transfer = int(container.streams.video[0].codec_context.color_trc)
+            report["source_hdr"] = transfer in (16, 18)  # PQ, HLG
             window._session_source = "local"
             window._session_path = args.file
             window.idle_hint.hide()
-            await player.play_local(args.file, 0.0, hdr=True)
+            await player.play_local(args.file, 0.0, hdr=report["source_hdr"])
         await wait_until(lambda: (player._observation("time-pos", 0) or 0) > 0.5, "playback")
         await asyncio.sleep(1.0)
         report["surface"] = surface_state(window)
