@@ -402,18 +402,25 @@ def test_reversing_fullscreen_midway_continues_the_control_bar_from_where_it_is(
 
 def test_sidebar_collapses_and_expands_the_same_way(window):
     # Both directions resize the video at each step; the hide slide used to pin
-    # it at its final size instead, so the two looked different.
+    # it at its final size instead, so the two looked different, and the pin
+    # sat at the top of the page: the video covered the top bar for the slide.
     window.resize(1100, 600)
     window.show()
     QApplication.instance().processEvents()
     layout = window._player_layout
     for visible in (False, True):
-        widths = []
+        widths, tops = [], []
+
+        def sample():
+            widths.append(window.player.width())
+            tops.append(window.player.y())
+            return "sidebar" not in window._slides
         window.browser_toggle.setChecked(visible)
-        assert wait_until(lambda: widths.append(window.player.width()) or "sidebar" not in window._slides)
+        assert wait_until(sample)
         assert layout.indexOf(window.player) >= 0
         assert len(set(widths)) > 2  # stepped, not jumped
         assert widths == sorted(widths, reverse=visible)
+        assert set(tops) == {main_window._TOP_BAR_HEIGHT}  # under the top bar throughout
 
 
 class _FrameSource(QObject):

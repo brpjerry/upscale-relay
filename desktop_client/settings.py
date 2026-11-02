@@ -82,6 +82,15 @@ class AppSettings:
         self._qs.setValue("session/model", v)
 
     @property
+    def passthrough_4k(self) -> bool:
+        """Stream 4K and larger sources with the passthrough model."""
+        return self._qs.value("session/passthrough_4k", False, type=bool)
+
+    @passthrough_4k.setter
+    def passthrough_4k(self, v: bool) -> None:
+        self._qs.setValue("session/passthrough_4k", bool(v))
+
+    @property
     def quality_tier(self) -> str:
         value = self._qs.value("session/tier", "lossless-hevc")
         # The former single lossy tier was closest to the new low-bandwidth
