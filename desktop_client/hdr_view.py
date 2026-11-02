@@ -369,6 +369,7 @@ class HdrPresenter(QOpenGLWindow):
         self._vao: QOpenGLVertexArrayObject | None = None
         self._textures: dict[_Layer, QOpenGLTexture] = {}
         self._mirror = OverlayMirror(view, self._overlays_changed)
+        self._tracker = _GeometryTracker(self)
         self._followed: list[QWidget] = []
         self._place_posted = False
         self.frames = 0  # composed frames, for measurements
@@ -390,13 +391,6 @@ class HdrPresenter(QOpenGLWindow):
                 widget.installEventFilter(self._tracker)
                 self._followed.append(widget)
         self._place_now()
-
-    @property
-    def _tracker(self) -> QObject:
-        tracker = getattr(self, "_tracker_obj", None)
-        if tracker is None:
-            tracker = self._tracker_obj = _GeometryTracker(self)
-        return tracker
 
     def place(self) -> None:
         """Follow the player widget, once per turn of the event loop.

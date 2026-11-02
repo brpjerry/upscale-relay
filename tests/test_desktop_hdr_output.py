@@ -8,8 +8,8 @@ from types import SimpleNamespace
 import pytest
 pytest.importorskip("PySide6")
 
-from PySide6.QtCore import QPoint, QRect, Qt
-from PySide6.QtGui import QColor, QPainter, QRegion
+from PySide6.QtCore import QPoint
+from PySide6.QtGui import QColor, QPainter
 from PySide6.QtWidgets import QApplication, QFrame, QGraphicsOpacityEffect, QWidget
 
 from desktop_client import hdr_output
@@ -68,21 +68,24 @@ def test_an_unsupported_platform_keeps_hdr_videos_on_the_widget(monkeypatch):
     assert MpvPlayerView._wanted_surface(_player())[0] is False
 
 
-@pytest.mark.parametrize(("hdr", "expected"), [
-    (True, [("target-trc", "pq"), ("target-prim", "bt.2020"), ("target-peak", "1107")]),
-    (False, [("target-trc", "auto"), ("target-prim", "auto"), ("target-peak", "auto")]),
-])
-def test_mpv_outputs_pq_only_on_the_hdr_surface(hdr, expected):
+def test_mpv_outputs_pq_only_on_the_hdr_surface():
     pytest.importorskip("mpv")
     from desktop_client.mpv_view import MpvPlayerView
     sets = []
     player = _player(
-        hdr_output=hdr, _display_hdr=HDR_DISPLAY,
+        hdr_output=False, _display_hdr=HDR_DISPLAY,
+        _output_target={"target-trc": "auto", "target-prim": "auto", "target-peak": "auto"},
         mpv=SimpleNamespace(command=lambda *args: sets.append(args[1:])),
         log_message=SimpleNamespace(emit=lambda *args: None),
     )
     MpvPlayerView._apply_output_target(player)
-    assert sets == expected
+    assert sets == []  # SDR loads send mpv nothing: its defaults stand
+    player.hdr_output = True
+    MpvPlayerView._apply_output_target(player)
+    assert sets == [("target-trc", "pq"), ("target-prim", "bt.2020"), ("target-peak", "1107")]
+    player.hdr_output = False
+    MpvPlayerView._apply_output_target(player)
+    assert sets[3:] == [("target-trc", "auto"), ("target-prim", "auto"), ("target-peak", "auto")]
 
 
 def test_a_display_switching_hdr_during_an_hdr_video_asks_for_one_reload(monkeypatch):

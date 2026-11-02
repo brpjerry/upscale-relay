@@ -114,7 +114,13 @@ relay-desktop
 
 - **Wayland sessions** work natively through mpv's render API. If a driver has
   an OpenGL/Wayland interop problem, `QT_QPA_PLATFORM=xcb relay-desktop` is a
-  useful XWayland fallback.
+  useful XWayland fallback. It cannot show HDR, though.
+- **HDR**: with Qt 6.10.2 or later and a compositor that implements
+  wp_color_management_v1, HDR videos play as HDR while the screen is in HDR
+  mode. On Hyprland that is the monitor's `cm = "hdr"`, which `hyprctl` can
+  also set at runtime; switching back needs an explicit `cm = "srgb"`.
+  `python -m desktop_client.hdr_output` prints what each screen reports. See
+  [HDR output](HDR_OUTPUT.md).
 - Select a **Nearby servers** result, or enter `<windows-box-ip>:8590`, then Connect.
 - Application settings and history persist in `~/.config/upscale-relay/`.
 - Saved progress resumes automatically; next-video autoplay defaults on.

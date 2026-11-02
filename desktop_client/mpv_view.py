@@ -468,6 +468,8 @@ class MpvPlayerView(QOpenGLWidget):
         self._hdr_enabled = True  # the "Show HDR videos in HDR" setting
         self._display_hdr = hdr_output.SDR  # as last read
         self._hdr_stale_reported = False
+        # mpv's output colour options as last set (its defaults at start).
+        self._output_target = {"target-trc": "auto", "target-prim": "auto", "target-peak": "auto"}
 
         if self.options.headless:
             extra = {
@@ -1140,6 +1142,10 @@ class MpvPlayerView(QOpenGLWidget):
             "target-prim": "bt.2020" if pq else "auto",
             "target-peak": str(round(peak)) if peak else "auto",
         }
+        # Only changes: an SDR load sends mpv nothing new.
+        if values == self._output_target:
+            return
+        self._output_target = values
         for name, value in values.items():
             try:
                 if asynchronous:

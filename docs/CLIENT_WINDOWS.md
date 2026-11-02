@@ -74,6 +74,12 @@ Client diagnostics and logging default off. Enabled client logs use timestamped
 including OneDrive/redirection, retaining ten files. See the
 [desktop feature guide](DESKTOP_FEATURES.md) for the complete behavior.
 
+HDR videos are tone-mapped to SDR on Windows. `RELAY_HDR_WINDOWS=1` enables
+the HDR output prototype: a D3D11 HDR10 swap chain fed through
+`WGL_NV_DX_interop2` (NVIDIA), for screens in Windows' HDR mode. It still
+runs transitions at about half the normal rate; see
+[HDR output](HDR_OUTPUT.md).
+
 For the complete local test suite, including the optional desktop modules:
 
 ```powershell
