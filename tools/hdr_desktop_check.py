@@ -245,6 +245,7 @@ async def exercise(window, clock, args):
             window._session_path = args.file
             window.idle_hint.hide()
             await player.play_local(args.file, 0.0, hdr=report["source_hdr"])
+            player.mpv["loop-file"] = "inf"  # a short clip would end before the pacing spans
         await wait_until(lambda: (player._observation("time-pos", 0) or 0) > 0.5, "playback")
         await asyncio.sleep(1.0)
         report["surface"] = surface_state(window)
