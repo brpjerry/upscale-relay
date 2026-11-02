@@ -41,7 +41,7 @@ from upscale_cli.encode import (
     add_video_encoder_stream,
     select_encoder,
 )
-from upscale_cli.hdr import (
+from relay_media.hdr import (
     DolbyVisionConfig,
     DynamicHdr,
     StaticHdr,
@@ -49,6 +49,7 @@ from upscale_cli.hdr import (
     extract_dynamic_hdr,
     hevc_nal_length_size,
     inject_hevc_metadata,
+    tags_to_wire,
 )
 from upscale_cli.fit import (
     DEFAULT_RESIZE_ALGORITHM,
@@ -482,7 +483,7 @@ class Pipeline:
             self.downlink_codec = {
                 "hevc_nvenc": "hevc", "libx265": "hevc", "libx264": "h264",
             }.get(self._enc_codec, self._enc_codec)
-            # HDR signalling the encoder cannot write (upscale_cli.hdr): static
+            # HDR signalling the encoder cannot write (relay_media.hdr): static
             # metadata on every keyframe, HDR10+ and the Dolby Vision RPU per
             # frame, copied from the HEVC source packet with the same PTS.
             self._hdr_signalling = (
@@ -877,7 +878,7 @@ class Pipeline:
         """Resolved colour of the downlink (``session_opened.downlink_color``);
         None until known (an uplink whose client sent no colour)."""
         color = self._source_color
-        return color.to_wire() if color is not None else None
+        return tags_to_wire(color.tags) if color is not None else None
 
     def hdr_metadata_report(self) -> dict | None:
         """HDR metadata written into the downlink, for GET /status."""

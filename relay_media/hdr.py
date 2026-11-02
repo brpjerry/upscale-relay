@@ -1,9 +1,12 @@
 """HDR signalling that a re-encode would otherwise lose.
 
-Colour tags (primaries, transfer, matrix, range) travel through
-``upscale_cli.color``. Everything else a player needs to show HDR as
-mastered lives in the HEVC bitstream, and an encoder fed raw frames writes
-none of it:
+Shared by clients (which describe their source in ``open_session.video``)
+and the server, so it lives here rather than in ``upscale_cli``, which
+client packages do not ship. Colour tags (primaries, transfer, matrix,
+range) cross the wire as ``tags_to_wire``; the server converts with them
+through ``upscale_cli.color``. Everything else a player needs to show HDR
+as mastered lives in the HEVC bitstream, and an encoder fed raw frames
+writes none of it:
 
 * static metadata: the mastering display colour volume and content light
   level SEI messages (SMPTE ST 2086, CTA-861.3), from the decoded frames'
@@ -59,8 +62,37 @@ _AV_MASTERING = struct.Struct("<20i2i")
 _AV_LIGHT_LEVEL = struct.Struct("<2I")
 
 
+_RANGE_LIMITED, _RANGE_FULL = 1, 2  # FFmpeg AVColorRange
+
+
 def is_hdr_transfer(transfer: int) -> bool:
     return int(transfer) in HDR_TRANSFERS
+
+
+def tags_to_wire(tags: tuple[int, int, int, int]) -> dict:
+    """``open_session.video.color`` / ``session_opened.downlink_color`` from
+    FFmpeg (matrix, range, primaries, transfer) tags: H.273 code points
+    (2 = unspecified), ``range`` by name and only when known."""
+    matrix, color_range, primaries, transfer = (int(t) for t in tags)
+    wire = {"primaries": primaries, "transfer": transfer, "matrix": matrix}
+    if color_range in (_RANGE_LIMITED, _RANGE_FULL):
+        wire["range"] = "full" if color_range == _RANGE_FULL else "limited"
+    return wire
+
+
+def tags_from_wire(value) -> tuple[int, int, int, int] | None:
+    """FFmpeg tags from ``open_session.video.color``; None when malformed."""
+    if not isinstance(value, dict):
+        return None
+    try:
+        codes = [int(value[key]) for key in ("matrix", "primaries", "transfer")]
+    except (KeyError, TypeError, ValueError):
+        return None
+    if not all(0 <= code <= 255 for code in codes):
+        return None
+    color_range = {"limited": _RANGE_LIMITED, "full": _RANGE_FULL}.get(value.get("range"), 0)
+    matrix, primaries, transfer = codes
+    return matrix, color_range, primaries, transfer
 
 
 @dataclass(frozen=True)

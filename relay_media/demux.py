@@ -17,8 +17,7 @@ from typing import Iterator
 import av
 
 from relay_protocol import FLAG_KEYFRAME, NO_TS, MediaPacket
-from upscale_cli.color import tags_to_wire
-from upscale_cli.hdr import DolbyVisionConfig, StaticHdr
+from .hdr import DolbyVisionConfig, StaticHdr, tags_to_wire
 from .subtitles import INDEXABLE_SUBTITLE_CODECS, SubtitleIndex
 
 log = logging.getLogger("relay.media")

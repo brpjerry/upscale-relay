@@ -24,7 +24,7 @@ import pytest
 from relay_media import VideoTrack
 from relay_protocol import FLAG_EOS, MediaPacket
 from relay_server.pipeline import Pipeline, VideoConfig
-from upscale_cli.hdr import (
+from relay_media.hdr import (
     DolbyVisionConfig,
     StaticHdr,
     escape_rbsp,

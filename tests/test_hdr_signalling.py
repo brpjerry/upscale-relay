@@ -1,4 +1,4 @@
-"""HEVC HDR metadata written back into re-encoded packets (upscale_cli.hdr)."""
+"""HEVC HDR metadata written back into re-encoded packets (relay_media.hdr)."""
 
 from __future__ import annotations
 
@@ -7,8 +7,8 @@ import struct
 import pytest
 
 from relay_server.pipeline import output_bit_depth
-from upscale_cli.color import VideoColor, tags_from_wire, tags_to_wire
-from upscale_cli.hdr import (
+from upscale_cli.color import VideoColor
+from relay_media.hdr import (
     ContentLightLevel,
     DolbyVisionConfig,
     DynamicHdr,
@@ -23,6 +23,8 @@ from upscale_cli.hdr import (
     iter_nals,
     nal_type,
     sei_nal,
+    tags_from_wire,
+    tags_to_wire,
     unescape_rbsp,
 )
 

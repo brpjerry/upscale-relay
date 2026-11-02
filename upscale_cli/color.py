@@ -35,32 +35,6 @@ def _is_hd(width: int, height: int) -> bool:
     return width >= 1280 or height > 576
 
 
-def tags_to_wire(tags: tuple[int, int, int, int]) -> dict:
-    """``open_session.video.color`` from raw (matrix, range, primaries,
-    transfer) tags: H.273 code points as the container declares them
-    (2 = unspecified); ``range`` only when known."""
-    matrix, color_range, primaries, transfer = (int(t) for t in tags)
-    wire = {"primaries": primaries, "transfer": transfer, "matrix": matrix}
-    if color_range in (_RANGE_LIMITED, _RANGE_FULL):
-        wire["range"] = "full" if color_range == _RANGE_FULL else "limited"
-    return wire
-
-
-def tags_from_wire(value) -> tuple[int, int, int, int] | None:
-    """Raw tags from ``open_session.video.color``; None when malformed."""
-    if not isinstance(value, dict):
-        return None
-    try:
-        codes = [int(value[key]) for key in ("matrix", "primaries", "transfer")]
-    except (KeyError, TypeError, ValueError):
-        return None
-    if not all(0 <= code <= 255 for code in codes):
-        return None
-    color_range = {"limited": _RANGE_LIMITED, "full": _RANGE_FULL}.get(value.get("range"), 0)
-    matrix, primaries, transfer = codes
-    return matrix, color_range, primaries, transfer
-
-
 @dataclass(frozen=True)
 class VideoColor:
     """How YUV samples are to be read, as FFmpeg enum values."""
@@ -110,13 +84,10 @@ class VideoColor:
     def _sws_matrix(self) -> int:
         return _SWS_MATRIX[self.matrix]
 
-    def to_wire(self) -> dict:
-        """``session_opened.downlink_color`` (docs/PROTOCOL.md): H.273 code
-        points, range by name."""
-        return {
-            "primaries": self.primaries, "transfer": self.transfer, "matrix": self.matrix,
-            "range": "full" if self.range == _RANGE_FULL else "limited",
-        }
+    @property
+    def tags(self) -> tuple[int, int, int, int]:
+        """(matrix, range, primaries, transfer), the order FFmpeg tags travel in."""
+        return self.matrix, self.range, self.primaries, self.transfer
 
     def tag(self, target) -> None:
         """Write this description onto an encoder codec context or a frame."""
