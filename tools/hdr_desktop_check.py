@@ -139,11 +139,12 @@ async def measure(window, clock, report):
     await span("sidebar hide", window.browser_toggle.click, 1.0)
     await span("sidebar show", window.browser_toggle.click, 1.0)
 
-    # A live splitter drag: the handle moves a few pixels each main frame.
-    # It stops itself: each move brings the next frame, and on Windows a
-    # queue that never empties starves the timers asyncio.sleep relies on.
+    # A live splitter drag: the handle swings 60 px either way of where it
+    # was, a few pixels each main frame. It stops itself: each move brings
+    # the next frame, and on Windows a queue that never empties starves the
+    # timers asyncio.sleep relies on.
     sizes = window.split.sizes()
-    step = {"n": 0}
+    step = {"n": 0, "moved": False}
     t0 = time.perf_counter()
 
     def drag():
@@ -152,13 +153,21 @@ async def measure(window, clock, report):
             window.player.frameSwapped.disconnect(drag)
             window.split.setSizes(sizes)
             return
-        offset = 6 * (step["n"] % 40 if step["n"] % 80 < 40 else 40 - step["n"] % 40)
+        phase = step["n"] % 40
+        offset = 6 * (phase if phase < 10 else 20 - phase if phase < 30 else phase - 40)
         window.split.setSizes([sizes[0] + offset, sizes[1] - offset])
+        step["moved"] |= window.split.sizes() != sizes
 
     window.player.frameSwapped.connect(drag)
     drag()
     await asyncio.sleep(2.0)
-    results.append(clock.window("splitter drag", t0, t0 + 1.5))
+    if step["moved"]:
+        results.append(clock.window("splitter drag", t0, t0 + 1.5))
+    else:
+        # A tiled window narrower than the sidebar's and the player's minimum
+        # widths together leaves the handle nowhere to go: float it, or give
+        # it a wider tile.
+        results.append({"name": "splitter drag", "skipped": f"no room to drag at sizes {sizes}"})
     print(json.dumps(results[-1]), flush=True)
     await asyncio.sleep(0.5)
 

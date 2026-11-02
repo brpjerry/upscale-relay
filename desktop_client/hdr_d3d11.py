@@ -554,20 +554,21 @@ class D3D11Presenter(QWindow):
         aspect = view._picture_aspect()
         scaling = view._scaling and aspect is not None
         video = self._video
-        if scaling:
-            stale = video is None or not (
-                1 / _RESCALE_LIMIT <= width / video.width <= _RESCALE_LIMIT
-                and 1 / _RESCALE_LIMIT <= height / video.height <= _RESCALE_LIMIT)
-        else:
-            stale = video is None or (video.width, video.height) != (width, height)
         self.makeCurrent()
         try:
+            new_frame = self.ctx.update()
+            render = video is None or new_frame or self._picture_due
+            if scaling:  # a new size alone is only scaled, as HdrPresenter does
+                stale = render and (video is None or not (
+                    1 / _RESCALE_LIMIT <= width / video.width <= _RESCALE_LIMIT
+                    and 1 / _RESCALE_LIMIT <= height / video.height <= _RESCALE_LIMIT))
+            else:
+                stale = video is None or (video.width, video.height) != (width, height)
             if stale:
                 if video is not None:
                     video.close()
                 video = self._video = _VideoTarget(self._d3d, self._interop, width, height)
-            new_frame = self.ctx.update()
-            if stale or new_frame or self._picture_due:
+            if stale or render:
                 video.lock()
                 try:
                     # Unflipped: through the interop GL's bottom row is the

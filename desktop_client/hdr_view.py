@@ -564,10 +564,14 @@ class HdrPresenter(QOpenGLWindow):
         aspect = view._picture_aspect()
         scaling = view._scaling and aspect is not None
         fbo = self._fbo
+        new_frame = self.ctx.update()
+        render = fbo is None or new_frame or self._picture_due
         if scaling:
-            stale = fbo is None or not (
+            # As the widget does: while resizing, a new size alone is only
+            # scaled; a new frame is rendered at it once 15% away.
+            stale = render and (fbo is None or not (
                 1 / _RESCALE_LIMIT <= width / fbo.width() <= _RESCALE_LIMIT
-                and 1 / _RESCALE_LIMIT <= height / fbo.height() <= _RESCALE_LIMIT)
+                and 1 / _RESCALE_LIMIT <= height / fbo.height() <= _RESCALE_LIMIT))
         else:
             stale = fbo is None or fbo.width() != width or fbo.height() != height
         if stale:
@@ -576,8 +580,7 @@ class HdrPresenter(QOpenGLWindow):
             # attachment (mpv_opengl_fbo.internal_format is ignored).
             fmt.setInternalTextureFormat(_GL_RGB10_A2)
             fbo = self._fbo = QOpenGLFramebufferObject(QSize(width, height), fmt)
-        new_frame = self.ctx.update()
-        if stale or new_frame or self._picture_due:
+        if stale or render:
             # The window's own framebuffer is bottom-up, as GL draws; unlike
             # the widget's, nothing flips it afterwards.
             self.ctx.render(

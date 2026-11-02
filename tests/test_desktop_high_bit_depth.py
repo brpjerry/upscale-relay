@@ -68,3 +68,28 @@ def test_toggle_restarts_only_a_10_bit_sdr_stream(window, monkeypatch, hdr, sour
         assert not errors
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("hdr", [True, False])
+def test_playing_locally_keeps_what_the_server_read_of_the_source(window, monkeypatch, hdr):
+    """The local fallback plays an HDR source on the HDR surface too: the
+    server read the file's colour, and its downlink is HDR for an HDR file."""
+    errors, _ = setup_deep(window, monkeypatch, hdr=hdr)
+
+    async def scenario():
+        await window._start_session("/videos/show.mkv", "uplink")
+        await window.on_fallback()
+        assert window._session_source == "local"
+        assert window.player.local_hdr is hdr
+        assert not errors
+
+    asyncio.run(scenario())
+
+
+def test_the_hdr_switch_is_a_setting_and_says_when_it_applies(window):
+    assert window.hdr_output_check.isChecked()
+    window.hdr_output_check.setChecked(False)
+    assert not window.settings.hdr_output
+    window.hdr_output_check.setChecked(True)
+    assert window.settings.hdr_output
+    assert window.hdr_output_hint.text()  # what the platform allows, or the display's state
