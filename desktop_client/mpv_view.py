@@ -1046,7 +1046,9 @@ class MpvPlayerView(QOpenGLWidget):
             if pq and hdr_output.platform_kind() == "windows":
                 from .hdr_d3d11 import D3D11Presenter  # noqa: PLC0415 - Windows only
                 surface = D3D11Presenter
-            presenter = self._presenter = surface(self, top, pq=pq, sdr_white_nits=display.sdr_white_nits)
+            options = {"cover": hdr_output.platform_kind() == "wayland"} if surface is HdrPresenter else {}
+            presenter = self._presenter = surface(
+                self, top, pq=pq, sdr_white_nits=display.sdr_white_nits, **options)
             presenter.failed.connect(self._on_presenter_failed)
         presenter.sdr_white_nits = display.sdr_white_nits or presenter.sdr_white_nits
         if self._on_presenter:

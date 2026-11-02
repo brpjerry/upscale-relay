@@ -351,13 +351,19 @@ class HdrPresenter(QOpenGLWindow):
     ready = Signal()
     failed = Signal(str)
 
-    def __init__(self, view, parent: QWindow, *, pq: bool, sdr_white_nits: float | None = None):
+    def __init__(self, view, parent: QWindow, *, pq: bool, sdr_white_nits: float | None = None,
+                 cover: bool = False):
         super().__init__(QOpenGLWindow.NoPartialUpdate, parent)
         self._view = view
         self.pq = pq
+        self.cover = cover
         self.sdr_white_nits = sdr_white_nits or DEFAULT_SDR_WHITE_NITS
         if pq:
-            self.setFormat(pq_surface_format())
+            self.setFormat(pq_surface_format())  # 2 bits of alpha: enough to be clear
+        elif cover:
+            fmt = QSurfaceFormat.defaultFormat()
+            fmt.setAlphaBufferSize(8)
+            self.setFormat(fmt)
         self.setFlags(self.flags() | Qt.WindowTransparentForInput | Qt.WindowDoesNotAcceptFocus)
         self.ctx = None  # mpv's render context while this surface owns it
         self._initialized = False
@@ -386,6 +392,8 @@ class HdrPresenter(QOpenGLWindow):
         while widget is not None and not widget.isWindow():
             chain.append(widget)
             widget = widget.parentWidget()
+        if self.cover and widget is not None:
+            chain.append(widget)  # the window: the surface takes its size
         for widget in chain:
             if widget not in self._followed:
                 widget.installEventFilter(self._tracker)
@@ -396,11 +404,17 @@ class HdrPresenter(QOpenGLWindow):
         """Follow the player widget, once per turn of the event loop.
 
         A layout step moves and resizes the player and its ancestors one
-        after another, each with its own event. On Wayland every geometry
-        change of a subsurface makes Qt expose the parent window, which
-        repaints and presents it in full at once; changing it for each event
-        held the slides to 15-57 steps a second (110-186 on the widget). The
-        layout settles within the turn, before the window's next frame.
+        after another, each with its own event; the layout settles within the
+        turn, before the window's next frame.
+
+        On Wayland every geometry change of a subsurface makes Qt expose the
+        parent window, which repaints and presents it in full at once.
+        Following the player per event held slides to 15-57 steps a second
+        (the widget: 110-186), and once per turn still to 62-89 main window
+        frames against 110-129 (laptop, 2026-11-02). In ``cover`` mode
+        (Wayland) the surface spans the whole window and stays put; only the
+        picture moves within it, clear around it. A Windows child window
+        cannot be clear, so there the surface follows the player.
         """
         if not self._place_posted:
             self._place_posted = True
@@ -409,10 +423,16 @@ class HdrPresenter(QOpenGLWindow):
     def _place_now(self) -> None:
         self._place_posted = False
         view = self._view
-        geometry = QRect(view.mapTo(view.window(), QPoint(0, 0)), view.size())
+        top = view.window()
+        if self.cover:
+            geometry = QRect(QPoint(0, 0), top.size())
+        else:
+            geometry = QRect(view.mapTo(top, QPoint(0, 0)), view.size())
         if geometry != self.geometry():
             self.setGeometry(geometry)
             self.update()
+        elif self.cover:
+            self.update()  # the picture moved within the surface
 
     def picture_due(self) -> None:
         """The current frame is to be rendered again (a resize began)."""
@@ -535,25 +555,58 @@ class HdrPresenter(QOpenGLWindow):
         gl.glClearColor(0.0, 0.0, 0.0, 1.0)
         gl.glClear(_GL_COLOR_BUFFER_BIT)
 
+    def _video_rect(self, dpr: float) -> QRect:
+        """The player's place on this surface, in device pixels, top-down."""
+        view = self._view
+        origin = view.mapTo(view.window(), QPoint(0, 0)) if self.cover else QPoint(0, 0)
+        return QRect(round(origin.x() * dpr), round(origin.y() * dpr),
+                     round(view.width() * dpr), round(view.height() * dpr))
+
     def _paint(self) -> None:
         dpr = self.devicePixelRatio()
         width, height = round(self.width() * dpr), round(self.height() * dpr)
         if width <= 0 or height <= 0:
             return
+        video = self._video_rect(dpr) & QRect(0, 0, width, height)
         gl = self.context().extraFunctions()
         target = self.defaultFramebufferObject()
         gl.glDisable(_GL_SCISSOR_TEST)
         gl.glBindFramebuffer(_GL_FRAMEBUFFER, target)
+        if self.cover:
+            # Transparent but for the player's rectangle, where the window
+            # beneath shows black anyway (and the letterbox is opaque).
+            gl.glClearColor(0.0, 0.0, 0.0, 0.0)
+            gl.glClear(_GL_COLOR_BUFFER_BIT)
+            if video.isEmpty():
+                return
+            self._clip(gl, video, height)
         gl.glClearColor(0.0, 0.0, 0.0, 1.0)
         gl.glClear(_GL_COLOR_BUFFER_BIT)
-        if self.ctx is not None:
-            self._paint_video(gl, target, width, height)
-        gl.glBindFramebuffer(_GL_FRAMEBUFFER, target)
-        layers = self._mirror.layers(dpr)
-        if layers:
-            self._paint_overlays(gl, layers, dpr, width, height)
+        try:
+            if self.ctx is not None:
+                self._paint_video(gl, target, video, height)
+            gl.glBindFramebuffer(_GL_FRAMEBUFFER, target)
+            layers = self._mirror.layers(dpr)
+            if layers:
+                self._clip(gl, video, height)
+                self._paint_overlays(gl, layers, dpr, video, width, height)
+        finally:
+            gl.glDisable(_GL_SCISSOR_TEST)
 
-    def _paint_video(self, gl, target: int, width: int, height: int) -> None:
+    def _clip(self, gl, video: QRect, surface_height: int) -> None:
+        """In cover mode, draw only over the player (the window draws the rest)."""
+        if self.cover:
+            gl.glEnable(_GL_SCISSOR_TEST)
+            gl.glScissor(video.x(), surface_height - video.y() - video.height(), video.width(), video.height())
+
+    def _paint_video(self, gl, target: int, video: QRect, surface_height: int) -> None:
+        """mpv's picture, rendered for a new frame (or a new size once the
+        player settles), drawn into the player's rectangle. Blits are clipped
+        to it by the scissor in cover mode."""
+        width, height = video.width(), video.height()
+        if width <= 0 or height <= 0:
+            return
+        x0, y0 = video.x(), surface_height - video.y() - height  # bottom-left, as GL counts
         view = self._view
         aspect = view._picture_aspect()
         scaling = view._scaling and aspect is not None
@@ -583,20 +636,22 @@ class HdrPresenter(QOpenGLWindow):
             )
             self._picture_due = False
             self.renders += 1
+            self._clip(gl, video, surface_height)  # mpv leaves the scissor test off
         gl.glBindFramebuffer(_GL_READ_FRAMEBUFFER, fbo.handle())
         gl.glBindFramebuffer(_GL_DRAW_FRAMEBUFFER, target)
         if fbo.width() == width and fbo.height() == height:
-            gl.glBlitFramebuffer(0, 0, width, height, 0, 0, width, height, _GL_COLOR_BUFFER_BIT, _GL_LINEAR)
+            gl.glBlitFramebuffer(0, 0, width, height, x0, y0, x0 + width, y0 + height,
+                                 _GL_COLOR_BUFFER_BIT, _GL_LINEAR)
             return
         if aspect is None:
-            gl.glBlitFramebuffer(0, 0, fbo.width(), fbo.height(), 0, 0, width, height,
+            gl.glBlitFramebuffer(0, 0, fbo.width(), fbo.height(), x0, y0, x0 + width, y0 + height,
                                  _GL_COLOR_BUFFER_BIT, _GL_LINEAR)
             return
         # Anchored on the letterboxed picture so it never stretches.
         src_x, src_y, src_w, _src_h = _fit(fbo.width(), fbo.height(), aspect)
         dst_x, dst_y, dst_w, _dst_h = _fit(width, height, aspect)
         scale = dst_w / src_w
-        left, bottom = dst_x - src_x * scale, dst_y - src_y * scale
+        left, bottom = x0 + dst_x - src_x * scale, y0 + dst_y - src_y * scale
         gl.glBlitFramebuffer(
             0, 0, fbo.width(), fbo.height(),
             round(left), round(bottom),
@@ -604,7 +659,7 @@ class HdrPresenter(QOpenGLWindow):
             _GL_COLOR_BUFFER_BIT, _GL_LINEAR,
         )
 
-    def _paint_overlays(self, gl, layers, dpr: float, width: int, height: int) -> None:
+    def _paint_overlays(self, gl, layers, dpr: float, video: QRect, width: int, height: int) -> None:
         program = self._program
         program.bind()
         if self._vao is not None:
@@ -631,7 +686,9 @@ class HdrPresenter(QOpenGLWindow):
             texture = self._texture(layer)
             live.add(layer)
             texture.bind(0)
-            x, y = round(pos.x() * dpr), round(pos.y() * dpr)
+            # Over the player, clipped to it in cover mode (the scissor):
+            # beyond it the window draws the overlay itself.
+            x, y = video.x() + round(pos.x() * dpr), video.y() + round(pos.y() * dpr)
             w, h = image.width(), image.height()
             program.setUniformValue("rect", QVector4D(
                 2.0 * x / width - 1.0, 1.0 - 2.0 * (y + h) / height, 2.0 * w / width, 2.0 * h / height))
