@@ -300,10 +300,13 @@ their volume, panscan, tracks and delays.
 - On Wayland every geometry change of a native child window (a subsurface)
   makes Qt expose the parent window, which repaints and presents it in full
   at once. An HDR surface that followed the player per Move/Resize event held
-  slides to 15-57 steps a second (the widget: 110-186); following it once per
-  event-loop turn, 62-89 main window frames against 110-129. So on Wayland
-  the surface spans the window and never moves (`HdrPresenter.cover`): the
-  picture moves within it, and the surface is clear around it.
+  slides to 15-57 steps a second (the widget: 110-186). On Wayland the
+  surface now spans the window and never moves (`HdrPresenter.cover`): the
+  picture moves within it, and the surface is clear around it, so the window
+  repaints as it does around the widget. Everything the surface paints is on
+  the GUI thread, inside the window's 8.3 ms frame: time it by phase
+  (`HdrPresenter.last_phases`, `tools/hdr_desktop_check.py`) before blaming
+  the compositor.
 - `QWidget.render` draws nothing for a widget that carries a graphics effect.
   `RenderFlag.DrawWindowBackground` (the default) first fills the widget with
   its palette's Window colour. The overlay mirror renders with `DrawChildren`
@@ -383,13 +386,14 @@ their volume, panscan, tracks and delays.
     surface over the player (Qt >= 6.10.2, wp_color_management_v1), with the
     overlays mirrored onto it. Everything else stays on the widget unchanged.
   - Hyprland shows it as HDR only with the monitor's `cm = "hdr"`.
-  - On the laptop, steady playback, overlay motion and sidebar slides on the
-    surface match the widget. Fullscreen transitions run at about 70-85% of
-    the widget's rate (main window 77-95 fps against 110-116), because each
-    layout step's subsurface geometry change re-presents the main window.
+  - On the laptop the surface matches the widget for steady playback,
+    overlay motion, sidebar slides and splitter drags (2026-11-02, 120 Hz).
+    Fullscreen transitions run at 101-110 fps entering (the widget: 118) and
+    84-99 leaving (111-112).
   - Windows (`RELAY_HDR_WINDOWS=1`): a D3D11 HDR10 swap chain fed through
-    `WGL_NV_DX_interop2`. It runs transitions at about half the widget's
-    rate.
+    `WGL_NV_DX_interop2`. Its transitions run at 60-85% of the widget's rate.
+  - Nobody has yet judged the HDR picture by eye: screenshots in HDR mode
+    are 8-bit conversions.
   - The render API is mpv's `gpu` renderer (gpu-next is not available through
     it), which ignores Dolby Vision and HDR10+.
 - Anamorphic uplinks: when a client sends no

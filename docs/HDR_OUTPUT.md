@@ -129,9 +129,39 @@ reached the player or the overlay.
 
 Laptop, 2026-11-02: Hyprland 0.56.2 with `cm = "hdr"`, Samsung OLED
 2880×1800 at 120 Hz, scale 2, Qt 6.12.0, a 1080p24 HDR10 clip played locally,
-window floated at 1401×860, two runs each.
+window floated at 1401×860. The surface's numbers come from two runs, the
+widget's from one, in the same session.
 
-<!-- MEASUREMENTS -->
+| scenario | HDR surface: main window fps | surface paints/s (median ms) | widget: main window fps |
+|---|---|---|---|
+| fullscreen enter | 101-110 | 104-113 (0.6) | 118 |
+| fullscreen leave | 84-99 | 99-110 (0.9-1.4) | 111-112 |
+| sidebar hide / show | 113-123 | 120-126 (0.24) | 124-127 |
+| splitter drag | 120-122 | 121-122 (0.22) | 121 |
+| steady playback | 26 paints/s, 0 dropped frames | | 0 dropped frames |
+
+Overlay motion was measured in the earlier rounds and matched the widget:
+107-140 steps a second for the cards, the settings sheet and the fullscreen
+bar, against 110-145. The rounds that led here, on the same scenarios:
+
+1. The surface followed the player on each Move/Resize of the player and its
+   ancestors: 15-57 resizes a second during slides.
+2. It followed once per event-loop turn: the main window ran at 62-89 fps.
+3. It spanned the window, clear around the picture (cover mode): no change,
+   55-92 fps. Splitting each paint into phases showed why. The video took
+   0.01-0.6 ms; the mirror took 1.3-5 ms, re-rendering the busy ring's
+   full-size clear picture at every step.
+4. The mirror pictured only what the busy ring paints (`mirror_rect`): the
+   rates above.
+
+Fullscreen leave is the one place still behind, at 75-90% of the widget's
+rate. Its paints are the longest of any span, probably because the control
+bar re-docks over the shrinking picture and is pictured anew at each width.
+
+The overlays and the window looked identical, pixel for pixel, in screenshots
+of every round. Screenshots in HDR mode are converted to 8 bits, though, so
+nobody has yet judged by eye that the 400-1000-nit patches are brighter than
+SDR white on the panel.
 
 ## Windows
 
