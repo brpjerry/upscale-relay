@@ -64,6 +64,16 @@ actions supersede older startup work. Track choices are remapped using type,
 language, title, codec, channel/default/forced metadata, and duplicate occurrence
 rather than relying on old numeric IDs.
 
+**Use passthrough for 4K or higher resolution videos** (off by default) opens a
+source 3840 pixels wide or 2160 tall and up with the `passthrough` model instead
+of the selected one; the now-playing line then reads `passthrough (4K source)`.
+A model upscaling a 4K frame runs well below realtime (~123 ms per frame for a
+2x model on the RTX 5090) and its output is downscaled to the display anyway.
+A local file's size comes from the client's own demux. A server-library file is
+probed through `/media` before the session opens (its header and libavformat's
+first-packet probe); when that probe fails the selected model is used. Toggling
+the switch restarts only a stream whose model it changes.
+
 These controls set mpv options; the player keeps their values itself
 (`AppSettings.mpv_defaults` in QSettings) and sets them on mpv at startup, at
 each session start, and after an edit once playback is stable:

@@ -55,7 +55,7 @@ from PySide6.QtWidgets import (
 )
 from qasync import asyncSlot
 
-from relay_client_core import RelayClient, SessionConfig, TeardownNotConfirmedError
+from relay_client_core import RelayClient, SessionConfig, TeardownNotConfirmedError, is_4k_or_higher
 
 from .chapters import (
     Chapter,
@@ -355,6 +355,11 @@ class MainWindow(DesktopFeatures, QMainWindow):
         self.autoconnect_check.setChecked(self.settings.auto_connect)
         self.model_combo = QComboBox()
         self.model_combo.addItem(self.settings.model)
+        self.passthrough_4k_check = FlatSwitch("Use passthrough for 4K or higher resolution videos")
+        self.passthrough_4k_check.setToolTip(
+            "Stream videos 3840 wide or 2160 tall and up without the upscale model."
+        )
+        self.passthrough_4k_check.setChecked(self.settings.passthrough_4k)
         self.tier_combo = QComboBox()
         self.tier_combo.addItem(self.settings.quality_tier, self.settings.quality_tier)
         # "Fit to screen" letterboxes inside the display; "Crop" requests a
@@ -454,6 +459,7 @@ class MainWindow(DesktopFeatures, QMainWindow):
             combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
             combo.setToolTip(help_text)
             form.addRow(label, combo)
+        form.insertRow(1, self.passthrough_4k_check)  # qualifies the model choice
         streaming_layout.addLayout(form)
         streaming_layout.addWidget(self.deband_check)
         settings_scroll = QScrollArea()
@@ -888,6 +894,7 @@ class MainWindow(DesktopFeatures, QMainWindow):
         # activated fires only for a user choice, avoiding a restart while
         # capability refreshes repopulate these menus.
         self.model_combo.activated.connect(self.on_model_changed)
+        self.passthrough_4k_check.toggled.connect(self.on_passthrough_4k_changed)
         self.tier_combo.activated.connect(self.on_quality_tier_changed)
         self.deband_check.toggled.connect(self.on_deband_changed)
         self.fullscreen_btn.clicked.connect(self.toggle_fullscreen)
@@ -2301,6 +2308,7 @@ class MainWindow(DesktopFeatures, QMainWindow):
             fit_mode=self._fit_mode(),
             source=source,
             resize_algorithm=self._resize_algorithm(),
+            passthrough_4k=self.settings.passthrough_4k,
             aux_tracks=(
                 "muxed"
                 if source == "server_file" and self._server_caps.get("muxed_aux_tracks")
@@ -2452,13 +2460,16 @@ class MainWindow(DesktopFeatures, QMainWindow):
         # A paused player still needs initial packets to establish its first
         # frame. The live buffer report applies the usual server watermark.
         output = f"{session.downlink_width}×{session.downlink_height}"
+        model = getattr(session, "model", None) or cfg.model
+        if model != cfg.model:
+            model = f"{model} (4K source)"
         self._show_now_playing(
             Path(path).name,
-            f"{cfg.model} · {self.tier_combo.currentText()} · {output}",
+            f"{model} · {self.tier_combo.currentText()} · {output}",
             [
                 ("File", path),
                 ("Source", "Server library" if source == "server_file" else "Uploaded from this computer"),
-                ("Upscale model", cfg.model),
+                ("Upscale model", model),
                 ("Stream quality", self.tier_combo.currentText()),
                 ("Output", f"{output} {session.downlink_codec}"),
                 ("Server", _server_address(self.client.host, self.client.port)),
@@ -2538,6 +2549,22 @@ class MainWindow(DesktopFeatures, QMainWindow):
     @asyncSlot(int)
     async def on_model_changed(self, _index: int) -> None:
         self.settings.model = self.model_combo.currentText()
+        await self._restart_for_playback_setting()
+
+    @asyncSlot(bool)
+    async def on_passthrough_4k_changed(self, enabled: bool) -> None:
+        self.settings.passthrough_4k = enabled
+        session = getattr(self.client, "session", None)
+        if session is None or self.model_combo.currentText() == "passthrough":
+            return
+        # Restart only a stream whose model this changes. A server file
+        # opened with the option off was never measured, so it restarts.
+        if enabled:
+            size = getattr(session, "source_size", None)
+            if size is not None and not is_4k_or_higher(*size):
+                return
+        elif getattr(session, "model", None) != "passthrough":
+            return
         await self._restart_for_playback_setting()
 
     @asyncSlot(int)

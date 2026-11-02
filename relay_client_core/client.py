@@ -28,6 +28,7 @@ from pathlib import Path
 from urllib.parse import quote
 
 import aiohttp
+import av
 
 from relay_protocol import (
     DIR_DOWNLINK,
@@ -54,6 +55,29 @@ def _open_local_source(path: str):
     except BaseException:
         track.close()
         raise
+
+
+def is_4k_or_higher(width: int, height: int) -> bool:
+    """3840 wide or 2160 tall and up: UHD, DCI 4K and scope crops of either."""
+    return width >= 3840 or height >= 2160
+
+
+# The open reads the file header and, at most, libavformat's default probe of
+# the first packets. The timeout covers each blocking read, not the total.
+_PROBE_TIMEOUT_S = 10
+
+
+def _probe_video_size(url: str) -> tuple[int, int] | None:
+    """Stored width and height of a URL's first video stream.
+
+    Owns its container from open to close, so a cancelled caller (whose
+    worker thread runs on) shares no native state with anyone.
+    """
+    with av.open(url, timeout=_PROBE_TIMEOUT_S) as container:
+        if not container.streams.video:
+            return None
+        ctx = container.streams.video[0].codec_context
+        return (ctx.width, ctx.height) if ctx.width and ctx.height else None
 
 
 class _SourceOpening:
@@ -291,6 +315,9 @@ class SessionConfig:
     # "cached" asks a capable server to omit immutable font bodies from each
     # epoch and expose a verified content-addressed manifest instead.
     aux_attachments: str = "embedded"
+    # Open a source that is 4K or larger (is_4k_or_higher) with "passthrough"
+    # in place of ``model``. A server file's size is read through /media.
+    passthrough_4k: bool = False
 
 
 @dataclass
@@ -320,6 +347,12 @@ class SessionInfo:
     # Server-file metadata; None preserves attachment behavior with old peers.
     source_has_audio: bool | None = None
     source_has_auxiliary: bool | None = None
+    # The model sent in open_session: SessionConfig.model, or "passthrough"
+    # in its place for a 4K source (SessionConfig.passthrough_4k).
+    model: str | None = None
+    # The source's stored (width, height) when the client read it: always for
+    # an uplink, and for a server file only when passthrough_4k probed it.
+    source_size: tuple[int, int] | None = None
 
 
 class RelayClient:
@@ -529,6 +562,15 @@ class RelayClient:
                 raise ConnectionError("client closed while opening source")
             track, video, duration_s, chapters = owner.take()
             self.track = track
+        model = cfg.model
+        source_size = None
+        if video is not None and video.get("width") and video.get("height"):
+            source_size = (video["width"], video["height"])
+        if cfg.passthrough_4k and model != "passthrough":
+            if source_size is None and cfg.source == "server_file":
+                source_size = await self._probe_server_file_size(cfg.path)
+            if source_size is not None and is_4k_or_higher(*source_size):
+                model = "passthrough"
         source = ("uplink" if cfg.source == "uplink" else
                   {"type": "server_file", "path": cfg.path})
         # keepalive=True: a cold TensorRT engine build at session open can run
@@ -541,7 +583,7 @@ class RelayClient:
         fields = {
             "source": source,
             "file": file_info,
-            "model": cfg.model,
+            "model": model,
             "quality_tier": cfg.quality_tier,
             "display": {"w": cfg.display_w, "h": cfg.display_h},
             "fit_mode": cfg.fit_mode,
@@ -594,8 +636,22 @@ class RelayClient:
                 msg["source_has_auxiliary"]
                 if type(msg.get("source_has_auxiliary")) is bool else None
             ),
+            model=model,
+            source_size=source_size,
         )
         return self.session
+
+    async def _probe_server_file_size(self, path: str) -> tuple[int, int] | None:
+        """A library file's stored dimensions, read through /media.
+
+        None when the probe fails: the session then opens with the chosen
+        model, as it would without passthrough_4k.
+        """
+        try:
+            return await asyncio.to_thread(_probe_video_size, self.media_url(path))
+        except Exception as err:
+            log.warning("could not read the video size of %s: %r", path, err)
+            return None
 
     async def prepare_attachments(self, cache_root: Path) -> Path | None:
         """Materialize negotiated cached fonts before mpv loads the epoch."""

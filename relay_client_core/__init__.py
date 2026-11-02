@@ -6,5 +6,6 @@ from .client import (  # noqa: F401
     RelayClient,
     SessionConfig,
     TeardownNotConfirmedError,
+    is_4k_or_higher,
 )
 from .demux import VideoTrack  # noqa: F401
