@@ -1040,7 +1040,11 @@ class MpvPlayerView(QOpenGLWidget):
         if top is None:
             return False
         if presenter is None:
-            presenter = self._presenter = HdrPresenter(self, top, pq=pq, sdr_white_nits=display.sdr_white_nits)
+            surface = HdrPresenter
+            if pq and hdr_output.platform_kind() == "windows":
+                from .hdr_d3d11 import D3D11Presenter  # noqa: PLC0415 - Windows only
+                surface = D3D11Presenter
+            presenter = self._presenter = surface(self, top, pq=pq, sdr_white_nits=display.sdr_white_nits)
             presenter.failed.connect(self._on_presenter_failed)
         presenter.sdr_white_nits = display.sdr_white_nits or presenter.sdr_white_nits
         if self._on_presenter:
@@ -1099,6 +1103,8 @@ class MpvPlayerView(QOpenGLWidget):
         presenter, self._presenter = self._presenter, None
         if presenter is not None:
             presenter.hide()
+            if hasattr(presenter, "destroy_d3d"):
+                presenter.destroy_d3d()
             presenter.deleteLater()
 
     def _render_ctx_lost(self, ctx) -> None:

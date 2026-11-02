@@ -83,11 +83,17 @@ async def wait_until(predicate, description, timeout=30):
         raise AssertionError(f"timed out waiting for {description}") from error
 
 
-async def shot(args, name):
+async def shot(args, name, window=None):
     if not args.shots:
         return
     path = Path(args.shots) / f"{name}.png"
     path.parent.mkdir(parents=True, exist_ok=True)
+    if args.shot_cmd == "qt":  # the screen under the window, as Qt grabs it (Windows)
+        screen = window.screen()
+        g = window.geometry()
+        screen.grabWindow(0, g.x() - screen.geometry().x(), g.y() - screen.geometry().y(),
+                          g.width(), g.height()).save(str(path))
+        return
     process = await asyncio.create_subprocess_shell(args.shot_cmd.format(path=shlex.quote(str(path))))
     await process.wait()
 
@@ -218,22 +224,22 @@ async def exercise(window, clock, args):
         await asyncio.sleep(1.0)
         report["surface"] = surface_state(window)
         print(json.dumps({"surface": report["surface"]}), flush=True)
-        await shot(args, "01_playing")
+        await shot(args, "01_playing", window)
         window._set_track_panel_visible(True)
         await asyncio.sleep(0.8)
-        await shot(args, "02_track_card")
+        await shot(args, "02_track_card", window)
         window._set_track_panel_visible(False)
         window._set_settings_visible(True)
         await asyncio.sleep(0.8)
-        await shot(args, "03_settings_sheet")
+        await shot(args, "03_settings_sheet", window)
         window._set_settings_visible(False)
         await asyncio.sleep(0.5)
         window.toggle_fullscreen()
         await asyncio.sleep(2.0)
-        await shot(args, "04_fullscreen")
+        await shot(args, "04_fullscreen", window)
         window._on_player_mouse_moved(player.width() // 2, player.height() - 4)
         await asyncio.sleep(1.0)
-        await shot(args, "05_fullscreen_bar")
+        await shot(args, "05_fullscreen_bar", window)
         window.toggle_fullscreen()
         await asyncio.sleep(2.0)
         if args.pacing:
@@ -258,7 +264,7 @@ def main():
     parser.add_argument("--tier", default="lossless-hevc")
     parser.add_argument("--surface", choices=("auto", "force", "off"), default="auto")
     parser.add_argument("--shots", help="directory for screenshots")
-    parser.add_argument("--shot-cmd", default="grim {path}", help="screenshot command; {path} is replaced")
+    parser.add_argument("--shot-cmd", default="grim {path}", help="screenshot command ({path} is replaced), or qt for Qt's own grab")
     parser.add_argument("--pacing", action="store_true")
     parser.add_argument("--size", default="1400x860", help="window size before fullscreen")
     args = parser.parse_args()
@@ -275,16 +281,22 @@ def main():
     scope = f"hdr-check-{uuid.uuid4().hex}"
     window = MainWindow(DesktopOptions(settings_scope=scope, discovery=False))
     clock = Clock(window)
-    paint = hdr_view.HdrPresenter.paintGL
+    def timed(paint):
+        def timed_paint(self):
+            started = time.perf_counter()
+            paint(self)
+            clock.paints.append((started, time.perf_counter() - started))
+        return timed_paint
 
-    def timed_paint(self):
-        started = time.perf_counter()
-        paint(self)
-        clock.paints.append((started, time.perf_counter() - started))
+    hdr_view.HdrPresenter.paintGL = timed(hdr_view.HdrPresenter.paintGL)
+    if sys.platform == "win32":
+        from desktop_client import hdr_d3d11  # noqa: PLC0415
 
-    hdr_view.HdrPresenter.paintGL = timed_paint
+        hdr_d3d11.D3D11Presenter._paint = timed(hdr_d3d11.D3D11Presenter._paint)
     width, _, height = args.size.partition("x")
-    window.resize(int(width), int(height))
+    # On the primary screen, whole: a window across two screens grabs badly.
+    window.setGeometry(app.primaryScreen().availableGeometry().x() + 40,
+                       app.primaryScreen().availableGeometry().y() + 40, int(width), int(height))
     window.show()
     try:
         with loop:

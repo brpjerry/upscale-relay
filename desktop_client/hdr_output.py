@@ -56,11 +56,15 @@ def platform_kind(app=None) -> str:
 
 
 def presentation_supported(app=None) -> bool:
-    """Whether this build can put a PQ surface on screen (HdrPresenter)."""
+    """Whether this build can put a PQ surface on screen: HdrPresenter on
+    Wayland, the D3D11 prototype (hdr_d3d11.py) on Windows when
+    RELAY_HDR_WINDOWS=1."""
     kind = platform_kind(app)
     if kind == "wayland":
         return QLibraryInfo.version() >= _QT_WAYLAND_COLOR
-    return False  # Windows: see docs/HDR_OUTPUT.md (prototype only)
+    if kind == "windows":
+        return os.environ.get("RELAY_HDR_WINDOWS") == "1"
+    return False
 
 
 def query(window=None) -> DisplayHdr:
