@@ -323,22 +323,28 @@ A server advertising `capabilities.high_bit_depth: true` accepts
 | `"hdr"` | 10-bit 4:2:0 (HEVC Main 10, or 10-bit FFV1) for sources whose transfer is PQ (16) or HLG (18); 8-bit for the rest |
 | `"all"` | as `"hdr"`, and also 10-bit for any other source deeper than 8 bits (e.g. 10-bit SDR anime) |
 
+A server with no 10-bit encoder for the requested tier streams 8 bits, as if
+nothing had been asked; `downlink_bit_depth` says which.
+
 A 10-bit HEVC downlink of an HDR source also carries, in its bitstream,
 what the source's had:
 
 - the mastering display colour volume and content light level SEI on every
-  keyframe: from the source bitstream, else from the source container (`video.hdr`);
+  keyframe, as the source frame encoded there has them: from the source
+  bitstream, else from the source container (`video.hdr`);
 - the source frame's HDR10+ messages (ITU-T T.35 SEI) on that frame;
 - the Dolby Vision RPU NAL unit (type 62, last in the access unit) on its frame,
-  when the source is Dolby Vision profile 8 (`video.dolby_vision.profile == 8`;
-  the base layer is HDR10, SDR or HLG). `session_opened.downlink_dolby_vision`
-  says so. Other profiles' RPUs are dropped: profile 7's composes an enhancement
-  layer the relay does not carry, and profile 5 has no displayable base layer
-  without it (its colours are wrong with or without this field). There is no
-  `dvcC` configuration record in the Matroska header.
+  when the source is Dolby Vision profile 8 (`video.dolby_vision.profile == 8`),
+  whatever its base layer: HDR10 (8.1), HLG (8.4) or SDR (8.2, which is 10-bit
+  only under `"all"`). `session_opened.downlink_dolby_vision` says so. Other
+  profiles' RPUs are dropped: profile 7's composes an enhancement layer the
+  relay does not carry, and profile 5 has no displayable base layer without it
+  (its colours are wrong with or without this field). There is no `dvcC`
+  configuration record in the Matroska header.
 
-Dynamic metadata is copied byte for byte from the source access unit with the
-same PTS. The FFV1 tier carries colour tags only.
+Static and dynamic metadata are copied from the source frame with the same
+PTS, dynamic metadata byte for byte from its access unit. The FFV1 tier
+carries colour tags only.
 
 The decision is made at `open_session`, so the server needs the source's
 colour and depth before any frame decodes. For `server_file` it reads them
@@ -346,8 +352,11 @@ from the file. An uplink client should send, from its own demuxer:
 
 - `video.color`: ITU-T H.273 code points (FFmpeg's enum values) as the
   container declares them, `2` for unspecified, and `range` only when known.
-  This also replaces the first decoded frame as the source of the colour tags
-  of an 8-bit downlink, so container-only tags are honoured.
+  The depth is decided from these. The downlink is tagged with the first
+  decoded frame's tags where the bitstream specifies them, as it always was
+  (FFmpeg applies an alternative transfer SEI, such as HLG broadcast over
+  BT.2020-10 signalling, only to frames), and with these where it does not,
+  so container-only tags are honoured.
 - `video.bit_depth`: bits per sample of the decoded format.
 - `video.hdr`: container-level static metadata,
   `{mastering_display:{primaries:[[x,y] red, green, blue], white_point:[x,y], max_luminance, min_luminance}, content_light_level:{max_cll, max_fall}}`,
@@ -361,7 +370,8 @@ the parameter sets in `extradata_b64`. Otherwise unknown means 8-bit.
 
 `session_opened` reports the outcome: `downlink_bit_depth` (8 or 10),
 `downlink_color` (the resolved tags the downlink is encoded with, `range` by
-name; null for an uplink whose colour is unknown until its first frame),
+name; for an uplink, as resolved from `video.color` before its first frame,
+and null when that is unknown too),
 `downlink_dolby_vision`,
 and `source_bit_depth`. `GET /status` `sessions[].pipeline` adds `bit_depth`,
 `color`, and `hdr_metadata` (null for SDR): the static metadata written and the

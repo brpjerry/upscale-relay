@@ -46,6 +46,8 @@ def _decoder_color_and_depth(extradata, width, height):
     ctx.width, ctx.height = width, height
     ctx.open()
     fmt = ctx.format
-    depth = max((c.bits for c in fmt.components), default=0) if fmt else 0
+    if fmt is None:  # no sequence parameter set it could read
+        return None, None
+    depth = max((c.bits for c in fmt.components), default=0)
     tags = (int(ctx.colorspace), int(ctx.color_range), int(ctx.color_primaries), int(ctx.color_trc))
     return tags, (depth or None)

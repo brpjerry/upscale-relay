@@ -35,7 +35,7 @@ from relay_protocol import (
     NO_TS,
     MediaPacket,
 )
-from upscale_cli.color import VideoColor
+from upscale_cli.color import VideoColor, color_tags_of, fill_unspecified
 from upscale_cli.encode import (
     DEFAULT_LOSSLESS_HEVC_PROFILE,
     add_video_encoder_stream,
@@ -211,6 +211,7 @@ class _Frame:
     frame: av.VideoFrame | None = None  # passthrough path
     rgb: object | None = None  # ndarray path (after inference)
     hdr: DynamicHdr | None = None  # source dynamic metadata to write back
+    static_hdr: StaticHdr | None = None  # the frame's static metadata, ditto
 
 
 @dataclass(slots=True)
@@ -310,10 +311,15 @@ class VideoConfig:
     # 1 for square pixels and for clients that do not send it.
     sample_aspect_ratio: Fraction = Fraction(1)
     # FFmpeg colour tags (matrix, range, primaries, transfer) as the source
-    # container declares them, known before any media flows. None: take
-    # them from the first decoded frame (uplink sessions whose client sent
-    # none; they carry no muxed auxiliary tracks).
+    # container declares them, known before any media flows; they decide the
+    # downlink's depth. None: unknown until the first decoded frame.
     color_tags: tuple[int, int, int, int] | None = None
+    # Uplinks: the first decoded frame's tags win where it specifies them, as
+    # they always have for uplinks, and color_tags fill in only the rest.
+    # FFmpeg applies an alternative transfer SEI (HLG broadcast over
+    # BT.2020-10 signalling) to frames, never to the demuxer's tags. Uplinks
+    # carry no muxed auxiliary tracks, so the encoder can wait for the frame.
+    color_from_first_frame: bool = False
     # Deep-colour inputs (open_session.video.bit_depth / hdr / dolby_vision):
     # None and empty mean unknown.
     bit_depth: int | None = None
@@ -399,13 +405,31 @@ class Pipeline:
             self.video = video
             # One colour description per session drives every YUV<->RGB
             # conversion and the encoder tags (upscale_cli.color).
-            self._source_color: VideoColor | None = (
+            self._open_color: VideoColor | None = (
                 VideoColor.resolve_values(*video.color_tags, video.width, video.height)
                 if video.color_tags is not None else None
             )
+            self._source_color = None if video.color_from_first_frame else self._open_color
             # Deep colour: 10-bit 4:2:0 out, rgb48 through the model. Decided
             # here, before the encoder, the model's I/O and session_opened.
-            self.bit_depth = output_bit_depth(high_bit_depth, self._source_color, video.bit_depth)
+            self.bit_depth = output_bit_depth(high_bit_depth, self._open_color, video.bit_depth)
+            self.lossless_hevc_profile = lossless_hevc_profile
+            self.quality_tier = quality_tier
+            try:
+                self._enc_codec, self._enc_pix_fmt, self._enc_options = select_encoder(
+                    quality_tier, lossless_hevc_profile=lossless_hevc_profile,
+                    bit_depth=self.bit_depth,
+                )
+            except RuntimeError:
+                if self.bit_depth == 8:
+                    raise
+                # Deep colour is a preference (session_opened reports the
+                # outcome): stream what a client that did not ask receives.
+                log.warning("no 10-bit encoder for tier %s; streaming 8 bits", quality_tier)
+                self.bit_depth = 8
+                self._enc_codec, self._enc_pix_fmt, self._enc_options = select_encoder(
+                    quality_tier, lossless_hevc_profile=lossless_hevc_profile,
+                )
             self._rgb_format = "rgb48le" if self.bit_depth > 8 else "rgb24"
             self.emit = emit
             self.on_error = on_error
@@ -473,12 +497,6 @@ class Pipeline:
                 )
                 self._crop_box = None
 
-            self.lossless_hevc_profile = lossless_hevc_profile
-            self.quality_tier = quality_tier
-            self._enc_codec, self._enc_pix_fmt, self._enc_options = select_encoder(
-                quality_tier, lossless_hevc_profile=lossless_hevc_profile,
-                bit_depth=self.bit_depth,
-            )
             self.encoder_name = self._enc_codec
             self.downlink_codec = {
                 "hevc_nvenc": "hevc", "libx265": "hevc", "libx264": "h264",
@@ -486,30 +504,42 @@ class Pipeline:
             # HDR signalling the encoder cannot write (relay_media.hdr): static
             # metadata on every keyframe, HDR10+ and the Dolby Vision RPU per
             # frame, copied from the HEVC source packet with the same PTS.
-            self._hdr_signalling = (
-                self.bit_depth > 8 and self.downlink_codec == "hevc"
-                and self._source_color is not None and self._source_color.is_hdr
-            )
+            self._deep_hevc = self.bit_depth > 8 and self.downlink_codec == "hevc"
             dovi = video.dolby_vision
+            # A profile 8 RPU maps whatever base layer it has, SDR (8.2) too.
             self.dolby_vision_rpu = (
-                self._hdr_signalling and video.codec == "hevc"
+                self._deep_hevc and video.codec == "hevc"
                 and dovi is not None and dovi.rpu_survives_reencode
             )
-            if self.bit_depth > 8 and dovi is not None and not dovi.rpu_survives_reencode:
+            if dovi is not None and not dovi.rpu_survives_reencode and (
+                self.bit_depth > 8 or dovi.profile == 5
+            ):
                 log.warning(
                     "Dolby Vision profile %d: its RPU cannot describe the re-encoded "
                     "base layer and is dropped%s", dovi.profile,
                     "; profile 5 has no HDR10 or SDR base layer, so colours will be wrong"
                     if dovi.profile == 5 else "",
                 )
-            self._dynamic_hdr = self._hdr_signalling and video.codec == "hevc"
+            # Both are decided again on the first frame when the source's
+            # colour comes from it (_put_decoded); until then any HEVC packet
+            # may hold metadata to keep.
+            self._hdr_signalling = self._deep_hevc and (
+                self.dolby_vision_rpu
+                or (self._source_color is not None and self._source_color.is_hdr)
+            )
+            self._dynamic_hdr = self._deep_hevc and video.codec == "hevc" and (
+                self._hdr_signalling or self._source_color is None
+            )
             self._nal_length_size = hevc_nal_length_size(video.extradata)
             self._pending_dynamic: dict[int, DynamicHdr] = {}  # decode thread
-            self._pending_out_hdr: dict[int, DynamicHdr] = {}  # finish thread
-            # Published by the decode thread from the first frame, before
-            # that frame is queued; read by the finish thread.
+            # (dynamic, static) of each frame handed to the encoder, until
+            # its packet comes out (finish thread).
+            self._pending_out_hdr: dict[
+                int, tuple[DynamicHdr | None, StaticHdr | None]
+            ] = {}
+            # The static metadata last written, and its SEI (finish thread).
             self._static_hdr: StaticHdr | None = None
-            self._static_hdr_nals: list[bytes] | None = None  # finish thread
+            self._static_hdr_nals: list[bytes] = []
             self._mux = None
             self._enc_stream = None
             self._aux_template_container = (
@@ -875,9 +905,10 @@ class Pipeline:
 
     @property
     def downlink_color(self) -> dict | None:
-        """Resolved colour of the downlink (``session_opened.downlink_color``);
-        None until known (an uplink whose client sent no colour)."""
-        color = self._source_color
+        """Resolved colour of the downlink (``session_opened.downlink_color``):
+        an uplink's as its client described it until its first frame decodes,
+        None while nothing is known."""
+        color = self._source_color or self._open_color
         return tags_to_wire(color.tags) if color is not None else None
 
     def hdr_metadata_report(self) -> dict | None:
@@ -1101,21 +1132,30 @@ class Pipeline:
             trace.first_frame_ms = (time.perf_counter() - trace.requested_at) * 1000.0
             trace.first_frame_pts = frame.pts
         if self._source_color is None:
-            # Published before the frame is queued, so later stages see it.
-            self._source_color = VideoColor.resolve(frame, self.video.width, self.video.height)
-        if self._hdr_signalling and self._static_hdr is None:
-            # The bitstream's mastering display / light level SEI, which the
-            # decoder exports on each frame, else the container's.
-            self._static_hdr = StaticHdr.from_side_data(frame.side_data).or_else(
-                self.video.hdr_static,
+            tags = color_tags_of(frame)
+            if self.video.color_tags is not None:
+                tags = fill_unspecified(tags, self.video.color_tags)
+            # Published before the frame is queued, so later stages see them.
+            self._source_color = VideoColor.resolve_values(*tags, self.video.width, self.video.height)
+            self._hdr_signalling = self._deep_hevc and (
+                self.dolby_vision_rpu or self._source_color.is_hdr
             )
+            self._dynamic_hdr = self._hdr_signalling and self.video.codec == "hevc"
+        static = None
+        if self._hdr_signalling:
+            # The bitstream's mastering display / light level SEI, which the
+            # decoder exports on each frame, else the container's. Read
+            # before a hardware download, whose frame has no side data.
+            static = StaticHdr.from_side_data(frame.side_data).or_else(self.video.hdr_static)
         if frame.format.name in self._HW_PIX_FMTS:
             # Download NVDEC frames on the decode thread (parallel with infer).
             cpu = frame.reformat(format="p010le" if self.bit_depth > 8 else "nv12")
             cpu.pts = frame.pts
             cpu.time_base = frame.time_base
             frame = cpu
-        self._safe_put(self._q_dec, _Frame(epoch=epoch, pts=frame.pts, frame=frame, hdr=dynamic))
+        self._safe_put(self._q_dec, _Frame(
+            epoch=epoch, pts=frame.pts, frame=frame, hdr=dynamic, static_hdr=static,
+        ))
 
     # Stage 2: decoded frames -> upscaled rgb (GPU inference)
 
@@ -1217,8 +1257,10 @@ class Pipeline:
             if not self._enc_tagged:
                 self._source_color.tag(self._enc_stream.codec_context)
                 self._enc_tagged = True
-            if item.hdr is not None and item.pts is not None:
-                _remember(self._pending_out_hdr, item.pts, item.hdr)
+            if self._hdr_signalling and item.pts is not None and (
+                item.hdr is not None or item.static_hdr
+            ):
+                _remember(self._pending_out_hdr, item.pts, (item.hdr, item.static_hdr))
             keyframe = False
             for av_pkt in self._enc_stream.encode(out):
                 keyframe = keyframe or bool(av_pkt.is_keyframe)
@@ -1229,18 +1271,19 @@ class Pipeline:
 
     def _with_hdr_signalling(self, av_pkt: av.Packet) -> av.Packet:
         """The encoded packet with the HDR metadata its encoder cannot write:
-        static SEI on keyframes, the source frame's HDR10+ SEI and Dolby
-        Vision RPU on its own packet (finish thread)."""
+        the source frame's static SEI if it is a keyframe, its HDR10+ SEI and
+        Dolby Vision RPU on every packet (finish thread)."""
         if not self._hdr_signalling:
             return av_pkt
-        dynamic = (
-            self._pending_out_hdr.pop(av_pkt.pts, None)
-            if self._pending_out_hdr and av_pkt.pts is not None else None
+        dynamic, static = (
+            self._pending_out_hdr.pop(av_pkt.pts, (None, None))
+            if self._pending_out_hdr and av_pkt.pts is not None else (None, None)
         )
         prefix, suffix = dynamic_hdr_nals(dynamic) if dynamic is not None else ([], [])
-        if av_pkt.is_keyframe and self._static_hdr:
-            if self._static_hdr_nals is None:
-                self._static_hdr_nals = self._static_hdr.sei_nals()
+        if av_pkt.is_keyframe:
+            # A frame whose metadata went untracked keeps the last written.
+            if static and static != self._static_hdr:
+                self._static_hdr, self._static_hdr_nals = static, static.sei_nals()
             prefix = self._static_hdr_nals + prefix
         if not prefix and not suffix:
             return av_pkt

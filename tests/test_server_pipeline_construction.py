@@ -68,7 +68,9 @@ def test_constructor_releases_every_allocated_owner(monkeypatch, failure):
             "model.onnx", "lossless-ffv1", (64, 64), lambda _: None, lambda _: None,
             aux_source_path="source.mkv",
         )
-    assert allocated
+    # The encoder is chosen before anything native is allocated (its 8-bit
+    # fallback decides the model's I/O).
+    assert allocated if failure != "encoder" else not allocated
     assert all(owner.closed == 1 for owner in allocated)
 
 

@@ -2592,7 +2592,9 @@ class MainWindow(DesktopFeatures, QMainWindow):
             return
         # Only a deep SDR source changes: HDR stays 10-bit either way, and an
         # 8-bit source never had more to keep.
-        if getattr(session, "downlink_hdr", False) or (getattr(session, "source_bit_depth", None) or 8) <= 8:
+        hdr = getattr(session, "downlink_hdr", False)
+        source_bits = getattr(session, "source_bit_depth", None) or 8
+        if hdr or source_bits <= 8:
             return
         await self._restart_for_playback_setting()
 

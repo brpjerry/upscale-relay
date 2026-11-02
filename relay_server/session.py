@@ -459,6 +459,7 @@ class Session:
             avg_rate=Fraction(*video["avg_rate"]) if video.get("avg_rate") else None,
             sample_aspect_ratio=sample_aspect_ratio,
             color_tags=color_tags,
+            color_from_first_frame=self.source_track is None,
             bit_depth=bit_depth or None,
             hdr_static=StaticHdr.from_wire(video.get("hdr")),
             dolby_vision=DolbyVisionConfig.from_wire(video.get("dolby_vision")),

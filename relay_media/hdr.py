@@ -31,7 +31,6 @@ import struct
 from dataclasses import dataclass
 
 # ITU-T H.273 code points (the FFmpeg enum values).
-PRIMARIES_BT2020 = 9
 TRANSFER_PQ = 16  # SMPTE ST 2084
 TRANSFER_HLG = 18  # ARIB STD-B67
 HDR_TRANSFERS = frozenset({TRANSFER_PQ, TRANSFER_HLG})
@@ -63,10 +62,10 @@ _AV_LIGHT_LEVEL = struct.Struct("<2I")
 
 
 _RANGE_LIMITED, _RANGE_FULL = 1, 2  # FFmpeg AVColorRange
-
-
-def is_hdr_transfer(transfer: int) -> bool:
-    return int(transfer) in HDR_TRANSFERS
+_RANGES = {"limited": _RANGE_LIMITED, "full": _RANGE_FULL}
+# What reading a malformed wire record raises: a missing key, a wrong type,
+# or a JSON number int() refuses (1e309 parses as inf and overflows).
+_MALFORMED = (KeyError, TypeError, ValueError, OverflowError)
 
 
 def tags_to_wire(tags: tuple[int, int, int, int]) -> dict:
@@ -86,11 +85,14 @@ def tags_from_wire(value) -> tuple[int, int, int, int] | None:
         return None
     try:
         codes = [int(value[key]) for key in ("matrix", "primaries", "transfer")]
-    except (KeyError, TypeError, ValueError):
+    except _MALFORMED:
         return None
     if not all(0 <= code <= 255 for code in codes):
         return None
-    color_range = {"limited": _RANGE_LIMITED, "full": _RANGE_FULL}.get(value.get("range"), 0)
+    wire_range = value.get("range")
+    if wire_range is not None and wire_range not in ("limited", "full"):
+        return None
+    color_range = _RANGES.get(wire_range, 0)
     matrix, primaries, transfer = codes
     return matrix, color_range, primaries, transfer
 
@@ -137,7 +139,7 @@ class MasteringDisplay:
                 max_luminance=int(value["max_luminance"]),
                 min_luminance=int(value["min_luminance"]),
             )
-        except (KeyError, TypeError, ValueError):
+        except _MALFORMED:
             return None
         if len(primaries) != 3 or len(white) != 2:
             return None
@@ -180,7 +182,7 @@ class ContentLightLevel:
     def from_wire(cls, value) -> "ContentLightLevel | None":
         try:
             result = cls(int(value["max_cll"]), int(value["max_fall"]))
-        except (KeyError, TypeError, ValueError):
+        except _MALFORMED:
             return None
         return result if result.max_cll >= 0 and result.max_fall >= 0 else None
 
@@ -204,15 +206,15 @@ class StaticHdr:
     @classmethod
     def from_side_data(cls, side_data) -> "StaticHdr":
         """From a mapping of FFmpeg side data names or types to bytes: a
-        stream's ``coded_side_data`` or a decoded frame's ``side_data``."""
+        stream's ``coded_side_data`` or a decoded frame's ``side_data``
+        (read for every frame: only the two records are copied out)."""
         mastering = light = None
         for key, value in side_data.items():
             name = str(getattr(key, "name", key)).lower()
-            raw = bytes(value)
             if "mastering_display" in name:
-                mastering = MasteringDisplay.from_side_data(raw)
+                mastering = MasteringDisplay.from_side_data(bytes(value))
             elif "content_light_level" in name:
-                light = ContentLightLevel.from_side_data(raw)
+                light = ContentLightLevel.from_side_data(bytes(value))
         return cls(mastering, light)
 
     @classmethod
@@ -276,7 +278,7 @@ class DolbyVisionConfig:
                 level=int(value.get("level", 0)),
                 bl_signal_compatibility_id=int(value.get("bl_signal_compatibility_id", 0)),
             )
-        except (KeyError, TypeError, ValueError):
+        except _MALFORMED:
             return None
 
     def to_wire(self) -> dict:
