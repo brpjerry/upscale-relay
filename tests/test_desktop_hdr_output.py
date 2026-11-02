@@ -98,7 +98,7 @@ def test_a_display_switching_hdr_during_an_hdr_video_asks_for_one_reload(monkeyp
     stale = []
     player = _player(
         _hdr_stale_reported=False, _task=object(), _local_playback=False, _on_presenter=False,
-        _presenter=None, _display_hdr=SDR_DISPLAY,
+        _presenter=None, _display_hdr=SDR_DISPLAY, _observed={}, _epoch_released=True,
         hdr_surface_stale=SimpleNamespace(emit=lambda: stale.append(True)),
     )
     player._wanted_surface = lambda: MpvPlayerView._wanted_surface(player)
@@ -109,6 +109,28 @@ def test_a_display_switching_hdr_during_an_hdr_video_asks_for_one_reload(monkeyp
     MpvPlayerView._check_hdr_surface(player)
     MpvPlayerView._check_hdr_surface(player)
     assert stale == [True]  # once, until the reload decides again
+
+
+@pytest.mark.parametrize(("gamma", "expected"), [("hlg", [True]), ("pq", [True]), ("bt.1886", [])])
+def test_a_stream_mpv_reads_as_hdr_moves_though_the_session_said_sdr(monkeypatch, gamma, expected):
+    """An HLG alternative-transfer SEI over BT.2020 tags reaches only the
+    frames: downlink_color can say SDR for an HLG stream (PROTOCOL §3.5)."""
+    pytest.importorskip("mpv")
+    from desktop_client.mpv_view import MpvPlayerView
+    monkeypatch.setenv("RELAY_HDR_SURFACE", "")
+    monkeypatch.setattr(hdr_output, "presentation_supported", lambda app=None: True)
+    monkeypatch.setattr(hdr_output, "query", lambda window=None: HDR_DISPLAY)
+    stale = []
+    player = _player(
+        _source_hdr=False, _hdr_stale_reported=False, _task=object(), _local_playback=False,
+        _on_presenter=False, _presenter=None, _display_hdr=SDR_DISPLAY, _epoch_released=True,
+        _observed={"video-params": {"gamma": gamma, "primaries": "bt.2020"}},
+        hdr_surface_stale=SimpleNamespace(emit=lambda: stale.append(True)),
+    )
+    player._wanted_surface = lambda: MpvPlayerView._wanted_surface(player)
+    player._pq_for = MpvPlayerView._pq_for
+    MpvPlayerView._check_hdr_surface(player)
+    assert stale == expected and player._source_hdr is bool(expected)
 
 
 def test_a_failing_hdr_surface_falls_back_to_the_widget():

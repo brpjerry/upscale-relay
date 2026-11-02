@@ -76,7 +76,7 @@ _OBSERVED_PROPERTIES = (
     "time-pos", "duration", "avsync", "frame-drop-count",
     "demuxer-cache-duration", "paused-for-cache", "seeking", "path",
     "volume", "mute", "audio-delay", "sub-delay", "aid", "sid",
-    "hwdec-current",
+    "hwdec-current", "video-params",
 )
 # Picture geometry for drawing the last rendered picture scaled while the
 # view is being resized. Anything but plain letterboxing renders at each size.
@@ -1164,6 +1164,12 @@ class MpvPlayerView(QOpenGLWidget):
             return
         if self._task is None and not self._local_playback:
             return
+        params = self._observed.get("video-params") or {}
+        if not self._source_hdr and self._epoch_released and params.get("gamma") in ("pq", "hlg"):
+            # The stream turned out HDR though the session said otherwise (an
+            # HLG alternative-transfer SEI over BT.2020 tags, PROTOCOL §3.5):
+            # mpv's reading of the frames wins, and one reload moves it over.
+            self._source_hdr = True
         if not (self._source_hdr or self._on_presenter):
             return
         want, display = self._wanted_surface()
