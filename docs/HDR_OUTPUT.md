@@ -52,6 +52,9 @@ included, reaches the screen as SDR.
   change. Moves and fade steps reuse the picture, and opacity is applied
   when compositing. `QWidget.render` draws nothing for a widget that carries
   a graphics effect, so the fade's effect is switched off around the render.
+  A widget that paints only part of itself names that part (`mirror_rect`):
+  the busy ring's widget spans the player, and picturing all of it at every
+  resize step cost 1.3-5 ms of each 8.3 ms frame.
 
 The other designs considered, and why each was set aside:
 
@@ -153,25 +156,24 @@ same design with Direct3D 11 for the surface:
 Measured on the RTX 5090 box (2026-11-02, Odyssey G80SH at 240 Hz in HDR
 mode, 500 nits, SDR white 80): the HDR clip plays on the swap chain with mpv
 writing PQ at a 500-nit peak, and the overlays are drawn over it and aligned.
-Steady playback composes at 24 frames a second with no drops. The overlays
-move step for step: the fullscreen bar ~220 steps a second, the track card
-~250, the settings sheet 160-170 (the widget path: 220-265). The picture
-looked right in SDR screen captures, but its brightness has not yet been
-judged by eye.
+Steady playback composes at 24-26 frames a second with no drops. The
+overlays move step for step: the fullscreen bar ~240 steps a second, the
+track card 245-270, the settings sheet 190-195 (the widget path: 220-265).
+The picture looked right in SDR screen captures, but its brightness has not
+yet been judged by eye.
 
 | scenario (rates per second) | surface paints | main window frames | widget path: main window frames |
 |---|---|---|---|
-| fullscreen enter | 47-49 | 50-52 | 102-108 |
-| fullscreen leave | 95-102 | 72-76 | 162 |
-| sidebar hide / show | 121 / 87 | 145 / 56 | 207 / 207 |
-| splitter drag | 99 | 75 | 165 |
+| fullscreen enter | 82-87 | 85-87 | 102-108 |
+| fullscreen leave | 136-138 | 98-100 | 162 |
+| sidebar hide / show | 171 / 132 | 171 / 88 | 207 / 207 |
+| splitter drag | 150 | 120 | 165 |
 
 Open before Windows can leave the prototype:
 
-1. **Transitions run at half the widget path's rate.** Growing is the
-   worst case: each 15% of growth re-allocates the shared texture and renders
-   mpv at the new size (~11 ms a paint). The surface's presents also share the
-   GUI thread with the window's own.
+1. **Transitions run at 60-85% of the widget path's rate.** The surface
+   follows the player's geometry: a child window cannot be clear, so cover
+   mode is out. Its presents also share the GUI thread with the window's own.
    - Windows delivers `requestUpdate()` on a `WM_TIMER`, which it generates
      only once the message queue is empty. Before the surface followed the
      player once per event-loop turn, it got almost no update requests while
@@ -179,11 +181,11 @@ Open before Windows can leave the prototype:
    - Things to try: a waitable swap chain
      (`DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT`) so Present never
      blocks; keeping the shared texture at the screen's size and viewporting
-     into it; a render thread for the surface, with the mirror's images
-     handed across.
-2. **Spikes.** Single paints reached 40-60 ms during the sidebar slide and
-   the splitter drag, probably the interop re-registering a texture. Not
-   investigated yet.
+     into it; DirectComposition, so a clear surface can span the window as on
+     Wayland.
+2. **Spikes.** Single paints reach 16-20 ms during transitions, probably the
+   interop re-registering a texture as the picture grows. Not investigated
+   yet.
 3. **Input transparency.** It works through `Qt.WindowTransparentForInput`
    (`HTTRANSPARENT` on the child window). It still has to be checked against
    every overlay control, including combo popups and the slider tip.

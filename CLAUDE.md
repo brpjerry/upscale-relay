@@ -308,7 +308,9 @@ their volume, panscan, tracks and delays.
   `RenderFlag.DrawWindowBackground` (the default) first fills the widget with
   its palette's Window colour. The overlay mirror renders with `DrawChildren`
   only, with the fade's effect switched off, and applies the opacity when
-  compositing.
+  compositing. A widget over the player that paints only part of itself
+  names that part (`mirror_rect`). The busy ring spans the player, and
+  mirroring all of it at every resize step cost 1.3-5 ms of each frame.
 - On Windows `requestUpdate()` (and every Qt timer, so `asyncio.sleep` too)
   arrives on a `WM_TIMER`, which Windows generates only once the message
   queue is empty. A frame-paced animation keeps the queue busy, so a child
