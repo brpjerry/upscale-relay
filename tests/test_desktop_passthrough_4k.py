@@ -37,7 +37,8 @@ def setup_sized(window, monkeypatch, size, model="2x_Model"):
     return errors, restarts
 
 
-def test_switch_persists_and_reaches_the_session(window, monkeypatch):
+@pytest.mark.parametrize("source", ["server_file", "uplink"])
+def test_switch_persists_and_reaches_the_session(window, monkeypatch, source):
     errors, _ = setup_sized(window, monkeypatch, (3840, 2160))
 
     async def scenario():
@@ -45,7 +46,7 @@ def test_switch_persists_and_reaches_the_session(window, monkeypatch):
         window.passthrough_4k_check.setChecked(True)
         await asyncio.sleep(0)
         assert window.settings.passthrough_4k
-        await window._start_session("film.mkv", "server_file")
+        await window._start_session("film.mkv", source)
         assert window.client.opened_config.passthrough_4k
         assert window.client.opened_config.model == "2x_Model"
         assert window.now_detail.text().startswith("passthrough (4K source) · ")
@@ -89,6 +90,36 @@ def test_toggle_restarts_only_a_stream_whose_model_changes(window, monkeypatch, 
         )
         await window.on_passthrough_4k_changed(False)
         assert restarts == expected
+        assert not errors
+
+    asyncio.run(scenario())
+
+
+def test_toggle_during_a_restart_reopens_with_the_new_value(window, monkeypatch):
+    # A settings restart has torn the old session down and its SessionConfig
+    # may already hold the old value: the toggle must reopen, not be dropped.
+    errors, restarts = setup_sized(window, monkeypatch, (1920, 1080))
+
+    async def scenario():
+        await window._start_session("film.mkv", "server_file")
+        window._restart_snapshot = window._snapshot()
+        window.client.session = None
+        await window.on_passthrough_4k_changed(True)
+        assert restarts == [True]
+        assert not errors
+
+    asyncio.run(scenario())
+
+
+def test_toggle_while_idle_opens_nothing(window, monkeypatch):
+    events, errors = setup_lifecycle(window, monkeypatch)
+    window.model_combo.addItem("2x_Model")
+    window.model_combo.setCurrentText("2x_Model")
+
+    async def scenario():
+        await window.on_passthrough_4k_changed(True)
+        await window.on_passthrough_4k_changed(False)
+        assert not [event for event in events if event[0] == "open"]
         assert not errors
 
     asyncio.run(scenario())

@@ -2461,8 +2461,8 @@ class MainWindow(DesktopFeatures, QMainWindow):
         # frame. The live buffer report applies the usual server watermark.
         output = f"{session.downlink_width}×{session.downlink_height}"
         model = getattr(session, "model", None) or cfg.model
-        if model != cfg.model:
-            model = f"{model} (4K source)"
+        if model == "passthrough" and cfg.model != "passthrough":
+            model = "passthrough (4K source)"
         self._show_now_playing(
             Path(path).name,
             f"{model} · {self.tier_combo.currentText()} · {output}",
@@ -2554,8 +2554,13 @@ class MainWindow(DesktopFeatures, QMainWindow):
     @asyncSlot(bool)
     async def on_passthrough_4k_changed(self, enabled: bool) -> None:
         self.settings.passthrough_4k = enabled
+        if self.model_combo.currentText() == "passthrough":
+            return
         session = getattr(self.client, "session", None)
-        if session is None or self.model_combo.currentText() == "passthrough":
+        if session is None:
+            # Mid-restart, the open may have read the old value: reopen with
+            # the new one, as the other playback settings do (idle: no-op).
+            await self._restart_for_playback_setting()
             return
         # Restart only a stream whose model this changes. A server file
         # opened with the option off was never measured, so it restarts.

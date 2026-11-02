@@ -569,6 +569,8 @@ class RelayClient:
         if cfg.passthrough_4k and model != "passthrough":
             if source_size is None and cfg.source == "server_file":
                 source_size = await self._probe_server_file_size(cfg.path)
+                if self._closing:
+                    raise ConnectionError("client closed while opening source")
             if source_size is not None and is_4k_or_higher(*source_size):
                 model = "passthrough"
         source = ("uplink" if cfg.source == "uplink" else

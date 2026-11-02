@@ -420,7 +420,7 @@ def test_sidebar_collapses_and_expands_the_same_way(window):
         assert layout.indexOf(window.player) >= 0
         assert len(set(widths)) > 2  # stepped, not jumped
         assert widths == sorted(widths, reverse=visible)
-        assert set(tops) == {64}  # under the top bar throughout
+        assert set(tops) == {main_window._TOP_BAR_HEIGHT}  # under the top bar throughout
 
 
 class _FrameSource(QObject):
