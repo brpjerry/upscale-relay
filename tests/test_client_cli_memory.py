@@ -22,7 +22,8 @@ class Client:
 
     async def open_session(self, config):
         return SimpleNamespace(session_id="test", downlink_codec="ffv1",
-                               downlink_width=32, downlink_height=32)
+                               downlink_width=32, downlink_height=32, downlink_bit_depth=8,
+                               downlink_hdr=False, downlink_dolby_vision=False)
 
     async def attach_media(self):
         pass
@@ -46,7 +47,7 @@ class Client:
 def arguments(**extra):
     return SimpleNamespace(**dict(host="localhost", port=1, file="unused",
         display="32x32", model="passthrough", tier="lossless-ffv1",
-        fit_mode="fit", resize_algorithm="server-default", mpv=False,
+        fit_mode="fit", resize_algorithm="server-default", high_bit_depth=None, mpv=False,
         save=None, **extra))
 
 

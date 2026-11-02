@@ -21,7 +21,7 @@ _SPC_RGB, _SPC_BT709, _SPC_FCC, _SPC_BT470BG, _SPC_SMPTE170M, _SPC_SMPTE240M = 0
 _SPC_BT2020_NCL, _SPC_BT2020_CL = 9, 10
 _RANGE_LIMITED, _RANGE_FULL = 1, 2
 _PRI_BT709, _PRI_BT470BG, _PRI_SMPTE170M = 1, 5, 6
-_TRC_BT709 = 1
+_TRC_BT709, _TRC_PQ, _TRC_HLG = 1, 16, 18
 _UNSPECIFIED = (0, 2)  # 0 is "reserved" for primaries/transfer, 2 "unspecified"
 
 # libswscale coefficient set (SWS_CS_*) for each matrix it converts.
@@ -33,6 +33,32 @@ _SWS_MATRIX = {
 
 def _is_hd(width: int, height: int) -> bool:
     return width >= 1280 or height > 576
+
+
+def tags_to_wire(tags: tuple[int, int, int, int]) -> dict:
+    """``open_session.video.color`` from raw (matrix, range, primaries,
+    transfer) tags: H.273 code points as the container declares them
+    (2 = unspecified); ``range`` only when known."""
+    matrix, color_range, primaries, transfer = (int(t) for t in tags)
+    wire = {"primaries": primaries, "transfer": transfer, "matrix": matrix}
+    if color_range in (_RANGE_LIMITED, _RANGE_FULL):
+        wire["range"] = "full" if color_range == _RANGE_FULL else "limited"
+    return wire
+
+
+def tags_from_wire(value) -> tuple[int, int, int, int] | None:
+    """Raw tags from ``open_session.video.color``; None when malformed."""
+    if not isinstance(value, dict):
+        return None
+    try:
+        codes = [int(value[key]) for key in ("matrix", "primaries", "transfer")]
+    except (KeyError, TypeError, ValueError):
+        return None
+    if not all(0 <= code <= 255 for code in codes):
+        return None
+    color_range = {"limited": _RANGE_LIMITED, "full": _RANGE_FULL}.get(value.get("range"), 0)
+    matrix, primaries, transfer = codes
+    return matrix, color_range, primaries, transfer
 
 
 @dataclass(frozen=True)
@@ -84,6 +110,14 @@ class VideoColor:
     def _sws_matrix(self) -> int:
         return _SWS_MATRIX[self.matrix]
 
+    def to_wire(self) -> dict:
+        """``session_opened.downlink_color`` (docs/PROTOCOL.md): H.273 code
+        points, range by name."""
+        return {
+            "primaries": self.primaries, "transfer": self.transfer, "matrix": self.matrix,
+            "range": "full" if self.range == _RANGE_FULL else "limited",
+        }
+
     def tag(self, target) -> None:
         """Write this description onto an encoder codec context or a frame."""
         target.colorspace = self.matrix
@@ -91,12 +125,18 @@ class VideoColor:
         target.color_primaries = self.primaries
         target.color_trc = self.transfer
 
-    def to_rgb(self, reformatter, frame):
-        """rgb24 of a frame whose YUV this describes (RGB frames pass through)."""
+    @property
+    def is_hdr(self) -> bool:
+        """PQ or HLG: the picture only reads right on an HDR-aware path."""
+        return self.transfer in (_TRC_PQ, _TRC_HLG)
+
+    def to_rgb(self, reformatter, frame, format: str = "rgb24"):
+        """RGB (rgb24, or rgb48le for deep colour) of a frame whose YUV this
+        describes (RGB frames pass through)."""
         if frame.format.is_rgb:
-            return reformatter.reformat(frame, format="rgb24")
+            return reformatter.reformat(frame, format=format)
         return reformatter.reformat(
-            frame, format="rgb24",
+            frame, format=format,
             src_colorspace=self._sws_matrix, src_color_range=self.range,
         )
 

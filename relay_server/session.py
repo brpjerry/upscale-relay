@@ -17,10 +17,12 @@ from relay_protocol import DIR_DOWNLINK, DIR_UPLINK, FLAG_EOS, NO_TS, MediaPacke
 from relay_media import AuxiliaryTrack, VideoTrack
 from upscale_cli.encode import DEFAULT_LOSSLESS_HEVC_PROFILE
 from upscale_cli.fit import DEFAULT_RESIZE_ALGORITHM, RESIZE_ALGORITHMS
+from upscale_cli.hdr import DolbyVisionConfig, StaticHdr
 
 from .library import MediaLibrary
-from .pipeline import Pipeline, PipelineConstructionError, VideoConfig
+from .pipeline import HIGH_BIT_DEPTH_MODES, Pipeline, PipelineConstructionError, VideoConfig
 from .source_aspect import sample_aspect_ratio_from_parameter_sets
+from .source_color import uplink_color_and_depth
 
 log = logging.getLogger("relay.session")
 
@@ -342,6 +344,10 @@ class Session:
                 message="muxed auxiliary tracks require server_file", fatal=False,
             )
             return
+        high_bit_depth = msg.get("high_bit_depth")
+        if high_bit_depth is not None and high_bit_depth not in HIGH_BIT_DEPTH_MODES:
+            await self.send("error", code="bad_message", message="invalid high_bit_depth", fatal=False)
+            return
         requested_attachments = msg.get("aux_attachments", "embedded")
         if requested_attachments not in ("embedded", "cached"):
             await self.send(
@@ -440,6 +446,10 @@ class Session:
                 sample_aspect_ratio = _sample_aspect_ratio(
                     {"sample_aspect_ratio": [derived.numerator, derived.denominator]},
                 )
+        if self.source_track is not None:
+            color_tags, bit_depth = self.source_track.color_tags, self.source_track.bit_depth
+        else:
+            color_tags, bit_depth = await asyncio.to_thread(uplink_color_and_depth, video, extradata)
         cfg = VideoConfig(
             codec=video["codec"],
             extradata=extradata,
@@ -448,7 +458,10 @@ class Session:
             time_base=Fraction(*video["time_base"]),
             avg_rate=Fraction(*video["avg_rate"]) if video.get("avg_rate") else None,
             sample_aspect_ratio=sample_aspect_ratio,
-            color_tags=self.source_track.color_tags if self.source_track is not None else None,
+            color_tags=color_tags,
+            bit_depth=bit_depth or None,
+            hdr_static=StaticHdr.from_wire(video.get("hdr")),
+            dolby_vision=DolbyVisionConfig.from_wire(video.get("dolby_vision")),
         )
         # Pipeline construction can block for minutes when a model's TensorRT
         # engine is built for the first time; keepalives stop the client's
@@ -476,6 +489,7 @@ class Session:
                 seek_discard_max_s=self.seek_discard_max_s,
                 aux_source_path=(resolved_path if self.aux_track_mode == "muxed" else None),
                 embed_aux_attachments=self.aux_attachment_mode == "embedded",
+                high_bit_depth=high_bit_depth,
             )
         except Exception as err:
             if isinstance(err, PipelineConstructionError):
@@ -532,6 +546,10 @@ class Session:
             attachment_token=(
                 self.attachment_token if self.aux_attachment_mode == "cached" else None
             ),
+            downlink_bit_depth=self.pipeline.bit_depth,
+            downlink_color=self.pipeline.downlink_color,
+            downlink_dolby_vision=self.pipeline.dolby_vision_rpu,
+            source_bit_depth=cfg.bit_depth,
             **source_metadata,
         )
 
@@ -808,6 +826,9 @@ class Session:
             ),
             "fit_mode": p.fit_mode,
             "resize_algorithm": p.resize_algorithm,
+            "bit_depth": p.bit_depth,
+            "color": p.downlink_color,
+            "hdr_metadata": p.hdr_metadata_report(),
             "provider": getattr(p.upscaler, "active_provider", None),
             "last_seek": p.stats.last_seek.report() if p.stats.last_seek else None,
         }

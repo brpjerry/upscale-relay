@@ -183,6 +183,15 @@ for _qp in (2, 4, 6, 10, 14, 18):
 
 LEGACY_TIER_ALIASES = {"visually-lossless": "hevc-qp18"}
 
+# 10-bit 4:2:0 input for a deep-colour (HDR or 10-bit SDR) output. The tier
+# tables list 8-bit formats; NVENC takes the semi-planar P010 (it refuses
+# yuv420p10le), the software encoders the planar format.
+_DEEP_PIX_FMT = {"hevc_nvenc": "p010le"}
+
+
+def deep_pix_fmt(codec: str) -> str:
+    return _DEEP_PIX_FMT.get(codec, "yuv420p10le")
+
 _PROBE_LOCK = threading.Lock()
 _PROBE_SUCCESSES: set[tuple[str, str, tuple[tuple[str, str], ...]]] = set()
 
@@ -282,7 +291,10 @@ def probe_encoder(codec: str, options: dict[str, str], width: int = 256, height:
 def select_encoder(
     tier: str,
     lossless_hevc_profile: str = DEFAULT_LOSSLESS_HEVC_PROFILE,
+    bit_depth: int = 8,
 ) -> tuple[str, str, dict[str, str]]:
+    """First encoder of ``tier`` that opens here. ``bit_depth`` 10 swaps each
+    candidate's pixel format for its 10-bit one (HEVC Main 10)."""
     requested_tier = tier
     tier = LEGACY_TIER_ALIASES.get(tier, tier)
     if tier not in TIERS:
@@ -296,6 +308,8 @@ def select_encoder(
         LOSSLESS_HEVC_PROFILES[lossless_hevc_profile]
         if tier == "lossless-hevc" else TIERS[tier]
     )
+    if bit_depth > 8:
+        candidates = [(codec, deep_pix_fmt(codec), options) for codec, _, options in candidates]
     failures: list[tuple[str, str, BaseException]] = []
     for codec, pix_fmt, options in candidates:
         key = _probe_key(codec, pix_fmt, options)
@@ -318,7 +332,7 @@ def select_encoder(
                 f" profile '{lossless_hevc_profile}'" if tier == "lossless-hevc" else ""
             )
             print(
-                f"encode: tier '{requested_tier}'{profile_text} -> {codec} {options}",
+                f"encode: tier '{requested_tier}'{profile_text} -> {codec} {pix_fmt} {options}",
                 file=sys.stderr,
             )
             return codec, pix_fmt, dict(options)

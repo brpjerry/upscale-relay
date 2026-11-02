@@ -77,6 +77,16 @@ episodes, whose Matroska headers carry their subtitle fonts. Toggling the switch
 restarts only a stream whose model it changes, except that turning it on restarts
 a server-library file opened with it off, whose size was never read.
 
+HDR sources (PQ or HLG) always stream with 10-bit color and their HDR metadata:
+mastering display and light level, HDR10+, and the Dolby Vision RPU of a
+profile 8 source (docs/PROTOCOL.md §3.5). **Keep 10-bit color for SDR videos**
+(off by default) asks for the same depth for other sources deeper than 8 bits,
+such as 10-bit anime encodes: less banding at roughly a quarter more lossless
+bandwidth. Toggling it restarts only a 10-bit SDR stream. On today's SDR video
+surface mpv tone-maps HDR from the 10-bit signal and its mastering metadata.
+The libmpv render API runs mpv's `gpu` renderer, which uses static metadata
+only; Dolby Vision and HDR10+ ride along for clients that use them.
+
 These controls set mpv options; the player keeps their values itself
 (`AppSettings.mpv_defaults` in QSettings) and sets them on mpv at startup, at
 each session start, and after an edit once playback is stable:

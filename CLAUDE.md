@@ -98,6 +98,12 @@ their volume, panscan, tracks and delays.
   to a division or a 0 s timestamp. Frames still read `None` when unset.
   `AVRational` does Fraction arithmetic but is not a `Fraction` and is not
   JSON-serializable; send `[numerator, denominator]`.
+- PyAV cannot give an encoder HDR metadata: `CodecContext.coded_side_data`
+  and `decoded_side_data` are read-only, so NVENC/x265 write no mastering
+  display, light level, HDR10+ or Dolby Vision. Deep-colour sessions write it
+  themselves into the encoded Annex B packets (`upscale_cli/hdr.py`, PROTOCOL
+  §3.5); the Matroska muxer keeps every NAL unit. NVENC takes 10-bit input
+  only as `p010le` (it refuses `yuv420p10le`; `encode.deep_pix_fmt`).
 - For server-file muxed auxiliary tracks, seek the auxiliary container against
   the video stream's keyframe cues. Matroska audio streams are often not
   indexed; using audio as the seek anchor caused a measured 7-second scan.
@@ -288,6 +294,9 @@ their volume, panscan, tracks and delays.
   subprocess (`SubprocessUpscaler`), restart-once-on-crash. The uint8 graph
   wrapper's tail must stay `Transpose(float) → Cast(uint8)` (3-5x faster TRT
   engines than NCHW-uint8 output; uint8 only legal at network boundaries).
+  TRT has no 16-bit integer tensors: deep-colour sessions' rgb48 frames cross
+  the graph boundary as uint8 byte pairs (`wrap_rgb48_io`, [N,H,W,3,2]) so the
+  CPU side only reinterprets buffers; the 10-bit output is exact in fp16.
 - NVDEC decode + NVENC encode concurrently in one process → native AV.
 - Never open a session while an earlier one may still hold its native
   owners. A teardown the server did not acknowledge (control connection
@@ -330,6 +339,15 @@ their volume, panscan, tracks and delays.
   laptop client is the intended topology.
 - FFV1 has no hardware decoder anywhere (codec-inherent); lossless-hevc is
   the recommended lossless tier for live playback.
+- **HDR is carried, not yet shown as HDR.** The desktop asks for 10-bit HDR
+  downlinks (PROTOCOL §3.5), but Qt Widgets' backing store is SDR on every
+  platform (QOpenGLWidget included), so mpv tone-maps to SDR. Real HDR needs
+  the video on its own native surface: on Hyprland a PQ-tagged child
+  QOpenGLWindow works (Qt >= 6.10.2, wp_color_management_v1) and overlay
+  windows stack above it only if their surfaces are created after its; on
+  Windows a D3D11 HDR10 swapchain with GL interop. The render API is mpv's
+  `gpu` renderer (gpu-next is not available through it), which ignores
+  Dolby Vision and HDR10+.
 - Anamorphic uplinks: when a client sends no
   `open_session.video.sample_aspect_ratio`, the server reads it from the
   H.264 SPS / HEVC parameter sets in `extradata_b64`

@@ -91,6 +91,16 @@ class AppSettings:
         self._qs.setValue("session/passthrough_4k", bool(v))
 
     @property
+    def ten_bit_sdr(self) -> bool:
+        """Keep 10-bit SDR sources at 10 bits through the relay. HDR sources
+        always stay 10-bit; off, other sources arrive as 8-bit."""
+        return self._qs.value("session/ten_bit_sdr", False, type=bool)
+
+    @ten_bit_sdr.setter
+    def ten_bit_sdr(self, v: bool) -> None:
+        self._qs.setValue("session/ten_bit_sdr", bool(v))
+
+    @property
     def quality_tier(self) -> str:
         value = self._qs.value("session/tier", "lossless-hevc")
         # The former single lossy tier was closest to the new low-bandwidth

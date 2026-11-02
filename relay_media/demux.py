@@ -17,6 +17,8 @@ from typing import Iterator
 import av
 
 from relay_protocol import FLAG_KEYFRAME, NO_TS, MediaPacket
+from upscale_cli.color import tags_to_wire
+from upscale_cli.hdr import DolbyVisionConfig, StaticHdr
 from .subtitles import INDEXABLE_SUBTITLE_CODECS, SubtitleIndex
 
 log = logging.getLogger("relay.media")
@@ -125,6 +127,14 @@ class VideoTrack:
         self.color_tags = (
             int(cc.colorspace), int(cc.color_range), int(cc.color_primaries), int(cc.color_trc),
         )
+        # What a deep-colour (HDR / 10-bit) session needs before any frame is
+        # decoded: sample depth, container HDR10 metadata (Matroska Colour,
+        # MP4 mdcv/clli) and the Dolby Vision configuration record.
+        fmt = cc.format
+        self.bit_depth = max((c.bits for c in fmt.components), default=0) if fmt else 0
+        side_data = dict(cc.coded_side_data)
+        self.hdr_static = StaticHdr.from_side_data(side_data)
+        self.dolby_vision = DolbyVisionConfig.from_side_data(side_data.get("dovi_conf", b""))
         # Serializes native demux/seek calls: a cancelled asyncio task's
         # in-flight to_thread(next, ...) keeps running on its worker thread,
         # and concurrent libav access is a native crash, not an exception.
@@ -162,6 +172,16 @@ class VideoTrack:
         if sar and sar > 0:
             sar = Fraction(sar.numerator, sar.denominator)
             video["sample_aspect_ratio"] = [sar.numerator, sar.denominator]
+        # Colour as the container declares it: the server's decoder sees only
+        # the bitstream, which may leave tags unspecified that the container
+        # sets. The rest decides and describes a deep-colour downlink.
+        video["color"] = tags_to_wire(self.color_tags)
+        if self.bit_depth:
+            video["bit_depth"] = self.bit_depth
+        if self.hdr_static:
+            video["hdr"] = self.hdr_static.to_wire()
+        if self.dolby_vision is not None:
+            video["dolby_vision"] = self.dolby_vision.to_wire()
         return video
 
     def packets(self, from_pts: int | None = None) -> Iterator[PacketInfo]:

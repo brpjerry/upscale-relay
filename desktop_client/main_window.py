@@ -360,6 +360,12 @@ class MainWindow(DesktopFeatures, QMainWindow):
             "Stream videos 3840 wide or 2160 tall and up without the upscale model."
         )
         self.passthrough_4k_check.setChecked(self.settings.passthrough_4k)
+        self.ten_bit_sdr_check = FlatSwitch("Keep 10-bit color for SDR videos")
+        self.ten_bit_sdr_check.setToolTip(
+            "HDR videos always stream with 10-bit color. On, 10-bit SDR videos do too: "
+            "less banding, about a quarter more bandwidth."
+        )
+        self.ten_bit_sdr_check.setChecked(self.settings.ten_bit_sdr)
         self.tier_combo = QComboBox()
         self.tier_combo.addItem(self.settings.quality_tier, self.settings.quality_tier)
         # "Fit to screen" letterboxes inside the display; "Crop" requests a
@@ -460,6 +466,7 @@ class MainWindow(DesktopFeatures, QMainWindow):
             combo.setToolTip(help_text)
             form.addRow(label, combo)
         form.insertRow(1, self.passthrough_4k_check)  # qualifies the model choice
+        form.insertRow(3, self.ten_bit_sdr_check)  # ... and this the stream quality
         streaming_layout.addLayout(form)
         streaming_layout.addWidget(self.deband_check)
         settings_scroll = QScrollArea()
@@ -895,6 +902,7 @@ class MainWindow(DesktopFeatures, QMainWindow):
         # capability refreshes repopulate these menus.
         self.model_combo.activated.connect(self.on_model_changed)
         self.passthrough_4k_check.toggled.connect(self.on_passthrough_4k_changed)
+        self.ten_bit_sdr_check.toggled.connect(self.on_ten_bit_sdr_changed)
         self.tier_combo.activated.connect(self.on_quality_tier_changed)
         self.deband_check.toggled.connect(self.on_deband_changed)
         self.fullscreen_btn.clicked.connect(self.toggle_fullscreen)
@@ -2309,6 +2317,9 @@ class MainWindow(DesktopFeatures, QMainWindow):
             source=source,
             resize_algorithm=self._resize_algorithm(),
             passthrough_4k=self.settings.passthrough_4k,
+            # HDR always: mpv tone-maps it for an SDR screen from the real
+            # 10-bit signal and its mastering metadata.
+            high_bit_depth="all" if self.settings.ten_bit_sdr else "hdr",
             aux_tracks=(
                 "muxed"
                 if source == "server_file" and self._server_caps.get("muxed_aux_tracks")
@@ -2569,6 +2580,19 @@ class MainWindow(DesktopFeatures, QMainWindow):
             if size is not None and not is_4k_or_higher(*size):
                 return
         elif getattr(session, "model", None) != "passthrough":
+            return
+        await self._restart_for_playback_setting()
+
+    @asyncSlot(bool)
+    async def on_ten_bit_sdr_changed(self, enabled: bool) -> None:
+        self.settings.ten_bit_sdr = enabled
+        session = getattr(self.client, "session", None)
+        if session is None:
+            await self._restart_for_playback_setting()  # as passthrough_4k
+            return
+        # Only a deep SDR source changes: HDR stays 10-bit either way, and an
+        # 8-bit source never had more to keep.
+        if getattr(session, "downlink_hdr", False) or (getattr(session, "source_bit_depth", None) or 8) <= 8:
             return
         await self._restart_for_playback_setting()
 
