@@ -85,6 +85,10 @@ flags:
   display (for testing the overlay mirror and its pacing without an HDR
   screen), or never uses the surface.
 - `RELAY_HDR_WINDOWS=1` enables the Windows D3D11 prototype.
+- `RELAY_HWDEC=<mpv hwdec>` replaces the player's hardware decode mode, for
+  testing: `auto-copy-safe` for copy-back on an Intel laptop, `vaapi` for
+  zero-copy elsewhere (`tools/hwdec_stress.py` drives the window through
+  seeks, restarts and fullscreen with it).
 
 `python -m desktop_client.hdr_output` prints each screen's HDR state.
 `tools/hdr_desktop_check.py` plays an `upscale-cli sample --hdr` clip and times
@@ -258,12 +262,32 @@ their volume, panscan, tracks and delays.
   desktop test runs (access violation; 0 of 16 with faulthandler off).
   `tests/conftest.py` and `relay-desktop --debug` limit Windows dumps to
   the faulting thread.
-- On Linux's embedded Qt/OpenGL render path, keep `hwdec=auto-copy-safe`.
-  A real core landed in
-  `paintGL → mpv_render_context_render → vaSyncSurface → iHD` when the user's
-  `hwdec=vaapi` (from `mpv.conf`, read back then) exposed a retired
-  zero-copy Intel surface. Copy-back retains hardware decode; never
-  restore zero-copy VA-API as the default here.
+- Zero-copy VA-API (the Linux default on an Intel GPU,
+  `hwdec=vaapi,auto-copy-safe`) is safe only with `_freeze_picture`. mpv
+  keeps its last frame across `stop`; a redraw once that decoder is gone
+  syncs a retired surface, and iHD crashes in
+  `paintGL → mpv_render_context_render → vaSyncSurface` (a real core in
+  August 2026; reproduced ~5 min into `tools/hwdec_stress.py` with
+  `RELAY_HWDEC=vaapi` on 2026-11-03). From just before every `stop` (and
+  before its input closes) until the playback restart of the entry id the
+  next `loadfile` returned, nothing draws mpv's frames: the widget paints a
+  copy of its last picture and the HDR surface its own framebuffer. Both
+  take each frame with `skip_rendering`, which never maps its surface: mpv
+  waits ~200 ms for a frame to be taken, the new stream's first included,
+  before it reports the restart, and leaving them stalled every load by that
+  much (37 "not being called or stuck" logs in 31 loads). Thawing on any
+  restart crashed the HDR surface within 1.5 minutes: a late restart of the
+  stopped file arrived after the stop. python-mpv's `loadfile()` drops the
+  entry id; `MpvPlayerView._loadfile` keeps it.
+  With the freeze, 35 minutes of stress (~1,330 actions: relay seeks and
+  session restarts, the HDR surface, local loads) ran clean, and so did 333
+  natural ends of file, which no freeze precedes (8- and 10-bit HEVC,
+  `hwdec_stress.py --local FILE --eof`; the unfixed build crashed after ~150
+  stops). Other Linux GPUs keep copy-back (`auto-copy-safe`;
+  their zero-copy paths are untested). Measured in the player on battery
+  (2026-11-03, fullscreen, a 2880x1620 relay stream): zero-copy drew 7.10 W
+  at 8 bits and 7.24 W at 10, copy-back 7.97 and 8.44 W, and the client's
+  CPU fell from 44-54% to 17-18%.
 - Fullscreen transitions resize the video widget at every step of the
   chrome slides. Pinning it at its final size (`_pin_player`) used to
   replace 17-23 resizes per transition (100-200 ms stalls, ~12 drops while

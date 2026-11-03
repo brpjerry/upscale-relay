@@ -62,7 +62,7 @@ For hardware decode of the HEVC tiers (optional but recommended), install
 your GPU's VA-API/NVDEC userspace:
 - Intel: `intel-media-va-driver-non-free` (Ubuntu) / `intel-media-driver`
 - AMD: `mesa-va-drivers`
-- NVIDIA: the proprietary driver includes NVDEC; the embedded player uses `hwdec=auto-copy-safe`.
+- NVIDIA: the proprietary driver includes NVDEC; the embedded player decodes with copy-back there (`hwdec=auto-copy-safe`).
 
 FFV1 has no hardware decoder on any platform — it always decodes on the CPU.
 With libmpv older than 0.38 (including Ubuntu 24.04's 0.37), FFV1 relay streams
@@ -70,13 +70,18 @@ use libavformat's Matroska demuxer because the native mpv demuxer does not
 recognize the `V_FFV1` tag emitted by newer FFmpeg. This per-stream override
 preserves absolute timestamps and does not change ordinary local playback.
 
-The embedded Qt/OpenGL player uses mpv's safe copy-back hardware decode mode on
-Linux (`auto-copy-safe`; the player does not read `mpv.conf`, so a user's
-`hwdec=vaapi` there no longer applies): a captured Intel iHD crash landed in
-`paintGL → mpv_render_context_render → vaSyncSurface` when the zero-copy VA-API
-surface was retired during live playback. Decode still runs on the GPU; only
-the decoded frame is copied before Qt renders it. Use `--no-hwdec` to disable
-hardware decode completely.
+On an Intel GPU the embedded Qt/OpenGL player decodes zero-copy
+(`hwdec=vaapi`, falling back to copy-back `auto-copy-safe`): mpv renders the
+VA-API surfaces where they are, which saves the copy of every frame: on a
+Lunar Lake laptop, fullscreen playback drew 0.87 W less at 8 bits and 1.20 W
+less at 10 (11% and 14%), and the player's CPU use fell from 44-54% to 17-18%. Zero-copy once crashed Intel's iHD in
+`paintGL → mpv_render_context_render → vaSyncSurface`, redrawing a frame whose
+decoder a stream change had retired; the player now never redraws across a
+stop. Other GPUs use copy-back (`auto-copy-safe`): decode still runs on the
+GPU, and only the decoded frame is copied before Qt renders it. The player
+does not read `mpv.conf`, so a `hwdec` set there does not apply;
+`RELAY_HWDEC=<mode>` replaces the mode (e.g. `auto-copy-safe`), and
+`--no-hwdec` disables hardware decode completely.
 
 ## 2. Get the code onto the laptop
 

@@ -105,6 +105,7 @@ def test_frame_notifications_acknowledge_unpresented_frames(monkeypatch, visible
         render=lambda **kw: calls.append(kw),
     )
     player = SimpleNamespace(
+        _frozen=False,
         _ctx=render, _on_presenter=False,
         isVisible=lambda: visible,
         window=lambda: SimpleNamespace(windowHandle=lambda: SimpleNamespace(isExposed=lambda: exposed)),
@@ -129,6 +130,7 @@ def test_display_sync_hands_timing_to_audio_while_the_window_is_hidden(monkeypat
     exposed = [True]
     sent = []
     player = SimpleNamespace(
+        _frozen=False,
         _ctx=SimpleNamespace(update=lambda: True, render=lambda **kw: None), _on_presenter=False,
         isVisible=lambda: True,
         window=lambda: SimpleNamespace(windowHandle=lambda: SimpleNamespace(isExposed=lambda: exposed[0])),
@@ -378,7 +380,7 @@ def test_stop_or_cancel_pending_local_load_cleans_up(local_player, monkeypatch, 
 
     async def scenario():
         loading = asyncio.Event()
-        monkeypatch.setattr(type(player.mpv), "loadfile", lambda *a, **kw: loading.set())
+        monkeypatch.setattr(type(player), "_loadfile", lambda *a, **kw: loading.set())
         task = asyncio.create_task(player.play_local("pending.mkv"))
         await asyncio.wait_for(loading.wait(), 2)
         assert not task.done()
@@ -398,7 +400,7 @@ def test_stop_or_cancel_pending_local_load_cleans_up(local_player, monkeypatch, 
 def test_stop_during_settle_prevents_late_local_load(local_player, monkeypatch):
     player = local_player
     loaded = []
-    monkeypatch.setattr(type(player.mpv), "loadfile", lambda *a, **kw: loaded.append(True))
+    monkeypatch.setattr(type(player), "_loadfile", lambda *a, **kw: loaded.append(True))
 
     async def scenario():
         task = asyncio.create_task(player.play_local("superseded.mkv"))
@@ -416,7 +418,7 @@ def test_pause_and_seek_during_local_load_are_applied_when_ready(tmp_path, local
     path = tmp_path / "original.mkv"
     make_sample(str(path), frames=144, width=64, height=64, fps=24)
     player = local_player
-    native_load = player.mpv.loadfile
+    native_load = player._loadfile
 
     async def scenario():
         loading = asyncio.Event()
@@ -426,7 +428,7 @@ def test_pause_and_seek_during_local_load_are_applied_when_ready(tmp_path, local
             command.append((args, kwargs))
             loading.set()
 
-        monkeypatch.setattr(type(player.mpv), "loadfile", delay_load)
+        monkeypatch.setattr(type(player), "_loadfile", delay_load)
         task = asyncio.create_task(player.play_local(str(path), paused=False))
         await asyncio.wait_for(loading.wait(), 2)
         player.set_paused(True)

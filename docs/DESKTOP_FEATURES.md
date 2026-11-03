@@ -89,9 +89,11 @@ of 46.0. It costs more elsewhere:
 - **On the server**, the model runs on 16-bit RGB. For a 1080p source its
   throughput on the RTX 5090 fell from 51 to 31.5 fps, enough for 24p but
   marginal for 30p.
-- **On the Lunar Lake laptop**, decoding costs about 0.4-0.65 W more on
-  battery, most of it copying twice the bytes back from the GPU
-  (`hwdec=auto-copy-safe`).
+- **On the Lunar Lake laptop**, fullscreen playback on battery drew 7.24 W
+  instead of 7.10 with zero-copy decoding, the Intel default. With copy-back
+  decoding (other GPUs, or `RELAY_HWDEC=auto-copy-safe`) it drew 8.44 W
+  instead of 7.97, most of the difference spent copying twice the bytes back
+  from the GPU.
 
 Toggling it restarts an SDR stream; an HDR one is 10-bit either way.
 
@@ -145,8 +147,8 @@ mpv's resume (`resume-playback`) is off: the player keeps its own history.
 Language preferences use native mpv semantics; there is intentionally no
 additional persistent subtitle-title preference. The current-video track picker
 is session-only and takes precedence for that session. Relay-owned options such
-as absolute timestamps, buffering, stream timeout, and safe Linux copy-back
-decode are application-controlled.
+as absolute timestamps, buffering, stream timeout, and the hardware decode
+mode are application-controlled.
 
 Scrubbing displays the proposed timestamp and signed delta. Release commits one
 seek; Escape or loss of slider focus cancels it. The **−10 s / +10 s** buttons,

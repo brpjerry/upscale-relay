@@ -479,11 +479,13 @@ class HdrPresenter(QOpenGLWindow):
         """mpv has a frame (or a redraw) for this surface."""
         if self.ctx is None:
             return
-        if self.isExposed():
+        if self.isExposed() and not getattr(self._view, "_frozen", False):
             self.update()
             return
         # Hidden (another workspace): acknowledge the frame, as the widget
-        # does, so mpv's VO does not time out and count it as dropped.
+        # does, so mpv's VO does not time out and count it as dropped. Frozen
+        # (MpvPlayerView._freeze_picture), take it without drawing it, as the
+        # widget does: skip_rendering never maps the frame's surface.
         self.makeCurrent()
         try:
             if self.ctx is not None and self.ctx.update():
@@ -692,6 +694,16 @@ class HdrPresenter(QOpenGLWindow):
         aspect = view._picture_aspect()
         scaling = view._scaling and aspect is not None
         fbo = self._fbo
+        if getattr(view, "_frozen", False):
+            # mpv's frame may be a stopped decoder's (MpvPlayerView.
+            # _freeze_picture): show the last picture rendered here instead.
+            if fbo is not None:
+                x, y, w, h = _fit(width, height, fbo.width() / fbo.height())
+                gl.glBindFramebuffer(_GL_READ_FRAMEBUFFER, fbo.handle())
+                gl.glBindFramebuffer(_GL_DRAW_FRAMEBUFFER, target)
+                gl.glBlitFramebuffer(0, 0, fbo.width(), fbo.height(), round(x0 + x), round(y0 + y),
+                                     round(x0 + x + w), round(y0 + y + h), _GL_COLOR_BUFFER_BIT, _GL_LINEAR)
+            return
         new_frame = self.ctx.update()
         render = fbo is None or new_frame or self._picture_due
         if scaling:
