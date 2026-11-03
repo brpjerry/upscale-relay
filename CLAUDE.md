@@ -142,6 +142,12 @@ their volume, panscan, tracks and delays.
   `to_output`), and tag the encoder before its first encode or mux: a muxed
   audio packet can open the encoder and write the container header before
   any video frame (audit #16).
+- YUV->RGB goes through `VideoColor.to_rgb`, which passes swscale's accurate
+  flags (`_TO_RGB_FLAGS`). At the same size, the default flags pick a table
+  converter that reads 8-bit sources 1-1.5 levels dark and 10-bit ones ~2
+  into rgb24: every 8-bit model session was darker than its source
+  (2026-11-02). Never pair BILINEAR with the full-chroma flags: that writes
+  garbage into rgb48le.
 
 **asyncio / Qt (qasync)**
 - **No modal dialogs / exec() / processEvents from coroutine context** — the

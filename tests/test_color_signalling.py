@@ -91,6 +91,73 @@ def test_unspecified_tags_resolve_like_mpv(tags, size, expected):
     assert (color.matrix, color.range, color.primaries, color.transfer) == expected
 
 
+def _yuv_frame(pix_fmt, width=320, height=180) -> av.VideoFrame:
+    """Limited-range BT.709 gradients, written as Y'CbCr samples, in gamut."""
+    scale = 4 if pix_fmt.endswith("10le") else 1
+    x = np.linspace(0, 1, width)[None, :]
+    y = np.linspace(0, 1, height)[:, None]
+    luma = 16 + 219 * (0.25 + 0.5 * (0.6 * x + 0.4 * y))
+    cb = 128 + 25 * np.sin(5 * x[:, ::2] + 3 * y[::2])
+    cr = 128 + 25 * np.cos(4 * x[:, ::2] - 2 * y[::2])
+    frame = av.VideoFrame(width, height, pix_fmt)
+    dtype = np.uint16 if scale == 4 else np.uint8
+    for index, values in enumerate((luma, cb, cr)):
+        plane = frame.planes[index]
+        padded = np.zeros((plane.height, plane.line_size // np.dtype(dtype).itemsize), dtype)
+        padded[:, :plane.width] = np.round(values * scale)
+        plane.update(padded.tobytes())
+    frame.colorspace, frame.color_range = 1, 1
+    return frame
+
+
+def _plane(frame, index) -> np.ndarray:
+    """One plane's samples on the 8-bit scale."""
+    plane = frame.planes[index]
+    deep = frame.format.name.endswith("10le")
+    dtype = np.uint16 if deep else np.uint8
+    data = np.frombuffer(bytes(plane), dtype).reshape(plane.height, plane.line_size // np.dtype(dtype).itemsize)
+    return data[:, :plane.width].astype(np.float64) / (4 if deep else 1)
+
+
+def _exact_rgb(frame) -> np.ndarray:
+    """BT.709 limited-range Y'CbCr to RGB (0-255) in floating point."""
+    y = (_plane(frame, 0) - 16) / 219
+    cb, cr = ((_plane(frame, index) - 128) / 224 for index in (1, 2))
+    cb, cr = (c.repeat(2, 0).repeat(2, 1) for c in (cb, cr))
+    r, b = y + 1.5748 * cr, y + 1.8556 * cb
+    g = (y - 0.2126 * r - 0.0722 * b) / 0.7152
+    return np.clip(np.stack([r, g, b], -1), 0, 1) * 255
+
+
+@pytest.mark.parametrize("pix_fmt", ["yuv420p", "yuv420p10le"])
+def test_source_reads_into_rgb_at_its_own_brightness(pix_fmt):
+    # swscale's default converter read 8-bit sources 1-1.5 levels dark and
+    # 10-bit ones ~2 levels, so every model session came out darker.
+    frame = _yuv_frame(pix_fmt)
+    color = VideoColor.resolve(frame, frame.width, frame.height)
+
+    rgb = color.to_rgb(VideoReformatter(), frame, "rgb24").to_ndarray()
+
+    error = rgb - _exact_rgb(frame)
+    assert np.abs(error.mean(axis=(0, 1))).max() < 0.1
+
+
+@pytest.mark.parametrize("pix_fmt", ["yuv420p", "yuv420p10le"])
+@pytest.mark.parametrize("rgb_format", ["rgb24", "rgb48le"])
+def test_rgb_round_trip_returns_the_source(pix_fmt, rgb_format):
+    # The model's way through: source YUV to RGB, then back at the same size.
+    frame = _yuv_frame(pix_fmt)
+    color = VideoColor.resolve(frame, frame.width, frame.height)
+
+    rgb = color.to_rgb(VideoReformatter(), frame, rgb_format)
+    back = color.to_output(VideoReformatter(), rgb, pix_fmt=pix_fmt)
+
+    luma = _plane(back, 0) - _plane(frame, 0)
+    assert abs(luma.mean()) < 0.1 and np.abs(luma).max() <= 1
+    for index in (1, 2):
+        assert abs((_plane(back, index) - _plane(frame, index)).mean()) < 0.25
+
+
 def test_full_range_bt709_survives_passthrough(tmp_path):
     source = tmp_path / "bt709-full.mkv"
     _write(source, (64, 64), (180, 80, 130), FULL_709)

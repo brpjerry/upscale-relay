@@ -16,6 +16,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from av.video.reformatter import Interpolation
+
 # FFmpeg enum values (libavutil/pixfmt.h).
 _SPC_RGB, _SPC_BT709, _SPC_FCC, _SPC_BT470BG, _SPC_SMPTE170M, _SPC_SMPTE240M = 0, 1, 4, 5, 6, 7
 _SPC_BT2020_NCL, _SPC_BT2020_CL = 9, 10
@@ -30,6 +32,18 @@ _SWS_MATRIX = {
     _SPC_BT709: 1, _SPC_FCC: 4, _SPC_BT470BG: 5, _SPC_SMPTE170M: 5,
     _SPC_SMPTE240M: 7, _SPC_BT2020_NCL: 9, _SPC_BT2020_CL: 9,
 }
+
+# YUV->RGB through swscale's exact path. Its default for a conversion at the
+# same size is a fast table converter that reads pictures dark: 1-1.5 levels
+# for 8-bit sources, ~2 for 10-bit ones into rgb24 (white comes out 253), and
+# 1.7-2.2 for 8-bit into rgb48le. It also repeats each chroma sample over its
+# 2x2 block. Accurate rounding with full chroma input and interpolation avoids
+# it, and BICUBIC interpolates the chroma. Not BILINEAR: with full chroma it
+# writes garbage into rgb48le (swscale 10.1, FFmpeg 9.0.2).
+_TO_RGB_FLAGS = (
+    Interpolation.BICUBIC | Interpolation.ACCURATE_RND
+    | Interpolation.FULL_CHR_H_INT | Interpolation.FULL_CHR_H_INP
+)
 
 
 def _is_hd(width: int, height: int) -> bool:
@@ -127,6 +141,7 @@ class VideoColor:
         return reformatter.reformat(
             frame, format=format,
             src_colorspace=self._sws_matrix, src_color_range=self.range,
+            interpolation=_TO_RGB_FLAGS,
         )
 
     def to_output(self, reformatter, frame, *, width=None, height=None,
