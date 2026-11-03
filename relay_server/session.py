@@ -19,6 +19,7 @@ from upscale_cli.encode import DEFAULT_LOSSLESS_HEVC_PROFILE
 from upscale_cli.fit import DEFAULT_RESIZE_ALGORITHM, RESIZE_ALGORITHMS
 from relay_media.hdr import DolbyVisionConfig, StaticHdr
 
+from .display_mapping import DisplayMapper, DisplayTarget
 from .library import MediaLibrary
 from .pipeline import HIGH_BIT_DEPTH_MODES, Pipeline, PipelineConstructionError, VideoConfig
 from .source_aspect import sample_aspect_ratio_from_parameter_sets
@@ -152,7 +153,8 @@ class Session:
                  library: MediaLibrary | None = None,
                  default_resize_algorithm: str = DEFAULT_RESIZE_ALGORITHM,
                  lossless_hevc_profile: str = DEFAULT_LOSSLESS_HEVC_PROFILE,
-                 seek_discard_max_s: float | None = None):
+                 seek_discard_max_s: float | None = None,
+                 display_mapper: DisplayMapper | None = None):
         self.id = uuid.uuid4().hex[:12]
         self.ws = ws
         self.models = models  # name -> path
@@ -161,6 +163,8 @@ class Session:
         self.default_resize_algorithm = default_resize_algorithm
         self.lossless_hevc_profile = lossless_hevc_profile
         self.seek_discard_max_s = seek_discard_max_s
+        # capabilities.display_mapping (PROTOCOL §3.6); None: not offered.
+        self.display_mapper = display_mapper
         self.source_kind = "uplink"
         self.source_path: str | None = None
         self.source_track: VideoTrack | None = None
@@ -348,6 +352,14 @@ class Session:
         if high_bit_depth is not None and high_bit_depth not in HIGH_BIT_DEPTH_MODES:
             await self.send("error", code="bad_message", message="invalid high_bit_depth", fatal=False)
             return
+        display_target = None
+        if msg.get("display_target") is not None:
+            display_target = DisplayTarget.from_wire(msg["display_target"])
+            if display_target is None:
+                await self.send("error", code="bad_message", message="invalid display_target", fatal=False)
+                return
+            if self.display_mapper is None or high_bit_depth is None:
+                display_target = None  # §3.5's stream: nothing to map for
         requested_attachments = msg.get("aux_attachments", "embedded")
         if requested_attachments not in ("embedded", "cached"):
             await self.send(
@@ -412,6 +424,10 @@ class Session:
                 return
             self.source_path = relative
             video = self.source_track.open_session_video_dict()
+            if display_target is not None and await asyncio.to_thread(
+                self.source_track.first_keyframe_hdr10plus,
+            ):
+                video["hdr10plus"] = True  # what an uplink reports (§3.6)
         else:
             video = msg.get("video")
             if not isinstance(video, dict):
@@ -463,6 +479,7 @@ class Session:
             bit_depth=bit_depth or None,
             hdr_static=StaticHdr.from_wire(video.get("hdr")),
             dolby_vision=DolbyVisionConfig.from_wire(video.get("dolby_vision")),
+            hdr10plus=video.get("hdr10plus") is True,
         )
         # Pipeline construction can block for minutes when a model's TensorRT
         # engine is built for the first time; keepalives stop the client's
@@ -491,6 +508,8 @@ class Session:
                 aux_source_path=(resolved_path if self.aux_track_mode == "muxed" else None),
                 embed_aux_attachments=self.aux_attachment_mode == "embedded",
                 high_bit_depth=high_bit_depth,
+                display_mapper=self.display_mapper,
+                display_target=display_target,
             )
         except Exception as err:
             if isinstance(err, PipelineConstructionError):
@@ -551,6 +570,7 @@ class Session:
             downlink_color=self.pipeline.downlink_color,
             downlink_dolby_vision=self.pipeline.dolby_vision_rpu,
             source_bit_depth=cfg.bit_depth,
+            downlink_mapping=self.pipeline.downlink_mapping,
             **source_metadata,
         )
 
@@ -570,14 +590,23 @@ class Session:
             pass
         self.pipeline.note_buffer_report(0)
         await self._stop_server_source()
+        # A malformed or absent display_target keeps the mapping (§3.6).
+        display_target = DisplayTarget.from_wire(msg.get("display_target"))
         trace = await asyncio.to_thread(
-            self.pipeline.flush, new_epoch, int(msg["target_pts"]))
+            self.pipeline.flush, new_epoch, int(msg["target_pts"]), display_target)
         if self.downlink_attached:
             await self.start_server_source(int(msg["target_pts"]), discontinuity=True)
         # seek_ready is only an ack that the epoch switched — the first media
         # for it may be seconds away (docs/SEEK_LATENCY_PLAN.md). The ticker is
         # what tells the client the server is working rather than wedged.
-        await self.send("seek_ready", epoch=new_epoch)
+        # A mapped session's epoch may change between PQ and SDR, mapped and
+        # not: the reply says what this one is.
+        mapping = self.pipeline.downlink_mapping
+        mapped = (
+            {"downlink_color": self.pipeline.downlink_color, "downlink_mapping": mapping}
+            if mapping is not None else {}
+        )
+        await self.send("seek_ready", epoch=new_epoch, **mapped)
         self._seek_progress_task = asyncio.create_task(
             self._seek_progress_loop(trace, new_epoch))
 
@@ -830,6 +859,7 @@ class Session:
             "bit_depth": p.bit_depth,
             "color": p.downlink_color,
             "hdr_metadata": p.hdr_metadata_report(),
+            "display_mapping": p.downlink_mapping,
             "provider": getattr(p.upscaler, "active_provider", None),
             "last_seek": p.stats.last_seek.report() if p.stats.last_seek else None,
         }

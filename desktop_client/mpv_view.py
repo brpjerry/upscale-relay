@@ -28,6 +28,8 @@ from PySide6.QtGui import QGuiApplication, QImage, QOpenGLContext, qRgb
 from PySide6.QtOpenGL import QOpenGLFramebufferObject
 from PySide6.QtOpenGLWidgets import QOpenGLWidget
 
+from relay_client_core.client import DisplayTarget
+
 from . import hdr_output
 from .hdr_view import _RESCALE_LIMIT, HdrPresenter, _fit  # noqa: F401 - _fit: tests use it here
 from .options import DesktopOptions
@@ -460,6 +462,7 @@ class MpvPlayerView(QOpenGLWidget):
         self._on_presenter = False  # the render context lives on the presenter
         self._presenter_broken = False
         self._source_hdr = False  # the stream (or file) being played is PQ/HLG
+        self._session = None  # the relay session being played (its display mapping)
         self._hdr_enabled = True  # the "Show HDR videos in HDR" setting
         self._display_hdr = hdr_output.SDR  # as last read
         self._hdr_stale_reported = False
@@ -1028,8 +1031,9 @@ class MpvPlayerView(QOpenGLWidget):
         an HDR video moves to the surface or back (one reload each way)."""
         self._check_hdr_surface()
 
-    def _wanted_surface(self) -> tuple[bool, hdr_output.DisplayHdr]:
-        """(play on the HDR surface?, the display's state). RELAY_HDR_SURFACE=
+    def _wanted_surface(self, source_hdr: bool | None = None) -> tuple[bool, hdr_output.DisplayHdr]:
+        """(play on the HDR surface?, the display's state), for the video
+        being played, or for one that is HDR or not (``source_hdr``). RELAY_HDR_SURFACE=
         force puts every video there, on any display (testing the surface and
         its overlays on an SDR screen); =off never does.
 
@@ -1043,8 +1047,10 @@ class MpvPlayerView(QOpenGLWidget):
         mode = os.environ.get("RELAY_HDR_SURFACE", "").lower()
         if self.options.headless or mode == "off" or self._presenter_broken:
             return False, hdr_output.SDR
+        if source_hdr is None:
+            source_hdr = self._source_hdr
         if mode != "force" and not (
-                self._hdr_enabled and self._source_hdr and hdr_output.presentation_supported()):
+                self._hdr_enabled and source_hdr and hdr_output.presentation_supported()):
             return False, hdr_output.SDR
         window = self.window()
         display = hdr_output.query(window)
@@ -1071,11 +1077,34 @@ class MpvPlayerView(QOpenGLWidget):
     def _pq_for(display: hdr_output.DisplayHdr) -> bool:
         return display.hdr and hdr_output.presentation_supported()
 
+    def display_target(self) -> DisplayTarget:
+        """The display an HDR video would be shown on now, for a server that
+        applies Dolby Vision and HDR10+ for it (PROTOCOL §3.6): PQ where it
+        would play on the HDR surface, with the display's peak (in fullscreen
+        before the compositor's switch, the peak that switch is expected to
+        bring), SDR anywhere else."""
+        want, display = self._wanted_surface(source_hdr=True)
+        if want and self._pq_for(display):
+            return DisplayTarget("pq", display.peak_nits, display.sdr_white_nits)
+        return DisplayTarget("sdr", None, display.sdr_white_nits)
+
+    def _mapping(self) -> dict | None:
+        """How the relay session's current epoch was mapped for a display
+        (PROTOCOL §3.6), or None: not mapped (local playback, a source with
+        static metadata only, or a server without display mapping)."""
+        return getattr(self._session, "downlink_mapping", None) if not self._local_playback else None
+
     async def _prepare_surface(self) -> None:
         """Put the render context where this video and display call for it."""
         was, was_failed = self.hdr_output, self._presenter_broken
         try:
             generation = self._load_generation
+            mapping = self._mapping()
+            if mapping is not None:
+                # A mapped session's epochs differ: the server sends SDR for
+                # an SDR display, HDR for an HDR one. The epoch's own colour
+                # (seek_ready's downlink_color) says which this one is.
+                self._source_hdr = bool(getattr(self._session, "downlink_hdr", False))
             want, display = self._wanted_surface()
             self._display_hdr = display
             self._hdr_stale_reported = False
@@ -1270,7 +1299,8 @@ class MpvPlayerView(QOpenGLWidget):
             # HLG alternative-transfer SEI over BT.2020 tags, PROTOCOL §3.5):
             # mpv's reading of the frames wins, and one reload moves it over.
             self._source_hdr = True
-        if not (self._source_hdr or self._on_presenter):
+        mapping = self._mapping()
+        if not (self._source_hdr or self._on_presenter or mapping is not None):
             return
         if not self._presenting():
             # Hidden or minimised: a new surface is never exposed, so it could
@@ -1290,6 +1320,13 @@ class MpvPlayerView(QOpenGLWidget):
                                                    "playing the HDR video tone-mapped")
             want, display = self._wanted_surface()
         self._follow_auto_hdr(want, display)
+        if mapping is not None and not self.display_target().fits(mapping):
+            # The server made this epoch for another display (HDR for an SDR
+            # one, SDR for an HDR one): the reload's seek names the display it
+            # is shown on now.
+            self._hdr_stale_reported = True
+            self.hdr_surface_stale.emit()
+            return
         fits = want == self._on_presenter and (
             not want or (self._presenter is not None and self._presenter.pq == self._pq_for(display)))
         if not fits:
@@ -1320,6 +1357,7 @@ class MpvPlayerView(QOpenGLWidget):
             return
         self._fps = float(avg_rate) if avg_rate else 30.0
         self._downlink_codec = getattr(session, "downlink_codec", None)
+        self._session = session
         self._source_hdr = bool(getattr(session, "downlink_hdr", False))
         self._source_path = source_path
         self._source_has_audio = source_has_audio
@@ -1673,6 +1711,7 @@ class MpvPlayerView(QOpenGLWidget):
         ``hdr``: the file is PQ or HLG (it may play on the HDR surface).
         """
         self.stop()
+        self._session = None
         self._source_hdr = bool(hdr)
         generation = self._load_generation
         loop = asyncio.get_running_loop()
@@ -1795,6 +1834,13 @@ class MpvPlayerView(QOpenGLWidget):
                 if pkt.discontinuity and (not first or self._buffer is None):
                     if trace:
                         print("[trace] discontinuity -> reload", flush=True, file=_sys.stderr)
+                    client = self.client
+                    if self._mapping() is not None and hasattr(client, "epoch_described"):
+                        # A mapped epoch's colour and mapping arrive with
+                        # seek_ready, which can trail its first media bytes.
+                        await client.epoch_described(pkt.epoch)
+                        if client is not self.client or pkt.epoch != client.epoch:
+                            continue
                     # Seek: fresh container stream -> reload mpv on a new buffer.
                     await self._load_stream()
                     if self.client is not None and pkt.epoch != self.client.epoch:

@@ -20,6 +20,7 @@ from relay_media.hdr import (
     dynamic_hdr_nals,
     escape_rbsp,
     extract_dynamic_hdr,
+    has_hdr10plus,
     hevc_nal_length_size,
     inject_hevc_metadata,
     iter_nals,
@@ -140,6 +141,18 @@ def test_dynamic_metadata_is_read_from_source_access_units(framing):
     assert extract_dynamic_hdr(_annexb(IDR + b"\xaf"), None, dovi_rpu=True) is None
 
 
+def test_an_uplink_reports_hdr10plus_from_its_first_keyframe():
+    """open_session.video.hdr10plus (PROTOCOL §3.6): mapped sessions decode
+    differently, so the server must know at open."""
+    hvcc = bytes(21) + bytes([3]) + bytes(10)  # length-prefixed, as demuxed from MKV/MP4
+    slice_ = IDR + bytes([0xAF])
+    keyframe = (VPS + bytes([0x0C]), SPS + bytes([1]), PPS + bytes([0xC1]), sei_nal(4, HDR10PLUS), slice_)
+    assert has_hdr10plus(_length_prefixed(*keyframe), "hevc", hvcc)
+    assert has_hdr10plus(_annexb(*keyframe), "hevc", None)
+    assert not has_hdr10plus(_length_prefixed(slice_, RPU), "hevc", hvcc)  # Dolby Vision alone
+    assert not has_hdr10plus(_annexb(*keyframe), "h264") and not has_hdr10plus(b"", "hevc")
+
+
 def test_metadata_is_placed_around_the_slices_of_an_access_unit():
     packet = _annexb(VPS + b"\x0c", SPS + b"\x01", PPS + b"\xc1", IDR + b"\xaf\x01", IDR + b"\x80\x02")
     prefix, suffix = dynamic_hdr_nals(DynamicHdr((HDR10PLUS,), RPU))
@@ -166,18 +179,17 @@ _HLG = VideoColor.resolve_values(9, 1, 9, 18, 3840, 2160)
 _SDR = VideoColor.resolve_values(1, 1, 1, 1, 1920, 1080)
 
 
-@pytest.mark.parametrize(("request_mode", "color", "depth", "expected"), [
-    (None, _PQ, 10, 8),     # old clients keep the 8-bit downlink
-    ("hdr", _PQ, 10, 10),
-    ("hdr", _HLG, 10, 10),
-    ("hdr", _SDR, 10, 8),   # 10-bit SDR only on request
-    ("all", _SDR, 10, 10),
-    ("all", _SDR, 8, 8),    # nothing deeper to keep
-    ("all", None, None, 8),  # unknown source
-    ("hdr", _PQ, 8, 10),    # an 8-bit PQ source is still HDR
+@pytest.mark.parametrize(("request_mode", "color", "expected"), [
+    (None, _PQ, 8),     # old clients keep the 8-bit downlink
+    ("hdr", _PQ, 10),   # whatever the source's depth: an 8-bit PQ one is still HDR
+    ("hdr", _HLG, 10),
+    ("hdr", _SDR, 8),   # SDR at 10 bits only on request
+    ("hdr", None, 8),   # unknown source
+    ("all", _SDR, 10),  # 8-bit and 10-bit sources alike
+    ("all", None, 10),
 ])
-def test_output_bit_depth(request_mode, color, depth, expected):
-    assert output_bit_depth(request_mode, color, depth) == expected
+def test_output_bit_depth(request_mode, color, expected):
+    assert output_bit_depth(request_mode, color) == expected
 
 
 def test_colour_tags_round_trip_through_the_wire():

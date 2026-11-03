@@ -91,14 +91,15 @@ class AppSettings:
         self._qs.setValue("session/passthrough_4k", bool(v))
 
     @property
-    def ten_bit_sdr(self) -> bool:
-        """Keep 10-bit SDR sources at 10 bits through the relay. HDR sources
-        always stay 10-bit; off, other sources arrive as 8-bit."""
-        return self._qs.value("session/ten_bit_sdr", False, type=bool)
+    def ten_bit_video(self) -> bool:
+        """Stream every video at 10 bits through the relay, whatever the
+        source's own depth. HDR sources always stream at 10 bits; off, every
+        other source arrives as 8-bit."""
+        return self._qs.value("session/ten_bit_video", False, type=bool)
 
-    @ten_bit_sdr.setter
-    def ten_bit_sdr(self, v: bool) -> None:
-        self._qs.setValue("session/ten_bit_sdr", bool(v))
+    @ten_bit_video.setter
+    def ten_bit_video(self, v: bool) -> None:
+        self._qs.setValue("session/ten_bit_video", bool(v))
 
     @property
     def quality_tier(self) -> str:

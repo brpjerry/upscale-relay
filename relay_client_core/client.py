@@ -52,7 +52,8 @@ def _open_local_source(path: str):
     """Open and inspect a potentially remote mounted file on one worker."""
     track = VideoTrack(path)
     try:
-        return track, track.open_session_video_dict(), track.duration_seconds(), track.chapters()
+        video = track.open_session_video_dict()
+        return track, video, track.duration_seconds(), track.chapters()
     except BaseException:
         track.close()
         raise
@@ -84,14 +85,24 @@ def _probe_video_size(url: str) -> tuple[int, int] | None:
 class _SourceOpening:
     """Keep native ownership on the worker until the loop accepts the source."""
 
-    def __init__(self, path: str):
+    def __init__(self, path: str, probe_hdr10plus: bool = False):
         self.path = path
+        # Read the first keyframe for HDR10+ (a second open of the file) only
+        # for a session that will send video.hdr10plus (PROTOCOL §3.6).
+        self.probe_hdr10plus = probe_hdr10plus
         self._lock = threading.Lock()
         self._abandoned = False
         self._result = None
 
     def run(self) -> None:
         opened = _open_local_source(self.path)
+        if self.probe_hdr10plus:
+            try:
+                if opened[0].first_keyframe_hdr10plus():
+                    opened[1]["hdr10plus"] = True
+            except BaseException:
+                opened[0].close()
+                raise
         with self._lock:
             if not self._abandoned:
                 self._result = opened
@@ -293,6 +304,33 @@ class _ThreadBridgeQueue:
         self._wake()
 
 
+@dataclass(frozen=True)
+class DisplayTarget:
+    """The display a client presents on, for a server that applies a
+    source's dynamic HDR metadata (Dolby Vision, HDR10+) for it
+    (docs/PROTOCOL.md §3.6): "pq" is shown as HDR up to ``peak_nits``, "sdr"
+    as SDR. None luminances: the platform does not say."""
+
+    transfer: str
+    peak_nits: float | None = None
+    sdr_white_nits: float | None = None
+
+    def to_wire(self) -> dict:
+        wire: dict = {"transfer": self.transfer}
+        if self.peak_nits:
+            wire["peak_nits"] = round(float(self.peak_nits), 1)
+        if self.sdr_white_nits:
+            wire["sdr_white_nits"] = round(float(self.sdr_white_nits), 1)
+        return wire
+
+    def fits(self, mapping: dict | None) -> bool:
+        """Whether an epoch the server made as ``mapping`` (session_opened /
+        seek_ready downlink_mapping) suits this display: it was made for the
+        same transfer. The server remaps only when the transfer changes; a
+        new peak or SDR white keeps its mapping."""
+        return isinstance(mapping, dict) and mapping.get("transfer") == self.transfer
+
+
 @dataclass
 class SessionConfig:
     path: str
@@ -320,9 +358,13 @@ class SessionConfig:
     # in place of ``model``. A server file's size is read through /media.
     passthrough_4k: bool = False
     # open_session.high_bit_depth for a capable server: "hdr" keeps HDR
-    # sources at 10 bits with their metadata, "all" also 10-bit SDR ones.
-    # None keeps the 8-bit downlink.
+    # sources at 10 bits with their metadata, "all" streams every source at
+    # 10 bits. None keeps the 8-bit downlink.
     high_bit_depth: str | None = None
+    # The display the stream is shown on, for a server that applies Dolby
+    # Vision and HDR10+ for it (capabilities.display_mapping, sent with
+    # high_bit_depth). None sends nothing: such sources stream as §3.5 says.
+    display_target: DisplayTarget | None = None
 
 
 @dataclass
@@ -365,12 +407,26 @@ class SessionInfo:
     downlink_color: dict | None = None
     downlink_dolby_vision: bool = False
     source_bit_depth: int | None = None  # None: the server did not say
+    # Display mapping (docs/PROTOCOL.md §3.6): the target this session asks
+    # for (None: not negotiated, and seeks send none), and the target the
+    # current epoch was made for ({transfer, peak_nits, sdr_white_nits,
+    # applied}; an empty applied: streamed as §3.5 for that target; None: a
+    # session the server never maps). Both follow each seek, and
+    # downlink_color with them.
+    display_target: DisplayTarget | None = None
+    downlink_mapping: dict | None = None
 
     @property
     def downlink_hdr(self) -> bool:
         """PQ or HLG downlink."""
         transfer = (self.downlink_color or {}).get("transfer")
         return type(transfer) is int and transfer in HDR_TRANSFERS
+
+    @property
+    def hdr_source(self) -> bool:
+        """The video can be shown as HDR: an HDR downlink, or a mapped one
+        (whose epoch may be SDR for an SDR display)."""
+        return self.downlink_hdr or self.downlink_mapping is not None
 
 
 class RelayClient:
@@ -516,6 +572,10 @@ class RelayClient:
                     continue
                 if mtype == "state":
                     self.state = msg["state"]
+                elif mtype == "seek_ready":
+                    # Before the waiting seek() resumes: the epoch's media can
+                    # be loaded as soon as it arrives (PROTOCOL §3.6).
+                    self._apply_epoch_mapping(msg)
                 elif mtype == "error":
                     log.warning("server error: %s", msg)
                     self.errors.append(msg)
@@ -560,8 +620,11 @@ class RelayClient:
         if self._closing:
             raise ConnectionError("client is closing")
         video, duration_s, chapters = None, None, []
+        capabilities = self.capabilities or {}
+        maps_display = bool(cfg.high_bit_depth and cfg.display_target is not None
+                            and capabilities.get("high_bit_depth") and capabilities.get("display_mapping"))
         if cfg.source == "uplink":
-            owner = _SourceOpening(cfg.path)
+            owner = _SourceOpening(cfg.path, probe_hdr10plus=maps_display)
             # Use an executor Future, not another asyncio Task: cancellation
             # of all loop tasks must not discard a native worker's result.
             opening = self._loop.run_in_executor(None, owner.run)
@@ -614,8 +677,10 @@ class RelayClient:
         }
         if cfg.resize_algorithm is not None:
             fields["resize_algorithm"] = cfg.resize_algorithm
-        if cfg.high_bit_depth and (self.capabilities or {}).get("high_bit_depth"):
+        if cfg.high_bit_depth and capabilities.get("high_bit_depth"):
             fields["high_bit_depth"] = cfg.high_bit_depth
+        if maps_display:
+            fields["display_target"] = cfg.display_target.to_wire()
         if video is not None:
             fields["video"] = video
         try:
@@ -671,6 +736,10 @@ class RelayClient:
             downlink_dolby_vision=msg.get("downlink_dolby_vision") is True,
             source_bit_depth=(
                 msg["source_bit_depth"] if type(msg.get("source_bit_depth")) is int else None
+            ),
+            display_target=cfg.display_target if "display_target" in fields else None,
+            downlink_mapping=(
+                msg["downlink_mapping"] if isinstance(msg.get("downlink_mapping"), dict) else None
             ),
         )
         return self.session
@@ -998,10 +1067,18 @@ class RelayClient:
     async def pause(self) -> None:
         await self._send("pause")
 
-    async def seek(self, target_pts: int) -> None:
-        """Full docs/PROTOCOL.md §4 seek dance."""
+    async def seek(self, target_pts: int, display_target: DisplayTarget | None = None) -> None:
+        """Full docs/PROTOCOL.md §4 seek dance. On a session that negotiated
+        display mapping (§3.6), every seek names the display for its epoch:
+        ``display_target``, else the one already asked for."""
         self.epoch += 1
         epoch = self.epoch
+        fields = {}
+        session = self.session
+        if session is not None and session.display_target is not None:
+            if display_target is not None:
+                session.display_target = display_target
+            fields["display_target"] = session.display_target.to_wire()
         # The server may acknowledge only the newest seek. Retire old waiters
         # immediately; an old acknowledgement must never resolve the new one.
         for key, future in list(self._pending.items()):
@@ -1018,11 +1095,36 @@ class RelayClient:
         except asyncio.QueueEmpty:
             pass
         self.buffered_ms = 0
-        msg = await self._request("seek_ready", "seek", target_pts=target_pts, epoch=epoch)
+        msg = await self._request("seek_ready", "seek", target_pts=target_pts, epoch=epoch, **fields)
         if msg["epoch"] < self.epoch:
             return  # superseded by a newer seek
+        if session is not None and session is self.session:
+            self._apply_epoch_mapping(msg)
         if self.track is not None:
             await self.start_uplink(from_pts=target_pts, discontinuity=True, epoch=epoch)
+
+    async def epoch_described(self, epoch: int) -> None:
+        """Wait until seek_ready for ``epoch`` has been read, so that the
+        session describes that epoch (its colour and display mapping, PROTOCOL
+        §3.6). The media connection can deliver the epoch's first bytes
+        sooner: a server starts a library file's source before it answers.
+        Returns at once when no seek for ``epoch`` is pending, and when the
+        seek fails or times out (its caller reports that)."""
+        fut = self._pending.get(("seek_ready", epoch))
+        if fut is not None and not fut.done():
+            await asyncio.wait([fut])
+
+    def _apply_epoch_mapping(self, msg: dict) -> None:
+        """A mapped session's epoch may switch between PQ and SDR (PROTOCOL
+        §3.6): take seek_ready's downlink_mapping and downlink_color for the
+        current epoch. Idempotent; the control reader and seek() both call it."""
+        session = self.session
+        if session is None or msg.get("epoch") != self.epoch or "downlink_mapping" not in msg:
+            return
+        mapping = msg.get("downlink_mapping")
+        session.downlink_mapping = mapping if isinstance(mapping, dict) else None
+        if isinstance(msg.get("downlink_color"), dict):
+            session.downlink_color = msg["downlink_color"]
 
     async def teardown(self) -> None:
         for task in (self._uplink_task, getattr(self, "_report_task", None)):

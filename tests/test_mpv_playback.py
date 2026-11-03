@@ -482,6 +482,9 @@ class ConsumerProbe:
     def _maybe_release_epoch(self):
         pass
 
+    def _mapping(self):
+        return None  # not display-mapped: a new epoch loads at once
+
 
 async def consume_through_epoch_eos(player, queue):
     task = asyncio.create_task(MpvPlayerView._consume(player, queue))
@@ -508,6 +511,44 @@ def test_stale_downlink_payload_and_eof_cannot_touch_current_stream():
         await consume_through_epoch_eos(player, queue)
         assert player.buffers == [([b"current-header", b"current-body"], [True])]
         assert player.errors == []
+
+    asyncio.run(scenario())
+
+
+def test_a_mapped_epoch_loads_once_its_seek_ready_is_read():
+    """A display-mapped epoch's colour comes with seek_ready on the control
+    connection, which can trail the epoch's first media bytes."""
+    described = []
+
+    class MappedProbe(ConsumerProbe):
+        def _mapping(self):
+            return {"transfer": "pq", "applied": []}
+
+    async def scenario():
+        ready = asyncio.Event()
+        player = MappedProbe(epoch=2)
+
+        async def epoch_described(epoch):
+            await ready.wait()
+            described.append(epoch)
+
+        player.client = SimpleNamespace(epoch=2, epoch_described=epoch_described)
+        queue = asyncio.Queue()
+        queue.put_nowait(MediaPacket(b"opened", flags=FLAG_DISCONTINUITY, epoch=2))  # session_opened described it
+        task = asyncio.create_task(MpvPlayerView._consume(player, queue))
+        try:
+            await asyncio.sleep(0.05)
+            player.client.epoch = 3  # a seek: its media comes before its seek_ready
+            queue.put_nowait(MediaPacket(b"seeked", flags=FLAG_DISCONTINUITY, epoch=3))
+            queue.put_nowait(MediaPacket(b"", flags=FLAG_EOS, epoch=3))
+            await asyncio.sleep(0.05)
+            assert player.buffers == [([b"opened"], [])]  # not reloaded before seek_ready
+            ready.set()
+            await asyncio.wait_for(player.finished_buffers.get(), 1)
+            assert described == [3] and player.buffers == [([b"opened"], []), ([b"seeked"], [True])]
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
 
     asyncio.run(scenario())
 

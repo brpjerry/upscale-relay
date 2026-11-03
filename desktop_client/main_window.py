@@ -126,6 +126,31 @@ def _format_time(seconds: float) -> str:
     return f"{int(seconds // 60):02d}:{int(seconds % 60):02d}"
 
 
+def _mapping_rows(mapping: dict | None) -> list[tuple[str, str]]:
+    """The info card's line for a stream the server mapped for this display
+    (PROTOCOL §3.6): which dynamic metadata it applied. None applied (Dolby
+    Vision 8 or HDR10+ for an HDR display, which stream as they are): no
+    line."""
+    if not isinstance(mapping, dict):
+        return []
+    names = {"dolby_vision": "Dolby Vision", "hdr10plus": "HDR10+"}
+    applied = [names.get(item, str(item)) for item in mapping.get("applied") or []]
+    if not applied:
+        return []
+    return [("Dynamic HDR", f"{' and '.join(applied)}, applied by the server for this display")]
+
+
+def _source_is_hdr(session) -> bool:
+    """SessionInfo.hdr_source: an HDR downlink, or a display-mapped session,
+    whose epoch may be SDR (PROTOCOL §3.6). A session without the property
+    (a test double) is read the same way from its fields."""
+    known = getattr(session, "hdr_source", None)
+    if known is not None:
+        return bool(known)
+    return bool(getattr(session, "downlink_hdr", False)
+                or getattr(session, "downlink_mapping", None) is not None)
+
+
 def _server_address(host: str, port: int) -> str:
     return f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
 
@@ -360,12 +385,12 @@ class MainWindow(DesktopFeatures, QMainWindow):
             "Stream videos 3840 wide or 2160 tall and up without the upscale model."
         )
         self.passthrough_4k_check.setChecked(self.settings.passthrough_4k)
-        self.ten_bit_sdr_check = FlatSwitch("Keep 10-bit color for SDR videos")
-        self.ten_bit_sdr_check.setToolTip(
-            "HDR videos always stream with 10-bit color. On, 10-bit SDR videos do too: "
-            "less banding, about a quarter more bandwidth."
+        self.ten_bit_video_check = FlatSwitch("Use 10 bit video")
+        self.ten_bit_video_check.setToolTip(
+            "HDR videos always stream with 10-bit color. On, every other video does too: "
+            "smoother gradients and a smaller stream, for a little more power to decode."
         )
-        self.ten_bit_sdr_check.setChecked(self.settings.ten_bit_sdr)
+        self.ten_bit_video_check.setChecked(self.settings.ten_bit_video)
         self.tier_combo = QComboBox()
         self.tier_combo.addItem(self.settings.quality_tier, self.settings.quality_tier)
         # "Fit to screen" letterboxes inside the display; "Crop" requests a
@@ -475,7 +500,7 @@ class MainWindow(DesktopFeatures, QMainWindow):
             combo.setToolTip(help_text)
             form.addRow(label, combo)
         form.insertRow(1, self.passthrough_4k_check)  # qualifies the model choice
-        form.insertRow(3, self.ten_bit_sdr_check)  # ... and this the stream quality
+        form.insertRow(3, self.ten_bit_video_check)  # ... and this the stream quality
         streaming_layout.addLayout(form)
         streaming_layout.addWidget(self.deband_check)
         streaming_layout.addWidget(self.hdr_output_check)
@@ -916,7 +941,7 @@ class MainWindow(DesktopFeatures, QMainWindow):
         # capability refreshes repopulate these menus.
         self.model_combo.activated.connect(self.on_model_changed)
         self.passthrough_4k_check.toggled.connect(self.on_passthrough_4k_changed)
-        self.ten_bit_sdr_check.toggled.connect(self.on_ten_bit_sdr_changed)
+        self.ten_bit_video_check.toggled.connect(self.on_ten_bit_video_changed)
         self.tier_combo.activated.connect(self.on_quality_tier_changed)
         self.deband_check.toggled.connect(self.on_deband_changed)
         self.hdr_output_check.toggled.connect(self.on_hdr_output_changed)
@@ -2368,7 +2393,10 @@ class MainWindow(DesktopFeatures, QMainWindow):
             passthrough_4k=self.settings.passthrough_4k,
             # HDR always: mpv tone-maps it for an SDR screen from the real
             # 10-bit signal and its mastering metadata.
-            high_bit_depth="all" if self.settings.ten_bit_sdr else "hdr",
+            high_bit_depth="all" if self.settings.ten_bit_video else "hdr",
+            # Dolby Vision and HDR10+ are applied on the server for the display
+            # the video is shown on (PROTOCOL §3.6); mpv's renderer cannot.
+            display_target=self._display_target(),
             aux_tracks=(
                 "muxed"
                 if source == "server_file" and self._server_caps.get("muxed_aux_tracks")
@@ -2532,6 +2560,7 @@ class MainWindow(DesktopFeatures, QMainWindow):
                 ("Upscale model", model),
                 ("Stream quality", self.tier_combo.currentText()),
                 ("Output", f"{output} {session.downlink_codec}"),
+                *_mapping_rows(getattr(session, "downlink_mapping", None)),
                 ("Server", _server_address(self.client.host, self.client.port)),
             ],
         )
@@ -2573,10 +2602,34 @@ class MainWindow(DesktopFeatures, QMainWindow):
         if hasattr(self.player, "prepare_seek"):
             self.player.prepare_seek(target_s)
         try:
-            await self.client.seek(int(target_s / float(tb)))
+            session = self.client.session
+            if getattr(session, "display_target", None) is not None:
+                # Each epoch is mapped for the display it is shown on now: the
+                # HDR reload after a display change is one of these seeks.
+                await self.client.seek(int(target_s / float(tb)), display_target=self._display_target())
+                self._show_mapping(session)
+            else:
+                await self.client.seek(int(target_s / float(tb)))
         except Exception as err:
             self._pending_seek_s = None
             self._error("Seek failed", str(err))
+
+    def _show_mapping(self, session) -> None:
+        """Rebuild the info card's Dynamic HDR line after a seek: a remap
+        changes what the server applied (PROTOCOL §3.6)."""
+        title, detail, rows = self._now_raw
+        if title is None or rows is None or getattr(self.client, "session", None) is not session:
+            return
+        rows = [row for row in rows if row[0] != "Dynamic HDR"]
+        at = next((i + 1 for i, row in enumerate(rows) if row[0] == "Output"), len(rows))
+        rows[at:at] = _mapping_rows(getattr(session, "downlink_mapping", None))
+        self._show_now_playing(title, detail, rows)
+
+    def _display_target(self):
+        """The display a relay stream is shown on (player.display_target),
+        or None for a player that cannot say."""
+        target = getattr(self.player, "display_target", None)
+        return target() if callable(target) else None
 
     def _fit_mode(self) -> str:
         return self.fit_combo.currentData() or "fit"
@@ -2633,17 +2686,18 @@ class MainWindow(DesktopFeatures, QMainWindow):
         await self._restart_for_playback_setting()
 
     @asyncSlot(bool)
-    async def on_ten_bit_sdr_changed(self, enabled: bool) -> None:
-        self.settings.ten_bit_sdr = enabled
+    async def on_ten_bit_video_changed(self, enabled: bool) -> None:
+        self.settings.ten_bit_video = enabled
         session = getattr(self.client, "session", None)
         if session is None:
             await self._restart_for_playback_setting()  # as passthrough_4k
             return
-        # Only a deep SDR source changes: HDR stays 10-bit either way, and an
-        # 8-bit source never had more to keep.
-        hdr = getattr(session, "downlink_hdr", False)
-        source_bits = getattr(session, "source_bit_depth", None) or 8
-        if hdr or source_bits <= 8:
+        # Every SDR stream changes depth; an HDR source stays 10-bit either way
+        # (a display-mapped one in its SDR epochs too), and a server without
+        # deep colour streams 8 bits whatever is asked.
+        capabilities = getattr(self.client, "capabilities", None)
+        if _source_is_hdr(session) or (
+                isinstance(capabilities, dict) and not capabilities.get("high_bit_depth")):
             return
         await self._restart_for_playback_setting()
 
@@ -2822,10 +2876,10 @@ class MainWindow(DesktopFeatures, QMainWindow):
         self.client_log.record("local_fallback", position=pos)
         if path is None:
             return
-        # The server read the file's colour: an HDR source has an HDR downlink.
-        # mpv may have read it in the frames too (an HLG alternative-transfer SEI).
-        hdr = bool(getattr(getattr(self.client, "session", None), "downlink_hdr", False)
-                   or getattr(self.player, "source_hdr", False))
+        # The server read the file's colour: an HDR source has an HDR downlink,
+        # or a display-mapped one whose epoch may be SDR. mpv may have read it
+        # in the frames too (an HLG alternative-transfer SEI).
+        hdr = _source_is_hdr(getattr(self.client, "session", None)) or bool(getattr(self.player, "source_hdr", False))
         # The control teardown closes the old downlink. Stop its consumer first
         # so that normal closure cannot enqueue a stale playback failure while
         # the local file is being loaded.

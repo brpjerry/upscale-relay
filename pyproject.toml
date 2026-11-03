@@ -8,7 +8,7 @@ version = "0.24.0"
 description = "Video upscale relay - offline pipeline CLI (phase 1)"
 requires-python = ">=3.12"
 dependencies = [
-    "av>=13",
+    "av>=19",
     "numpy>=1.26",
     "aiohttp>=3.9",
     "zeroconf>=0.132",

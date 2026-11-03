@@ -19,3 +19,12 @@ def pytest_configure(config):
 
     fd = config.stash.get(plugin.fault_handler_stderr_fd_key, None)
     faulthandler.enable(file=sys.__stderr__ if fd is None else fd, all_threads=False)
+
+
+@pytest.fixture(autouse=True)
+def _no_display_mapper_detection(monkeypatch):
+    """A server started by a test offers no display mapping, whatever ffmpeg
+    is on PATH: detection runs the GPU. Tests of it probe a mapper directly."""
+    from relay_server.display_mapping import DisplayMapper
+
+    monkeypatch.setattr(DisplayMapper, "detect", classmethod(lambda cls, ffmpeg=None: None))

@@ -79,10 +79,21 @@ a server-library file opened with it off, whose size was never read.
 
 HDR sources (PQ or HLG) always stream with 10-bit color and their HDR metadata:
 mastering display and light level, HDR10+, and the Dolby Vision RPU of a
-profile 8 source (docs/PROTOCOL.md §3.5). **Keep 10-bit color for SDR videos**
-(off by default) asks for the same depth for other sources deeper than 8 bits,
-such as 10-bit anime encodes: less banding at roughly a quarter more lossless
-bandwidth. Toggling it restarts only a 10-bit SDR stream.
+profile 8 source (docs/PROTOCOL.md §3.5). **Use 10 bit video** (off by
+default) streams every other video at 10 bits too, whatever the source's own
+depth; off, they stream at 8 bits, 10-bit sources included. The model's output
+keeps its in-between levels, so gradients band less, and the stream is smaller
+at the same quality tier. At `hevc-qp4`, 2880x1620, through AnimeJaNai, a
+10-bit anime episode took 78 Mbps instead of 113, and an 8-bit one 24.9 instead
+of 46.0. It costs more elsewhere:
+- **On the server**, the model runs on 16-bit RGB. For a 1080p source its
+  throughput on the RTX 5090 fell from 51 to 31.5 fps, enough for 24p but
+  marginal for 30p.
+- **On the Lunar Lake laptop**, decoding costs about 0.4-0.65 W more on
+  battery, most of it copying twice the bytes back from the GPU
+  (`hwdec=auto-copy-safe`).
+
+Toggling it restarts an SDR stream; an HDR one is 10-bit either way.
 
 **Show HDR videos in HDR** (on by default) plays an HDR video as HDR while the
 window's screen is in HDR mode. That works on Wayland with Qt 6.10.2 or later;
@@ -99,8 +110,17 @@ every other case (the switch off, an SDR screen, an SDR video, another
 platform) mpv tone-maps HDR to SDR from the 10-bit signal and its mastering
 metadata, as before. A local fallback keeps the source's HDR, as the server
 read it. The libmpv render API runs mpv's `gpu` renderer, which uses static
-metadata only; Dolby Vision and HDR10+ ride along for clients that use them.
-docs/HDR_OUTPUT.md has the design and its measurements.
+metadata only, so a server that can apply Dolby Vision and HDR10+ does it for
+the display the video is shown on (docs/PROTOCOL.md §3.6).
+Where the video plays as SDR, the server tone-maps Dolby Vision and HDR10+ to
+SDR by their metadata. Where it plays as HDR, the server reshapes Dolby Vision
+profile 5 to PQ; other Dolby Vision profiles and HDR10+ arrive on their HDR10
+or HLG base, which mpv fits to the display's peak as it does HDR10. When that
+changes (the display's HDR mode, the setting, fullscreen where Hyprland
+switches to HDR), the reload asks the server to map for the new display. The
+info card says when the server applied them, and follows each remap. Other
+servers, and local playback, send Dolby Vision and HDR10+ along unused, as
+before. docs/HDR_OUTPUT.md has the design and its measurements.
 
 These controls set mpv options; the player keeps their values itself
 (`AppSettings.mpv_defaults` in QSettings) and sets them on mpv at startup, at

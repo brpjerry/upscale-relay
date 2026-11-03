@@ -32,7 +32,7 @@ def _player(**fields):
     defaults = dict(
         options=SimpleNamespace(headless=False), _presenter_broken=False, _hdr_enabled=True,
         _source_hdr=True, window=lambda: None, _presenting=lambda: True, _reloading=False,
-        _auto_hdr_deadline=None, _auto_hdr_refused=set(),
+        _auto_hdr_deadline=None, _auto_hdr_refused=set(), _session=None, _local_playback=False,
     )
     defaults.update(fields)
     return SimpleNamespace(**defaults)
@@ -41,7 +41,7 @@ def _player(**fields):
 def _bind(player, *names):
     """MpvPlayerView's own methods on a fake, for those that call others."""
     from desktop_client.mpv_view import MpvPlayerView
-    for name in names:
+    for name in (*names, "_mapping", "display_target"):
         setattr(player, name, getattr(MpvPlayerView, name).__get__(player))
     player._pq_for = MpvPlayerView._pq_for
     return player

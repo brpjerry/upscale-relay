@@ -433,6 +433,38 @@ def test_controller_serializes_overlapping_restarts(settings, monkeypatch):
     asyncio.run(scenario())
 
 
+def test_controller_probes_for_display_mapping_until_one_is_found(settings, monkeypatch):
+    # Autostart can run before the GPU driver is up: a miss is probed again
+    # on the next (re)start, a find is kept for the run.
+    from relay_server.display_mapping import DisplayMapper
+
+    found, given = object(), []
+    answers = iter([None, found])
+    monkeypatch.setattr(DisplayMapper, "detect", classmethod(lambda cls, ffmpeg=None: next(answers)))
+
+    class Server:
+        def __init__(self, models, port, **kwargs):
+            given.append(kwargs["display_mapper"])
+            self.running = False
+
+        async def start(self):
+            self.running = True
+
+        async def stop(self):
+            self.running = False
+
+    monkeypatch.setattr("relay_server.tray.RelayServer", Server)
+    controller = ServerController(settings)
+
+    async def scenario():
+        for _ in range(3):
+            await controller.start()
+        await controller.stop()
+
+    asyncio.run(scenario())
+    assert given == [None, found, found]
+
+
 def test_tray_gui_needs_only_qt_essentials_and_no_mpv():
     # The server GUI borrows the desktop client's theme and widgets; that must
     # not drag in the client's player stack or a Qt module outside Essentials.

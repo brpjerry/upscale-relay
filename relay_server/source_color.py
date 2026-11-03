@@ -38,6 +38,19 @@ def uplink_color_and_depth(
     return tags, depth
 
 
+def bitstream_color(extradata, width, height) -> tuple[int, int, int, int] | None:
+    """The colour tags HEVC's decoder exports from the parameter sets in
+    ``extradata``, unspecified where they set none; None if unreadable."""
+    if not extradata:
+        return None
+    try:
+        tags, _depth = _decoder_color_and_depth(extradata, width, height)
+    except Exception as error:
+        log.info("could not read the hevc colour description: %s", error)
+        return None
+    return tags
+
+
 def _decoder_color_and_depth(extradata, width, height):
     import av
 

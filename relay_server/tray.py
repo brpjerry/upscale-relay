@@ -53,6 +53,7 @@ from . import autostart
 from .gui_settings import ServerSettings, available_ep_choices
 from .instance_lock import AlreadyRunningError, acquire_instance_lock
 from .logo import make_icon, paint_logo  # noqa: F401  (re-exported; tests import from here)
+from .display_mapping import DisplayMapper
 from .server import RelayServer
 from .server_id import load_or_create_server_id
 
@@ -390,6 +391,10 @@ class ServerController:
         self.settings = settings
         self.server: RelayServer | None = None
         self._lifecycle_lock = asyncio.Lock()
+        # Display mapping's ffmpeg ($RELAY_FFMPEG or PATH), kept once found.
+        # Until then every (re)start probes again: autostart can run before
+        # the GPU driver is ready, and a settings restart then finds it.
+        self._display_mapper: DisplayMapper | None = None
         # Set by TrayApp; wired onto every new RelayServer instance so
         # connection/playback events survive config-applied restarts.
         self.event_callback = None
@@ -409,6 +414,8 @@ class ServerController:
             await self._stop_locked()
             s = self.settings
             server_id = await asyncio.to_thread(load_or_create_server_id)
+            if self._display_mapper is None:
+                self._display_mapper = await asyncio.to_thread(DisplayMapper.detect)
             server = RelayServer(
                 s.models_dir,
                 s.port,
@@ -417,6 +424,7 @@ class ServerController:
                 library_roots=s.library_dirs or None,
                 mdns=s.mdns,
                 server_id=server_id,
+                display_mapper=self._display_mapper,
             )
             server.event_callback = self.event_callback
             try:

@@ -28,6 +28,7 @@ layer.
 from __future__ import annotations
 
 import struct
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 # ITU-T H.273 code points (the FFmpeg enum values).
@@ -356,6 +357,37 @@ def hevc_nal_length_size(extradata: bytes | None) -> int | None:
     return (extradata[21] & 3) + 1
 
 
+def hevc_parameter_sets(extradata: bytes | None) -> list[bytes]:
+    """The NAL units of HEVC extradata: the hvcC arrays (VPS, SPS, PPS and
+    any SEI), or Annex B extradata's units. Malformed tails are dropped."""
+    if not extradata:
+        return []
+    if extradata.startswith((b"\x00\x00\x01", b"\x00\x00\x00\x01")):
+        return list(iter_nals(extradata, None))
+    if len(extradata) < 23:
+        return []
+    nals, pos, end = [], 23, len(extradata)
+    for _ in range(extradata[22]):
+        if pos + 3 > end:
+            break
+        count = int.from_bytes(extradata[pos + 1:pos + 3], "big")
+        pos += 3
+        for _ in range(count):
+            size = int.from_bytes(extradata[pos:pos + 2], "big")
+            pos += 2
+            if size == 0 or pos + size > end:
+                return nals
+            nals.append(extradata[pos:pos + size])
+            pos += size
+    return nals
+
+
+def to_annexb(packet: bytes, length_size: int | None, prefix: Sequence[bytes] = ()) -> bytes:
+    """One access unit in Annex B framing with ``prefix`` NAL units first
+    (parameter sets, for a decoder that has no extradata)."""
+    return b"".join(_START_CODE + nal for nal in (*prefix, *iter_nals(packet, length_size)))
+
+
 def iter_nals(data: bytes, length_size: int | None):
     """NAL units of one packet: length-prefixed, or Annex B when
     ``length_size`` is None. Malformed tails end the iteration."""
@@ -439,6 +471,17 @@ def extract_dynamic_hdr(
     if not hdr10plus and rpu is None:
         return None
     return DynamicHdr(tuple(hdr10plus), rpu)
+
+
+def has_hdr10plus(packet: bytes, codec: str, extradata: bytes | None = None) -> bool:
+    """Whether a video packet carries an HDR10+ (ST 2094-40) message: what an
+    uplink reports as ``open_session.video.hdr10plus`` from its first
+    keyframe (PROTOCOL §3.6). HEVC only; ``extradata`` selects the NAL
+    framing (hvcC: length-prefixed, else Annex B)."""
+    if codec != "hevc" or not packet:
+        return False
+    meta = extract_dynamic_hdr(bytes(packet), hevc_nal_length_size(extradata), dovi_rpu=False)
+    return meta is not None and bool(meta.hdr10plus)
 
 
 def inject_hevc_metadata(

@@ -23,7 +23,7 @@ import av
 from relay_protocol import NO_TS
 from relay_protocol.video import RESIZE_ALGORITHMS
 
-from .client import RelayClient, SessionConfig
+from .client import DisplayTarget, RelayClient, SessionConfig
 
 
 class PlaybackSim:
@@ -96,12 +96,15 @@ async def _run_session(args, client, resources: ExitStack) -> int:
         path=args.file, model=args.model, quality_tier=args.tier,
         display_w=int(dw), display_h=int(dh), fit_mode=args.fit_mode,
         resize_algorithm=None if args.resize_algorithm == "server-default" else args.resize_algorithm,
-        high_bit_depth=args.high_bit_depth,
+        high_bit_depth=args.high_bit_depth, display_target=args.display_target,
     ))
     print(f"session {session.session_id}: downlink {session.downlink_codec} "
           f"{session.downlink_width}x{session.downlink_height} {session.downlink_bit_depth}-bit"
           f"{' HDR' if session.downlink_hdr else ''}"
           f"{' + Dolby Vision RPU' if session.downlink_dolby_vision else ''}")
+    if args.display_target is not None:
+        print(f"display mapping: {session.downlink_mapping}"
+              f"{'' if session.display_target else ' (not negotiated)'}")
 
     await client.attach_media()
     sim = PlaybackSim(client.track.time_base)
@@ -227,6 +230,20 @@ async def _run_session(args, client, resources: ExitStack) -> int:
     return 0
 
 
+def _display_target(text: str) -> DisplayTarget:
+    """pq:PEAK[:WHITE] or sdr[:WHITE], luminances in nits."""
+    transfer, *values = text.split(":")
+    try:
+        numbers = [float(value) for value in values]
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not a luminance in {text!r}") from None
+    if transfer == "pq" and len(numbers) in (1, 2):
+        return DisplayTarget("pq", *numbers)
+    if transfer == "sdr" and len(numbers) <= 1:
+        return DisplayTarget("sdr", None, *numbers)
+    raise argparse.ArgumentTypeError("expected pq:PEAK[:WHITE] or sdr[:WHITE]")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(prog="relay-client")
     parser.add_argument("file")
@@ -245,7 +262,11 @@ def main() -> None:
     )
     parser.add_argument(
         "--high-bit-depth", choices=["hdr", "all"], default=None,
-        help="ask for a 10-bit downlink: HDR sources, or every source deeper than 8 bits",
+        help="ask for a 10-bit downlink: HDR sources, or every source",
+    )
+    parser.add_argument(
+        "--display-target", type=_display_target, default=None, metavar="pq:PEAK[:WHITE] | sdr[:WHITE]",
+        help="the display to map Dolby Vision and HDR10+ for (PROTOCOL §3.6); needs --high-bit-depth",
     )
     parser.add_argument("--decode", action="store_true", help="decode downlink and count frames")
     parser.add_argument("--mpv", action="store_true", help="pipe downlink video into mpv")
