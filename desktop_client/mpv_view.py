@@ -106,19 +106,50 @@ _HDR_RECHECK_TICKS = 6  # stats ticks (0.5 s)
 _AUTO_HDR_TIMEOUT_S = 5.0
 
 
-def _render_hwdec_mode(no_hwdec: bool, platform: str | None = None) -> str:
-    """Return the hardware decode mode safe for the embedded render path.
+def _vaapi_vendor() -> str | None:
+    """PCI vendor of the render node VA-API opens by default (mpv's
+    --vaapi-device), e.g. 0x8086 for Intel; None where it cannot be read."""
+    try:
+        return Path("/sys/class/drm/renderD128/device/vendor").read_text().strip().lower()
+    except OSError:
+        return None
 
-    Intel's zero-copy VA-API path can let Qt paint a surface while iHD is
-    retiring it during a live-stream transition.  The captured crash was
-    paintGL -> mpv_render_context_render -> vaSyncSurface -> iHD.  Copy-back
-    keeps hardware decode but gives the render API an ordinary software frame.
-    Other platforms retain mpv's safe automatic selection.
+
+def _render_hwdec_mode(no_hwdec: bool, platform: str | None = None, environ=None,
+                       vendor: str | None = "read") -> str:
+    """Return the hardware decode mode for the embedded render path.
+
+    Linux on an Intel GPU decodes zero-copy (VA-API surfaces rendered where
+    they are), falling back to copy-back. Zero-copy is safe there only
+    because the player never lets mpv redraw a frame across a stop
+    (MpvPlayerView._freeze_picture): without that, iHD crashed in paintGL ->
+    mpv_render_context_render -> vaSyncSurface on a retired surface. Copy-back
+    cost the Lunar Lake laptop 0.87 W (8-bit) and 1.20 W (10-bit) of
+    fullscreen playback power. Other Linux GPUs keep copy-back (their
+    zero-copy paths are untested), and other platforms mpv's safe automatic
+    selection.
+    RELAY_HWDEC names another mpv hwdec mode, for testing.
     """
     if no_hwdec:
         return "no"
+    override = (os.environ if environ is None else environ).get("RELAY_HWDEC", "").strip()
+    if override:
+        return override
     platform = platform or sys.platform
-    return "auto-copy-safe" if platform.startswith("linux") else "auto-safe"
+    if not platform.startswith("linux"):
+        return "auto-safe"
+    vendor = _vaapi_vendor() if vendor == "read" else vendor
+    return "vaapi,auto-copy-safe" if vendor == "0x8086" else "auto-copy-safe"
+
+
+_ANY_ENTRY = object()  # thaw on the next restart: a libmpv that does not report entry ids
+
+
+def _zero_copy(mode: str) -> bool:
+    """Whether an mpv hwdec mode (or the first of a list) hands the render API
+    the decoder's own surfaces rather than copies."""
+    first = mode.split(",")[0].strip()
+    return first not in ("", "no") and "copy" not in first
 
 
 def _mpv_config_dirs(environ=None, platform: str | None = None) -> list[Path]:
@@ -399,6 +430,7 @@ class MpvPlayerView(QOpenGLWidget):
     auto_hdr_refused = Signal(str)
     _frame_ready = Signal()  # mpv render thread -> queued repaint on GUI thread
     _playback_restarted = Signal(int)  # libmpv event thread -> GUI thread
+    _video_restarted = Signal(object)  # libmpv event thread -> GUI thread: every restart, its entry id
     _external_media_ready = Signal(int)  # attach worker -> GUI thread
     _idle_state_changed = Signal()  # native property observer -> GUI thread
     _pause_observed = Signal()  # native property observer -> GUI thread
@@ -434,6 +466,13 @@ class MpvPlayerView(QOpenGLWidget):
         self._scaling = False
         self._scaling_broken = False
         self._picture_fbo: QOpenGLFramebufferObject | None = None
+        # Zero-copy hardware decoding: the picture painted between a stop and
+        # the next stream's first frame, instead of mpv's (_freeze_picture).
+        self._freeze_on_stop = False
+        self._frozen = False
+        self._frozen_fbo: QOpenGLFramebufferObject | None = None
+        self._thaw_entry = None  # the playlist entry whose playback restart ends the freeze
+        self._started_entry = None  # libmpv event thread: the last start-file's entry
         self._picture_due = False
         self._settle_timer = QTimer(self)
         self._settle_timer.setSingleShot(True)
@@ -536,11 +575,11 @@ class MpvPlayerView(QOpenGLWidget):
             if pictures:
                 extra["screenshot_dir"] = pictures
             # Hardware decode for the HEVC tiers; FFV1 has no hw decoder and
-            # mpv falls back silently. Linux uses copy-back: an actual core
-            # captured Intel iHD crashing in vaSyncSurface from paintGL when a
-            # user's mpv.conf (read back then) forced zero-copy hwdec=vaapi.
-            # --no-hwdec disables.
+            # mpv falls back silently. Zero-copy on Intel under Linux, which
+            # needs _freeze_picture; copy-back on other Linux GPUs
+            # (_render_hwdec_mode). --no-hwdec disables.
             extra["hwdec"] = _render_hwdec_mode(self.options.no_hwdec)
+            self._freeze_on_stop = sys.platform.startswith("linux") and _zero_copy(extra["hwdec"])
             # OSC is OFF by default: it's a LuaJIT script that re-initializes
             # on every stream reload (seek), and that path intermittently
             # crashed mpv's event thread (native AV, exception 0xe24c4a02 =
@@ -647,12 +686,15 @@ class MpvPlayerView(QOpenGLWidget):
             self.mpv.observe_property(name, self._on_observed)
 
         self._playback_restarted.connect(self._on_playback_restarted)
+        self._video_restarted.connect(self._on_video_restarted)
         self._external_media_ready.connect(self._on_external_media_ready)
 
         @self.mpv.event_callback("playback-restart")
         def on_restart(_event):
             # libmpv invokes callbacks on its event thread. Hop back to Qt's
             # thread before changing properties or starting the attach worker.
+            # Events arrive in order: the last start-file is this file's.
+            self._video_restarted.emit(self._started_entry)
             if self._accept_playback_restart:
                 self._playback_restarted.emit(self._load_generation)
 
@@ -663,6 +705,7 @@ class MpvPlayerView(QOpenGLWidget):
             entry = event.data.playlist_entry_id
             if event.event_id.value == mpv.MpvEventID.START_FILE:
                 self._entry_generations[entry] = self._load_generation
+                self._started_entry = entry
                 return
             generation = self._entry_generations.pop(entry, -1)
             if self._reloading or generation != self._load_generation:
@@ -820,6 +863,7 @@ class MpvPlayerView(QOpenGLWidget):
         if self._ctx is not None and not self._on_presenter:
             self.makeCurrent()
             self._picture_fbo = None  # its GL objects go with this context
+            self._frozen_fbo = None
             self._ctx.free()
             self._ctx = None
             self.doneCurrent()
@@ -883,6 +927,9 @@ class MpvPlayerView(QOpenGLWidget):
         # QOpenGLWidget's backing FBO is in physical pixels (HiDPI-scaled).
         dpr = self.devicePixelRatioF()
         width, height = round(self.width() * dpr), round(self.height() * dpr)
+        if self._frozen:
+            self._paint_frozen(width, height)
+            return
         if self._scaling:
             try:
                 if self._paint_scaled(width, height):
@@ -947,6 +994,81 @@ class MpvPlayerView(QOpenGLWidget):
         gl.glBindFramebuffer(_GL_FRAMEBUFFER, target)
         return True
 
+    def _freeze_picture(self) -> None:
+        """Before mpv stops: keep the picture it shows now, and paint that
+        instead of mpv's until the next stream's playback restarts.
+
+        Zero-copy hardware decoding hands the render API the decoder's own
+        surfaces. mpv keeps its last frame across a stop, and a redraw of it
+        once the decoder is gone syncs a retired surface: Intel's iHD crashed
+        in paintGL -> mpv_render_context_render -> vaSyncSurface 5 minutes
+        into tools/hwdec_stress.py with RELAY_HWDEC=vaapi, during a seek's
+        reload (2026-11-03), the crash that made copy-back the default. A
+        copy-back frame is ordinary memory, so it needs none of this.
+        """
+        if not self._freeze_on_stop:
+            return
+        self._thaw_entry = None  # until the next file is loaded
+        if self._frozen:
+            return
+        self._frozen = True
+        if self._on_presenter:
+            return  # the HDR surface paints its own last picture meanwhile
+        if self._ctx is None or not self._presenting():
+            self._frozen_fbo = None  # nothing on screen to keep: black until the next frame
+            return
+        self.makeCurrent()
+        try:
+            if QOpenGLContext.currentContext() != self.context():
+                self._frozen_fbo = None
+                return
+            dpr = self.devicePixelRatioF()
+            width, height = round(self.width() * dpr), round(self.height() * dpr)
+            fbo = self._frozen_fbo
+            if fbo is None or fbo.width() != width or fbo.height() != height:
+                fbo = self._frozen_fbo = QOpenGLFramebufferObject(QSize(width, height))
+            self._ctx.render(flip_y=True, opengl_fbo={"fbo": fbo.handle(), "w": width, "h": height})
+        finally:
+            self.doneCurrent()
+
+    def _paint_frozen(self, width: int, height: int) -> None:
+        """The picture _freeze_picture kept, fitted to this size, or black."""
+        gl = QOpenGLContext.currentContext().extraFunctions()
+        target = self.defaultFramebufferObject()
+        gl.glBindFramebuffer(_GL_FRAMEBUFFER, target)
+        gl.glDisable(_GL_SCISSOR_TEST)
+        gl.glClearColor(0.0, 0.0, 0.0, 1.0)
+        gl.glClear(_GL_COLOR_BUFFER_BIT)
+        fbo = self._frozen_fbo
+        if fbo is None or width <= 0 or height <= 0:
+            return
+        x, y, w, h = _fit(width, height, fbo.width() / fbo.height())
+        gl.glBindFramebuffer(_GL_READ_FRAMEBUFFER, fbo.handle())
+        gl.glBindFramebuffer(_GL_DRAW_FRAMEBUFFER, target)
+        gl.glBlitFramebuffer(0, 0, fbo.width(), fbo.height(), round(x), round(y), round(x + w), round(y + h),
+                             _GL_COLOR_BUFFER_BIT, _GL_LINEAR)
+        gl.glBindFramebuffer(_GL_FRAMEBUFFER, target)
+
+    def _note_load(self, entry) -> None:
+        """A file was loaded during a freeze: its playback restart, and only
+        its, ends the freeze. An earlier file's restart can arrive after a
+        stop; thawing on it painted a stopped decoder's frame and crashed."""
+        if self._frozen:
+            self._thaw_entry = entry if entry is not None else _ANY_ENTRY
+
+    def _on_video_restarted(self, entry) -> None:
+        """The loaded file's first frame is queued (mpv shows it before it
+        reports the restart): mpv's own picture is safe to paint again."""
+        if not self._frozen or self._thaw_entry is None:
+            return
+        if self._thaw_entry is not _ANY_ENTRY and entry != self._thaw_entry:
+            return
+        self._frozen = False
+        self._picture_due = True
+        if self._on_presenter and self._presenter is not None:
+            self._presenter.picture_due()
+        self.update()
+
     def _presenting(self) -> bool:
         window = self.window().windowHandle()
         return self.isVisible() and window is not None and window.isExposed()
@@ -969,6 +1091,8 @@ class MpvPlayerView(QOpenGLWidget):
         # those frames through libmpv's render API instead of letting its VO
         # time out and count intentional non-presentation as dropped frames.
         # Even skip_rendering requires the owning OpenGL context to be current.
+        if self._frozen:
+            return  # mpv's frame may be a stopped decoder's (_freeze_picture)
         self.makeCurrent()
         try:
             if QOpenGLContext.currentContext() == self.context() and self._ctx.update():
@@ -1195,6 +1319,7 @@ class MpvPlayerView(QOpenGLWidget):
         self.makeCurrent()
         try:
             self._picture_fbo = None
+            self._frozen_fbo = None
             self._ctx.free()
             self._ctx = None
         finally:
@@ -1422,11 +1547,12 @@ class MpvPlayerView(QOpenGLWidget):
             # libavformat. Scope this compatibility override to relay epochs.
             load_options += ",demuxer=lavf,demuxer-lavf-format=matroska"
         if self.mpv.mpv_version_tuple >= (0, 38, 0):
-            self.mpv.command(
+            loaded = self.mpv.command(
                 "loadfile", self._buffer.uri, "replace", -1, load_options)
         else:
-            self.mpv.command(
+            loaded = self.mpv.command(
                 "loadfile", self._buffer.uri, "replace", load_options)
+        self._note_load(loaded.get("playlist_entry_id") if isinstance(loaded, dict) else None)
         self._reloading = False
 
     def set_subtitle_fonts_dir(self, path: Path | None) -> None:
@@ -1444,6 +1570,7 @@ class MpvPlayerView(QOpenGLWidget):
         self._buffer = None
         if old is not None:
             old.abort()
+        self._freeze_picture()
         try:
             self.mpv.command("stop")
         except Exception:
@@ -1548,6 +1675,7 @@ class MpvPlayerView(QOpenGLWidget):
         if self._buffer is not None:
             self._buffer.close()
             self._buffer = None
+        self._freeze_picture()
         try:
             self.mpv.command("stop")
         except Exception:
@@ -1751,6 +1879,8 @@ class MpvPlayerView(QOpenGLWidget):
                 kind = event.event_id.value
                 if kind == mpv.MpvEventID.START_FILE:
                     entry_id = event.data.playlist_entry_id
+                    if generation == self._load_generation:
+                        self._note_load(entry_id)
                     return
                 if entry_id is None:
                     return

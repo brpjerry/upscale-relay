@@ -692,6 +692,16 @@ class HdrPresenter(QOpenGLWindow):
         aspect = view._picture_aspect()
         scaling = view._scaling and aspect is not None
         fbo = self._fbo
+        if getattr(view, "_frozen", False):
+            # mpv's frame may be a stopped decoder's (MpvPlayerView.
+            # _freeze_picture): show the last picture rendered here instead.
+            if fbo is not None:
+                x, y, w, h = _fit(width, height, fbo.width() / fbo.height())
+                gl.glBindFramebuffer(_GL_READ_FRAMEBUFFER, fbo.handle())
+                gl.glBindFramebuffer(_GL_DRAW_FRAMEBUFFER, target)
+                gl.glBlitFramebuffer(0, 0, fbo.width(), fbo.height(), round(x0 + x), round(y0 + y),
+                                     round(x0 + x + w), round(y0 + y + h), _GL_COLOR_BUFFER_BIT, _GL_LINEAR)
+            return
         new_frame = self.ctx.update()
         render = fbo is None or new_frame or self._picture_due
         if scaling:
