@@ -20,6 +20,7 @@ from relay_media.hdr import (
     dynamic_hdr_nals,
     escape_rbsp,
     extract_dynamic_hdr,
+    has_hdr10plus,
     hevc_nal_length_size,
     inject_hevc_metadata,
     iter_nals,
@@ -138,6 +139,18 @@ def test_dynamic_metadata_is_read_from_source_access_units(framing):
     # Without a Dolby Vision profile 8 source, its RPU stays behind.
     assert extract_dynamic_hdr(packet, length_size, dovi_rpu=False) == DynamicHdr((HDR10PLUS,), None)
     assert extract_dynamic_hdr(_annexb(IDR + b"\xaf"), None, dovi_rpu=True) is None
+
+
+def test_an_uplink_reports_hdr10plus_from_its_first_keyframe():
+    """open_session.video.hdr10plus (PROTOCOL §3.6): mapped sessions decode
+    differently, so the server must know at open."""
+    hvcc = bytes(21) + bytes([3]) + bytes(10)  # length-prefixed, as demuxed from MKV/MP4
+    slice_ = IDR + bytes([0xAF])
+    keyframe = (VPS + bytes([0x0C]), SPS + bytes([1]), PPS + bytes([0xC1]), sei_nal(4, HDR10PLUS), slice_)
+    assert has_hdr10plus(_length_prefixed(*keyframe), "hevc", hvcc)
+    assert has_hdr10plus(_annexb(*keyframe), "hevc", None)
+    assert not has_hdr10plus(_length_prefixed(slice_, RPU), "hevc", hvcc)  # Dolby Vision alone
+    assert not has_hdr10plus(_annexb(*keyframe), "h264") and not has_hdr10plus(b"", "hevc")
 
 
 def test_metadata_is_placed_around_the_slices_of_an_access_unit():

@@ -441,6 +441,17 @@ def extract_dynamic_hdr(
     return DynamicHdr(tuple(hdr10plus), rpu)
 
 
+def has_hdr10plus(packet: bytes, codec: str, extradata: bytes | None = None) -> bool:
+    """Whether a video packet carries an HDR10+ (ST 2094-40) message: what an
+    uplink reports as ``open_session.video.hdr10plus`` from its first
+    keyframe (PROTOCOL §3.6). HEVC only; ``extradata`` selects the NAL
+    framing (hvcC: length-prefixed, else Annex B)."""
+    if codec != "hevc" or not packet:
+        return False
+    meta = extract_dynamic_hdr(bytes(packet), hevc_nal_length_size(extradata), dovi_rpu=False)
+    return meta is not None and bool(meta.hdr10plus)
+
+
 def inject_hevc_metadata(
     packet: bytes, *, prefix: list[bytes] = (), suffix: list[bytes] = (),
 ) -> bytes | None:

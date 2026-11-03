@@ -119,7 +119,7 @@ required.
 | type | fields | notes |
 |---|---|---|
 | `hello` | `protocol_version:int`, `client_name:str`, `display:{w:int,h:int}` | first message; server replies `capabilities` |
-| `open_session` | `source:"uplink" \| {type:"server_file",path:str}` plus `file:{name:str, duration_s:float?, chapters:[{start_s:float, end_s:float?, title:str?}]?}`, `video:{codec:str, extradata_b64:str?, width:int, height:int, time_base:[num,den], avg_rate:[num,den]?, sample_aspect_ratio:[num,den]?, color:{primaries:int, transfer:int, matrix:int, range:"limited"\|"full"?}?, bit_depth:int?, hdr:{...}?, dolby_vision:{...}?}`, `model:str`, `quality_tier:str`, `display:{w:int,h:int}`, `fit_mode:str?`, `resize_algorithm:str?`, `aux_tracks:"external"\|"muxed"?`, `aux_attachments:"embedded"\|"cached"?`, `high_bit_depth:"hdr"\|"all"?`, `display_target:{transfer:"pq"\|"sdr", peak_nits:float?, sdr_white_nits:float?}?` | `source` defaults to `"uplink"`; `video` is omitted for `server_file`; omitting `resize_algorithm` selects the server default. `file.chapters` carries the source container's chapter marks for uplink sessions (only the client can read them). `video.sample_aspect_ratio` is the source's pixel width over height, including any container override (e.g. Matroska display dimensions); send it for anamorphic sources. Absent, zero, non-integer or implausible (outside 1/10..10) values mean square pixels, as before this field existed. The server fits and crops by the displayed shape and delivers square pixels: a 720x576 16:15 source on a 1920x1080 display gives `downlink_width/height` 1440x1080. For `server_file` the server reads it from the file itself. When an uplink omits it, the server reads the aspect from the parameter sets in `extradata_b64` where it can (H.264 SPS VUI, HEVC), so a client need only send what its container declares; an explicit value always wins. Additive: no protocol version change. `aux_tracks` defaults to `"external"`; request `"muxed"` only for `server_file` after `capabilities.muxed_aux_tracks == true`. `aux_attachments` defaults to `"embedded"`; request `"cached"` only together with muxed tracks after `attachment_cache >= 1`. The server may still confirm a fallback mode. `high_bit_depth` (after `capabilities.high_bit_depth`) and the `video.color` / `bit_depth` / `hdr` / `dolby_vision` fields are §3.5's; `display_target` (after `capabilities.display_mapping`) is §3.6's; all additive |
+| `open_session` | `source:"uplink" \| {type:"server_file",path:str}` plus `file:{name:str, duration_s:float?, chapters:[{start_s:float, end_s:float?, title:str?}]?}`, `video:{codec:str, extradata_b64:str?, width:int, height:int, time_base:[num,den], avg_rate:[num,den]?, sample_aspect_ratio:[num,den]?, color:{primaries:int, transfer:int, matrix:int, range:"limited"\|"full"?}?, bit_depth:int?, hdr:{...}?, dolby_vision:{...}?, hdr10plus:bool?}`, `model:str`, `quality_tier:str`, `display:{w:int,h:int}`, `fit_mode:str?`, `resize_algorithm:str?`, `aux_tracks:"external"\|"muxed"?`, `aux_attachments:"embedded"\|"cached"?`, `high_bit_depth:"hdr"\|"all"?`, `display_target:{transfer:"pq"\|"sdr", peak_nits:float?, sdr_white_nits:float?}?` | `source` defaults to `"uplink"`; `video` is omitted for `server_file`; omitting `resize_algorithm` selects the server default. `file.chapters` carries the source container's chapter marks for uplink sessions (only the client can read them). `video.sample_aspect_ratio` is the source's pixel width over height, including any container override (e.g. Matroska display dimensions); send it for anamorphic sources. Absent, zero, non-integer or implausible (outside 1/10..10) values mean square pixels, as before this field existed. The server fits and crops by the displayed shape and delivers square pixels: a 720x576 16:15 source on a 1920x1080 display gives `downlink_width/height` 1440x1080. For `server_file` the server reads it from the file itself. When an uplink omits it, the server reads the aspect from the parameter sets in `extradata_b64` where it can (H.264 SPS VUI, HEVC), so a client need only send what its container declares; an explicit value always wins. Additive: no protocol version change. `aux_tracks` defaults to `"external"`; request `"muxed"` only for `server_file` after `capabilities.muxed_aux_tracks == true`. `aux_attachments` defaults to `"embedded"`; request `"cached"` only together with muxed tracks after `attachment_cache >= 1`. The server may still confirm a fallback mode. `high_bit_depth` (after `capabilities.high_bit_depth`) and the `video.color` / `bit_depth` / `hdr` / `dolby_vision` fields are §3.5's; `display_target` (after `capabilities.display_mapping`) and `video.hdr10plus` are §3.6's; all additive |
 | `play` | | |
 | `pause` | | |
 | `seek` | `target_pts:int`, `epoch:int`, `display_target:{...}?` | epoch = client's current epoch + 1; see §4. `display_target` (§3.6) applies from this epoch on; absent keeps the current one |
@@ -412,6 +412,18 @@ Every other source (HDR10, HLG, SDR) streams as §3.5 says, whatever the
 target: the client's renderer handles static metadata itself. A request
 without `display_target`, or to a server without the capability, is §3.5's.
 
+The server decides at `open_session` whether a session is mapped: a mapped
+session decodes through a different stage. Dolby Vision is known from
+`video.dolby_vision`. HDR10+ messages ride in the frames, so an uplink says
+whether its first keyframe carries one in `video.hdr10plus`
+(`relay_media.hdr.has_hdr10plus` reads it from the packet). An uplink
+that omits it is mapped for Dolby Vision only; its HDR10+ streams as §3.5
+says. For `server_file` the server reads both itself.
+
+A server advertises `display_mapping` only when it can map: it needs a
+tone mapper that applies Dolby Vision RPUs and HDR10+, and checks for it at
+start-up.
+
 `session_opened.downlink_mapping` is null when the stream is not mapped, and
 otherwise says what was applied:
 
@@ -429,7 +441,9 @@ about to show the video fullscreen where the compositor switches to HDR.
 Its `seek_ready` repeats `downlink_color` and `downlink_mapping` for the new
 epoch, which is a fresh Matroska file (§4) and may change between PQ and SDR.
 A `seek` without `display_target`, or one to the same target, keeps the
-mapping. `seek_ready` carries the two fields only on a mapped session.
+mapping. `seek_ready` carries the two fields only on a mapped session. The
+first frame of a mapped epoch comes ~0.5 s later than an unmapped seek's:
+the mapping stage starts again with each epoch.
 
 ## 4. Seek protocol (epochs)
 
