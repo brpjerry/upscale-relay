@@ -119,10 +119,10 @@ required.
 | type | fields | notes |
 |---|---|---|
 | `hello` | `protocol_version:int`, `client_name:str`, `display:{w:int,h:int}` | first message; server replies `capabilities` |
-| `open_session` | `source:"uplink" \| {type:"server_file",path:str}` plus `file:{name:str, duration_s:float?, chapters:[{start_s:float, end_s:float?, title:str?}]?}`, `video:{codec:str, extradata_b64:str?, width:int, height:int, time_base:[num,den], avg_rate:[num,den]?, sample_aspect_ratio:[num,den]?, color:{primaries:int, transfer:int, matrix:int, range:"limited"\|"full"?}?, bit_depth:int?, hdr:{...}?, dolby_vision:{...}?}`, `model:str`, `quality_tier:str`, `display:{w:int,h:int}`, `fit_mode:str?`, `resize_algorithm:str?`, `aux_tracks:"external"\|"muxed"?`, `aux_attachments:"embedded"\|"cached"?`, `high_bit_depth:"hdr"\|"all"?` | `source` defaults to `"uplink"`; `video` is omitted for `server_file`; omitting `resize_algorithm` selects the server default. `file.chapters` carries the source container's chapter marks for uplink sessions (only the client can read them). `video.sample_aspect_ratio` is the source's pixel width over height, including any container override (e.g. Matroska display dimensions); send it for anamorphic sources. Absent, zero, non-integer or implausible (outside 1/10..10) values mean square pixels, as before this field existed. The server fits and crops by the displayed shape and delivers square pixels: a 720x576 16:15 source on a 1920x1080 display gives `downlink_width/height` 1440x1080. For `server_file` the server reads it from the file itself. When an uplink omits it, the server reads the aspect from the parameter sets in `extradata_b64` where it can (H.264 SPS VUI, HEVC), so a client need only send what its container declares; an explicit value always wins. Additive: no protocol version change. `aux_tracks` defaults to `"external"`; request `"muxed"` only for `server_file` after `capabilities.muxed_aux_tracks == true`. `aux_attachments` defaults to `"embedded"`; request `"cached"` only together with muxed tracks after `attachment_cache >= 1`. The server may still confirm a fallback mode. `high_bit_depth` (after `capabilities.high_bit_depth`) and the `video.color` / `bit_depth` / `hdr` / `dolby_vision` fields are §3.5's; all additive |
+| `open_session` | `source:"uplink" \| {type:"server_file",path:str}` plus `file:{name:str, duration_s:float?, chapters:[{start_s:float, end_s:float?, title:str?}]?}`, `video:{codec:str, extradata_b64:str?, width:int, height:int, time_base:[num,den], avg_rate:[num,den]?, sample_aspect_ratio:[num,den]?, color:{primaries:int, transfer:int, matrix:int, range:"limited"\|"full"?}?, bit_depth:int?, hdr:{...}?, dolby_vision:{...}?}`, `model:str`, `quality_tier:str`, `display:{w:int,h:int}`, `fit_mode:str?`, `resize_algorithm:str?`, `aux_tracks:"external"\|"muxed"?`, `aux_attachments:"embedded"\|"cached"?`, `high_bit_depth:"hdr"\|"all"?`, `display_target:{transfer:"pq"\|"sdr", peak_nits:float?, sdr_white_nits:float?}?` | `source` defaults to `"uplink"`; `video` is omitted for `server_file`; omitting `resize_algorithm` selects the server default. `file.chapters` carries the source container's chapter marks for uplink sessions (only the client can read them). `video.sample_aspect_ratio` is the source's pixel width over height, including any container override (e.g. Matroska display dimensions); send it for anamorphic sources. Absent, zero, non-integer or implausible (outside 1/10..10) values mean square pixels, as before this field existed. The server fits and crops by the displayed shape and delivers square pixels: a 720x576 16:15 source on a 1920x1080 display gives `downlink_width/height` 1440x1080. For `server_file` the server reads it from the file itself. When an uplink omits it, the server reads the aspect from the parameter sets in `extradata_b64` where it can (H.264 SPS VUI, HEVC), so a client need only send what its container declares; an explicit value always wins. Additive: no protocol version change. `aux_tracks` defaults to `"external"`; request `"muxed"` only for `server_file` after `capabilities.muxed_aux_tracks == true`. `aux_attachments` defaults to `"embedded"`; request `"cached"` only together with muxed tracks after `attachment_cache >= 1`. The server may still confirm a fallback mode. `high_bit_depth` (after `capabilities.high_bit_depth`) and the `video.color` / `bit_depth` / `hdr` / `dolby_vision` fields are §3.5's; `display_target` (after `capabilities.display_mapping`) is §3.6's; all additive |
 | `play` | | |
 | `pause` | | |
-| `seek` | `target_pts:int`, `epoch:int` | epoch = client's current epoch + 1; see §4 |
+| `seek` | `target_pts:int`, `epoch:int`, `display_target:{...}?` | epoch = client's current epoch + 1; see §4. `display_target` (§3.6) applies from this epoch on; absent keeps the current one |
 | `buffer_report` | `buffered_ms:int`, `playing_pts:int?` | send ~every 500 ms while media attached |
 | `teardown` | | graceful close; `closed` is sent only after pipeline workers and native encoder/mux/inference owners have released their resources |
 
@@ -130,11 +130,11 @@ required.
 
 | type | fields | notes |
 |---|---|---|
-| `capabilities` | `protocol_version:int`, `server_name:str`, `models:[{name, scale_factor}]`, `quality_tiers:[str]`, `quality_options:[{id,label,codec,lossless,android_supported,p95_mbps}]`, `resize_algorithms:[str]`, `default_resize_algorithm:str`, `library:bool`, `library_sort:[str]`, `muxed_aux_tracks:bool`, `attachment_cache:int`, `high_bit_depth:bool?`, `server_id:str?` | `quality_tiers` remains the authoritative ID list; `quality_options` supplies presentation metadata. `library` means the library HTTP API is available. `muxed_aux_tracks` permits the opt-in mode. `attachment_cache >= 1` permits authenticated content-addressed attachment manifests; absent/zero means embedded attachments only. `high_bit_depth` permits `open_session.high_bit_depth` (§3.5). `server_id` is an opaque, non-secret identity for this server install, for keying per-server client state (history, watched flags, recents): 1-64 characters from `[A-Za-z0-9_-]`, stable across restarts, settings changes, address or port changes and upgrades. Clients must treat a missing value, or one outside that format, as absent and fall back to their own host:port. The server generates it once and keeps it in a `server-id` file in its per-user state directory (beside the instance lock; `UPSCALE_RELAY_LOCK_DIR` overrides it); deleting the file makes a new id, and a copied state directory shares its id. Additive: no protocol version change |
-| `session_opened` | `session_id:str`, `media_port:int`, `uplink_token:str?`, `downlink_token:str`, `epoch:int(=0)`, `source:str`, `time_base:[num,den]`, `duration_s:float?`, `avg_rate:[num,den]?`, `chapters:[...]?`, `downlink_container:"matroska"`, `downlink_codec:str`, `downlink_extradata_b64:str?`, `downlink_width:int`, `downlink_height:int`, `fit_mode:str`, `resize_algorithm:str`, `aux_tracks:"external"\|"muxed"`, `aux_attachments:"embedded"\|"cached"`, `attachment_manifest:[{name,mimetype,size,sha256}]?`, `attachment_token:str?`, `source_has_audio:bool?`, `source_has_auxiliary:bool?`, `downlink_bit_depth:int?`, `downlink_color:{primaries,transfer,matrix,range}?`, `downlink_dolby_vision:bool?`, `source_bit_depth:int?` | Effective choices are authoritative. The `downlink_*` colour fields and `source_bit_depth` are §3.5's; absent means an 8-bit downlink from a server that predates them. A client omits its external original-media source after muxed confirmation or confirmed absence of source audio/subtitle tracks. `cached` means attachment bodies are omitted from every epoch and both manifest and token are required; `embedded` means any accepted attachments remain in each Matroska header. Absent auxiliary mode fields mean `external` and `embedded` |
+| `capabilities` | `protocol_version:int`, `server_name:str`, `models:[{name, scale_factor}]`, `quality_tiers:[str]`, `quality_options:[{id,label,codec,lossless,android_supported,p95_mbps}]`, `resize_algorithms:[str]`, `default_resize_algorithm:str`, `library:bool`, `library_sort:[str]`, `muxed_aux_tracks:bool`, `attachment_cache:int`, `high_bit_depth:bool?`, `display_mapping:bool?`, `server_id:str?` | `quality_tiers` remains the authoritative ID list; `quality_options` supplies presentation metadata. `library` means the library HTTP API is available. `muxed_aux_tracks` permits the opt-in mode. `attachment_cache >= 1` permits authenticated content-addressed attachment manifests; absent/zero means embedded attachments only. `high_bit_depth` permits `open_session.high_bit_depth` (§3.5). `display_mapping` permits `display_target` (§3.6). `server_id` is an opaque, non-secret identity for this server install, for keying per-server client state (history, watched flags, recents): 1-64 characters from `[A-Za-z0-9_-]`, stable across restarts, settings changes, address or port changes and upgrades. Clients must treat a missing value, or one outside that format, as absent and fall back to their own host:port. The server generates it once and keeps it in a `server-id` file in its per-user state directory (beside the instance lock; `UPSCALE_RELAY_LOCK_DIR` overrides it); deleting the file makes a new id, and a copied state directory shares its id. Additive: no protocol version change |
+| `session_opened` | `session_id:str`, `media_port:int`, `uplink_token:str?`, `downlink_token:str`, `epoch:int(=0)`, `source:str`, `time_base:[num,den]`, `duration_s:float?`, `avg_rate:[num,den]?`, `chapters:[...]?`, `downlink_container:"matroska"`, `downlink_codec:str`, `downlink_extradata_b64:str?`, `downlink_width:int`, `downlink_height:int`, `fit_mode:str`, `resize_algorithm:str`, `aux_tracks:"external"\|"muxed"`, `aux_attachments:"embedded"\|"cached"`, `attachment_manifest:[{name,mimetype,size,sha256}]?`, `attachment_token:str?`, `source_has_audio:bool?`, `source_has_auxiliary:bool?`, `downlink_bit_depth:int?`, `downlink_color:{primaries,transfer,matrix,range}?`, `downlink_dolby_vision:bool?`, `source_bit_depth:int?`, `downlink_mapping:{...}?` | Effective choices are authoritative. The `downlink_*` colour fields and `source_bit_depth` are §3.5's, `downlink_mapping` §3.6's; absent means an 8-bit downlink from a server that predates them. A client omits its external original-media source after muxed confirmation or confirmed absence of source audio/subtitle tracks. `cached` means attachment bodies are omitted from every epoch and both manifest and token are required; `embedded` means any accepted attachments remain in each Matroska header. Absent auxiliary mode fields mean `external` and `embedded` |
 | `state` | `state:"open"\|"playing"\|"paused"\|"closed"` | emitted on every transition |
 | `session_progress` | `stage:str`, `message:str`, `elapsed_s:float` | ticked ~every 2 s while a slow `open_session` is being processed (today: `stage:"pipeline_init"`, e.g. a first-use TensorRT engine build, which can run for minutes). Clients must treat it as a keepalive for the pending open — refresh the open_session timeout on every tick — and should surface `message` as a loading indicator. Quick opens send none |
-| `seek_ready` | `epoch:int` | server has flushed; an uplink client may start sending the new epoch. A server-file source is restarted by the server. **Not a readiness signal for media** — it is dispatched within milliseconds, before any frame of the new epoch exists (§4) |
+| `seek_ready` | `epoch:int`, `downlink_color:{...}?`, `downlink_mapping:{...}?` | server has flushed; an uplink client may start sending the new epoch. A server-file source is restarted by the server. **Not a readiness signal for media** — it is dispatched within milliseconds, before any frame of the new epoch exists (§4) |
 | `seek_progress` | `epoch:int`, `target_pts:int`, `keyframe_pts:int?`, `frames_discarded:int`, `elapsed_s:float` | ticked ~every 500 ms while a seek has produced no downlink bytes yet, starting ~750 ms after the `seek`. Purely informational: the client renders it as seek progress so a long discard window (§4 step 4) is distinguishable from a wedged pipeline. `keyframe_pts` is null until the server's demuxer reports where the seek landed. A seek that produces media promptly sends none, and the server stops ticking after 60 s without downlink bytes or advancing subtitle-index progress. Additive and safe to ignore — clients that do not know the type must skip it, so it carries no protocol-version change |
 | `stats` | `pipeline_fps:float`, `queue_depths:{...}`, `buffered_ahead_ms:int` | periodic, informational |
 | `error` | `code:str`, `message:str`, `fatal:bool` | non-fatal errors leave the session usable |
@@ -377,6 +377,59 @@ and `source_bit_depth`. `GET /status` `sessions[].pipeline` adds `bit_depth`,
 `color`, and `hdr_metadata` (null for SDR): the static metadata written and the
 counts of frames given an RPU or HDR10+. These `/status` fields are
 diagnostics, not part of the §1.1 contract.
+
+### 3.6 Display-mapped HDR (dynamic metadata)
+
+Dolby Vision and HDR10+ describe each scene for the display that shows it.
+Clients whose renderer uses static HDR10 metadata only (the desktop player:
+libmpv's render API runs mpv's `gpu` renderer) cannot apply them, so a server
+advertising `capabilities.display_mapping: true` applies them for the
+client's display instead, and sends a stream already fitted to it.
+
+The client describes the display it presents on in `open_session` (with
+`high_bit_depth`), and again in any `seek` after it changes:
+
+```
+display_target: {transfer: "pq" | "sdr", peak_nits: float?, sdr_white_nits: float?}
+```
+
+- `"pq"`: the client shows PQ, BT.2020, as HDR, up to `peak_nits` (the
+  display's peak), with SDR white at `sdr_white_nits` (203 when absent).
+- `"sdr"`: the client shows SDR. `sdr_white_nits` is the display's white
+  level, when known.
+
+The server maps a source that carries dynamic metadata a client cannot use:
+a Dolby Vision RPU (profiles 5, 7 and 8; profile 7's enhancement layer stays
+dropped) or HDR10+ messages. It applies them as Dolby Vision or HDR10+ would
+for the target and encodes the result:
+
+| `transfer` | downlink |
+|---|---|
+| `"pq"` | 10-bit PQ, BT.2020. Nothing exceeds `peak_nits`: brighter content is tone-mapped using the dynamic metadata, the rest passes through. Its static metadata says so: mastering display max luminance and MaxCLL at most `peak_nits`. No RPU or HDR10+ messages (they are applied) |
+| `"sdr"` | SDR, BT.709 primaries and transfer, tone-mapped using the dynamic metadata; 10-bit under `high_bit_depth` |
+
+Every other source (HDR10, HLG, SDR) streams as §3.5 says, whatever the
+target: the client's renderer handles static metadata itself. A request
+without `display_target`, or to a server without the capability, is §3.5's.
+
+`session_opened.downlink_mapping` is null when the stream is not mapped, and
+otherwise says what was applied:
+
+```
+downlink_mapping: {transfer: "pq" | "sdr", peak_nits: float?, sdr_white_nits: float?,
+                   applied: ["dolby_vision" | "hdr10plus", ...]}
+```
+
+`downlink_color` describes the mapped stream (BT.709 for `"sdr"`), so a client
+that knows nothing of §3.6 still tags and plays it correctly.
+
+A `seek` with a different `display_target` remaps from that epoch on: the
+client changed screens, its display switched between SDR and HDR, or it is
+about to show the video fullscreen where the compositor switches to HDR.
+Its `seek_ready` repeats `downlink_color` and `downlink_mapping` for the new
+epoch, which is a fresh Matroska file (§4) and may change between PQ and SDR.
+A `seek` without `display_target`, or one to the same target, keeps the
+mapping. `seek_ready` carries the two fields only on a mapped session.
 
 ## 4. Seek protocol (epochs)
 
