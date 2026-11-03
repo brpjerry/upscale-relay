@@ -641,6 +641,33 @@ def test_ffmpeg_finishing_does_not_count_a_slow_consumer(tmp_path, real_mapper, 
     assert errors == [] and sorted(frames) == sorted(info.pts for info in packets)
 
 
+def test_ffmpeg_finishing_does_not_count_a_slow_consumer_of_the_last_items(
+    tmp_path, real_mapper, monkeypatch,
+):
+    # What is still held after the last frame goes on at the end of the
+    # stream, where a client paused in the last seconds holds it up too.
+    monkeypatch.setattr(display_mapping, "_FINISH_IDLE_S", 0.5)
+    monkeypatch.setattr(display_mapping.MapperProcess, "_idle", lambda self: not self.killed)
+    track, process = _real_process(real_mapper, _dynamic_source(tmp_path, frames=4))
+    items, errors = [], []
+
+    def slow(item):
+        time.sleep(1.5)
+        items.append(item)
+
+    try:
+        process.start(lambda frame: None, slow, errors.append)
+        for info in track.packets():
+            process.send(info.payload, info.pts, info.keyframe)
+        process._sent_pts = 1 << 40  # held for a frame that never comes (one ffmpeg dropped)
+        process.hold("tail")
+        process.finish()
+    finally:
+        process.close()
+        track.close()
+    assert errors == [] and items == ["tail"]
+
+
 def test_ffmpeg_idle_releases_what_it_holds(tmp_path, real_mapper, monkeypatch):
     # Audio after a source's last video packet: no frame comes out for it,
     # and holding it all to the end of the stream grew without bound.

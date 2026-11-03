@@ -26,6 +26,7 @@ profile 5), at its own brightness. SDR targets get the full mapping.
 from __future__ import annotations
 
 import collections
+import contextlib
 import logging
 import math
 import os
@@ -574,18 +575,15 @@ class MapperProcess:
                     # A packet without a PTS took its decode-clock tick.
                     frame.pts = pts if pts > -_DTS_LEAD // 2 else None
                 frame.time_base = self._time_base
-                self._delivering = True
-                try:
+                with self._handing_on():
                     self._on_frame(frame)
                     self.frames_out += 1
                     if frame.pts is not None:
                         self._release_through(frame.pts)
-                finally:
-                    self._progress_at = time.monotonic()
-                    self._delivering = False
             if not self._finishing and not self._killed.is_set():
                 raise self._failure("ffmpeg stopped mid-stream")
-            self._release_through(None)
+            with self._handing_on():
+                self._release_through(None)
         except Exception as error:
             if not self._killed.is_set() and self.claim_failure():
                 self._on_error(str(error) if isinstance(error, MapperError)
@@ -607,13 +605,24 @@ class MapperProcess:
         on. False once killed, which ends the stream."""
         if self._killed.is_set():
             return False
-        if time.monotonic() - self._written_at >= _IDLE_S:
-            self._delivering = True
-            try:
+        # Only with something to release: an idle check is no progress, and
+        # counting it would hide an ffmpeg that hangs in finish().
+        if self._held and time.monotonic() - self._written_at >= _IDLE_S:
+            with self._handing_on():
                 self._release_through(None)
-            finally:
-                self._delivering = False
         return True
+
+    @contextlib.contextmanager
+    def _handing_on(self):
+        """Around every hand-off downstream (reader thread). A paused client
+        can hold it up as long as it likes: finish() does not count that
+        time as ffmpeg's, and the hand-off itself is progress."""
+        self._delivering = True
+        try:
+            yield
+        finally:
+            self._progress_at = time.monotonic()
+            self._delivering = False
 
     def _release_through(self, pts: int | None) -> None:
         """Deliver held items whose frames are out (None: all of them);
