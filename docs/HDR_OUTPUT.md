@@ -207,7 +207,7 @@ for that long. On leaving, the display query (`hdr_output.query`) waits out
 the switch back, so the leave slides hold still meanwhile; on entering the
 wait falls in the surface's first frames. Hyprland presents nothing during
 the switch either, so little of it shows. A preset query that gets no answer
-reads as SDR. Moving the queries off the GUI thread is an open item.
+keeps that monitor's last answer (SDR if it has none). Moving the queries off the GUI thread is an open item.
 
 Verified on the laptop (2026-11-02, the user, Hyprland 0.56.2, the panel in
 SDR mode): a 10000-nit card relayed from the library through the dev server

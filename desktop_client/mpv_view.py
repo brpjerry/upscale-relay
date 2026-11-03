@@ -1060,8 +1060,8 @@ class MpvPlayerView(QOpenGLWidget):
                 return True, display
             screen = window.screen() if window is not None else None
             mine = hdr_output.configured_hdr(screen.name() if screen is not None else None)
-            # Unknown counts as the switch's: Hyprland answers nothing for
-            # ~1.1 s while it switches the screen back (laptop, 2026-11-02).
+            # Unknown (never read, and no answer: Hyprland answers nothing for
+            # ~1.1 s while it switches the screen back) counts as the switch's.
             return mine is True, display
         if fullscreen and auto and display.source not in self._auto_hdr_refused:
             return True, hdr_output.expected_hdr(display)

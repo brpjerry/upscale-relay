@@ -394,7 +394,7 @@ def test_fullscreen_hdr_moves_waits_for_the_switch_adopts_its_peak_and_leaves(mo
 
 @pytest.mark.parametrize(("preset", "expected"), [
     (True, True), (False, False),
-    (None, False),  # no answer: Hyprland is busy switching the screen back
+    (None, False),  # never read, and no answer: Hyprland is busy switching the screen back
 ])
 def test_hdr_the_monitor_is_set_to_stays_on_the_surface_out_of_fullscreen(monkeypatch, preset, expected):
     """cm = "hdr" is the user's own HDR mode; HDR under an SDR preset is the
@@ -440,14 +440,20 @@ def test_back_on_the_widget_the_surface_drops_its_description_before_hiding():
 
 def test_hyprland_says_which_monitors_are_set_to_hdr(monkeypatch):
     monkeypatch.setenv("HYPRLAND_INSTANCE_SIGNATURE", "abc")
+    monkeypatch.setattr(hdr_output, "_configured_hdr", {})
     monitors = [{"name": "eDP-1", "colorManagementPreset": "srgb"},
                 {"name": "DP-1", "colorManagementPreset": "hdr"}, {"name": "DP-2"}]
-    monkeypatch.setattr(hdr_output, "_hyprland_request", lambda signature, command: monitors)
+    answer = [monitors]
+    monkeypatch.setattr(hdr_output, "_hyprland_request", lambda signature, command: answer[0])
     assert hdr_output.configured_hdr("DP-1") is True
     assert hdr_output.configured_hdr("eDP-1") is False
-    assert hdr_output.configured_hdr("DP-2") is None and hdr_output.configured_hdr("HDMI-A-1") is None
-    monkeypatch.setattr(hdr_output, "_hyprland_request", lambda signature, command: None)
-    assert hdr_output.configured_hdr("DP-1") is None
+    assert hdr_output.configured_hdr("DP-2") is True  # no such field: the user's own HDR, as before
+    assert hdr_output.configured_hdr("HDMI-A-1") is None  # no such monitor
+    answer[0] = None  # Hyprland's stall while it switches a mode: the last answer stands
+    assert hdr_output.configured_hdr("DP-1") is True and hdr_output.configured_hdr("eDP-1") is False
+    assert hdr_output.configured_hdr("HDMI-A-1") is None  # never read
+    monkeypatch.setenv("HYPRLAND_INSTANCE_SIGNATURE", "other")
+    assert hdr_output.configured_hdr("DP-1") is None  # another Hyprland instance
     monkeypatch.delenv("HYPRLAND_INSTANCE_SIGNATURE")
     assert hdr_output.configured_hdr("DP-1") is None
 

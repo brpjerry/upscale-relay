@@ -127,18 +127,30 @@ def configured_hdr(screen_name: str | None) -> bool | None:
     """Whether the compositor's own setting puts this screen in HDR mode
     (Hyprland's ``cm = "hdr"``/``"hdredid"``). Its switch for a fullscreen
     HDR surface leaves that setting as it is, so a screen that reads HDR
-    with this False is in HDR only for the fullscreen window. None: unknown."""
+    with this False is in HDR only for the fullscreen window.
+
+    Hyprland answers nothing for ~1.1 s while it switches a monitor's mode:
+    then the last answer stands. None: never read (or no such monitor). A
+    Hyprland without the field cannot tell its switch apart: True, the
+    user's own HDR, as before the switch was used."""
     signature = os.environ.get("HYPRLAND_INSTANCE_SIGNATURE")
     if not signature or not screen_name:
         return None
+    key = (signature, screen_name)
     monitors = _hyprland_request(signature, "j/monitors")
     if not isinstance(monitors, list):
-        return None
+        return _configured_hdr.get(key)
     for monitor in monitors:
         if isinstance(monitor, dict) and monitor.get("name") == screen_name:
             preset = monitor.get("colorManagementPreset")
-            return preset in ("hdr", "hdredid") if isinstance(preset, str) else None
+            _configured_hdr[key] = preset in ("hdr", "hdredid") if isinstance(preset, str) else True
+            return _configured_hdr[key]
+    _configured_hdr.pop(key, None)
     return None
+
+
+# configured_hdr's last answers, by (Hyprland instance, monitor name).
+_configured_hdr: dict[tuple[str, str], bool] = {}
 
 
 def _hyprland_option(signature: str, name: str) -> int | None:
