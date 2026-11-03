@@ -311,8 +311,8 @@ class RelayServer:
                         # request muxed auxiliary tracks in open_session.
                         "muxed_aux_tracks": self.library is not None,
                         "attachment_cache": 1 if self.library is not None else 0,
-                        # open_session.high_bit_depth is understood: HDR and
-                        # (on request) 10-bit SDR sources stay 10-bit.
+                        # open_session.high_bit_depth is understood: HDR
+                        # sources stay 10-bit, and on request every source.
                         "high_bit_depth": True,
                         # open_session/seek display_target is understood
                         # (PROTOCOL §3.6): a working mapper was found.

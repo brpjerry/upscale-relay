@@ -46,23 +46,24 @@ X265_HDR10 = (
 )
 
 
-def _write_source(path, *, tags=PQ_TAGS, x265_params=X265_HDR10, frames=8, size=(64, 64)):
-    """A 10-bit x265 source with a different gradient in every frame."""
+def _write_source(path, *, tags=PQ_TAGS, x265_params=X265_HDR10, frames=8, size=(64, 64), bits=10):
+    """A 10-bit (or 8-bit) x265 source with a different gradient in every frame."""
     width, height = size
+    pix_fmt, dtype, step = ("yuv420p10le", np.uint16, 4) if bits == 10 else ("yuv420p", np.uint8, 1)
     with av.open(str(path), "w") as output:
         stream = output.add_stream("libx265", rate=24, options={
             "x265-params": x265_params, "preset": "ultrafast",
         })
-        stream.width, stream.height, stream.pix_fmt = width, height, "yuv420p10le"
+        stream.width, stream.height, stream.pix_fmt = width, height, pix_fmt
         cc = stream.codec_context
         cc.colorspace, cc.color_range, cc.color_primaries, cc.color_trc = tags
-        ramp = np.linspace(64, 940, width, dtype=np.uint16)
+        ramp = np.linspace(16 * step, 235 * step, width).astype(int)
         for index in range(frames):
-            frame = av.VideoFrame(width, height, "yuv420p10le")
-            luma = np.broadcast_to((ramp + index * 7).clip(64, 940), (height, width))
-            chroma = np.full((height // 2, width // 2), 512 + index, np.uint16)
+            frame = av.VideoFrame(width, height, pix_fmt)
+            luma = np.broadcast_to((ramp + index * 7).clip(16 * step, 235 * step), (height, width))
+            chroma = np.full((height // 2, width // 2), 128 * step + index, dtype)
             for plane, values in zip(frame.planes, (luma, chroma, chroma)):
-                rows = np.zeros((plane.height, plane.line_size // 2), np.uint16)
+                rows = np.zeros((plane.height, plane.line_size // np.dtype(dtype).itemsize), dtype)
                 rows[:, :values.shape[1]] = values
                 plane.update(rows.tobytes())
             frame.pts, frame.time_base = index, Fraction(1, 24)
@@ -260,6 +261,36 @@ def test_10_bit_sdr_stays_10_bit_only_on_request(tmp_path, mode, expected):
     assert pipeline.hdr_metadata_report() is None  # SDR: nothing to write back
     with av.open(io.BytesIO(downlink)) as relayed:
         assert next(relayed.decode(video=0)).format.name == expected
+
+
+def _planes_8(frame) -> list[np.ndarray]:
+    return [np.frombuffer(plane, np.uint8).reshape(plane.height, -1)[:, :plane.width]
+            for plane in frame.planes]
+
+
+@pytest.mark.parametrize(("mode", "expected"), [("hdr", "yuv420p"), ("all", "yuv420p10le")])
+def test_8_bit_sdr_goes_10_bit_under_all(tmp_path, mode, expected):
+    source = tmp_path / "sdr8.mkv"
+    _write_source(source, tags=(1, 1, 1, 1), x265_params="lossless=1", frames=2, bits=8)
+
+    downlink, fed, cfg, pipeline = _relay(
+        source, high_bit_depth=mode, dynamic=False, dolby_vision=None,
+    )
+
+    assert pipeline.bit_depth == (10 if mode == "all" else 8)
+    assert pipeline.hdr_metadata_report() is None  # SDR: nothing to write back
+    reference = _decode(fed, cfg)
+    with av.open(io.BytesIO(downlink)) as relayed:
+        frames = list(relayed.decode(video=0))
+    assert len(frames) == 2
+    for frame in frames:
+        assert frame.format.name == expected and _tags(frame) == (1, 1, 1, 1)
+        source_planes = _planes_8(reference[frame.pts])
+        if mode == "hdr":
+            assert all(np.array_equal(a, b) for a, b in zip(_planes_8(frame), source_planes))
+        else:  # limited range: each 8-bit code is exactly a quarter of its 10-bit one
+            assert all(np.array_equal(a, b.astype(np.uint16) * 4)
+                       for a, b in zip(_planes(frame), source_planes))
 
 
 @pytest.mark.parametrize(("mode", "carried"), [("all", True), ("hdr", False)])
@@ -467,3 +498,32 @@ def test_model_runs_on_16_bit_rgb_for_a_deep_colour_session(tmp_path):
     expected = np.repeat(source_luma, 2, axis=0)[:, :].astype(int)
     assert np.abs(luma[:, ::2].astype(int)[:, 1:-1] - expected[:, 1:-1]).max() <= 6
     assert np.unique(luma[32]).size > 64  # the ramp kept its 10-bit steps
+
+
+def test_8_bit_source_runs_the_16_bit_model_under_all(tmp_path):
+    pytest.importorskip("onnxruntime")
+    sys.path.insert(0, str(ROOT))
+    from tools.make_test_model import build
+
+    model = tmp_path / "bilinear2x.onnx"
+    build(model)
+    source = tmp_path / "sdr8.mkv"
+    _write_source(source, tags=(1, 1, 1, 1), x265_params="lossless=1", frames=2, bits=8)
+
+    downlink, fed, cfg, pipeline = _relay(
+        source, high_bit_depth="all", model=str(model), tier="lossless-ffv1",
+        display=(128, 128), dynamic=False, dolby_vision=None,
+    )
+
+    assert pipeline.relayed_with.io_bits == 16
+    source_luma = _planes_8(_decode(fed, cfg)[0])[0].astype(int) * 4
+    with av.open(io.BytesIO(downlink)) as relayed:
+        frame = next(relayed.decode(video=0))
+    assert (frame.format.name, _tags(frame)) == ("yuv420p10le", (1, 1, 1, 1))
+    luma = _planes(frame)[0].astype(int)
+    # The source's codes at 10 bits (a bilinear 2x keeps the mean: no
+    # darkening), and in between 10-bit codes no 8-bit stream could carry.
+    expected = np.repeat(source_luma, 2, axis=0)
+    assert np.abs(luma[:, ::2][:, 1:-1] - expected[:, 1:-1]).max() <= 6
+    assert abs(luma.mean() - source_luma.mean()) < 0.5
+    assert (luma % 4 != 0).any()

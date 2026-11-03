@@ -179,18 +179,17 @@ _HLG = VideoColor.resolve_values(9, 1, 9, 18, 3840, 2160)
 _SDR = VideoColor.resolve_values(1, 1, 1, 1, 1920, 1080)
 
 
-@pytest.mark.parametrize(("request_mode", "color", "depth", "expected"), [
-    (None, _PQ, 10, 8),     # old clients keep the 8-bit downlink
-    ("hdr", _PQ, 10, 10),
-    ("hdr", _HLG, 10, 10),
-    ("hdr", _SDR, 10, 8),   # 10-bit SDR only on request
-    ("all", _SDR, 10, 10),
-    ("all", _SDR, 8, 8),    # nothing deeper to keep
-    ("all", None, None, 8),  # unknown source
-    ("hdr", _PQ, 8, 10),    # an 8-bit PQ source is still HDR
+@pytest.mark.parametrize(("request_mode", "color", "expected"), [
+    (None, _PQ, 8),     # old clients keep the 8-bit downlink
+    ("hdr", _PQ, 10),   # whatever the source's depth: an 8-bit PQ one is still HDR
+    ("hdr", _HLG, 10),
+    ("hdr", _SDR, 8),   # SDR at 10 bits only on request
+    ("hdr", None, 8),   # unknown source
+    ("all", _SDR, 10),  # 8-bit and 10-bit sources alike
+    ("all", None, 10),
 ])
-def test_output_bit_depth(request_mode, color, depth, expected):
-    assert output_bit_depth(request_mode, color, depth) == expected
+def test_output_bit_depth(request_mode, color, expected):
+    assert output_bit_depth(request_mode, color) == expected
 
 
 def test_colour_tags_round_trip_through_the_wire():

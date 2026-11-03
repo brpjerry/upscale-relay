@@ -100,20 +100,16 @@ def _remember(pending: dict, pts: int, value) -> None:
     pending[pts] = value
 
 
-def output_bit_depth(
-    request: str | None, color: VideoColor | None, source_bit_depth: int | None,
-) -> int:
+def output_bit_depth(request: str | None, color: VideoColor | None) -> int:
     """Downlink sample depth (docs/PROTOCOL.md ``open_session.high_bit_depth``).
 
     8 unless the client asked for deep colour: "hdr" keeps PQ and HLG sources
-    at 10 bits, "all" also any other source deeper than 8 bits. Without a
-    request the stream is what older clients have always received.
+    at 10 bits, "all" streams every source at 10 bits, 8-bit ones included.
+    Without a request the stream is what older clients have always received.
     """
     if request not in HIGH_BIT_DEPTH_MODES:
         return 8
-    if color is not None and color.is_hdr:
-        return 10
-    if request == "all" and (source_bit_depth or 8) > 8:
+    if request == "all" or (color is not None and color.is_hdr):
         return 10
     return 8
 
@@ -444,7 +440,7 @@ class Pipeline:
             )
             # Deep colour: 10-bit 4:2:0 out, rgb48 through the model. Decided
             # here, before the encoder, the model's I/O and session_opened.
-            self.bit_depth = output_bit_depth(high_bit_depth, self._open_color, video.bit_depth)
+            self.bit_depth = output_bit_depth(high_bit_depth, self._open_color)
             if self._mapping is not None:
                 # Every epoch stays 10-bit, mapped to SDR or not: one encoder
                 # and model I/O per session. (A profile 5 source may declare
