@@ -278,6 +278,28 @@ def test_seek_ready_is_taken_for_the_current_epoch_only():
     assert (session.downlink_mapping, session.downlink_color) == (MAPPED_SDR, SDR)
 
 
+def test_a_new_epoch_waits_for_its_seek_ready():
+    client = RelayClient.__new__(RelayClient)
+    client._pending = {}
+
+    async def scenario():
+        await asyncio.wait_for(client.epoch_described(3), 1)  # nothing pending: at once
+        fut = asyncio.get_running_loop().create_future()
+        client._pending[("seek_ready", 3)] = fut
+        waiter = asyncio.ensure_future(client.epoch_described(3))
+        await asyncio.sleep(0.05)
+        assert not waiter.done()
+        fut.set_result({"type": "seek_ready", "epoch": 3})
+        await asyncio.wait_for(waiter, 1)
+        failed = asyncio.get_running_loop().create_future()
+        client._pending[("seek_ready", 4)] = failed
+        failed.set_exception(ConnectionError("gone"))
+        await asyncio.wait_for(client.epoch_described(4), 1)  # a failed seek does not hang the player
+        failed.exception()
+
+    asyncio.run(scenario())
+
+
 def test_the_uplink_reports_hdr10plus_from_its_first_keyframe(tmp_path):
     plain = tmp_path / "hdr10.mkv"
     _write_source(plain)

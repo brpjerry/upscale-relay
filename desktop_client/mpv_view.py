@@ -1834,6 +1834,13 @@ class MpvPlayerView(QOpenGLWidget):
                 if pkt.discontinuity and (not first or self._buffer is None):
                     if trace:
                         print("[trace] discontinuity -> reload", flush=True, file=_sys.stderr)
+                    client = self.client
+                    if self._mapping() is not None and hasattr(client, "epoch_described"):
+                        # A mapped epoch's colour and mapping arrive with
+                        # seek_ready, which can trail its first media bytes.
+                        await client.epoch_described(pkt.epoch)
+                        if client is not self.client or pkt.epoch != client.epoch:
+                            continue
                     # Seek: fresh container stream -> reload mpv on a new buffer.
                     await self._load_stream()
                     if self.client is not None and pkt.epoch != self.client.epoch:

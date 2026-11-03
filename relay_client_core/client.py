@@ -1103,6 +1103,17 @@ class RelayClient:
         if self.track is not None:
             await self.start_uplink(from_pts=target_pts, discontinuity=True, epoch=epoch)
 
+    async def epoch_described(self, epoch: int) -> None:
+        """Wait until seek_ready for ``epoch`` has been read, so that the
+        session describes that epoch (its colour and display mapping, PROTOCOL
+        §3.6). The media connection can deliver the epoch's first bytes
+        sooner: a server starts a library file's source before it answers.
+        Returns at once when no seek for ``epoch`` is pending, and when the
+        seek fails or times out (its caller reports that)."""
+        fut = self._pending.get(("seek_ready", epoch))
+        if fut is not None and not fut.done():
+            await asyncio.wait([fut])
+
     def _apply_epoch_mapping(self, msg: dict) -> None:
         """A mapped session's epoch may switch between PQ and SDR (PROTOCOL
         §3.6): take seek_ready's downlink_mapping and downlink_color for the
