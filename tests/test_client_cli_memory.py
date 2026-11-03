@@ -47,7 +47,7 @@ class Client:
 def arguments(**extra):
     return SimpleNamespace(**dict(host="localhost", port=1, file="unused",
         display="32x32", model="passthrough", tier="lossless-ffv1",
-        fit_mode="fit", resize_algorithm="server-default", high_bit_depth=None, mpv=False,
+        fit_mode="fit", resize_algorithm="server-default", high_bit_depth=None, display_target=None, mpv=False,
         save=None, **extra))
 
 

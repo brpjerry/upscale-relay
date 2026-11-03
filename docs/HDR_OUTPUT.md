@@ -216,9 +216,18 @@ switched the panel to HDR in fullscreen.
 ### What mpv does with the metadata
 
 The render API runs mpv's `gpu` renderer. gpu-next is not available through
-it. `gpu` uses static HDR10 metadata only, so the Dolby Vision RPU and HDR10+
-still ride along unused. It tone-maps content brighter than `target-peak` (the
-display's peak) and passes the rest through.
+it. `gpu` uses static HDR10 metadata only: it tone-maps content brighter than
+`target-peak` (the display's peak) and passes the rest through. The Dolby
+Vision RPU and HDR10+ are therefore applied on the server, for the display the
+player names (docs/PROTOCOL.md §3.6). `MpvPlayerView.display_target()` takes the
+same decision as the surface: PQ at the display's peak and SDR white where an
+HDR video would play on the HDR surface (in fullscreen before Hyprland's
+switch, the peak it is expected to bring), SDR elsewhere. The open and every
+seek carry it, and a mapped epoch that no longer fits the display (PQ for an
+SDR one, SDR for an HDR one, a peak above the display's or far below it)
+reloads through the same seek as a surface change. A mapped stream's peak is
+at most the display's, so mpv passes it through. Without a capable server, and
+for local playback, the RPU and HDR10+ ride along unused.
 
 ## Measurements
 

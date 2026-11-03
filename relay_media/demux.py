@@ -17,7 +17,7 @@ from typing import Iterator
 import av
 
 from relay_protocol import FLAG_KEYFRAME, NO_TS, MediaPacket
-from .hdr import DolbyVisionConfig, StaticHdr, tags_to_wire
+from .hdr import DolbyVisionConfig, StaticHdr, has_hdr10plus, tags_to_wire
 from .subtitles import INDEXABLE_SUBTITLE_CODECS, SubtitleIndex
 
 log = logging.getLogger("relay.media")
@@ -116,6 +116,13 @@ def _source_identity(path: str) -> tuple[str, int, int]:
     return os.path.abspath(path), stat.st_size, stat.st_mtime_ns
 
 
+# SMPTE ST 2084 (PQ), the transfer HDR10+ accompanies.
+_PQ_TRANSFER = 16
+# Packets an HDR10+ check reads looking for the first keyframe (normally the
+# first packet; a file starting mid-GOP has its keyframe within a few).
+_HDR10PLUS_SCAN_PACKETS = 16
+
+
 class VideoTrack:
     """Wrap a media file's first video stream for packet-level streaming."""
 
@@ -189,6 +196,27 @@ class VideoTrack:
         if self.dolby_vision is not None:
             video["dolby_vision"] = self.dolby_vision.to_wire()
         return video
+
+    def first_keyframe_hdr10plus(self) -> bool:
+        """Whether the first keyframe carries HDR10+ (ST 2094-40): an uplink's
+        ``open_session.video.hdr10plus`` (PROTOCOL §3.6). Only a PQ HEVC
+        stream is read, through a container of its own, so the packets()
+        iterators keep their place. A failed read is False."""
+        cc = self._stream.codec_context
+        if cc.name != "hevc" or self.color_tags[3] != _PQ_TRANSFER:
+            return False
+        extradata = bytes(cc.extradata) if cc.extradata else None
+        try:
+            with av.open(self.path) as probe:
+                stream = probe.streams.video[0]
+                for count, packet in enumerate(probe.demux(stream)):
+                    if count >= _HDR10PLUS_SCAN_PACKETS:
+                        break
+                    if packet.is_keyframe and packet.size:
+                        return has_hdr10plus(bytes(packet), cc.name, extradata)
+        except (av.FFmpegError, OSError) as err:
+            log.warning("could not read HDR10+ from %s: %r", self.path, err)
+        return False
 
     def packets(self, from_pts: int | None = None) -> Iterator[PacketInfo]:
         """Iterate packets, optionally seeking to a keyframe before ``from_pts``.

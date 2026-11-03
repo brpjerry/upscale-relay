@@ -78,7 +78,7 @@ def test_cli_reports_a_source_read_failure_and_exits_nonzero(sample_file, monkey
             args = SimpleNamespace(
                 host="127.0.0.1", port=server.port, file=sample_file, display="64x64",
                 model="passthrough", tier="lossless-ffv1", fit_mode="fit",
-                resize_algorithm="server-default", high_bit_depth=None, decode=False, mpv=False, save=None,
+                resize_algorithm="server-default", high_bit_depth=None, display_target=None, decode=False, mpv=False, save=None,
             )
             return await asyncio.wait_for(cli.run(args), 15)
         finally:

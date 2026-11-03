@@ -126,6 +126,17 @@ def _format_time(seconds: float) -> str:
     return f"{int(seconds // 60):02d}:{int(seconds % 60):02d}"
 
 
+def _mapping_rows(mapping: dict | None) -> list[tuple[str, str]]:
+    """The info card's line for a stream the server mapped for this display
+    (PROTOCOL §3.6): which dynamic metadata it applied."""
+    if not isinstance(mapping, dict):
+        return []
+    names = {"dolby_vision": "Dolby Vision", "hdr10plus": "HDR10+"}
+    applied = [names.get(item, str(item)) for item in mapping.get("applied") or []]
+    what = " and ".join(applied) or "Dynamic HDR metadata"
+    return [("Dynamic HDR", f"{what}, applied by the server for this display")]
+
+
 def _server_address(host: str, port: int) -> str:
     return f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
 
@@ -2369,6 +2380,9 @@ class MainWindow(DesktopFeatures, QMainWindow):
             # HDR always: mpv tone-maps it for an SDR screen from the real
             # 10-bit signal and its mastering metadata.
             high_bit_depth="all" if self.settings.ten_bit_sdr else "hdr",
+            # Dolby Vision and HDR10+ are applied on the server for the display
+            # the video is shown on (PROTOCOL §3.6); mpv's renderer cannot.
+            display_target=self._display_target(),
             aux_tracks=(
                 "muxed"
                 if source == "server_file" and self._server_caps.get("muxed_aux_tracks")
@@ -2532,6 +2546,7 @@ class MainWindow(DesktopFeatures, QMainWindow):
                 ("Upscale model", model),
                 ("Stream quality", self.tier_combo.currentText()),
                 ("Output", f"{output} {session.downlink_codec}"),
+                *_mapping_rows(getattr(session, "downlink_mapping", None)),
                 ("Server", _server_address(self.client.host, self.client.port)),
             ],
         )
@@ -2573,10 +2588,21 @@ class MainWindow(DesktopFeatures, QMainWindow):
         if hasattr(self.player, "prepare_seek"):
             self.player.prepare_seek(target_s)
         try:
-            await self.client.seek(int(target_s / float(tb)))
+            if getattr(self.client.session, "display_target", None) is not None:
+                # Each epoch is mapped for the display it is shown on now: the
+                # HDR reload after a display change is one of these seeks.
+                await self.client.seek(int(target_s / float(tb)), display_target=self._display_target())
+            else:
+                await self.client.seek(int(target_s / float(tb)))
         except Exception as err:
             self._pending_seek_s = None
             self._error("Seek failed", str(err))
+
+    def _display_target(self):
+        """The display a relay stream is shown on (player.display_target),
+        or None for a player that cannot say."""
+        target = getattr(self.player, "display_target", None)
+        return target() if callable(target) else None
 
     def _fit_mode(self) -> str:
         return self.fit_combo.currentData() or "fit"
