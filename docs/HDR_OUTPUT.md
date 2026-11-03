@@ -185,6 +185,10 @@ Hyprland finds the HDR surface of a fullscreen window even hidden, and would
 keep the screen in HDR for it. Each way costs one reload: a relay seek
 (0.5-1.8 s on a 4K stream) or the local file again.
 
+Verified on the laptop (2026-11-02, the user, Hyprland 0.56.2, the panel in
+SDR mode): a 10000-nit card relayed from the library through the dev server
+switched the panel to HDR in fullscreen.
+
 ### What mpv does with the metadata
 
 The render API runs mpv's `gpu` renderer. gpu-next is not available through
