@@ -130,6 +130,25 @@ def test_hvcc_parameter_sets_go_in_band_for_an_annex_b_decoder():
     assert list(iter_nals(to_annexb(packet, 4), None)) == [slice_]
 
 
+@pytest.mark.parametrize(("decoded", "container", "expected"), [
+    # The bitstream's VUI says nothing of colour; the container says PQ.
+    ((2, 1, 2, 2), PQ_TAGS, "setparams=colorspace=9:color_primaries=9:color_trc=16"),
+    (PQ_TAGS, SDR_TAGS, None),  # the bitstream's own tags win
+    ((9, 1, 9, 2), PQ_TAGS, "setparams=color_trc=16"),
+    ((2, 1, 2, 2), None, None),  # nothing to fill them from
+    ((2, 1, 2, 2), (2, 0, 2, 2), None),
+    # Unreadable parameter sets: all of the container's, range included.
+    (None, PQ_TAGS, "setparams=colorspace=9:range=1:color_primaries=9:color_trc=16"),
+])
+def test_container_tags_fill_only_what_the_bitstream_leaves_unspecified(decoded, container, expected):
+    assert display_mapping.container_fill(decoded, container) == expected
+
+
+def test_detect_gives_all_of_its_probes_one_deadline(monkeypatch):
+    monkeypatch.setattr(display_mapping, "_PROBE_TIMEOUT_S", 0.0)
+    assert DisplayMapper("ffmpeg").probe() == "the probes took over 0 s"
+
+
 # -- the pipeline, through a mapper that decodes in process ----------------------
 
 
@@ -138,18 +157,26 @@ class _FakeProcess:
     in-band parameter sets suffice) and delivers frames tagged as the mapping
     would make them. The pictures themselves stay the source's."""
 
-    def __init__(self, owner, mapping, *, codec, extradata, width, height, time_base):
-        self.mapping, self.owner = mapping, owner
+    killed = False
+
+    def __init__(self, owner, mapping, *, codec, extradata, width, height, time_base,
+                 prefilter=None):
+        self.mapping, self.owner, self.prefilter = mapping, owner, prefilter
         self._length_size = hevc_nal_length_size(extradata)
         self._parameter_sets = hevc_parameter_sets(extradata)
         self._decoder = av.CodecContext.create(codec, "r")  # no extradata
         self._time_base = time_base
         self.alive, self.started = True, False
+        self._claimed = False
         self.held = []
 
     def start(self, on_frame, on_item, on_error):
         self.started = True
-        self._on_frame, self._on_item = on_frame, on_item
+        self._on_frame, self._on_item, self._on_error = on_frame, on_item, on_error
+
+    def claim_failure(self):
+        first, self._claimed = not self._claimed, True
+        return first
 
     def _deliver(self, frames):
         for frame in frames:
@@ -174,7 +201,7 @@ class _FakeProcess:
         self.alive = False
 
     def kill(self):
-        self.alive = False
+        self.alive, self.killed = False, True
 
     close = kill
 
@@ -202,6 +229,29 @@ class _StuckProcess(_FakeProcess):
         self._dead.set()
 
     close = kill
+
+
+class _ReaderFailsProcess(_FakeProcess):
+    """ffmpeg dies with the second packet: the reader reports it, and every
+    write after that fails too."""
+
+    dead = False
+
+    def send(self, payload, pts, keyframe):
+        if self.dead:
+            raise MapperError("display mapping: writing to ffmpeg failed: broken pipe")
+        super().send(payload, pts, keyframe)
+        if len(self.owner.sent) == 2 and self.claim_failure():
+            self._on_error("display mapping: ffmpeg stopped mid-stream")
+            self.dead = True
+
+
+class _FinishFailsProcess(_FakeProcess):
+    """ffmpeg never finishes: finish() gives up, killing it, and raises."""
+
+    def finish(self):
+        self.killed = True
+        raise MapperError("display mapping: ffmpeg did not finish")
 
 
 class _FakeMapper:
@@ -233,7 +283,7 @@ class _Relay:
         self.cfg = dataclasses.replace(_config(self.track, video), **config)
         self.length_size = hevc_nal_length_size(self.cfg.extradata)
         self.downlink: dict[int, list[bytes]] = defaultdict(list)
-        self.errors, self.eos = [], threading.Event()
+        self.errors, self.eos, self.ended = [], threading.Event(), threading.Event()
         self.pipeline = Pipeline(
             self.cfg, None, "lossless-hevc", (self.cfg.width, self.cfg.height),
             self._emit, self._error, ep="cpu", lossless_hevc_profile="x265-ultrafast",
@@ -242,9 +292,16 @@ class _Relay:
 
     def _emit(self, packet):
         if packet.eos:
+            self.ended.set()
             self.eos.set()
         else:
             self.downlink[packet.epoch].append(packet.payload)
+
+    def feed_all(self, epoch=0):
+        """Every source packet then the end of stream, without waiting."""
+        for info in self.track.packets(from_pts=0):
+            self.pipeline.feed(self.track.media_packet(info, epoch))
+        self.pipeline.feed(MediaPacket(payload=b"", flags=FLAG_EOS, epoch=epoch))
 
     def _error(self, message):
         self.errors.append(message)
@@ -299,6 +356,65 @@ def test_a_mapped_epoch_is_the_mappings_colour_with_nothing_dynamic_left(tmp_pat
     assert len(mapper.sent) == len(source_pts)
     assert any(nal_type(nal) == 62 for nal in iter_nals(mapper.sent[0], relay.length_size))
     assert mapper.spawned == [EpochMapping("sdr", ("dolby_vision",))] * 2
+    # Its bitstream says PQ itself: nothing to fill in from the container.
+    assert {process.prefilter for process in mapper.processes} == {None}
+
+
+def _container_only(tmp_path, frames=4):
+    """A PQ source whose bitstream says nothing of its colour: only its
+    container does (Matroska's Colour element)."""
+    plain = tmp_path / "untagged.mkv"
+    _write_source(plain, tags=(2, 0, 2, 2), x265_params="lossless=1", frames=frames)
+    path = tmp_path / "container-pq.mkv"
+    with av.open(str(plain)) as source, av.open(str(path), "w") as output:
+        template = source.streams.video[0]
+        stream = output.add_stream_from_template(template)
+        cc = stream.codec_context
+        cc.colorspace, cc.color_range, cc.color_primaries, cc.color_trc = PQ_TAGS
+        for packet in source.demux(template):
+            if packet.size:
+                packet.stream = stream
+                output.mux(packet)
+    return path
+
+
+def test_container_only_colour_reaches_the_mapper(tmp_path):
+    mapper = _FakeMapper()
+    relay = _Relay(_container_only(tmp_path, frames=2), mapper, DisplayTarget("sdr"),
+                   dolby_vision=None, hdr10plus=True)
+    try:
+        assert relay.cfg.color_tags == PQ_TAGS
+        relay.play(0)
+    finally:
+        relay.close()
+    assert {process.prefilter for process in mapper.processes} == {
+        "setparams=colorspace=9:color_primaries=9:color_trc=16"}
+
+
+def test_a_mapper_that_dies_mid_epoch_is_reported_once(tmp_path):
+    # Its reader reports it; the decode stage's next write fails too, and
+    # used to report the same failure again.
+    mapper = _FakeMapper(_ReaderFailsProcess)
+    relay = _Relay(_dynamic_source(tmp_path), mapper, DisplayTarget("sdr"), dolby_vision=P81)
+    try:
+        relay.feed_all()
+        assert relay.ended.wait(30)  # the decode stage went through every packet
+    finally:
+        relay.close()
+    assert relay.errors == ["display mapping: ffmpeg stopped mid-stream"]
+
+
+def test_a_mapper_that_does_not_finish_is_an_error_not_a_seek(tmp_path):
+    # finish() kills what it gives up on, which looked like a seek's doing.
+    mapper = _FakeMapper(_FinishFailsProcess)
+    relay = _Relay(_dynamic_source(tmp_path, frames=3), mapper, DisplayTarget("sdr"), dolby_vision=P81)
+    try:
+        relay.feed_all()
+        assert relay.eos.wait(30)
+    finally:
+        relay.close()
+    assert len(relay.errors) == 1 and "did not finish" in relay.errors[0]
+    assert not relay.ended.is_set()
 
 
 def test_a_seek_remaps_only_when_the_transfer_changes(tmp_path):
@@ -471,3 +587,91 @@ def test_ffmpeg_maps_hdr10plus_to_sdr_frame_for_frame(tmp_path, real_mapper):
         assert {_tags(frame) for frame in frames} == {tags}
     # Tone-mapped, not relabelled: the SDR picture differs from the PQ one.
     assert bytes(mapped[0].planes[0]) != bytes(unmapped[0].planes[0])
+
+
+def test_ffmpeg_reads_a_container_only_pq_source_as_pq(tmp_path, real_mapper):
+    # NUT carries no colour: without the container's tags ffmpeg's frames
+    # are untagged, and libplacebo maps them as SDR.
+    tagged = tmp_path / "tagged.mkv"
+    _write_source(tagged, x265_params="lossless=1", frames=3)
+    pictures = []
+    for source in (tagged, _container_only(tmp_path, frames=3)):
+        relay = _Relay(source, real_mapper, DisplayTarget("sdr"), dolby_vision=None, hdr10plus=True)
+        try:
+            relay.play(0)
+            frames, _ = relay.epoch_stream(0)
+        finally:
+            relay.close()
+        pictures.append([bytes(frame.planes[0]) for frame in frames])
+    assert len(pictures[0]) == 3 and pictures[0] == pictures[1]
+
+
+def _real_process(real_mapper, source):
+    track = VideoTrack(str(source))
+    video = track.open_session_video_dict()
+    process = real_mapper.spawn(
+        EpochMapping("sdr", ("hdr10plus",)), codec="hevc",
+        extradata=base64.b64decode(video["extradata_b64"]),
+        width=video["width"], height=video["height"], time_base=Fraction(*video["time_base"]),
+    )
+    return track, process
+
+
+def test_ffmpeg_finishing_does_not_count_a_slow_consumer(tmp_path, real_mapper, monkeypatch):
+    # A paused client holds the reader inside on_frame for as long as it
+    # likes; finish() used to give up 30 s into the whole drain.
+    monkeypatch.setattr(display_mapping, "_FINISH_IDLE_S", 0.5)
+    track, process = _real_process(real_mapper, _dynamic_source(tmp_path, frames=4))
+    frames, errors = [], []
+
+    def slow(frame):
+        if not frames:
+            time.sleep(1.5)
+        frames.append(frame.pts)
+
+    try:
+        process.start(slow, lambda item: None, errors.append)
+        packets = list(track.packets())
+        for info in packets:
+            process.send(info.payload, info.pts, info.keyframe)
+        process.finish()
+    finally:
+        process.close()
+        track.close()
+    assert errors == [] and sorted(frames) == sorted(info.pts for info in packets)
+
+
+def test_ffmpeg_idle_releases_what_it_holds(tmp_path, real_mapper, monkeypatch):
+    # Audio after a source's last video packet: no frame comes out for it,
+    # and holding it all to the end of the stream grew without bound.
+    monkeypatch.setattr(display_mapping, "_HOLD_MAX", 2)  # hold() waits beyond it
+    track, process = _real_process(real_mapper, _dynamic_source(tmp_path, frames=4))
+    items, frames = [], []
+    try:
+        process.start(lambda frame: frames.append(frame.pts), items.append, lambda message: None)
+        for info in track.packets():
+            process.send(info.payload, info.pts, info.keyframe)
+        for index in range(5):
+            process.hold(index)
+        deadline = time.monotonic() + 10
+        while len(items) < 5 and time.monotonic() < deadline:
+            time.sleep(0.05)
+        released_before_the_end = list(items)
+        process.finish()
+    finally:
+        process.close()
+        track.close()
+    assert released_before_the_end == items == list(range(5)) and len(frames) == 4
+
+
+def test_a_mapper_killed_before_it_starts_fails_as_a_mapper_error(tmp_path, real_mapper):
+    # A seek can kill a mapper between its spawn and its start: a raw
+    # OSError from its closed sockets would end the session.
+    track, process = _real_process(real_mapper, _dynamic_source(tmp_path, frames=1))
+    try:
+        process.kill()
+        with pytest.raises(MapperError):
+            process.start(lambda frame: None, lambda item: None, lambda message: None)
+    finally:
+        process.close()
+        track.close()

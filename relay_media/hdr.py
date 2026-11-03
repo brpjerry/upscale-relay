@@ -28,6 +28,7 @@ layer.
 from __future__ import annotations
 
 import struct
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 # ITU-T H.273 code points (the FFmpeg enum values).
@@ -381,7 +382,7 @@ def hevc_parameter_sets(extradata: bytes | None) -> list[bytes]:
     return nals
 
 
-def to_annexb(packet: bytes, length_size: int | None, prefix: list[bytes] = ()) -> bytes:
+def to_annexb(packet: bytes, length_size: int | None, prefix: Sequence[bytes] = ()) -> bytes:
     """One access unit in Annex B framing with ``prefix`` NAL units first
     (parameter sets, for a decoder that has no extradata)."""
     return b"".join(_START_CODE + nal for nal in (*prefix, *iter_nals(packet, length_size)))

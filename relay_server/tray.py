@@ -391,9 +391,10 @@ class ServerController:
         self.settings = settings
         self.server: RelayServer | None = None
         self._lifecycle_lock = asyncio.Lock()
-        # Display mapping's ffmpeg ($RELAY_FFMPEG or PATH), probed once per
-        # run: False until then, None when there is none that can map.
-        self._display_mapper: DisplayMapper | None | bool = False
+        # Display mapping's ffmpeg ($RELAY_FFMPEG or PATH), kept once found.
+        # Until then every (re)start probes again: autostart can run before
+        # the GPU driver is ready, and a settings restart then finds it.
+        self._display_mapper: DisplayMapper | None = None
         # Set by TrayApp; wired onto every new RelayServer instance so
         # connection/playback events survive config-applied restarts.
         self.event_callback = None
@@ -413,7 +414,7 @@ class ServerController:
             await self._stop_locked()
             s = self.settings
             server_id = await asyncio.to_thread(load_or_create_server_id)
-            if self._display_mapper is False:
+            if self._display_mapper is None:
                 self._display_mapper = await asyncio.to_thread(DisplayMapper.detect)
             server = RelayServer(
                 s.models_dir,

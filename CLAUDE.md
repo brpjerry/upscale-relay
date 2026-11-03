@@ -376,6 +376,16 @@ their volume, panscan, tracks and delays.
   - NUT's muxer needs increasing DTS no later than each PTS (Matroska B-frame
     sources have none), so the mapper stamps its own decode clock below the
     PTS.
+  - NUT carries no colour description, and HEVC's decoder resets what its
+    VUI leaves out: a `setparams` ahead of libplacebo fills those tags from
+    the container (`container_fill`), or a container-only PQ source is
+    mapped as SDR.
+  - Muxed audio and subtitles wait in `hold()` for the frames written
+    before them. When nothing goes in and nothing comes out for 0.25 s they
+    go on regardless (a long audio tail after the last video packet), and
+    `hold()` blocks beyond 4096 items. The reader also checks while it
+    waits for ffmpeg to connect: ffmpeg sends nothing until it has probed
+    its input, and a capped `hold()` deadlocked there.
   - The child runs with `VK_LOADER_LAYERS_DISABLE=~implicit~`: the box's
     overlay layers (Steam, OBS, Galaxy, EOS, ASUS) otherwise load into it.
   - FFmpeg's libplacebo filter takes the target's luminance from the source

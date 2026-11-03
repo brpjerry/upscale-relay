@@ -66,8 +66,10 @@ from .display_mapping import (
     MapperError,
     MapperProcess,
     SourceDynamics,
+    container_fill,
     decide,
 )
+from .source_color import bitstream_color
 
 log = logging.getLogger("relay.pipeline")
 
@@ -438,13 +440,23 @@ class Pipeline:
                 if display_mapper is not None and high_bit_depth in HIGH_BIT_DEPTH_MODES
                 else None
             )
+            # The container's colour for the mapper's frames where the
+            # bitstream has none, as _put_decoded fills an unmapped epoch's.
+            self._mapper_prefilter = (
+                container_fill(
+                    bitstream_color(video.extradata, video.width, video.height),
+                    video.color_tags,
+                )
+                if self._mapping is not None else None
+            )
             # Deep colour: 10-bit 4:2:0 out, rgb48 through the model. Decided
             # here, before the encoder, the model's I/O and session_opened.
             self.bit_depth = output_bit_depth(high_bit_depth, self._open_color)
             if self._mapping is not None:
-                # Every epoch stays 10-bit, mapped to SDR or not: one encoder
-                # and model I/O per session. (A profile 5 source may declare
-                # no HDR transfer of its own.)
+                # Every epoch is 10-bit, mapped to SDR or not: one encoder and
+                # model I/O per session. (A profile 5 source may declare no
+                # HDR transfer of its own.) A tier with no 10-bit encoder
+                # streams all of them at 8 bits instead, below.
                 self.bit_depth = 10
             self.lossless_hevc_profile = lossless_hevc_profile
             self.quality_tier = quality_tier
@@ -725,27 +737,35 @@ class Pipeline:
             on_item=lambda item: self._safe_put(self._q_dec, item),
             on_error=self._mapper_failed,
         )
-        self._spare_mapper = self._spawn_mapper(mapping)
+        try:
+            self._spare_mapper = self._spawn_mapper(mapping)
+        except MapperError as error:  # this epoch maps; the next spawns its own
+            log.warning("%s", error)
         return proc
 
     def _spawn_mapper(self, mapping: EpochMapping) -> MapperProcess:
         return self._display_mapper.spawn(
             mapping, codec=self.video.codec, extradata=self.video.extradata,
             width=self.video.width, height=self.video.height, time_base=self.video.time_base,
+            prefilter=self._mapper_prefilter,
         )
 
     @contextlib.contextmanager
     def _abandoned_mapper_ok(self):
         """A mapper that a seek or close killed fails whatever the decode
         stage was doing with it: that epoch is over, and its flush (or the
-        stop) is next in the queue."""
+        stop) is next in the queue. A failure of its own goes on, unless
+        its reader reported it already."""
         proc = self._mapper_proc
         try:
             yield
         except MapperError:
+            if self._flush_pending.is_set() or self._closed.is_set():
+                return
             proc = proc or self._mapper_proc
-            if proc is None or not proc.killed:
-                raise
+            if proc is not None and not proc.claim_failure():
+                return
+            raise
 
     def _release_mapper(self) -> None:
         proc, self._mapper_proc = self._mapper_proc, None
