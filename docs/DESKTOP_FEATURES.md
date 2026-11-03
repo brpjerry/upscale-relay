@@ -79,10 +79,15 @@ a server-library file opened with it off, whose size was never read.
 
 HDR sources (PQ or HLG) always stream with 10-bit color and their HDR metadata:
 mastering display and light level, HDR10+, and the Dolby Vision RPU of a
-profile 8 source (docs/PROTOCOL.md §3.5). **Keep 10-bit color for SDR videos**
-(off by default) asks for the same depth for other sources deeper than 8 bits,
-such as 10-bit anime encodes: less banding at roughly a quarter more lossless
-bandwidth. Toggling it restarts only a 10-bit SDR stream.
+profile 8 source (docs/PROTOCOL.md §3.5). **Use 10 bit video** (off by
+default) streams every other video at 10 bits too, whatever the source's own
+depth; off, they stream at 8 bits, 10-bit sources included. The model's output
+keeps its in-between levels, so gradients band less, and the stream is smaller
+at the same quality tier: 78 against 113 Mbps for a 10-bit anime episode at
+`hevc-qp4`, 2880x1620. Decoding it costs a little more: on the Lunar Lake
+laptop, about 0.4-0.65 W more on battery, most of it copying twice the bytes
+back from the GPU (`hwdec=auto-copy-safe`). Toggling it restarts an SDR
+stream; an HDR one is 10-bit either way.
 
 **Show HDR videos in HDR** (on by default) plays an HDR video as HDR while the
 window's screen is in HDR mode. That works on Wayland with Qt 6.10.2 or later;

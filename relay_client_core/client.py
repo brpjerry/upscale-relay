@@ -351,8 +351,8 @@ class SessionConfig:
     # in place of ``model``. A server file's size is read through /media.
     passthrough_4k: bool = False
     # open_session.high_bit_depth for a capable server: "hdr" keeps HDR
-    # sources at 10 bits with their metadata, "all" also 10-bit SDR ones.
-    # None keeps the 8-bit downlink.
+    # sources at 10 bits with their metadata, "all" streams every source at
+    # 10 bits. None keeps the 8-bit downlink.
     high_bit_depth: str | None = None
     # The display the stream is shown on, for a server that applies Dolby
     # Vision and HDR10+ for it (capabilities.display_mapping, sent with

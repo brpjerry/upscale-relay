@@ -262,7 +262,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--high-bit-depth", choices=["hdr", "all"], default=None,
-        help="ask for a 10-bit downlink: HDR sources, or every source deeper than 8 bits",
+        help="ask for a 10-bit downlink: HDR sources, or every source",
     )
     parser.add_argument(
         "--display-target", type=_display_target, default=None, metavar="pq:PEAK[:WHITE] | sdr[:WHITE]",

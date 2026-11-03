@@ -321,10 +321,12 @@ A server advertising `capabilities.high_bit_depth: true` accepts
 |---|---|
 | absent | 8-bit 4:2:0, as every server before this field. HDR sources keep their PQ/HLG and BT.2020 tags but lose precision and all HDR metadata |
 | `"hdr"` | 10-bit 4:2:0 (HEVC Main 10, or 10-bit FFV1) for sources whose transfer is PQ (16) or HLG (18); 8-bit for the rest |
-| `"all"` | as `"hdr"`, and also 10-bit for any other source deeper than 8 bits (e.g. 10-bit SDR anime) |
+| `"all"` | as `"hdr"`, and 10-bit for every other source too, whatever its own depth: an 8-bit source is widened, so the model's output keeps its in-between levels |
 
 A server with no 10-bit encoder for the requested tier streams 8 bits, as if
-nothing had been asked; `downlink_bit_depth` says which.
+nothing had been asked; `downlink_bit_depth` says which. A server from before
+`"all"` covered every source widens only sources deeper than 8 bits, and
+streams 8-bit ones at 8 bits; `downlink_bit_depth` says so too.
 
 A 10-bit HEVC downlink of an HDR source also carries, in its bitstream,
 what the source's had:

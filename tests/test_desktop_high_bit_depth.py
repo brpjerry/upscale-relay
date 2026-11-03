@@ -1,4 +1,5 @@
-"""The desktop asks for HDR at 10 bits, and for 10-bit SDR when switched on."""
+"""The desktop asks for HDR at 10 bits, and for every video at 10 bits when
+switched on."""
 import asyncio
 
 import pytest
@@ -13,6 +14,7 @@ class DeepClient(LifecycleClient):
 
     hdr = False
     source_bits = 10
+    capabilities = {"high_bit_depth": True}
 
     async def open_session(self, config):
         session = await super().open_session(config)
@@ -21,29 +23,30 @@ class DeepClient(LifecycleClient):
         return session
 
 
-def setup_deep(window, monkeypatch, *, hdr=False, source_bits=10):
+def setup_deep(window, monkeypatch, *, hdr=False, source_bits=10, deep_server=True):
     events, errors = setup_lifecycle(window, monkeypatch)
     DeepClient.hdr, DeepClient.source_bits = hdr, source_bits
     window.client = DeepClient(events)
+    window.client.capabilities = {"high_bit_depth": deep_server}
     restarts = []
 
     async def restart():
-        restarts.append(window.settings.ten_bit_sdr)
+        restarts.append(window.settings.ten_bit_video)
 
     monkeypatch.setattr(window, "_restart_for_playback_setting", restart)
     return errors, restarts
 
 
-def test_hdr_always_and_10_bit_sdr_on_request(window, monkeypatch):
+def test_hdr_always_and_every_video_at_10_bits_on_request(window, monkeypatch):
     errors, _ = setup_deep(window, monkeypatch)
 
     async def scenario():
-        assert not window.ten_bit_sdr_check.isChecked()
+        assert not window.ten_bit_video_check.isChecked()
         await window._start_session("show.mkv", "server_file")
         assert window.client.opened_config.high_bit_depth == "hdr"
-        window.ten_bit_sdr_check.setChecked(True)
+        window.ten_bit_video_check.setChecked(True)
         await asyncio.sleep(0)
-        assert window.settings.ten_bit_sdr
+        assert window.settings.ten_bit_video
         await window._start_session("show.mkv", "uplink")
         assert window.client.opened_config.high_bit_depth == "all"
         assert not errors
@@ -51,19 +54,20 @@ def test_hdr_always_and_10_bit_sdr_on_request(window, monkeypatch):
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize(("hdr", "source_bits", "expected"), [
-    (False, 10, [True, False]),  # 10-bit SDR: the switch changes the stream
-    (False, 8, []),              # 8-bit source: nothing more to keep
-    (True, 10, []),              # HDR stays 10-bit either way
-    (False, None, []),           # a server that does not report depth
+@pytest.mark.parametrize(("hdr", "source_bits", "deep_server", "expected"), [
+    (False, 10, True, [True, False]),   # 10-bit SDR
+    (False, 8, True, [True, False]),    # 8-bit SDR: widened to 10 bits too
+    (False, None, True, [True, False]),  # a server that does not report the source's depth
+    (True, 10, True, []),               # HDR stays 10-bit either way
+    (False, 8, False, []),              # a server without deep colour streams 8 bits anyway
 ])
-def test_toggle_restarts_only_a_10_bit_sdr_stream(window, monkeypatch, hdr, source_bits, expected):
-    errors, restarts = setup_deep(window, monkeypatch, hdr=hdr, source_bits=source_bits)
+def test_toggle_restarts_every_sdr_stream(window, monkeypatch, hdr, source_bits, deep_server, expected):
+    errors, restarts = setup_deep(window, monkeypatch, hdr=hdr, source_bits=source_bits, deep_server=deep_server)
 
     async def scenario():
         await window._start_session("show.mkv", "server_file")
-        await window.on_ten_bit_sdr_changed(True)
-        await window.on_ten_bit_sdr_changed(False)
+        await window.on_ten_bit_video_changed(True)
+        await window.on_ten_bit_video_changed(False)
         assert restarts == expected
         assert not errors
 
