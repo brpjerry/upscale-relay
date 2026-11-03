@@ -76,6 +76,7 @@ async def exercise(window, args):
             window._session_source = "local"
             window._session_path = args.local
             window.idle_hint.hide()
+            window._paused = False  # play_local plays: keep the window's pause intent in step
             await player.play_local(args.local, position, hdr=False)
             player.mpv["loop-file"] = "no" if args.eof else "inf"
             await wait_until(lambda: (player._observation("time-pos", 0) or 0) > 0.2, "playback", 60,
@@ -94,6 +95,10 @@ async def exercise(window, args):
             assert window.client.session is not None, errors
             await wait_until(lambda: (player._observation("time-pos", 0) or 0) > 0.2, "playback", 60)
 
+    ended_early = []
+    if args.steady:
+        player.finished.connect(lambda: ended_early.append("finished"))
+        player.failed.connect(ended_early.append)
     await start()
     duration = window._duration_s or 600.0
     params = player._observation("video-params") or {}
@@ -107,6 +112,8 @@ async def exercise(window, args):
             fullscreen = True
         while time.monotonic() < deadline and window.isVisible():
             await asyncio.sleep(1.0)
+            if ended_early:
+                raise RuntimeError(f"playback ended during the steady run ({ended_early[0]}): use a longer source")
             hwdec = player._observation("hwdec-current")
             if hwdec:
                 hwdec_seen.add(str(hwdec))
@@ -218,6 +225,7 @@ def main():
         window.close()
         # Shut mpv down before Python does: its callbacks, still firing after
         # the stop, crashed the interpreter's exit (SIGSEGV in 2 of 8 runs).
+        window.player._release_surface_if_idle()  # stop() defers it to the closed loop
         window.player._free_render_ctx()
         window.player.mpv.terminate()
         settings = QSettings("upscale-relay", scope)

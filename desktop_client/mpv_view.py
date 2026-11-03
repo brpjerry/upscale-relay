@@ -107,8 +107,9 @@ _AUTO_HDR_TIMEOUT_S = 5.0
 
 
 def _vaapi_vendor() -> str | None:
-    """PCI vendor of the render node VA-API opens by default (mpv's
-    --vaapi-device), e.g. 0x8086 for Intel; None where it cannot be read."""
+    """PCI vendor of the first render node, e.g. 0x8086 for Intel: the GPU
+    that decodes on a single-GPU machine (mpv's render API takes its VA
+    display from the window system's); None where it cannot be read."""
     try:
         return Path("/sys/class/drm/renderD128/device/vendor").read_text().strip().lower()
     except OSError:
@@ -142,14 +143,11 @@ def _render_hwdec_mode(no_hwdec: bool, platform: str | None = None, environ=None
     return "vaapi,auto-copy-safe" if vendor == "0x8086" else "auto-copy-safe"
 
 
-_ANY_ENTRY = object()  # thaw on the next restart: a libmpv that does not report entry ids
-
-
 def _zero_copy(mode: str) -> bool:
-    """Whether an mpv hwdec mode (or the first of a list) hands the render API
-    the decoder's own surfaces rather than copies."""
-    first = mode.split(",")[0].strip()
-    return first not in ("", "no") and "copy" not in first
+    """Whether an mpv hwdec mode, or any candidate of a list, can hand the
+    render API the decoder's own surfaces rather than copies."""
+    return any(candidate not in ("", "no") and "copy" not in candidate
+               for candidate in (part.strip() for part in mode.split(",")))
 
 
 def _mpv_config_dirs(environ=None, platform: str | None = None) -> list[Path]:
@@ -1049,24 +1047,34 @@ class MpvPlayerView(QOpenGLWidget):
                              _GL_COLOR_BUFFER_BIT, _GL_LINEAR)
         gl.glBindFramebuffer(_GL_FRAMEBUFFER, target)
 
+    def _loadfile(self, target, options: str) -> None:
+        """Replace the playlist with target. python-mpv's loadfile() drops the
+        command's result, the new entry's id, which ends a freeze."""
+        if self.mpv.mpv_version_tuple >= (0, 38, 0):
+            loaded = self.mpv.command("loadfile", target, "replace", -1, options)
+        else:
+            loaded = self.mpv.command("loadfile", target, "replace", options)
+        self._note_load(loaded.get("playlist_entry_id") if isinstance(loaded, dict) else None)
+
     def _note_load(self, entry) -> None:
         """A file was loaded during a freeze: its playback restart, and only
         its, ends the freeze. An earlier file's restart can arrive after a
-        stop; thawing on it painted a stopped decoder's frame and crashed."""
+        stop; thawing on it painted a stopped decoder's frame and crashed.
+        libmpv reports entry ids from 0.33, which the player's end-file
+        handling needs too; without one the freeze holds."""
         if self._frozen:
-            self._thaw_entry = entry if entry is not None else _ANY_ENTRY
+            self._thaw_entry = entry
 
     def _on_video_restarted(self, entry) -> None:
-        """The loaded file's first frame is queued (mpv shows it before it
-        reports the restart): mpv's own picture is safe to paint again."""
-        if not self._frozen or self._thaw_entry is None:
-            return
-        if self._thaw_entry is not _ANY_ENTRY and entry != self._thaw_entry:
+        """The loaded file's first frame has been taken (mpv reports the
+        restart after that): its surfaces are live, safe to draw again."""
+        if not self._frozen or self._thaw_entry is None or entry != self._thaw_entry:
             return
         self._frozen = False
         self._picture_due = True
         if self._on_presenter and self._presenter is not None:
             self._presenter.picture_due()
+            self._presenter.update()
         self.update()
 
     def _presenting(self) -> bool:
@@ -1084,15 +1092,18 @@ class MpvPlayerView(QOpenGLWidget):
         if self._on_presenter:
             self._presenter.frame_ready()
             return
-        if presenting:
+        if presenting and not self._frozen:
             self.update()
             return
         # Wayland stops delivering paints on another workspace. Acknowledge
         # those frames through libmpv's render API instead of letting its VO
         # time out and count intentional non-presentation as dropped frames.
+        # Frozen (_freeze_picture), mpv's frame may be a stopped decoder's,
+        # which must not be drawn, but mpv waits ~200 ms for each frame to be
+        # taken, the new stream's first included, before it reports the
+        # restart that ends the freeze. skip_rendering takes a frame without
+        # drawing it: it never maps the frame's surface (vo_libmpv).
         # Even skip_rendering requires the owning OpenGL context to be current.
-        if self._frozen:
-            return  # mpv's frame may be a stopped decoder's (_freeze_picture)
         self.makeCurrent()
         try:
             if QOpenGLContext.currentContext() == self.context() and self._ctx.update():
@@ -1546,13 +1557,7 @@ class MpvPlayerView(QOpenGLWidget):
             # learned that tag in 0.38; older libmpv can decode it through
             # libavformat. Scope this compatibility override to relay epochs.
             load_options += ",demuxer=lavf,demuxer-lavf-format=matroska"
-        if self.mpv.mpv_version_tuple >= (0, 38, 0):
-            loaded = self.mpv.command(
-                "loadfile", self._buffer.uri, "replace", -1, load_options)
-        else:
-            loaded = self.mpv.command(
-                "loadfile", self._buffer.uri, "replace", load_options)
-        self._note_load(loaded.get("playlist_entry_id") if isinstance(loaded, dict) else None)
+        self._loadfile(self._buffer.uri, load_options)
         self._reloading = False
 
     def set_subtitle_fonts_dir(self, path: Path | None) -> None:
@@ -1568,9 +1573,9 @@ class MpvPlayerView(QOpenGLWidget):
         self._reloading = True
         old = self._buffer
         self._buffer = None
+        self._freeze_picture()  # before the input ends: mpv could retire the decoder
         if old is not None:
             old.abort()
-        self._freeze_picture()
         try:
             self.mpv.command("stop")
         except Exception:
@@ -1672,10 +1677,10 @@ class MpvPlayerView(QOpenGLWidget):
         self._task = self._stats_task = None
         self._accept_playback_restart = False
         self._load_generation += 1
+        self._freeze_picture()  # before the input ends: mpv could retire the decoder
         if self._buffer is not None:
             self._buffer.close()
             self._buffer = None
-        self._freeze_picture()
         try:
             self.mpv.command("stop")
         except Exception:
@@ -1879,8 +1884,6 @@ class MpvPlayerView(QOpenGLWidget):
                 kind = event.event_id.value
                 if kind == mpv.MpvEventID.START_FILE:
                     entry_id = event.data.playlist_entry_id
-                    if generation == self._load_generation:
-                        self._note_load(entry_id)
                     return
                 if entry_id is None:
                     return
@@ -1896,9 +1899,7 @@ class MpvPlayerView(QOpenGLWidget):
                 except RuntimeError:
                     pass  # the application loop was closed during shutdown
 
-            self.mpv.loadfile(
-                self._source_path, start=str(max(0.0, position_s)), pause="yes",
-            )
+            self._loadfile(os.fsencode(self._source_path), f"start={max(0.0, position_s)},pause=yes")
             async with asyncio.timeout(30):
                 await ready
             if generation != self._load_generation:

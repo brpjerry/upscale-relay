@@ -479,11 +479,13 @@ class HdrPresenter(QOpenGLWindow):
         """mpv has a frame (or a redraw) for this surface."""
         if self.ctx is None:
             return
-        if self.isExposed():
+        if self.isExposed() and not getattr(self._view, "_frozen", False):
             self.update()
             return
         # Hidden (another workspace): acknowledge the frame, as the widget
-        # does, so mpv's VO does not time out and count it as dropped.
+        # does, so mpv's VO does not time out and count it as dropped. Frozen
+        # (MpvPlayerView._freeze_picture), take it without drawing it, as the
+        # widget does: skip_rendering never maps the frame's surface.
         self.makeCurrent()
         try:
             if self.ctx is not None and self.ctx.update():

@@ -268,12 +268,17 @@ their volume, panscan, tracks and delays.
   syncs a retired surface, and iHD crashes in
   `paintGL → mpv_render_context_render → vaSyncSurface` (a real core in
   August 2026; reproduced ~5 min into `tools/hwdec_stress.py` with
-  `RELAY_HWDEC=vaapi` on 2026-11-03). From just before every `stop` until
-  the playback restart of the entry id the next `loadfile` returned, nothing
-  calls mpv's `render`: the widget paints a copy of its last picture, the
-  HDR surface its own framebuffer, and a hidden window skips its frame
-  acknowledgement. Thawing on any restart crashed the HDR surface within
-  1.5 minutes: a late restart of the stopped file arrived after the stop.
+  `RELAY_HWDEC=vaapi` on 2026-11-03). From just before every `stop` (and
+  before its input closes) until the playback restart of the entry id the
+  next `loadfile` returned, nothing draws mpv's frames: the widget paints a
+  copy of its last picture and the HDR surface its own framebuffer. Both
+  take each frame with `skip_rendering`, which never maps its surface: mpv
+  waits ~200 ms for a frame to be taken, the new stream's first included,
+  before it reports the restart, and leaving them stalled every load by that
+  much (37 "not being called or stuck" logs in 31 loads). Thawing on any
+  restart crashed the HDR surface within 1.5 minutes: a late restart of the
+  stopped file arrived after the stop. python-mpv's `loadfile()` drops the
+  entry id; `MpvPlayerView._loadfile` keeps it.
   With the freeze, 35 minutes of stress (~1,330 actions: relay seeks and
   session restarts, the HDR surface, local loads) ran clean, and so did 333
   natural ends of file, which no freeze precedes (8- and 10-bit HEVC,
