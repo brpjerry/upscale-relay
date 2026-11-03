@@ -199,10 +199,11 @@ display's peak) and passes the rest through.
 ## Measurements
 
 `tools/hdr_desktop_check.py --file hdr.mkv --pacing` plays a clip from
-`upscale-cli sample hdr.mkv --hdr` in the real window and times the CLAUDE.md
+`upscale-cli sample hdr.mkv --hdr --frames 3600` in the real window and times the CLAUDE.md
 scenarios. `--surface off` measures the widget for comparison. `--hold
-SECONDS` instead keeps the clip playing in the window (looped) for a by-eye
-check, until the window closes. Rates are per
+SECONDS` instead keeps the clip playing in the window for a by-eye check,
+until the window closes (looped when played locally; through `--server` it
+plays once). Rates are per
 second, measured over the span of the motion. "Main" is the main window's
 presented frames. Resizes and steps are the layout and animation steps that
 reached the player or the overlay.

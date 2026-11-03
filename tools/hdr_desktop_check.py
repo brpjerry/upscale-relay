@@ -3,14 +3,16 @@
     python tools/hdr_desktop_check.py --file hdr.mkv [--server HOST:PORT] \
         [--shots DIR --shot-cmd 'grim {path}'] [--surface auto|force|off] [--pacing]
 
-Plays an HDR clip (``upscale-cli sample hdr.mkv --hdr``) on its own, or
-through a relay with --server (uplink, passthrough model by default), in a
-visible window. Prints the display's HDR state, where the video renders and
+Plays an HDR clip (``upscale-cli sample hdr.mkv --hdr --frames 3600``, two
+minutes) on its own, looped, or through a relay with --server (uplink,
+passthrough model by default; played once), in a visible window. Prints the display's HDR state, where the video renders and
 what mpv outputs, and takes a screenshot as each overlay appears (--shots).
 --pacing times fullscreen transitions, sidebar slides, a live splitter drag,
 overlay motion and steady playback: the rates CLAUDE.md quotes for the
 widget, here with the video on the HDR surface. --surface off measures the
-same on the widget, for comparison (RELAY_HDR_SURFACE).
+same on the widget, for comparison (RELAY_HDR_SURFACE). A clip that ends
+during the run makes it an error: the rest would time an idle window.
+--hold keeps the clip up for a by-eye check until the window closes.
 """
 
 from __future__ import annotations
@@ -219,8 +221,11 @@ async def exercise(window, clock, args):
         report["outputs"] = hdr_output.wayland_outputs()
     print(json.dumps(report), flush=True)
     errors = []
+    ended = []
     window._error = lambda title, message: errors.append(f"{title}: {message}")
     player = window.player
+    on_end = lambda: ended.append(True)  # noqa: E731
+    player.finished.connect(on_end)
     try:
         if args.server:
             window.host_edit.setText(args.server)
@@ -277,6 +282,9 @@ async def exercise(window, clock, args):
         await asyncio.sleep(2.0)
         if args.pacing:
             await measure(window, clock, report)
+        if ended:
+            errors.append("the clip ended during the run: use a longer one "
+                          "(upscale-cli sample --hdr --frames 3600)")
         report["errors"] = errors
         return report
     finally:
@@ -306,6 +314,9 @@ def main():
     if args.surface != "auto":
         os.environ["RELAY_HDR_SURFACE"] = args.surface
     app = QApplication([])
+    # --hold ends when the window closes: quitting then would stop the loop
+    # under the run before it reports and cleans up.
+    app.setQuitOnLastWindowClosed(not args.hold)
     locale.setlocale(locale.LC_NUMERIC, "C")
     from desktop_client import hdr_view  # noqa: PLC0415
     from desktop_client.main_window import MainWindow  # noqa: PLC0415

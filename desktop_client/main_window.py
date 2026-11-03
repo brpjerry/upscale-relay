@@ -2683,15 +2683,15 @@ class MainWindow(DesktopFeatures, QMainWindow):
         """The display's HDR state changed under an HDR video (or the setting
         did): reload it at the current position on the surface that fits."""
         if self._transitioning:
+            if hasattr(self.player, "retry_hdr_check"):
+                self.player.retry_hdr_check()  # the next check asks again
             return
         position = self._pending_seek_s if self._pending_seek_s is not None else self._position_s
         self.client_log.record("hdr_surface_reload", position=position)
         if self._session_source == "local" and self._session_path:
-            try:
-                await self.player.play_local(
-                    self._session_path, position, paused=self._paused, hdr=self.player._source_hdr)
-            except Exception as err:
-                self._error("Local playback failed", str(err))
+            # As a transition: a failed load tears the session down.
+            path, hdr, paused = self._session_path, self.player.source_hdr, self._paused
+            await self._run_transition(lambda: self.player.play_local(path, position, paused=paused, hdr=hdr))
             return
         await self._seek_to_seconds(position, announce=False)
 
@@ -2792,7 +2792,9 @@ class MainWindow(DesktopFeatures, QMainWindow):
         if path is None:
             return
         # The server read the file's colour: an HDR source has an HDR downlink.
-        hdr = bool(getattr(getattr(self.client, "session", None), "downlink_hdr", False))
+        # mpv may have read it in the frames too (an HLG alternative-transfer SEI).
+        hdr = bool(getattr(getattr(self.client, "session", None), "downlink_hdr", False)
+                   or getattr(self.player, "source_hdr", False))
         # The control teardown closes the old downlink. Stop its consumer first
         # so that normal closure cannot enqueue a stale playback failure while
         # the local file is being loaded.

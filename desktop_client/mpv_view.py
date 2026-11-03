@@ -1001,6 +1001,17 @@ class MpvPlayerView(QOpenGLWidget):
         """The display's HDR state as read at the last load."""
         return self._display_hdr
 
+    @property
+    def source_hdr(self) -> bool:
+        """The video playing is PQ or HLG: as its session or file said, or as
+        mpv read the frames."""
+        return self._source_hdr
+
+    def retry_hdr_check(self) -> None:
+        """The reload hdr_surface_stale asked for did not happen (a playback
+        transition was under way): ask again at the next check."""
+        self._hdr_stale_reported = False
+
     def set_hdr_output_enabled(self, enabled: bool) -> None:
         """The "Show HDR videos in HDR" setting. Applies at the next load;
         during an HDR video hdr_surface_stale asks for one."""
@@ -1050,10 +1061,14 @@ class MpvPlayerView(QOpenGLWidget):
         """Put the render context where this video and display call for it."""
         was = self.hdr_output
         try:
+            generation = self._load_generation
             want, display = self._wanted_surface()
             self._display_hdr = display
             self._hdr_stale_reported = False
-            if not want or not await self._move_to_presenter(display):
+            moved = want and await self._move_to_presenter(display)
+            if generation != self._load_generation:
+                return  # stopped or replaced while the surface started
+            if not moved:
                 self._move_to_widget()
             self._follow_auto_hdr(want, display)
         except asyncio.CancelledError:
@@ -1105,14 +1120,21 @@ class MpvPlayerView(QOpenGLWidget):
         presenter.follow_view()
         presenter.show()
         presenter.update()
+        generation = self._load_generation
         deadline = time.monotonic() + _HDR_SURFACE_TIMEOUT_S
         while not presenter.initialized:
+            if generation != self._load_generation:
+                return False  # stopped or replaced meanwhile: its successor decides
             if self._presenter_broken or presenter.broken or time.monotonic() > deadline:
                 presenter.hide()
+                if self._presenting():
+                    # Shown and still not started: broken here. (A hidden window
+                    # never exposes it; the next check after it shows retries.)
+                    self._presenter_broken = True
                 self.log_message.emit("warn", "relay", "HDR surface did not start; playing on the SDR surface")
                 return False
             await asyncio.sleep(0.02)
-        if self._presenter is not presenter:
+        if generation != self._load_generation or self._presenter is not presenter:
             return False
         self._release_widget_ctx()
         presenter.makeCurrent()
@@ -1182,10 +1204,16 @@ class MpvPlayerView(QOpenGLWidget):
 
     def _release_surface_if_idle(self) -> None:
         # Deferred from stop(): a start or local load that follows at once
-        # keeps the surface for its own decision (_prepare_surface).
-        if self._on_presenter and self._task is None and not self._local_playback:
+        # keeps the surface for its own decision (_prepare_surface). A
+        # surface still starting for a cancelled load goes too.
+        presenter = self._presenter
+        if presenter is None or self._task is not None or self._local_playback:
+            return
+        was = self.hdr_output
+        if self._on_presenter or presenter.isVisible():
             self._move_to_widget()
             self._apply_output_target()
+        if was:
             self.hdr_output_changed.emit(False)
 
     def _apply_output_target(self, *, asynchronous: bool = False) -> None:
@@ -1229,6 +1257,11 @@ class MpvPlayerView(QOpenGLWidget):
             self._source_hdr = True
         if not (self._source_hdr or self._on_presenter):
             return
+        if not self._presenting():
+            # Hidden or minimised: a new surface is never exposed, so it could
+            # not start (each reload would time out and ask again). Decide
+            # once the window shows.
+            return
         want, display = self._wanted_surface()
         if display.auto and self._auto_hdr_deadline is not None and time.monotonic() > self._auto_hdr_deadline:
             # The compositor kept the screen in SDR (a no_auto_hdr window
@@ -1254,7 +1287,7 @@ class MpvPlayerView(QOpenGLWidget):
                 self._presenter.peak_nits = display.peak_nits
             self._presenter.update()  # composes, and describes the surface, anew
             self._apply_output_target(asynchronous=True)
-            self.hdr_output_changed.emit(True)  # the hint's peak
+            self.hdr_output_changed.emit(self.hdr_output)  # the hint's peak
 
     # -- public API -----------------------------------------------------------
 
@@ -1465,7 +1498,7 @@ class MpvPlayerView(QOpenGLWidget):
         self._epoch_released = False
         self._caller_paused = False
         self._local_playback = False
-        if self._on_presenter:
+        if self._presenter is not None:
             QTimer.singleShot(0, self._release_surface_if_idle)
 
     def set_paused(self, paused: bool) -> None:

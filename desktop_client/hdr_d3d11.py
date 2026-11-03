@@ -205,18 +205,19 @@ class _D3D:
         self._make_rtv()
         self._compile()
 
-    def _set_hdr_metadata(self, peak_nits: float) -> None:
+    def _set_hdr_metadata(self, peak_nits: float) -> bool:
         """Tell the display the swap chain's range (IDXGISwapChain4::
         SetHDRMetaData). DWM composes HDR10 without tone-mapping it either way;
-        a display that tone-maps by the metadata sees the real peak."""
+        a display that tone-maps by the metadata sees the real peak. A hint
+        only: a swap chain that refuses it plays on without (False)."""
         swapchain4 = c_void_p()
         if _com(self.swapchain, 0, c_int, [POINTER(_GUID), POINTER(c_void_p)],
                 byref(_GUID.parse(_IID_IDXGISwapChain4)), byref(swapchain4)) != 0:
-            return  # before Windows 10 1709
+            return False  # before Windows 10 1709
         try:
             metadata = _hdr10_metadata(peak_nits)
-            _check(_com(swapchain4, 40, c_int, [c_uint, c_uint, c_void_p], _DXGI_HDR_METADATA_TYPE_HDR10,
-                        ctypes.sizeof(metadata), byref(metadata)), "SetHDRMetaData")
+            return _com(swapchain4, 40, c_int, [c_uint, c_uint, c_void_p], _DXGI_HDR_METADATA_TYPE_HDR10,
+                        ctypes.sizeof(metadata), byref(metadata)) >= 0
         finally:
             _release(swapchain4)
 
@@ -323,7 +324,9 @@ class _D3D:
         _com(context, 13, None, [c_uint, c_uint], 4, 0)
 
     def present(self) -> None:
-        _com(self.swapchain, 8, c_int, [c_uint, c_uint], 1, 0)
+        # A failure (a removed device) breaks the surface, and playback falls
+        # back to the widget; DXGI_STATUS_OCCLUDED is a success code.
+        _check(_com(self.swapchain, 8, c_int, [c_uint, c_uint], 1, 0), "Present")
 
     def close(self) -> None:
         for name in ("raster", "blend", "sampler", "constants", "ps", "vs", "rtv", "swapchain", "context", "device"):
@@ -423,6 +426,7 @@ class D3D11Presenter(QWindow):
         self.pq = True
         self.sdr_white_nits = sdr_white_nits or DEFAULT_SDR_WHITE_NITS
         self.peak_nits = peak_nits
+        self._metadata_peak_nits = None  # the peak the swap chain's HDR10 metadata gives
         self.setFlags(self.flags() | Qt.WindowTransparentForInput | Qt.WindowDoesNotAcceptFocus)
         self.ctx = None
         self._d3d: _D3D | None = None
@@ -468,7 +472,7 @@ class D3D11Presenter(QWindow):
         try:
             if self._d3d is None and not self._broken and self.isExposed():
                 self._start()
-            if self._d3d is not None and self.isExposed():
+            if self._d3d is not None and not self._broken and self.isExposed():
                 self._paint()
         except Exception as error:  # noqa: BLE001 - a native crash otherwise
             self._broken = True
@@ -542,6 +546,7 @@ class D3D11Presenter(QWindow):
     def _start(self) -> None:
         width, height = self._pixel_size()
         self._d3d = _D3D(int(self.winId()), width, height, self.peak_nits)
+        self._metadata_peak_nits = self.peak_nits
         self._gl = QOpenGLContext()
         if not self._gl.create():
             raise OSError("no OpenGL context for mpv")
@@ -564,6 +569,10 @@ class D3D11Presenter(QWindow):
     def _paint(self) -> None:
         started = time.perf_counter()
         d3d = self._d3d
+        if self.peak_nits and self.peak_nits != self._metadata_peak_nits:
+            # Another display's peak (mpv's target-peak follows it too).
+            d3d._set_hdr_metadata(self.peak_nits)
+            self._metadata_peak_nits = self.peak_nits
         width, height = self._pixel_size()
         d3d.resize(width, height)
         dpr = self.devicePixelRatio()
@@ -607,6 +616,9 @@ class D3D11Presenter(QWindow):
             else:
                 stale = video is None or (video.width, video.height) != (width, height)
             if stale:
+                # Not ours any more before it closes: a replacement that fails
+                # must not leave the closed one to be closed again.
+                self._video = None
                 if video is not None:
                     video.close()
                 video = self._video = _VideoTarget(self._d3d, self._interop, width, height)

@@ -70,17 +70,21 @@ def test_toggle_restarts_only_a_10_bit_sdr_stream(window, monkeypatch, hdr, sour
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize("hdr", [True, False])
-def test_playing_locally_keeps_what_the_server_read_of_the_source(window, monkeypatch, hdr):
+@pytest.mark.parametrize(("hdr", "mpv_read", "expected"), [
+    (True, False, True), (False, False, False),
+    (False, True, True),  # an HLG alternative-transfer SEI: only mpv saw it, in the frames
+])
+def test_playing_locally_keeps_what_the_server_read_of_the_source(window, monkeypatch, hdr, mpv_read, expected):
     """The local fallback plays an HDR source on the HDR surface too: the
     server read the file's colour, and its downlink is HDR for an HDR file."""
     errors, _ = setup_deep(window, monkeypatch, hdr=hdr)
+    window.player.source_hdr = mpv_read
 
     async def scenario():
         await window._start_session("/videos/show.mkv", "uplink")
         await window.on_fallback()
         assert window._session_source == "local"
-        assert window.player.local_hdr is hdr
+        assert window.player.local_hdr is expected
         assert not errors
 
     asyncio.run(scenario())

@@ -31,7 +31,7 @@ def app():
 def _player(**fields):
     defaults = dict(
         options=SimpleNamespace(headless=False), _presenter_broken=False, _hdr_enabled=True,
-        _source_hdr=True, window=lambda: None,
+        _source_hdr=True, window=lambda: None, _presenting=lambda: True,
         _auto_hdr=False, _auto_hdr_deadline=None, _auto_hdr_refused=False,
     )
     defaults.update(fields)
@@ -146,6 +146,82 @@ def test_a_stream_mpv_reads_as_hdr_moves_though_the_session_said_sdr(monkeypatch
     assert stale == expected and player._source_hdr is bool(expected)
 
 
+def test_no_reload_is_asked_while_the_window_is_hidden(monkeypatch):
+    """A hidden window never exposes a new surface: every reload would time
+    out and ask again, a relay seek every few seconds."""
+    pytest.importorskip("mpv")
+    from desktop_client.mpv_view import MpvPlayerView
+    monkeypatch.setenv("RELAY_HDR_SURFACE", "")
+    monkeypatch.setattr(hdr_output, "presentation_supported", lambda app=None: True)
+    monkeypatch.setattr(hdr_output, "query", lambda window=None: HDR_DISPLAY)
+    stale = []
+    presenting = [False]
+    player = _player(
+        _presenting=lambda: presenting[0], _hdr_stale_reported=False, _task=object(), _local_playback=False,
+        _on_presenter=False, _presenter=None, _display_hdr=SDR_DISPLAY, _observed={}, _epoch_released=True,
+        hdr_surface_stale=SimpleNamespace(emit=lambda: stale.append(True)),
+    )
+    _bind(player, "_wanted_surface", "_follow_auto_hdr")
+    MpvPlayerView._check_hdr_surface(player)
+    assert not stale
+    presenting[0] = True  # shown again: now the reload can start the surface
+    MpvPlayerView._check_hdr_surface(player)
+    assert stale == [True]
+
+
+class _Presenter:
+    """An HDR surface that never starts, or whose load is replaced meanwhile."""
+
+    def __init__(self, player, replaced=False):
+        self.player, self.replaced, self.pq, self.broken = player, replaced, True, False
+        self.calls = []
+
+    @property
+    def initialized(self):
+        if self.replaced:
+            self.player._load_generation += 1  # a stop() while it waited
+        return False
+
+    def __getattr__(self, name):
+        return lambda *args: self.calls.append(name)
+
+
+@pytest.mark.parametrize(("presenting", "replaced", "broken", "hidden"), [
+    (True, False, True, True),    # shown and never started: broken, SDR from now on
+    (False, False, False, True),  # hidden: it could not start; the next check retries
+    (True, True, False, False),   # its load was stopped or replaced: left to the next one
+])
+def test_a_surface_that_does_not_start(monkeypatch, presenting, replaced, broken, hidden):
+    pytest.importorskip("mpv")
+    from desktop_client import mpv_view
+    monkeypatch.setattr(mpv_view, "_HDR_SURFACE_TIMEOUT_S", 0.05)
+    monkeypatch.setattr(hdr_output, "presentation_supported", lambda app=None: True)
+    player = _player(
+        _on_presenter=False, _load_generation=0, _presenting=lambda: presenting,
+        window=lambda: SimpleNamespace(windowHandle=lambda: object()),
+        log_message=SimpleNamespace(emit=lambda *args: None),
+    )
+    player._presenter = presenter = _Presenter(player, replaced)
+    player._pq_for = mpv_view.MpvPlayerView._pq_for
+    moved = asyncio.run(mpv_view.MpvPlayerView._move_to_presenter(player, HDR_DISPLAY))
+    assert moved is False and player._presenter_broken is broken
+    assert ("hide" in presenter.calls) is hidden
+
+
+def test_stop_takes_down_a_surface_that_never_started():
+    pytest.importorskip("mpv")
+    from desktop_client.mpv_view import MpvPlayerView
+    calls = []
+    player = _player(
+        _presenter=SimpleNamespace(isVisible=lambda: True), _on_presenter=False, _task=None,
+        _local_playback=False, hdr_output=False,
+        _move_to_widget=lambda: calls.append("widget"), _apply_output_target=lambda: calls.append("target"),
+        hdr_output_changed=SimpleNamespace(emit=lambda on: calls.append(("hdr_output", on))),
+    )
+    MpvPlayerView._release_surface_if_idle(player)
+    assert calls == ["widget", "target"]  # hidden; it never showed HDR, so nothing to announce
+
+
 def test_a_failing_hdr_surface_falls_back_to_the_widget():
     pytest.importorskip("mpv")
     from desktop_client.mpv_view import MpvPlayerView
@@ -155,7 +231,7 @@ def test_a_failing_hdr_surface_falls_back_to_the_widget():
         raise RuntimeError("no surface")
 
     player = _player(
-        hdr_output=False, _presenter_broken=False, _on_presenter=False,
+        hdr_output=False, _presenter_broken=False, _on_presenter=False, _load_generation=0,
         _follow_auto_hdr=lambda *_: None,
         _wanted_surface=lambda: (True, HDR_DISPLAY), _move_to_presenter=broken,
         _move_to_widget=lambda: moved.append("widget"), _apply_output_target=lambda: None,
@@ -214,7 +290,7 @@ def _auto_player(monkeypatch, display, fullscreen):
         hdr_surface_stale=SimpleNamespace(emit=lambda: events.append("reload")),
         hdr_output_changed=SimpleNamespace(emit=lambda on: events.append(("hdr_output", on))),
         log_message=SimpleNamespace(emit=lambda *args: events.append(("log",) + args)),
-        _apply_output_target=lambda asynchronous=False: events.append("target"),
+        _apply_output_target=lambda asynchronous=False: events.append("target"), hdr_output=True,
     )
     _bind(player, "_wanted_surface", "_follow_auto_hdr")
     return player, events
@@ -592,6 +668,30 @@ def test_a_fade_applies_its_opacity_when_composing(scene):
         _layer, _pos, opacity = next(item for item in mirror.layers(1.0) if item[0].widget is card)
         assert opacity == step
     assert not renders  # fade steps are composed, not drawn again
+
+
+def test_the_end_of_a_fade_draws_the_overlay_again(scene):
+    """Fade steps are not drawn again, nor a repaint after a move. A fade
+    that ends with a move (FadeSlide._place) would leave a change that came
+    with a step unmirrored, unless the end of the fade draws it in full."""
+    mirror, card = scene.mirror, scene.card
+    effect = QGraphicsOpacityEffect(card)
+    effect.setOpacity(0.5)
+    card.setGraphicsEffect(effect)
+    scene.app.processEvents()
+    mirror.layers(1.0)
+    scene.app.processEvents()  # the effect's own first paint
+    mirror.layers(1.0)
+    renders = _count_renders(card)
+    effect.setOpacity(0.75)
+    scene.app.processEvents()
+    mirror.layers(1.0)
+    assert not renders  # a fade step
+    card.move(card.pos() + QPoint(0, 5))
+    card.setGraphicsEffect(None)  # the fade ends where it lands
+    scene.app.processEvents()
+    _layer, _pos, opacity = next(item for item in mirror.layers(1.0) if item[0].widget is card)
+    assert opacity == 1.0 and len(renders) == 1
 
 
 def test_a_hidden_overlay_leaves_the_surface(scene):

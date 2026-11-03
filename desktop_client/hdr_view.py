@@ -335,6 +335,11 @@ class OverlayMirror(QObject):
                     layer.opacity = opacity
                     if opacity is not None:
                         layer.expect_repaint = True
+                    else:
+                        # The fade ended: picture it whole once more, for any
+                        # change a skipped fade step carried (new text, say).
+                        layer.expect_repaint = False
+                        layer.dirty = QRegion(root.rect())
                 if layer.expect_repaint:
                     # Its children repaint in the same pass, which ends
                     # before the next event is processed.
@@ -358,8 +363,9 @@ class OverlayMirror(QObject):
 class HdrPresenter(QOpenGLWindow):
     """A native child window over the player widget that mpv renders into.
 
-    It follows the player's geometry, takes no input or focus, and composes
-    mpv's last picture (rendered only for a new frame, or once the surface
+    It follows the player's geometry (in ``cover`` mode, on Wayland, it spans
+    the window and draws at the player's place), takes no input or focus, and
+    composes mpv's last picture (rendered only for a new frame, or once the surface
     has settled at a new size) with the mirrored overlays. ``pq`` makes it a
     10-bit BT.2100 PQ surface; otherwise it is an ordinary SDR window (the
     RELAY_HDR_SURFACE=force test mode on an SDR display).
