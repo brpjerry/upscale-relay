@@ -317,19 +317,11 @@ class DisplayTarget:
         return wire
 
     def fits(self, mapping: dict | None) -> bool:
-        """Whether a stream mapped as ``mapping`` (session_opened /
-        seek_ready downlink_mapping) suits this display. PQ mapped for a
-        peak up to ~20% below the display's still fits (the display shows
-        it as it is: a guessed peak before the compositor's switch to HDR
-        need not cost another reload); brighter than the display does not."""
-        if not isinstance(mapping, dict) or mapping.get("transfer") != self.transfer:
-            return False
-        if self.transfer != "pq":
-            return True
-        mapped, peak = mapping.get("peak_nits"), self.peak_nits
-        if not (isinstance(mapped, (int, float)) and mapped > 0 and peak):
-            return True  # a side that does not say: nothing to compare
-        return 0.8 * peak <= mapped <= 1.05 * peak
+        """Whether an epoch the server made as ``mapping`` (session_opened /
+        seek_ready downlink_mapping) suits this display: it was made for the
+        same transfer. The server remaps only when the transfer changes; a
+        new peak or SDR white keeps its mapping."""
+        return isinstance(mapping, dict) and mapping.get("transfer") == self.transfer
 
 
 @dataclass
@@ -409,10 +401,11 @@ class SessionInfo:
     downlink_dolby_vision: bool = False
     source_bit_depth: int | None = None  # None: the server did not say
     # Display mapping (docs/PROTOCOL.md §3.6): the target this session asks
-    # for (None: not negotiated, and seeks send none), and what the current
-    # epoch's stream was mapped for ({transfer, peak_nits, sdr_white_nits,
-    # applied}; None: not mapped). Both follow each seek, and downlink_color
-    # with them.
+    # for (None: not negotiated, and seeks send none), and the target the
+    # current epoch was made for ({transfer, peak_nits, sdr_white_nits,
+    # applied}; an empty applied: streamed as §3.5 for that target; None: a
+    # session the server never maps). Both follow each seek, and
+    # downlink_color with them.
     display_target: DisplayTarget | None = None
     downlink_mapping: dict | None = None
 

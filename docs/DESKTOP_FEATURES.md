@@ -100,11 +100,13 @@ platform) mpv tone-maps HDR to SDR from the 10-bit signal and its mastering
 metadata, as before. A local fallback keeps the source's HDR, as the server
 read it. The libmpv render API runs mpv's `gpu` renderer, which uses static
 metadata only, so the player has a server that can apply Dolby Vision and
-HDR10+ do it for the display the video is shown on (docs/PROTOCOL.md §3.6): the
-stream arrives as PQ fitted to the display's peak where the video plays as HDR,
-and as SDR elsewhere. When that changes (the display's HDR mode, the setting,
-fullscreen where Hyprland switches to HDR), the reload asks the server to map
-for the new display. The info card says when the server applied them. Other
+HDR10+ do it for the display the video is shown on (docs/PROTOCOL.md §3.6).
+Where the video plays as SDR, the server tone-maps Dolby Vision and HDR10+ to
+SDR by their metadata. Where it plays as HDR, the server reshapes Dolby Vision
+profile 5 to PQ; other Dolby Vision profiles and HDR10+ arrive on their HDR10
+or HLG base, which mpv fits to the display's peak as it does HDR10. When that
+changes (the display's HDR mode, the setting, fullscreen where Hyprland
+switches to HDR), the reload asks the server to map for the new display. The info card says when the server applied them. Other
 servers, and local playback, send Dolby Vision and HDR10+ along unused, as
 before. docs/HDR_OUTPUT.md has the design and its measurements.
 

@@ -128,13 +128,16 @@ def _format_time(seconds: float) -> str:
 
 def _mapping_rows(mapping: dict | None) -> list[tuple[str, str]]:
     """The info card's line for a stream the server mapped for this display
-    (PROTOCOL §3.6): which dynamic metadata it applied."""
+    (PROTOCOL §3.6): which dynamic metadata it applied. None applied (Dolby
+    Vision 8 or HDR10+ for an HDR display, which stream as they are): no
+    line."""
     if not isinstance(mapping, dict):
         return []
     names = {"dolby_vision": "Dolby Vision", "hdr10plus": "HDR10+"}
     applied = [names.get(item, str(item)) for item in mapping.get("applied") or []]
-    what = " and ".join(applied) or "Dynamic HDR metadata"
-    return [("Dynamic HDR", f"{what}, applied by the server for this display")]
+    if not applied:
+        return []
+    return [("Dynamic HDR", f"{' and '.join(applied)}, applied by the server for this display")]
 
 
 def _server_address(host: str, port: int) -> str:

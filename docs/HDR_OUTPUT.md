@@ -220,14 +220,23 @@ it. `gpu` uses static HDR10 metadata only: it tone-maps content brighter than
 `target-peak` (the display's peak) and passes the rest through. The Dolby
 Vision RPU and HDR10+ are therefore applied on the server, for the display the
 player names (docs/PROTOCOL.md §3.6). `MpvPlayerView.display_target()` takes the
-same decision as the surface: PQ at the display's peak and SDR white where an
+same decision as the surface: PQ with the display's peak and SDR white where an
 HDR video would play on the HDR surface (in fullscreen before Hyprland's
 switch, the peak it is expected to bring), SDR elsewhere. The open and every
-seek carry it, and a mapped epoch that no longer fits the display (PQ for an
-SDR one, SDR for an HDR one, a peak above the display's or far below it)
-reloads through the same seek as a surface change. A mapped stream's peak is
-at most the display's, so mpv passes it through. Without a capable server, and
-for local playback, the RPU and HDR10+ ride along unused.
+seek carry it, and an epoch made for the other transfer (HDR for an SDR
+display, SDR for an HDR one) reloads through the same seek as a surface
+change.
+
+For an SDR display the server tone-maps Dolby Vision (profiles 5, 7 and 8) and
+HDR10+ to BT.709 by their dynamic metadata. For an HDR display it maps only
+Dolby Vision profile 5, whose base layer is not viewable alone, reshaping it to
+PQ at the source's brightness. Other Dolby Vision profiles and HDR10+ stream
+on their HDR10 or HLG base, and mpv fits them to the display's peak by static
+metadata, as it does HDR10. The server's FFmpeg libplacebo filter cannot be
+given a target peak, so it does not fit PQ to the display; the peak the player
+sends is a hint the server keeps the mapping across. The info card names what
+the server applied. Without a capable server, and for local playback, the RPU
+and HDR10+ ride along unused.
 
 ## Measurements
 

@@ -17,8 +17,9 @@ from test_desktop_features_gui import LifecycleClient, setup_lifecycle
 from test_desktop_hdr_output import HDR_DISPLAY, SDR_DISPLAY, _bind, _player, _window
 from test_server_library_gui import window  # noqa: F401
 
-MAPPED_PQ = {"transfer": "pq", "peak_nits": 1107, "sdr_white_nits": 203, "applied": ["dolby_vision"]}
-MAPPED_SDR = {"transfer": "sdr", "sdr_white_nits": 80, "applied": ["dolby_vision"]}
+MAPPED_PQ = {"transfer": "pq", "peak_nits": None, "sdr_white_nits": None, "applied": ["dolby_vision"]}
+MAPPED_SDR = {"transfer": "sdr", "peak_nits": None, "sdr_white_nits": None, "applied": ["dolby_vision"]}
+UNMAPPED_PQ = {**MAPPED_PQ, "applied": []}  # Dolby Vision 8 for an HDR display: streamed as §3.5
 
 
 @pytest.fixture()
@@ -34,9 +35,11 @@ def displays(monkeypatch):
     return shown
 
 
-def _mapped_player(mapping, **fields):
+def _mapped_player(mapping, downlink_hdr=None, **fields):
+    if downlink_hdr is None:
+        downlink_hdr = isinstance(mapping, dict) and mapping.get("transfer") == "pq"
     defaults = dict(
-        _session=SimpleNamespace(downlink_mapping=mapping), _local_playback=False,
+        _session=SimpleNamespace(downlink_mapping=mapping, downlink_hdr=downlink_hdr), _local_playback=False,
         _hdr_stale_reported=False, _task=object(), _on_presenter=False, _presenter=None,
         _display_hdr=SDR_DISPLAY, _observed={}, _epoch_released=True, window=_window(False),
     )
@@ -79,9 +82,12 @@ def test_without_hdr_presentation_the_target_is_sdr(displays, monkeypatch):
                               "_presenter": SimpleNamespace(pq=True)}, []),
     (MAPPED_PQ, SDR_DISPLAY, {"_on_presenter": True,
                               "_presenter": SimpleNamespace(pq=True)}, [True]),  # back to SDR
-    # Mapped for the expected 1000 nits; the switch brought 1107: it fits.
-    ({**MAPPED_PQ, "peak_nits": 1000}, HDR_DISPLAY,
+    # Made for an HDR display without mapping (Dolby Vision 8 as HDR10): it
+    # fits as a mapped epoch does.
+    (UNMAPPED_PQ, HDR_DISPLAY,
      {"_on_presenter": True, "_display_hdr": HDR_DISPLAY, "_presenter": SimpleNamespace(pq=True)}, []),
+    (UNMAPPED_PQ, SDR_DISPLAY, {"_on_presenter": True,
+                                "_presenter": SimpleNamespace(pq=True)}, [True]),
     # Fullscreen on an SDR screen: the SDR epoch reloads to be PQ for the switch.
     (MAPPED_SDR, SDR_DISPLAY, {"_source_hdr": False, "window": _window(True)}, [True]),
 ])
@@ -101,8 +107,12 @@ def test_local_playback_is_never_mapped(displays):
     assert not stale
 
 
-@pytest.mark.parametrize(("mapping", "expected"), [(MAPPED_PQ, True), (MAPPED_SDR, False)])
-def test_a_mapped_epoch_goes_on_the_surface_only_when_it_is_pq(displays, mapping, expected):
+@pytest.mark.parametrize(("mapping", "downlink_hdr", "expected"), [
+    (MAPPED_PQ, True, True),
+    (MAPPED_SDR, False, False),
+    (UNMAPPED_PQ, True, True),  # Dolby Vision 8.4 for an HDR display: its HLG base
+])
+def test_an_epoch_goes_on_the_surface_by_its_own_colour(displays, mapping, downlink_hdr, expected):
     displays[0] = HDR_DISPLAY
     moved = []
 
@@ -111,7 +121,7 @@ def test_a_mapped_epoch_goes_on_the_surface_only_when_it_is_pq(displays, mapping
         return True
 
     player, _stale = _mapped_player(
-        mapping, _source_hdr=True, _load_generation=0, hdr_output=False,
+        mapping, downlink_hdr, _source_hdr=not expected, _load_generation=0, hdr_output=False,
         _move_to_presenter=move, _move_to_widget=lambda: None, _apply_output_target=lambda: None,
         hdr_output_changed=SimpleNamespace(emit=lambda hdr: None),
     )
@@ -172,7 +182,7 @@ def test_sessions_without_mapping_seek_as_before(window, monkeypatch):
     (None, []),
     ({"applied": ["dolby_vision", "hdr10plus"]},
      [("Dynamic HDR", "Dolby Vision and HDR10+, applied by the server for this display")]),
-    ({"applied": []}, [("Dynamic HDR", "Dynamic HDR metadata, applied by the server for this display")]),
+    (UNMAPPED_PQ, []),  # made for this display, but streamed as it is
 ])
 def test_info_card_line(mapping, expected):
     assert _mapping_rows(mapping) == expected

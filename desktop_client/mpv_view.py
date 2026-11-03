@@ -1079,8 +1079,8 @@ class MpvPlayerView(QOpenGLWidget):
 
     def display_target(self) -> DisplayTarget:
         """The display an HDR video would be shown on now, for a server that
-        applies Dolby Vision and HDR10+ for it (PROTOCOL §3.6): PQ up to the
-        display's peak where it would play on the HDR surface (in fullscreen
+        applies Dolby Vision and HDR10+ for it (PROTOCOL §3.6): PQ where it
+        would play on the HDR surface, with the display's peak (in fullscreen
         before the compositor's switch, the peak that switch is expected to
         bring), SDR anywhere else."""
         want, display = self._wanted_surface(source_hdr=True)
@@ -1101,9 +1101,10 @@ class MpvPlayerView(QOpenGLWidget):
             generation = self._load_generation
             mapping = self._mapping()
             if mapping is not None:
-                # A mapped epoch is PQ only when it was mapped for an HDR
-                # display (the server sent SDR for an SDR one).
-                self._source_hdr = mapping.get("transfer") == "pq"
+                # A mapped session's epochs differ: the server sends SDR for
+                # an SDR display, HDR for an HDR one. The epoch's own colour
+                # (seek_ready's downlink_color) says which this one is.
+                self._source_hdr = bool(getattr(self._session, "downlink_hdr", False))
             want, display = self._wanted_surface()
             self._display_hdr = display
             self._hdr_stale_reported = False
@@ -1320,9 +1321,9 @@ class MpvPlayerView(QOpenGLWidget):
             want, display = self._wanted_surface()
         self._follow_auto_hdr(want, display)
         if mapping is not None and not self.display_target().fits(mapping):
-            # The server mapped this epoch for another display (PQ for an SDR
-            # one, SDR for an HDR one, or too bright a peak): the reload's
-            # seek names the display it is shown on now.
+            # The server made this epoch for another display (HDR for an SDR
+            # one, SDR for an HDR one): the reload's seek names the display it
+            # is shown on now.
             self._hdr_stale_reported = True
             self.hdr_surface_stale.emit()
             return

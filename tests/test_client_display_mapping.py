@@ -20,8 +20,9 @@ from test_hdr_pipeline import _hdr10plus, _write_source
 PQ = {"primaries": 9, "transfer": 16, "matrix": 9, "range": "limited"}
 SDR = {"primaries": 1, "transfer": 1, "matrix": 1, "range": "limited"}
 HDR_DISPLAY = DisplayTarget("pq", 1107, 203)
-MAPPED_PQ = {"transfer": "pq", "peak_nits": 1107, "sdr_white_nits": 203, "applied": ["dolby_vision"]}
-MAPPED_SDR = {"transfer": "sdr", "sdr_white_nits": 80, "applied": ["dolby_vision"]}
+MAPPED_PQ = {"transfer": "pq", "peak_nits": None, "sdr_white_nits": None, "applied": ["dolby_vision"]}
+MAPPED_SDR = {"transfer": "sdr", "peak_nits": None, "sdr_white_nits": None, "applied": ["dolby_vision"]}
+UNMAPPED_PQ = {**MAPPED_PQ, "applied": []}  # Dolby Vision 8 for an HDR display: streamed as §3.5
 
 
 def _open(monkeypatch, cfg, *, capabilities, opened):
@@ -88,6 +89,16 @@ def test_the_target_is_sent_only_where_it_can_apply(monkeypatch, capabilities, h
     )
     assert "display_target" not in sent
     assert info.display_target is None and info.downlink_mapping is None
+
+
+def test_an_epoch_made_for_the_target_without_mapping_is_still_mapped(monkeypatch):
+    _sent, info = _open(
+        monkeypatch, SessionConfig(path="a.mkv", high_bit_depth="hdr", display_target=HDR_DISPLAY),
+        capabilities={"high_bit_depth": True, "display_mapping": True},
+        opened={"downlink_bit_depth": 10, "downlink_color": PQ, "downlink_mapping": UNMAPPED_PQ,
+                "downlink_dolby_vision": True},
+    )
+    assert info.downlink_mapping == UNMAPPED_PQ and info.downlink_hdr and info.hdr_source
 
 
 def test_a_static_metadata_source_reads_as_unmapped(monkeypatch):
@@ -170,10 +181,10 @@ def test_sessions_without_mapping_seek_as_before():
 
 @pytest.mark.parametrize(("target", "mapping", "fits"), [
     (HDR_DISPLAY, MAPPED_PQ, True),
-    (HDR_DISPLAY, {**MAPPED_PQ, "peak_nits": 1000}, True),   # the guess before the switch
-    (HDR_DISPLAY, {**MAPPED_PQ, "peak_nits": 600}, False),   # far too dim
-    (DisplayTarget("pq", 600), MAPPED_PQ, False),            # brighter than the display
-    (HDR_DISPLAY, {**MAPPED_PQ, "peak_nits": None}, True),
+    (HDR_DISPLAY, UNMAPPED_PQ, True),
+    # The server remaps only for another transfer: a peak it names is not
+    # compared with the display's.
+    (HDR_DISPLAY, {**MAPPED_PQ, "peak_nits": 600}, True),
     (DisplayTarget("pq"), MAPPED_PQ, True),
     (HDR_DISPLAY, MAPPED_SDR, False),
     (DisplayTarget("sdr", None, 80), MAPPED_SDR, True),
