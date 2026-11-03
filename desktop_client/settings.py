@@ -146,6 +146,20 @@ class AppSettings:
         self._qs.setValue("playback/hdr_output", bool(v))
 
     @property
+    def hdr_auto_refused(self) -> list[str]:
+        """The screens (hdr_output.DisplayHdr.source) whose compositor did not
+        switch to HDR for a fullscreen HDR video: the player does not ask
+        again until the HDR setting is switched."""
+        value = self._qs.value("playback/hdr_auto_refused", [])
+        if isinstance(value, str):  # QSettings returns one value as a string
+            value = [value]
+        return [str(item) for item in value or []]
+
+    @hdr_auto_refused.setter
+    def hdr_auto_refused(self, sources: list[str]) -> None:
+        self._qs.setValue("playback/hdr_auto_refused", list(sources))
+
+    @property
     def display_sync(self) -> bool:
         """Tell mpv the display's refresh rate (so its display-sync modes
         work) while the window is not settled in fullscreen."""

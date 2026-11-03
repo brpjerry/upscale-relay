@@ -123,8 +123,31 @@ def compositor_auto_hdr() -> bool:
     return value != 0  # unknown: Hyprland's default, on
 
 
+def configured_hdr(screen_name: str | None) -> bool | None:
+    """Whether the compositor's own setting puts this screen in HDR mode
+    (Hyprland's ``cm = "hdr"``/``"hdredid"``). Its switch for a fullscreen
+    HDR surface leaves that setting as it is, so a screen that reads HDR
+    with this False is in HDR only for the fullscreen window. None: unknown."""
+    signature = os.environ.get("HYPRLAND_INSTANCE_SIGNATURE")
+    if not signature or not screen_name:
+        return None
+    monitors = _hyprland_request(signature, "j/monitors")
+    if not isinstance(monitors, list):
+        return None
+    for monitor in monitors:
+        if isinstance(monitor, dict) and monitor.get("name") == screen_name:
+            preset = monitor.get("colorManagementPreset")
+            return preset in ("hdr", "hdredid") if isinstance(preset, str) else None
+    return None
+
+
 def _hyprland_option(signature: str, name: str) -> int | None:
     """An integer option over Hyprland's IPC socket (``hyprctl getoption``)."""
+    return _option_value(_hyprland_request(signature, f"j/getoption {name}"))
+
+
+def _hyprland_request(signature: str, command: str):
+    """A JSON reply over Hyprland's IPC socket, or None."""
     import json  # noqa: PLC0415
     import socket  # noqa: PLC0415
 
@@ -137,13 +160,13 @@ def _hyprland_option(signature: str, name: str) -> int | None:
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
                 connection.settimeout(0.5)
                 connection.connect(path)
-                connection.sendall(f"j/getoption {name}".encode())
+                connection.sendall(command.encode())
                 reply = b""
                 while chunk := connection.recv(4096):
                     reply += chunk
-            return _option_value(json.loads(reply))
+            return json.loads(reply)
         except (OSError, ValueError):
-            return None
+            continue  # a stale socket: try the other place
     return None
 
 

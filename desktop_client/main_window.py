@@ -596,6 +596,7 @@ class MainWindow(DesktopFeatures, QMainWindow):
             self.player.set_deband(self.settings.deband_enabled)
         if hasattr(self.player, "set_hdr_output_enabled"):
             self.player.set_hdr_output_enabled(self.settings.hdr_output)
+            self.player.set_auto_hdr_refusals(self.settings.hdr_auto_refused)
         # Display pacing follows a policy (settings x fullscreen state); the
         # fullscreen transition settles before the policy is re-evaluated.
         self._fullscreen_settled = False
@@ -922,6 +923,7 @@ class MainWindow(DesktopFeatures, QMainWindow):
         if hasattr(self.player, "hdr_surface_stale"):
             self.player.hdr_surface_stale.connect(self._reload_for_hdr_surface)
             self.player.hdr_output_changed.connect(self._on_hdr_output_shown)
+            self.player.auto_hdr_refused.connect(self._remember_auto_hdr_refusal)
         self.fullscreen_btn.clicked.connect(self.toggle_fullscreen)
         if hasattr(self.player, "fullscreen_toggled"):
             self.player.fullscreen_toggled.connect(self.toggle_fullscreen)
@@ -1447,6 +1449,12 @@ class MainWindow(DesktopFeatures, QMainWindow):
         if not hasattr(self.player, "set_display_rate_reporting"):
             return
         self.player.set_display_rate_reporting(self.settings.display_sync and not self._fullscreen_settled)
+
+    @property
+    def fullscreen_settled(self) -> bool:
+        """Fullscreen, and its slides have ended (the player reloads onto the
+        HDR surface for the compositor's switch only then)."""
+        return self._fullscreen_settled
 
     def _on_fullscreen_settled(self) -> None:
         if self.isFullScreen():
@@ -2652,10 +2660,17 @@ class MainWindow(DesktopFeatures, QMainWindow):
 
     def on_hdr_output_changed(self, enabled: bool) -> None:
         self.settings.hdr_output = enabled
+        self.settings.hdr_auto_refused = []  # switching tries every screen again
         if hasattr(self.player, "set_hdr_output_enabled"):
             # During an HDR video this asks for the reload that switches.
             self.player.set_hdr_output_enabled(enabled)
         self._show_hdr_output_hint()
+
+    def _remember_auto_hdr_refusal(self, source: str) -> None:
+        refused = self.settings.hdr_auto_refused
+        if source not in refused:
+            self.settings.hdr_auto_refused = [*refused, source]
+        self.client_log.record("hdr_auto_refused", display=source)
 
     def _on_hdr_output_shown(self, hdr: bool) -> None:
         display = getattr(self.player, "display_hdr", None)
@@ -2669,8 +2684,11 @@ class MainWindow(DesktopFeatures, QMainWindow):
             display = self.player.display_hdr
             peak = f" (up to {display.peak_nits:.0f} nits)" if display.peak_nits else ""
             text = f"Playing in HDR{peak}."
+        elif getattr(self.player, "hdr_output_failed", False):
+            text = "HDR output stopped after an error. Switch it off and on to try again."
         elif not hdr_output.presentation_supported():
-            text = "HDR output needs a Wayland session with Qt 6.10.2 or later."
+            text = ("HDR output needs a Wayland session with Qt 6.10.2 or later "
+                    "(on Windows, the RELAY_HDR_WINDOWS=1 prototype).")
         elif hdr_output.compositor_auto_hdr():
             text = ("HDR videos play as HDR while the display is in HDR mode, "
                     "and in fullscreen, where the display switches to HDR.")

@@ -163,8 +163,9 @@ The player uses it for HDR videos (`MpvPlayerView._wanted_surface`), when
 Hyprland's IPC socket reports the option on (`hdr_output.compositor_auto_hdr`):
 
 1. **Entering fullscreen** (once the transition has settled, so the reload
-   does not hitch it), an HDR video on the widget reloads at its position
-   onto the HDR surface. Until the switch it uses the screen's last HDR
+   does not hitch it: `MainWindow.fullscreen_settled`, for the periodic check
+   too), an HDR video on the widget reloads at its position onto the HDR
+   surface. Until the switch it uses the screen's last HDR
    reading in this process, or 1000 nits and a 203-nit white
    (`hdr_output.expected_hdr`).
 2. **The switch.** Hyprland sees the surface and switches the screen. The
@@ -174,16 +175,25 @@ Hyprland's IPC socket reports the option on (`hdr_output.compositor_auto_hdr`):
 3. **Leaving fullscreen**, the video reloads at once onto the widget,
    tone-mapped. Hyprland's shader does not tone-map HDR to SDR, so a PQ
    surface on the screen that is about to be SDR would clip. The screen reads
-   HDR about a second longer; until it reads SDR again that HDR counts as
-   Hyprland's switch, and does not pull the video back.
-4. **No switch** within 5 seconds (a `no_auto_hdr` window rule, say): the
-   video goes back to the widget, and the player does not ask again until the
-   setting is switched.
+   HDR about a second longer, but the monitor's own setting, which the switch
+   leaves alone (`colorManagementPreset` in Hyprland's monitor list,
+   `hdr_output.configured_hdr`), is still SDR, so that HDR does not pull the
+   video back. A monitor set to `cm = "hdr"` keeps HDR videos on the surface
+   in a window as before.
+4. **No switch** within 5 seconds (a monitor without HDR, which Hyprland
+   never switches and its IPC does not report, or a `no_auto_hdr` window
+   rule): the video goes back to the widget. That screen is not asked again,
+   across runs too (`AppSettings.hdr_auto_refused`), until the setting is
+   switched off and on.
 
 Moving back to the widget drops the surface's description before hiding it:
 Hyprland finds the HDR surface of a fullscreen window even hidden, and would
 keep the screen in HDR for it. Each way costs one reload: a relay seek
 (0.5-1.8 s on a 4K stream) or the local file again.
+
+A surface that fails (or does not start within 3 s in a shown window) sends
+HDR videos to the widget for the rest of the run, and the hint under the
+switch says so; switching it off and on tries a new surface.
 
 Verified on the laptop (2026-11-02, the user, Hyprland 0.56.2, the panel in
 SDR mode): a 10000-nit card relayed from the library through the dev server

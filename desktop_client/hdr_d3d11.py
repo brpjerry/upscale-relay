@@ -27,14 +27,12 @@ from ctypes import (
 from PySide6.QtCore import QEvent, QObject, QPoint, QRect, Qt, QTimer, Signal
 from PySide6.QtGui import QOffscreenSurface, QOpenGLContext, QWindow
 
-from .hdr_output import _GUID, _com, _release
-from .hdr_view import DEFAULT_SDR_WHITE_NITS, OverlayMirror, _fit
+from .hdr_output import _DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020, _GUID, _com, _release
+from .hdr_view import _RESCALE_LIMIT, DEFAULT_SDR_WHITE_NITS, OverlayMirror, _fit
 
-_RESCALE_LIMIT = 1.15
 _DXGI_FORMAT_R10G10B10A2_UNORM = 24
 _DXGI_FORMAT_R16G16B16A16_FLOAT = 10
 _DXGI_FORMAT_R8G8B8A8_UNORM = 28
-_DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020 = 12
 _D3D11_BIND_SHADER_RESOURCE = 0x8
 _D3D11_BIND_RENDER_TARGET = 0x20
 _D3D11_BIND_CONSTANT_BUFFER = 0x4
@@ -135,8 +133,9 @@ class _SwapChainDesc1(Structure):
 
 
 class _HdrMetadataHdr10(Structure):
-    """DXGI_HDR_METADATA_HDR10: chromaticities in 0.00002 units, mastering
-    luminances in 0.0001 nits, light levels in nits."""
+    """DXGI_HDR_METADATA_HDR10: chromaticities in 0.00002 units, the maximum
+    mastering luminance in nits and the minimum in 0.0001 nits (as Chromium
+    and libplacebo fill it in), light levels in nits."""
     _fields_ = [
         ("RedPrimary", c_uint16 * 2), ("GreenPrimary", c_uint16 * 2), ("BluePrimary", c_uint16 * 2),
         ("WhitePoint", c_uint16 * 2), ("MaxMasteringLuminance", c_uint), ("MinMasteringLuminance", c_uint),
@@ -150,7 +149,7 @@ def _hdr10_metadata(peak_nits: float) -> _HdrMetadataHdr10:
     def xy(x, y):
         return (c_uint16 * 2)(round(x * 50000), round(y * 50000))
     return _HdrMetadataHdr10(xy(0.708, 0.292), xy(0.170, 0.797), xy(0.131, 0.046), xy(0.3127, 0.3290),
-                             round(peak_nits * 10000), 50, 0, 0)  # min 0.005 nits; light levels unknown
+                             round(peak_nits), 50, 0, 0)  # min 0.005 nits; light levels unknown
 
 
 class _Box(Structure):
