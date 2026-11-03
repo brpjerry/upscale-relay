@@ -105,7 +105,7 @@ def test_frame_notifications_acknowledge_unpresented_frames(monkeypatch, visible
         render=lambda **kw: calls.append(kw),
     )
     player = SimpleNamespace(
-        _ctx=render,
+        _ctx=render, _on_presenter=False,
         isVisible=lambda: visible,
         window=lambda: SimpleNamespace(windowHandle=lambda: SimpleNamespace(isExposed=lambda: exposed)),
         update=lambda: calls.append("paint"),
@@ -129,7 +129,7 @@ def test_display_sync_hands_timing_to_audio_while_the_window_is_hidden(monkeypat
     exposed = [True]
     sent = []
     player = SimpleNamespace(
-        _ctx=SimpleNamespace(update=lambda: True, render=lambda **kw: None),
+        _ctx=SimpleNamespace(update=lambda: True, render=lambda **kw: None), _on_presenter=False,
         isVisible=lambda: True,
         window=lambda: SimpleNamespace(windowHandle=lambda: SimpleNamespace(isExposed=lambda: exposed[0])),
         update=lambda: None, makeCurrent=lambda: None, doneCurrent=lambda: None, context=lambda: context,

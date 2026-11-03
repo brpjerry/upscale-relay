@@ -1197,6 +1197,13 @@ class PlayerOverlay(QWidget):
         side = round(self._DISC * 1.3) + 4
         return QRect((self.width() - side) // 2, (self.height() - side) // 2, side, side)
 
+    def mirror_rect(self) -> QRect:
+        """The part it paints, for the HDR surface's overlay mirror
+        (hdr_view.OverlayMirror): the disc while busy or flashing, else none."""
+        if self._busy.value > 0 or self._flash.state() == QVariantAnimation.Running:
+            return self._centre()
+        return QRect()
+
     def _step(self) -> None:
         self._angle = (self._angle + 12) % 360
         if not self._busy_on and self._busy.value <= 0:

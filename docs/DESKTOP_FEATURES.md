@@ -82,10 +82,25 @@ mastering display and light level, HDR10+, and the Dolby Vision RPU of a
 profile 8 source (docs/PROTOCOL.md §3.5). **Keep 10-bit color for SDR videos**
 (off by default) asks for the same depth for other sources deeper than 8 bits,
 such as 10-bit anime encodes: less banding at roughly a quarter more lossless
-bandwidth. Toggling it restarts only a 10-bit SDR stream. On today's SDR video
-surface mpv tone-maps HDR from the 10-bit signal and its mastering metadata.
-The libmpv render API runs mpv's `gpu` renderer, which uses static metadata
-only; Dolby Vision and HDR10+ ride along for clients that use them.
+bandwidth. Toggling it restarts only a 10-bit SDR stream.
+
+**Show HDR videos in HDR** (on by default) plays an HDR video as HDR while the
+window's screen is in HDR mode. That works on Wayland with Qt 6.10.2 or later;
+on Hyprland, set the monitor's `cm = "hdr"`, or go fullscreen: Hyprland then
+switches a screen in SDR mode to HDR for the video, and back afterwards
+(`render:cm_auto_hdr`, on by default). Entering and leaving fullscreen each
+reload the video at its position. The video then renders on a
+native PQ surface over the player, with mpv converting it for the display's
+peak brightness. The control bar, the cards and the settings sheet are drawn
+over it at the display's SDR white level. The hint under the switch says when
+a video is playing in HDR. Switching the display's HDR mode, or moving the
+window to a screen of the other kind, reloads the video at its position. In
+every other case (the switch off, an SDR screen, an SDR video, another
+platform) mpv tone-maps HDR to SDR from the 10-bit signal and its mastering
+metadata, as before. A local fallback keeps the source's HDR, as the server
+read it. The libmpv render API runs mpv's `gpu` renderer, which uses static
+metadata only; Dolby Vision and HDR10+ ride along for clients that use them.
+docs/HDR_OUTPUT.md has the design and its measurements.
 
 These controls set mpv options; the player keeps their values itself
 (`AppSettings.mpv_defaults` in QSettings) and sets them on mpv at startup, at

@@ -84,7 +84,7 @@ class VideoPreviewView(QWidget):
         pass
 
     async def play_local(
-        self, path: str, position_s: float = 0.0, *, paused: bool = False,
+        self, path: str, position_s: float = 0.0, *, paused: bool = False, hdr: bool = False,
     ) -> None:
         self.failed.emit("local fallback requires the mpv backend")
 

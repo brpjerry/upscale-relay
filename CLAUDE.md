@@ -35,7 +35,13 @@ load-bearing), `docs/CLIENT_LINUX.md` (Linux setup), and
   style sheet are `palette(...)` references, so an accent change is a palette
   change (~2 ms) rather than a new style sheet (~70 ms re-polish, a video hitch).
   `naming.py` makes the optional readable file names (display only: sorting,
-  history keys and playback keep the real names).
+  history keys and playback keep the real names). HDR output
+  (`docs/HDR_OUTPUT.md`) has three modules:
+  - `hdr_view.py`: the native PQ surface over the player, plus the overlay
+    mirror that draws the widgets above the player onto it.
+  - `hdr_output.py`: reads whether a screen is in HDR mode
+    (wp_color_management_v1 on Wayland via ctypes, DXGI on Windows).
+  - `hdr_d3d11.py`: the opt-in Windows prototype.
 - `upscale_cli/` — offline pipeline, ONNX/EP handling, uint8 graph wrapper,
   `upscale-cli` (run/info/sample/bench subcommands).
 
@@ -65,7 +71,16 @@ tests MUST set this option or pass the equivalent `DesktopOptions`). Server
 flags: `--seek-discard-max-s S` (seeks land keyframe-accurate rather than
 decoding a keyframe-to-target span longer than S — off by default, see
 `docs/SEEK_LATENCY_PLAN.md`). Server env flag: `RELAY_NVDEC=1` (server hw
-source decode — crashed with NVENC concurrently, off by default). The desktop client loads the user's
+source decode — crashed with NVENC concurrently, off by default). Client env
+flags:
+- `RELAY_HDR_SURFACE=force|off` puts every video on the HDR surface, on any
+  display (for testing the overlay mirror and its pacing without an HDR
+  screen), or never uses the surface.
+- `RELAY_HDR_WINDOWS=1` enables the Windows D3D11 prototype.
+
+`python -m desktop_client.hdr_output` prints each screen's HDR state.
+`tools/hdr_desktop_check.py` plays an `upscale-cli sample --hdr` clip and times
+the surface. The desktop client loads the user's
 `input.conf`
 for key bindings only and never reads `mpv.conf`: libmpv runs without its
 configuration, the mpv options the settings sheet offers are QSettings
@@ -277,6 +292,41 @@ their volume, panscan, tracks and delays.
   mpv's asynchronous `screenshot-raw` instead (`request_frame_sample`).
   Blitting *into* the widget from a framebuffer of our own works; the scaled
   resize path does that every frame.
+- mpv's render context is bound to one GL context. Freeing it while a video
+  plays tears the video down ("Video was forcefully killed"). It moves
+  between the widget and the HDR surface only in `_prepare_surface`, before a
+  `loadfile` and with mpv stopped. When the right surface changes during a
+  video, the player reloads at the position instead (`hdr_surface_stale`).
+- On Wayland every geometry change of a native child window (a subsurface)
+  makes Qt expose the parent window, which repaints and presents it in full
+  at once. An HDR surface that followed the player per Move/Resize event held
+  slides to 15-57 steps a second (the widget: 110-186). On Wayland the
+  surface now spans the window and never moves (`HdrPresenter.cover`): the
+  picture moves within it, and the surface is clear around it, so the window
+  repaints as it does around the widget. Everything the surface paints is on
+  the GUI thread, inside the window's 8.3 ms frame: time it by phase
+  (`HdrPresenter.last_phases`, `tools/hdr_desktop_check.py`) before blaming
+  the compositor.
+- `QWidget.render` draws nothing for a widget that carries a graphics effect.
+  `RenderFlag.DrawWindowBackground` (the default) first fills the widget with
+  its palette's Window colour. The overlay mirror renders with `DrawChildren`
+  only, with the fade's effect switched off, and applies the opacity when
+  compositing. A widget over the player that paints only part of itself
+  names that part (`mirror_rect`). The busy ring spans the player, and
+  mirroring all of it at every resize step cost 1.3-5 ms of each frame.
+- Declare the HDR surface's luminances. Hyprland tone-maps a surface whose
+  range exceeds the output's peak, and Qt's `QColorSpace.Bt2100Pq` tag
+  carries no luminances, so it claimed PQ's 10000 nits. mpv had already
+  mapped the video to the 1107-nit panel, and Hyprland compressed it again:
+  white 203 -> 111 nits, highlights 1107 -> 258 (2026-11-02). On Wayland
+  `HdrPresenter` describes itself (`hdr_output.describe_pq_surface`: peak,
+  SDR white) and its format carries no colour space. Never add one back
+  there: Qt would create a second colour management surface for the same
+  `wl_surface`, a protocol error that ends the connection.
+- On Windows `requestUpdate()` (and every Qt timer, so `asyncio.sleep` too)
+  arrives on a `WM_TIMER`, which Windows generates only once the message
+  queue is empty. A frame-paced animation keeps the queue busy, so a child
+  window's update requests wait until it ends.
 - For external auxiliary media, load the video-only epoch paused, then issue
   exactly one raw-argument `audio-add` after mpv's `playback-restart`; that
   demuxer contributes both audio and subtitle tracks. Attaching during
@@ -339,15 +389,30 @@ their volume, panscan, tracks and delays.
   laptop client is the intended topology.
 - FFV1 has no hardware decoder anywhere (codec-inherent); lossless-hevc is
   the recommended lossless tier for live playback.
-- **HDR is carried, not yet shown as HDR.** The desktop asks for 10-bit HDR
-  downlinks (PROTOCOL §3.5), but Qt Widgets' backing store is SDR on every
-  platform (QOpenGLWidget included), so mpv tone-maps to SDR. Real HDR needs
-  the video on its own native surface: on Hyprland a PQ-tagged child
-  QOpenGLWindow works (Qt >= 6.10.2, wp_color_management_v1) and overlay
-  windows stack above it only if their surfaces are created after its; on
-  Windows a D3D11 HDR10 swapchain with GL interop. The render API is mpv's
-  `gpu` renderer (gpu-next is not available through it), which ignores
-  Dolby Vision and HDR10+.
+- **HDR output: Wayland only, Windows a prototype** (`docs/HDR_OUTPUT.md`).
+  - Qt Widgets' backing store is SDR on every platform, QOpenGLWidget
+    included. So an HDR video on a screen in HDR mode plays on a native PQ
+    surface over the player (Qt >= 6.10.2, wp_color_management_v1), with the
+    overlays mirrored onto it. The surface declares the display's peak, so
+    the compositor does not tone-map it again. Everything else stays on the
+    widget unchanged.
+  - Hyprland shows it as HDR with the monitor's `cm = "hdr"`, and in
+    fullscreen on an SDR screen it switches the screen to HDR itself for the
+    surface (`render:cm_auto_hdr`). The player moves an HDR video onto the
+    surface when fullscreen settles and back to the widget when it ends
+    (one reload each way); docs/HDR_OUTPUT.md has the steps.
+  - On the laptop the surface matches the widget for steady playback,
+    overlay motion, sidebar slides and splitter drags (2026-11-02, 120 Hz).
+    Fullscreen transitions run at 101-110 fps entering (the widget: 118) and
+    84-99 leaving (111-112).
+  - Windows (`RELAY_HDR_WINDOWS=1`): a D3D11 HDR10 swap chain fed through
+    `WGL_NV_DX_interop2`. Its transitions run at 60-85% of the widget's rate.
+  - Judged by eye on the laptop panel and on the Windows prototype
+    (2026-11-02): white matches the interface's, highlights reach the
+    display's peak. Screenshots in HDR mode are 8-bit conversions and cannot
+    show that (`tools/hdr_desktop_check.py --hold` keeps a clip up to look at).
+  - The render API is mpv's `gpu` renderer (gpu-next is not available through
+    it), which ignores Dolby Vision and HDR10+.
 - Anamorphic uplinks: when a client sends no
   `open_session.video.sample_aspect_ratio`, the server reads it from the
   H.264 SPS / HEVC parameter sets in `extradata_b64`

@@ -515,7 +515,7 @@ def test_resize_skips_the_render_qt_would_discard_and_requests_one_that_shows():
     from desktop_client.mpv_view import MpvPlayerView
     renders = []
     player = SimpleNamespace(
-        _ctx=SimpleNamespace(render=lambda **kw: renders.append(kw)), _resizing=True,
+        _ctx=SimpleNamespace(render=lambda **kw: renders.append(kw)), _resizing=True, _on_presenter=False,
         _scaling=False, _picture_fbo=None,
         devicePixelRatioF=lambda: 1.0, defaultFramebufferObject=lambda: 1,
         width=lambda: 64, height=lambda: 36,
@@ -680,7 +680,7 @@ def test_a_failing_scaled_paint_falls_back_instead_of_escaping_the_qt_virtual():
         raise RuntimeError("no blit")
 
     player = SimpleNamespace(
-        _ctx=SimpleNamespace(render=lambda **kw: renders.append(kw["opengl_fbo"])),
+        _ctx=SimpleNamespace(render=lambda **kw: renders.append(kw["opengl_fbo"])), _on_presenter=False,
         _resizing=False, _scaling=True, _scaling_broken=False, _picture_fbo=None,
         _paint_scaled=broken, devicePixelRatioF=lambda: 2.0, width=lambda: 100, height=lambda: 50,
         defaultFramebufferObject=lambda: 7, log_message=SimpleNamespace(emit=lambda *args: logged.append(args)),

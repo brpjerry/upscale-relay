@@ -76,8 +76,9 @@ class FakePlayer(QWidget):
     def select_audio(self, aid):
         pass
 
-    async def play_local(self, path, position_s=0.0, *, paused=False):
+    async def play_local(self, path, position_s=0.0, *, paused=False, hdr=False):
         self.local_playback = (path, position_s, paused)
+        self.local_hdr = hdr
 
     def seek_local(self, target_s):
         self.local_seek = target_s

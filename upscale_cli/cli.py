@@ -15,7 +15,7 @@ import sys
 from pathlib import Path
 
 from .info import print_info, verify_passthrough, verify_pts
-from .sample import make_sample
+from .sample import make_hdr_sample, make_sample
 from .stages import FrameSink, FrameSource, run_pipeline
 
 _SUBCOMMANDS = {"run", "info", "sample", "bench"}
@@ -64,6 +64,8 @@ def _build_parser() -> argparse.ArgumentParser:
     sample.add_argument("--frames", type=int, default=240)
     sample.add_argument("--size", default="640x360", help="WxH")
     sample.add_argument("--fps", type=int, default=30)
+    sample.add_argument("--hdr", action="store_true",
+                        help="10-bit HDR10 (PQ) HEVC with grey patches up to 1000 nits")
 
     bench = sub.add_parser("bench", help="benchmark models in a directory")
     bench.add_argument("--models-dir", default="models")
@@ -92,7 +94,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "sample":
         width, _, height = args.size.partition("x")
-        make_sample(args.output, frames=args.frames, width=int(width), height=int(height), fps=args.fps)
+        make = make_hdr_sample if args.hdr else make_sample
+        make(args.output, frames=args.frames, width=int(width), height=int(height), fps=args.fps)
         return 0
 
     if args.command == "bench":
