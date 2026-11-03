@@ -21,8 +21,9 @@ _SPC_RGB, _SPC_BT709, _SPC_FCC, _SPC_BT470BG, _SPC_SMPTE170M, _SPC_SMPTE240M = 0
 _SPC_BT2020_NCL, _SPC_BT2020_CL = 9, 10
 _RANGE_LIMITED, _RANGE_FULL = 1, 2
 _PRI_BT709, _PRI_BT470BG, _PRI_SMPTE170M = 1, 5, 6
-_TRC_BT709 = 1
+_TRC_BT709, _TRC_PQ, _TRC_HLG = 1, 16, 18
 _UNSPECIFIED = (0, 2)  # 0 is "reserved" for primaries/transfer, 2 "unspecified"
+_SPC_UNSPECIFIED = 2
 
 # libswscale coefficient set (SWS_CS_*) for each matrix it converts.
 _SWS_MATRIX = {
@@ -33,6 +34,26 @@ _SWS_MATRIX = {
 
 def _is_hd(width: int, height: int) -> bool:
     return width >= 1280 or height > 576
+
+
+def color_tags_of(tagged) -> tuple[int, int, int, int]:
+    """(matrix, range, primaries, transfer) of a frame or codec context."""
+    return (
+        int(tagged.colorspace), int(tagged.color_range),
+        int(tagged.color_primaries), int(tagged.color_trc),
+    )
+
+
+def fill_unspecified(tags, fallback) -> tuple[int, int, int, int]:
+    """``tags`` with each one they leave unspecified taken from ``fallback``
+    (both (matrix, range, primaries, transfer))."""
+    matrix, color_range, primaries, transfer = tags
+    return (
+        fallback[0] if matrix == _SPC_UNSPECIFIED else matrix,
+        color_range if color_range in (_RANGE_LIMITED, _RANGE_FULL) else fallback[1],
+        fallback[2] if primaries in _UNSPECIFIED else primaries,
+        fallback[3] if transfer in _UNSPECIFIED else transfer,
+    )
 
 
 @dataclass(frozen=True)
@@ -47,10 +68,7 @@ class VideoColor:
     @classmethod
     def resolve(cls, tags, width: int, height: int) -> "VideoColor":
         """From anything carrying FFmpeg colour tags (a frame or codec context)."""
-        return cls.resolve_values(
-            int(tags.colorspace), int(tags.color_range),
-            int(tags.color_primaries), int(tags.color_trc), width, height,
-        )
+        return cls.resolve_values(*color_tags_of(tags), width, height)
 
     @classmethod
     def resolve_values(
@@ -84,6 +102,11 @@ class VideoColor:
     def _sws_matrix(self) -> int:
         return _SWS_MATRIX[self.matrix]
 
+    @property
+    def tags(self) -> tuple[int, int, int, int]:
+        """(matrix, range, primaries, transfer), the order FFmpeg tags travel in."""
+        return self.matrix, self.range, self.primaries, self.transfer
+
     def tag(self, target) -> None:
         """Write this description onto an encoder codec context or a frame."""
         target.colorspace = self.matrix
@@ -91,12 +114,18 @@ class VideoColor:
         target.color_primaries = self.primaries
         target.color_trc = self.transfer
 
-    def to_rgb(self, reformatter, frame):
-        """rgb24 of a frame whose YUV this describes (RGB frames pass through)."""
+    @property
+    def is_hdr(self) -> bool:
+        """PQ or HLG: the picture only reads right on an HDR-aware path."""
+        return self.transfer in (_TRC_PQ, _TRC_HLG)
+
+    def to_rgb(self, reformatter, frame, format: str = "rgb24"):
+        """RGB (rgb24, or rgb48le for deep colour) of a frame whose YUV this
+        describes (RGB frames pass through)."""
         if frame.format.is_rgb:
-            return reformatter.reformat(frame, format="rgb24")
+            return reformatter.reformat(frame, format=format)
         return reformatter.reformat(
-            frame, format="rgb24",
+            frame, format=format,
             src_colorspace=self._sws_matrix, src_color_range=self.range,
         )
 

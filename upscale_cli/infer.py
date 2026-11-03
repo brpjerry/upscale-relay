@@ -88,20 +88,21 @@ def _trt_options() -> dict:
     }
 
 
-def _with_trt_profile(providers: list, input_name: str) -> list:
+def _with_trt_profile(providers: list, input_name: str, sample_dims: str = "") -> list:
     """Attach an explicit dynamic-shape profile to the TensorRT provider:
     min 64x64 (tile/probe floor), opt 1080p, max 1440p input. One engine
     covers all shapes, so ORT's crash-prone rebuild-at-new-shape path never
     runs. Max is capped at 1440p to bound the engine's activation memory
-    (TRT allocates for max); larger sources go through the tiling path."""
+    (TRT allocates for max); larger sources go through the tiling path.
+    ``sample_dims`` is the trailing byte dimension of the 16-bit wrapper."""
     out = []
     for p in providers:
         if isinstance(p, tuple) and p[0] == "TensorrtExecutionProvider":
             opts = dict(p[1])
             opts.update({
-                "trt_profile_min_shapes": f"{input_name}:1x64x64x3",
-                "trt_profile_opt_shapes": f"{input_name}:1x1080x1920x3",
-                "trt_profile_max_shapes": f"{input_name}:1x1440x2560x3",
+                "trt_profile_min_shapes": f"{input_name}:1x64x64x3{sample_dims}",
+                "trt_profile_opt_shapes": f"{input_name}:1x1080x1920x3{sample_dims}",
+                "trt_profile_max_shapes": f"{input_name}:1x1440x2560x3{sample_dims}",
             })
             out.append((p[0], opts))
         else:
@@ -158,13 +159,19 @@ class OnnxUpscaler:
     _TILE_LADDER = [1024, 512, 256, 128]
 
     def __init__(self, model_path: str, ep: str = "auto",
-                 tile_size: int | str | None = None, overlap: int = 16):
+                 tile_size: int | str | None = None, overlap: int = 16,
+                 io_bits: int = 8):
+        """``io_bits`` 16 takes and returns rgb48le arrays (uint16 HWC) for
+        deep-colour sessions instead of rgb24."""
         if overlap < 0 or overlap % 2:
             raise ValueError("tile overlap must be a non-negative even number of pixels")
+        if io_bits not in (8, 16):
+            raise ValueError("io_bits must be 8 or 16")
         self.overlap = overlap
         if isinstance(tile_size, int):
             self._check_tile(tile_size)
         self.tile_size = tile_size
+        self.io_bits = io_bits
         self._reformatter = av.video.reformatter.VideoReformatter()
         self.model_path = model_path
         self.manifest = ModelManifest.load(model_path)
@@ -176,16 +183,20 @@ class OnnxUpscaler:
         try:
             import onnx
 
-            from .wrap_uint8 import wrap_uint8_io
+            from .wrap_uint8 import wrap_rgb48_io, wrap_uint8_io
 
-            wrapped = wrap_uint8_io(
+            wrap = wrap_rgb48_io if io_bits == 16 else wrap_uint8_io
+            wrapped = wrap(
                 onnx.load(model_path), self.manifest.value_range, self.manifest.channel_order
             )
             # Explicit TRT optimization profile: one engine covers every input
             # size. Without it, a new shape mid-stream triggers ORT's engine
             # rebuild path — observed to die with a native access violation
             # when the first real frame's shape wasn't in the cache.
-            wrapped_providers = _with_trt_profile(providers, "u8wrap_in")
+            wrapped_providers = (
+                _with_trt_profile(providers, "u16wrap_in", "x2") if io_bits == 16
+                else _with_trt_profile(providers, "u8wrap_in")
+            )
             self.session = ort.InferenceSession(
                 wrapped.SerializeToString(), providers=wrapped_providers
             )
@@ -199,7 +210,7 @@ class OnnxUpscaler:
             )
             # Some graphs load but fail at run time on a given EP — probe now
             # (at the profile's min shape) so we can fall back to numpy.
-            probe = np.zeros((1, 64, 64, 3), dtype=np.uint8)
+            probe = np.zeros((1, 64, 64, 3, 2) if io_bits == 16 else (1, 64, 64, 3), dtype=np.uint8)
             self.session.run(None, {self.session.get_inputs()[0].name: probe})
             self.uint8_io = True
         except Exception as err:
@@ -215,16 +226,18 @@ class OnnxUpscaler:
         self._dtype = np.float16 if self.fp16 else np.float32
         self.scale_factor = self.manifest.scale_factor  # may be None until first frame
 
+        io = f"{'rgb48' if io_bits == 16 else 'uint8'}-wrapped" if self.uint8_io else (
+            "fp16" if self.fp16 else "fp32")
         print(
-            f"model: {Path(model_path).name} | provider: {self.active_provider}"
-            f" | io: {'uint8-wrapped' if self.uint8_io else ('fp16' if self.fp16 else 'fp32')}",
+            f"model: {Path(model_path).name} | provider: {self.active_provider} | io: {io}",
             file=sys.stderr,
         )
 
     # -- array-level API (reused by the tiling stage later) -----------------
 
     def infer_array(self, rgb: np.ndarray) -> np.ndarray:
-        """uint8 HWC RGB in -> uint8 HWC RGB out (scaled).
+        """uint8 HWC RGB in -> uint8 HWC RGB out (scaled); uint16 (rgb48le)
+        both ways with ``io_bits`` 16.
 
         Perf note: transposes happen on uint8 arrays and all float math runs
         in-place on contiguous buffers — element-wise ops on strided fp32
@@ -232,33 +245,44 @@ class OnnxUpscaler:
         uint8-wrapped graph none of that runs at all: the session does it all
         on the execution provider.
         """
+        if self.uint8_io and self.io_bits == 16:
+            h, w = rgb.shape[:2]
+            pairs = np.ascontiguousarray(rgb, dtype="<u2").view(np.uint8).reshape(1, h, w, 3, 2)
+            y = self.session.run([self.output_name], {self.input_name: pairs})[0]
+            oh, ow = y.shape[1:3]
+            return np.ascontiguousarray(y[0]).view("<u2").reshape(oh, ow, 3)
         if self.uint8_io:
             y = self.session.run(
                 [self.output_name], {self.input_name: np.ascontiguousarray(rgb)[None]}
             )[0]
             return y[0]  # uint8 HWC straight from the graph
 
+        top = 65535.0 if self.io_bits == 16 else 255.0
         lo, hi = self.manifest.value_range
         chw = rgb.transpose(2, 0, 1)  # HWC -> CHW view
         if self.manifest.channel_order == "bgr":
             chw = chw[::-1]
-        x = np.ascontiguousarray(chw).astype(self._dtype)  # uint8 copy, then SIMD convert
-        x *= np.asarray((hi - lo) / 255.0, dtype=self._dtype)
+        if self.io_bits == 16 and self.fp16:
+            # 65535 overflows float16: scale in float32 on the way in.
+            x = (np.ascontiguousarray(chw).astype(np.float32) * ((hi - lo) / top)).astype(self._dtype)
+        else:
+            x = np.ascontiguousarray(chw).astype(self._dtype)  # uint8 copy, then SIMD convert
+            x *= np.asarray((hi - lo) / top, dtype=self._dtype)
         if lo:
             x += np.asarray(lo, dtype=self._dtype)
 
         y = self.session.run([self.output_name], {self.input_name: x[None]})[0]
 
         z = np.ascontiguousarray(y[0]).astype(np.float32, copy=False)
-        z *= 255.0 / (hi - lo)
+        z *= top / (hi - lo)
         if lo:
-            z -= lo * 255.0 / (hi - lo)
+            z -= lo * top / (hi - lo)
         np.rint(z, out=z)
-        np.clip(z, 0, 255, out=z)
-        u8 = z.astype(np.uint8)  # CHW uint8
+        np.clip(z, 0, top, out=z)
+        out = z.astype(np.uint16 if self.io_bits == 16 else np.uint8)  # CHW
         if self.manifest.channel_order == "bgr":
-            u8 = u8[::-1]
-        return np.ascontiguousarray(u8.transpose(1, 2, 0))  # -> HWC
+            out = out[::-1]
+        return np.ascontiguousarray(out.transpose(1, 2, 0))  # -> HWC
 
     def _check_tile(self, tile: int) -> None:
         """Tiles step forward by ``tile - overlap``; anything smaller cannot
@@ -292,7 +316,7 @@ class OnnxUpscaler:
                     s = round(tile_out.shape[0] / th)
                     self.scale_factor = s
                 if out is None:
-                    out = np.empty((h * s, w * s, 3), dtype=np.uint8)
+                    out = np.empty((h * s, w * s, 3), dtype=tile_out.dtype)
                 # Discard overlap margins on interior edges.
                 top = m if y0 > 0 else 0
                 left = m if x0 > 0 else 0
@@ -352,15 +376,16 @@ class OnnxUpscaler:
 
     def process(self, frame: av.VideoFrame) -> Iterable[av.VideoFrame]:
         # Frames from FrameSource carry their resolved colour tags.
+        rgb_format = "rgb48le" if self.io_bits == 16 else "rgb24"
         rgb = VideoColor.resolve(frame, frame.width, frame.height).to_rgb(
-            self._reformatter, frame,
-        ).to_ndarray()
+            self._reformatter, frame, rgb_format,
+        ).to_ndarray(format=rgb_format)
         up = self._infer_with_fallback(rgb)
         if self.scale_factor is None:
             self.scale_factor = round(up.shape[0] / rgb.shape[0])
             print(f"model: inferred scale factor x{self.scale_factor}", file=sys.stderr)
 
-        out = av.VideoFrame.from_ndarray(up, format="rgb24")
+        out = av.VideoFrame.from_ndarray(up, format=rgb_format)
         out.pts = frame.pts
         out.time_base = frame.time_base
         yield out

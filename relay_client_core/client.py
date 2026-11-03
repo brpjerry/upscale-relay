@@ -30,6 +30,7 @@ from urllib.parse import quote
 import aiohttp
 import av
 
+from relay_media.hdr import HDR_TRANSFERS
 from relay_protocol import (
     DIR_DOWNLINK,
     DIR_UPLINK,
@@ -318,6 +319,10 @@ class SessionConfig:
     # Open a source that is 4K or larger (is_4k_or_higher) with "passthrough"
     # in place of ``model``. A server file's size is read through /media.
     passthrough_4k: bool = False
+    # open_session.high_bit_depth for a capable server: "hdr" keeps HDR
+    # sources at 10 bits with their metadata, "all" also 10-bit SDR ones.
+    # None keeps the 8-bit downlink.
+    high_bit_depth: str | None = None
 
 
 @dataclass
@@ -353,6 +358,19 @@ class SessionInfo:
     # The source's stored (width, height) when the client read it: always for
     # an uplink, and for a server file only when passthrough_4k probed it.
     source_size: tuple[int, int] | None = None
+    # What the downlink carries (docs/PROTOCOL.md session_opened): 8 or 10
+    # bits, its resolved colour ({primaries, transfer, matrix, range}, H.273
+    # code points) when known, and whether a Dolby Vision RPU rides along.
+    downlink_bit_depth: int = 8
+    downlink_color: dict | None = None
+    downlink_dolby_vision: bool = False
+    source_bit_depth: int | None = None  # None: the server did not say
+
+    @property
+    def downlink_hdr(self) -> bool:
+        """PQ or HLG downlink."""
+        transfer = (self.downlink_color or {}).get("transfer")
+        return type(transfer) is int and transfer in HDR_TRANSFERS
 
 
 class RelayClient:
@@ -537,6 +555,8 @@ class RelayClient:
             raise ValueError(f"unknown auxiliary attachment mode: {cfg.aux_attachments}")
         if cfg.aux_attachments == "cached" and cfg.aux_tracks != "muxed":
             raise ValueError("cached attachments require muxed auxiliary tracks")
+        if cfg.high_bit_depth not in (None, "hdr", "all"):
+            raise ValueError(f"unknown high bit depth mode: {cfg.high_bit_depth}")
         if self._closing:
             raise ConnectionError("client is closing")
         video, duration_s, chapters = None, None, []
@@ -594,6 +614,8 @@ class RelayClient:
         }
         if cfg.resize_algorithm is not None:
             fields["resize_algorithm"] = cfg.resize_algorithm
+        if cfg.high_bit_depth and (self.capabilities or {}).get("high_bit_depth"):
+            fields["high_bit_depth"] = cfg.high_bit_depth
         if video is not None:
             fields["video"] = video
         try:
@@ -640,6 +662,16 @@ class RelayClient:
             ),
             model=model,
             source_size=source_size,
+            downlink_bit_depth=(
+                msg["downlink_bit_depth"] if msg.get("downlink_bit_depth") in (8, 10) else 8
+            ),
+            downlink_color=(
+                msg["downlink_color"] if isinstance(msg.get("downlink_color"), dict) else None
+            ),
+            downlink_dolby_vision=msg.get("downlink_dolby_vision") is True,
+            source_bit_depth=(
+                msg["source_bit_depth"] if type(msg.get("source_bit_depth")) is int else None
+            ),
         )
         return self.session
 

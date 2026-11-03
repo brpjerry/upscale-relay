@@ -320,6 +320,7 @@ def test_cached_attachment_negotiation_omits_epoch_attachment_bodies(monkeypatch
             has_auxiliary_tracks = True
             average_rate = Fraction(24, 1)
             color_tags = (2, 0, 2, 2)  # unspecified, as probed from an untagged file
+            bit_depth = 8
 
             def __init__(self, _path):
                 pass
@@ -365,6 +366,9 @@ def test_cached_attachment_negotiation_omits_epoch_attachment_bodies(monkeypatch
             fit_mode = "fit"
             resize_algorithm = "lanczos"
             playing = False
+            bit_depth = 8
+            downlink_color = None
+            dolby_vision_rpu = False
 
             def __init__(self, *_args, **kwargs):
                 pipeline_kwargs.update(kwargs)

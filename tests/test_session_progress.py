@@ -47,6 +47,9 @@ class SlowPipeline:
     out_h = 180
     fit_mode = "fit"
     resize_algorithm = "lanczos"
+    bit_depth = 8
+    downlink_color = None
+    dolby_vision_rpu = False
 
     def __init__(self, *args, **kwargs):
         self.playing = False
