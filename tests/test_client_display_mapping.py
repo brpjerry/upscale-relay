@@ -25,10 +25,15 @@ MAPPED_SDR = {"transfer": "sdr", "peak_nits": None, "sdr_white_nits": None, "app
 UNMAPPED_PQ = {**MAPPED_PQ, "applied": []}  # Dolby Vision 8 for an HDR display: streamed as §3.5
 
 
-def _open(monkeypatch, cfg, *, capabilities, opened):
+def _open(monkeypatch, cfg, *, capabilities, opened, probed=None, hdr10plus=False):
+    def first_keyframe_hdr10plus():
+        if probed is not None:
+            probed.append(True)
+        return hdr10plus
+
     monkeypatch.setattr(
         module, "_open_local_source",
-        lambda path: (SimpleNamespace(close=lambda: None),
+        lambda path: (SimpleNamespace(close=lambda: None, first_keyframe_hdr10plus=first_keyframe_hdr10plus),
                       {"codec": "hevc", "width": 64, "height": 64, "time_base": [1, 1000]},
                       None, []),
     )
@@ -243,13 +248,45 @@ def _with_hdr10plus_on_first_keyframe(source, path):
             out.mux(packet)
 
 
+@pytest.mark.parametrize(("capabilities", "high_bit_depth", "target", "expected"), [
+    ({"high_bit_depth": True, "display_mapping": True}, "hdr", HDR_DISPLAY, True),
+    ({"high_bit_depth": True}, "hdr", HDR_DISPLAY, False),                      # no display mapping
+    ({"high_bit_depth": True, "display_mapping": True}, None, HDR_DISPLAY, False),  # 8-bit asked for
+    ({"high_bit_depth": True, "display_mapping": True}, "hdr", None, False),    # no display named
+])
+def test_the_hdr10plus_probe_runs_only_where_it_is_sent(monkeypatch, capabilities, high_bit_depth, target, expected):
+    probed = []
+    sent, _info = _open(
+        monkeypatch, SessionConfig(path="a.mkv", high_bit_depth=high_bit_depth, display_target=target),
+        capabilities=capabilities, opened={}, probed=probed, hdr10plus=True,
+    )
+    assert bool(probed) is expected
+    assert sent["video"].get("hdr10plus", False) is expected
+
+
+def test_seek_ready_is_taken_for_the_current_epoch_only():
+    session = _session(display_target=HDR_DISPLAY, downlink_mapping=MAPPED_PQ)
+    client = RelayClient.__new__(RelayClient)
+    client.session, client.epoch = session, 2
+    client._apply_epoch_mapping({"type": "seek_ready", "epoch": 1, "downlink_mapping": MAPPED_SDR,
+                                 "downlink_color": SDR})
+    assert (session.downlink_mapping, session.downlink_color) == (MAPPED_PQ, PQ)  # a superseded epoch
+    client._apply_epoch_mapping({"type": "seek_ready", "epoch": 2})
+    assert session.downlink_mapping == MAPPED_PQ  # a session the server never maps says nothing
+    client._apply_epoch_mapping({"type": "seek_ready", "epoch": 2, "downlink_mapping": MAPPED_SDR,
+                                 "downlink_color": SDR})
+    assert (session.downlink_mapping, session.downlink_color) == (MAPPED_SDR, SDR)
+
+
 def test_the_uplink_reports_hdr10plus_from_its_first_keyframe(tmp_path):
     plain = tmp_path / "hdr10.mkv"
     _write_source(plain)
     tagged = tmp_path / "hdr10plus.mkv"
     _with_hdr10plus_on_first_keyframe(plain, tagged)
     for path, expected in ((plain, False), (tagged, True)):
-        track, video, _duration, _chapters = module._open_local_source(str(path))
+        opening = module._SourceOpening(str(path), probe_hdr10plus=True)
+        opening.run()
+        track, video, _duration, _chapters = opening.take()
         try:
             assert video.get("hdr10plus", False) is expected, path.name
             # The check reads through a container of its own: the uplink

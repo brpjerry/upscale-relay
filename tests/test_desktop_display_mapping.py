@@ -140,12 +140,14 @@ class MappingClient(LifecycleClient):
 
     async def seek(self, pts, display_target=None):
         self.events.append(("seek", pts, display_target))
+        # Dolby Vision 8: mapped for SDR, streamed as it is for PQ.
+        self.session.downlink_mapping = MAPPED_SDR if display_target.transfer == "sdr" else UNMAPPED_PQ
 
 
 def test_the_window_names_the_display_at_open_and_with_each_seek(window, monkeypatch):
     events, errors = setup_lifecycle(window, monkeypatch)
     window.client = MappingClient(events)
-    targets = iter([DisplayTarget("sdr", None, 80), DisplayTarget("pq", 1107, 203)])
+    targets = iter([DisplayTarget("sdr", None, 80), DisplayTarget("pq", 1107, 203), DisplayTarget("sdr", None, 80)])
     monkeypatch.setattr(window.player, "display_target", lambda: next(targets), raising=False)
 
     async def scenario():
@@ -155,6 +157,10 @@ def test_the_window_names_the_display_at_open_and_with_each_seek(window, monkeyp
         await window._seek_to_seconds(10.0, announce=False)
         seeks = [event for event in events if event[0] == "seek"]
         assert seeks[-1][2] == DisplayTarget("pq", 1107, 203)
+        # The card follows each remap: nothing applied for PQ, Dolby Vision again for SDR.
+        assert not [row for row in window._now_info[1] if row[0] == "Dynamic HDR"]
+        await window._seek_to_seconds(20.0, announce=False)
+        assert ("Dynamic HDR", "Dolby Vision, applied by the server for this display") in window._now_info[1]
         assert not errors
 
     asyncio.run(scenario())

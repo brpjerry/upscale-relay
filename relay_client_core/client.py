@@ -53,9 +53,6 @@ def _open_local_source(path: str):
     track = VideoTrack(path)
     try:
         video = track.open_session_video_dict()
-        if track.first_keyframe_hdr10plus():
-            # Lets a display-mapping server apply it (PROTOCOL §3.6).
-            video["hdr10plus"] = True
         return track, video, track.duration_seconds(), track.chapters()
     except BaseException:
         track.close()
@@ -88,14 +85,24 @@ def _probe_video_size(url: str) -> tuple[int, int] | None:
 class _SourceOpening:
     """Keep native ownership on the worker until the loop accepts the source."""
 
-    def __init__(self, path: str):
+    def __init__(self, path: str, probe_hdr10plus: bool = False):
         self.path = path
+        # Read the first keyframe for HDR10+ (a second open of the file) only
+        # for a session that will send video.hdr10plus (PROTOCOL §3.6).
+        self.probe_hdr10plus = probe_hdr10plus
         self._lock = threading.Lock()
         self._abandoned = False
         self._result = None
 
     def run(self) -> None:
         opened = _open_local_source(self.path)
+        if self.probe_hdr10plus:
+            try:
+                if opened[0].first_keyframe_hdr10plus():
+                    opened[1]["hdr10plus"] = True
+            except BaseException:
+                opened[0].close()
+                raise
         with self._lock:
             if not self._abandoned:
                 self._result = opened
@@ -565,6 +572,10 @@ class RelayClient:
                     continue
                 if mtype == "state":
                     self.state = msg["state"]
+                elif mtype == "seek_ready":
+                    # Before the waiting seek() resumes: the epoch's media can
+                    # be loaded as soon as it arrives (PROTOCOL §3.6).
+                    self._apply_epoch_mapping(msg)
                 elif mtype == "error":
                     log.warning("server error: %s", msg)
                     self.errors.append(msg)
@@ -609,8 +620,11 @@ class RelayClient:
         if self._closing:
             raise ConnectionError("client is closing")
         video, duration_s, chapters = None, None, []
+        capabilities = self.capabilities or {}
+        maps_display = bool(cfg.high_bit_depth and cfg.display_target is not None
+                            and capabilities.get("high_bit_depth") and capabilities.get("display_mapping"))
         if cfg.source == "uplink":
-            owner = _SourceOpening(cfg.path)
+            owner = _SourceOpening(cfg.path, probe_hdr10plus=maps_display)
             # Use an executor Future, not another asyncio Task: cancellation
             # of all loop tasks must not discard a native worker's result.
             opening = self._loop.run_in_executor(None, owner.run)
@@ -663,10 +677,10 @@ class RelayClient:
         }
         if cfg.resize_algorithm is not None:
             fields["resize_algorithm"] = cfg.resize_algorithm
-        if cfg.high_bit_depth and (self.capabilities or {}).get("high_bit_depth"):
+        if cfg.high_bit_depth and capabilities.get("high_bit_depth"):
             fields["high_bit_depth"] = cfg.high_bit_depth
-            if cfg.display_target is not None and (self.capabilities or {}).get("display_mapping"):
-                fields["display_target"] = cfg.display_target.to_wire()
+        if maps_display:
+            fields["display_target"] = cfg.display_target.to_wire()
         if video is not None:
             fields["video"] = video
         try:
@@ -1084,14 +1098,22 @@ class RelayClient:
         msg = await self._request("seek_ready", "seek", target_pts=target_pts, epoch=epoch, **fields)
         if msg["epoch"] < self.epoch:
             return  # superseded by a newer seek
-        if session is not None and session is self.session and "downlink_mapping" in msg:
-            # A mapped session's epoch may switch between PQ and SDR (§3.6).
-            mapping = msg.get("downlink_mapping")
-            session.downlink_mapping = mapping if isinstance(mapping, dict) else None
-            if isinstance(msg.get("downlink_color"), dict):
-                session.downlink_color = msg["downlink_color"]
+        if session is not None and session is self.session:
+            self._apply_epoch_mapping(msg)
         if self.track is not None:
             await self.start_uplink(from_pts=target_pts, discontinuity=True, epoch=epoch)
+
+    def _apply_epoch_mapping(self, msg: dict) -> None:
+        """A mapped session's epoch may switch between PQ and SDR (PROTOCOL
+        §3.6): take seek_ready's downlink_mapping and downlink_color for the
+        current epoch. Idempotent; the control reader and seek() both call it."""
+        session = self.session
+        if session is None or msg.get("epoch") != self.epoch or "downlink_mapping" not in msg:
+            return
+        mapping = msg.get("downlink_mapping")
+        session.downlink_mapping = mapping if isinstance(mapping, dict) else None
+        if isinstance(msg.get("downlink_color"), dict):
+            session.downlink_color = msg["downlink_color"]
 
     async def teardown(self) -> None:
         for task in (self._uplink_task, getattr(self, "_report_task", None)):

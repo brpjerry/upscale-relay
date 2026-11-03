@@ -140,6 +140,17 @@ def _mapping_rows(mapping: dict | None) -> list[tuple[str, str]]:
     return [("Dynamic HDR", f"{' and '.join(applied)}, applied by the server for this display")]
 
 
+def _source_is_hdr(session) -> bool:
+    """SessionInfo.hdr_source: an HDR downlink, or a display-mapped session,
+    whose epoch may be SDR (PROTOCOL §3.6). A session without the property
+    (a test double) is read the same way from its fields."""
+    known = getattr(session, "hdr_source", None)
+    if known is not None:
+        return bool(known)
+    return bool(getattr(session, "downlink_hdr", False)
+                or getattr(session, "downlink_mapping", None) is not None)
+
+
 def _server_address(host: str, port: int) -> str:
     return f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
 
@@ -2591,15 +2602,28 @@ class MainWindow(DesktopFeatures, QMainWindow):
         if hasattr(self.player, "prepare_seek"):
             self.player.prepare_seek(target_s)
         try:
-            if getattr(self.client.session, "display_target", None) is not None:
+            session = self.client.session
+            if getattr(session, "display_target", None) is not None:
                 # Each epoch is mapped for the display it is shown on now: the
                 # HDR reload after a display change is one of these seeks.
                 await self.client.seek(int(target_s / float(tb)), display_target=self._display_target())
+                self._show_mapping(session)
             else:
                 await self.client.seek(int(target_s / float(tb)))
         except Exception as err:
             self._pending_seek_s = None
             self._error("Seek failed", str(err))
+
+    def _show_mapping(self, session) -> None:
+        """Rebuild the info card's Dynamic HDR line after a seek: a remap
+        changes what the server applied (PROTOCOL §3.6)."""
+        title, detail, rows = self._now_raw
+        if title is None or rows is None or getattr(self.client, "session", None) is not session:
+            return
+        rows = [row for row in rows if row[0] != "Dynamic HDR"]
+        at = next((i + 1 for i, row in enumerate(rows) if row[0] == "Output"), len(rows))
+        rows[at:at] = _mapping_rows(getattr(session, "downlink_mapping", None))
+        self._show_now_playing(title, detail, rows)
 
     def _display_target(self):
         """The display a relay stream is shown on (player.display_target),
@@ -2668,10 +2692,11 @@ class MainWindow(DesktopFeatures, QMainWindow):
         if session is None:
             await self._restart_for_playback_setting()  # as passthrough_4k
             return
-        # Every SDR stream changes depth; HDR stays 10-bit either way, and a
-        # server without deep colour streams 8 bits whatever is asked.
+        # Every SDR stream changes depth; an HDR source stays 10-bit either way
+        # (a display-mapped one in its SDR epochs too), and a server without
+        # deep colour streams 8 bits whatever is asked.
         capabilities = getattr(self.client, "capabilities", None)
-        if getattr(session, "downlink_hdr", False) or (
+        if _source_is_hdr(session) or (
                 isinstance(capabilities, dict) and not capabilities.get("high_bit_depth")):
             return
         await self._restart_for_playback_setting()
@@ -2851,10 +2876,10 @@ class MainWindow(DesktopFeatures, QMainWindow):
         self.client_log.record("local_fallback", position=pos)
         if path is None:
             return
-        # The server read the file's colour: an HDR source has an HDR downlink.
-        # mpv may have read it in the frames too (an HLG alternative-transfer SEI).
-        hdr = bool(getattr(getattr(self.client, "session", None), "downlink_hdr", False)
-                   or getattr(self.player, "source_hdr", False))
+        # The server read the file's colour: an HDR source has an HDR downlink,
+        # or a display-mapped one whose epoch may be SDR. mpv may have read it
+        # in the frames too (an HLG alternative-transfer SEI).
+        hdr = _source_is_hdr(getattr(self.client, "session", None)) or bool(getattr(self.player, "source_hdr", False))
         # The control teardown closes the old downlink. Stop its consumer first
         # so that normal closure cannot enqueue a stale playback failure while
         # the local file is being loaded.

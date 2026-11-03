@@ -14,18 +14,24 @@ class DeepClient(LifecycleClient):
 
     hdr = False
     source_bits = 10
+    mapping = None
     capabilities = {"high_bit_depth": True}
 
     async def open_session(self, config):
         session = await super().open_session(config)
         session.downlink_hdr = self.hdr
         session.source_bit_depth = self.source_bits
+        session.downlink_mapping = self.mapping
         return session
 
 
-def setup_deep(window, monkeypatch, *, hdr=False, source_bits=10, deep_server=True):
+# A display-mapped Dolby Vision source in an epoch the server made SDR.
+MAPPED_SDR = {"transfer": "sdr", "peak_nits": None, "sdr_white_nits": None, "applied": ["dolby_vision"]}
+
+
+def setup_deep(window, monkeypatch, *, hdr=False, source_bits=10, deep_server=True, mapping=None):
     events, errors = setup_lifecycle(window, monkeypatch)
-    DeepClient.hdr, DeepClient.source_bits = hdr, source_bits
+    DeepClient.hdr, DeepClient.source_bits, DeepClient.mapping = hdr, source_bits, mapping
     window.client = DeepClient(events)
     window.client.capabilities = {"high_bit_depth": deep_server}
     restarts = []
@@ -54,15 +60,17 @@ def test_hdr_always_and_every_video_at_10_bits_on_request(window, monkeypatch):
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize(("hdr", "source_bits", "deep_server", "expected"), [
-    (False, 10, True, [True, False]),   # 10-bit SDR
-    (False, 8, True, [True, False]),    # 8-bit SDR: widened to 10 bits too
-    (False, None, True, [True, False]),  # a server that does not report the source's depth
-    (True, 10, True, []),               # HDR stays 10-bit either way
-    (False, 8, False, []),              # a server without deep colour streams 8 bits anyway
+@pytest.mark.parametrize(("hdr", "source_bits", "deep_server", "mapping", "expected"), [
+    (False, 10, True, None, [True, False]),    # 10-bit SDR
+    (False, 8, True, None, [True, False]),     # 8-bit SDR: widened to 10 bits too
+    (False, None, True, None, [True, False]),  # a server that does not report the source's depth
+    (True, 10, True, None, []),                # HDR stays 10-bit either way
+    (False, 10, True, MAPPED_SDR, []),         # so does a mapped HDR source in an SDR epoch
+    (False, 8, False, None, []),               # a server without deep colour streams 8 bits anyway
 ])
-def test_toggle_restarts_every_sdr_stream(window, monkeypatch, hdr, source_bits, deep_server, expected):
-    errors, restarts = setup_deep(window, monkeypatch, hdr=hdr, source_bits=source_bits, deep_server=deep_server)
+def test_toggle_restarts_every_sdr_stream(window, monkeypatch, hdr, source_bits, deep_server, mapping, expected):
+    errors, restarts = setup_deep(window, monkeypatch, hdr=hdr, source_bits=source_bits, deep_server=deep_server,
+                                  mapping=mapping)
 
     async def scenario():
         await window._start_session("show.mkv", "server_file")
@@ -74,14 +82,15 @@ def test_toggle_restarts_every_sdr_stream(window, monkeypatch, hdr, source_bits,
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize(("hdr", "mpv_read", "expected"), [
-    (True, False, True), (False, False, False),
-    (False, True, True),  # an HLG alternative-transfer SEI: only mpv saw it, in the frames
+@pytest.mark.parametrize(("hdr", "mpv_read", "mapping", "expected"), [
+    (True, False, None, True), (False, False, None, False),
+    (False, True, None, True),  # an HLG alternative-transfer SEI: only mpv saw it, in the frames
+    (False, False, MAPPED_SDR, True),  # a mapped HDR source whose epoch the server made SDR
 ])
-def test_playing_locally_keeps_what_the_server_read_of_the_source(window, monkeypatch, hdr, mpv_read, expected):
+def test_playing_locally_keeps_what_the_server_read_of_the_source(window, monkeypatch, hdr, mpv_read, mapping, expected):
     """The local fallback plays an HDR source on the HDR surface too: the
     server read the file's colour, and its downlink is HDR for an HDR file."""
-    errors, _ = setup_deep(window, monkeypatch, hdr=hdr)
+    errors, _ = setup_deep(window, monkeypatch, hdr=hdr, mapping=mapping)
     window.player.source_hdr = mpv_read
 
     async def scenario():
