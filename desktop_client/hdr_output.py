@@ -33,15 +33,25 @@ from PySide6.QtGui import QGuiApplication
 @dataclass(frozen=True)
 class DisplayHdr:
     """What one screen shows. ``peak_nits`` and ``sdr_white_nits`` are None
-    when the platform does not say."""
+    when the platform does not say. ``auto``: not read but expected, an SDR
+    screen the compositor is to switch to HDR (``expected_hdr``)."""
 
     hdr: bool
     peak_nits: float | None = None
     sdr_white_nits: float | None = None
     source: str = ""
+    auto: bool = False
 
 
 SDR = DisplayHdr(False)
+
+# Each screen's last HDR reading, by source: what the compositor's own switch
+# to HDR will most likely give it again.
+_seen_hdr: dict[str, DisplayHdr] = {}
+# Until a screen has been read in HDR: a common HDR peak, and PQ's reference
+# white (which Hyprland's HDR mode reports too).
+_EXPECTED_PEAK_NITS = 1000.0
+_EXPECTED_WHITE_NITS = 203.0
 
 # The Qt release whose Wayland plugin tags a surface with its format's colour
 # space (wp_color_management_v1 set_image_description).
@@ -77,13 +87,73 @@ def query(window=None) -> DisplayHdr:
         kind = platform_kind()
         if kind == "wayland":
             screen = window.screen() if window is not None else None
-            return _wayland_query(screen.name() if screen is not None else None)
-        if kind == "windows":
+            display = _wayland_query(screen.name() if screen is not None else None)
+        elif kind == "windows":
             hwnd = int(window.winId()) if window is not None else None
-            return _windows_query(hwnd)
+            display = _windows_query(hwnd)
+        else:
+            return SDR
     except Exception:  # noqa: BLE001 - a failed query reads as SDR
         return SDR
-    return SDR
+    if display.hdr:
+        _seen_hdr[display.source] = display
+    return display
+
+
+def expected_hdr(display: DisplayHdr) -> DisplayHdr:
+    """What ``display`` (read as SDR) will most likely report once the
+    compositor switches it to HDR: its last HDR reading, else a guess."""
+    seen = _seen_hdr.get(display.source)
+    return DisplayHdr(
+        True,
+        seen.peak_nits if seen is not None and seen.peak_nits else _EXPECTED_PEAK_NITS,
+        seen.sdr_white_nits if seen is not None and seen.sdr_white_nits else _EXPECTED_WHITE_NITS,
+        display.source, auto=True,
+    )
+
+
+def compositor_auto_hdr() -> bool:
+    """Whether the compositor switches a screen to HDR by itself while a
+    fullscreen window shows an HDR surface, and back once it leaves:
+    Hyprland's ``render:cm_auto_hdr`` (on by default)."""
+    signature = os.environ.get("HYPRLAND_INSTANCE_SIGNATURE")
+    if not signature or platform_kind() != "wayland":
+        return False
+    value = _hyprland_option(signature, "render:cm_auto_hdr")
+    return value != 0  # unknown: Hyprland's default, on
+
+
+def _hyprland_option(signature: str, name: str) -> int | None:
+    """An integer option over Hyprland's IPC socket (``hyprctl getoption``)."""
+    import json  # noqa: PLC0415
+    import socket  # noqa: PLC0415
+
+    runtime = os.environ.get("XDG_RUNTIME_DIR", "")
+    for path in (os.path.join(runtime, "hypr", signature, ".socket.sock"),
+                 os.path.join("/tmp", "hypr", signature, ".socket.sock")):
+        if not os.path.exists(path):
+            continue
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+                connection.settimeout(0.5)
+                connection.connect(path)
+                connection.sendall(f"j/getoption {name}".encode())
+                reply = b""
+                while chunk := connection.recv(4096):
+                    reply += chunk
+            return _option_value(json.loads(reply))
+        except (OSError, ValueError):
+            return None
+    return None
+
+
+def _option_value(reply) -> int | None:
+    if not isinstance(reply, dict):
+        return None
+    for key in ("int", "value"):
+        if isinstance(reply.get(key), int) and not isinstance(reply.get(key), bool):
+            return reply[key]
+    return None
 
 
 # -- Wayland -------------------------------------------------------------------

@@ -88,9 +88,10 @@ The other designs considered, and why each was set aside:
 
 The surface is used for a PQ or HLG video (the relay's `downlink_color`, or the
 source the server read for local fallback) on a screen that is in HDR mode,
-while **Show HDR videos in HDR** is on (the default). In every other case the
-video plays on the widget exactly as before: mpv tone-maps, with the same
-code and the same pacing.
+while **Show HDR videos in HDR** is on (the default). On Hyprland it is also
+used in fullscreen on a screen in SDR mode, which Hyprland then switches to
+HDR (see Hyprland below). In every other case the video plays on the widget
+exactly as before: mpv tone-maps, with the same code and the same pacing.
 
 `desktop_client/hdr_output.py` reads the screen's state:
 
@@ -148,12 +149,41 @@ monitor's `max_luminance` to 10000, so that nothing was tone-mapped, made the
 square match the cursor. The surface now declares the panel's peak, which
 Hyprland only clamps.
 
-Hyprland also switches a panel in SDR mode to HDR on its own while a
-fullscreen window shows a PQ surface (`render:cm_auto_hdr`, on by default):
-the connector's colorspace became BT2020_RGB with PQ metadata ~1.2 s after
-fullscreen, and the output's image description read PQ with 1107/203. The
-player does not use this yet: it picks the HDR surface only on a screen that
-already reports HDR.
+### Fullscreen on an SDR screen (Hyprland's auto HDR)
+
+Hyprland switches a monitor in SDR mode to HDR on its own while its
+fullscreen window has a surface with an HDR image description, anywhere in
+the window's surface tree (`render:cm_auto_hdr`, on by default;
+`IHyprRenderer::handleFullscreenSettings`). It goes back to SDR once no
+window is fullscreen. On the laptop the connector's colorspace became
+BT2020_RGB with PQ metadata ~1.2 s after fullscreen, and the output's image
+description read PQ with 1107/203.
+
+The player uses it for HDR videos (`MpvPlayerView._wanted_surface`), when
+Hyprland's IPC socket reports the option on (`hdr_output.compositor_auto_hdr`):
+
+1. **Entering fullscreen** (once the transition has settled, so the reload
+   does not hitch it), an HDR video on the widget reloads at its position
+   onto the HDR surface. Until the switch it uses the screen's last HDR
+   reading in this process, or 1000 nits and a 203-nit white
+   (`hdr_output.expected_hdr`).
+2. **The switch.** Hyprland sees the surface and switches the screen. The
+   player rereads the screen every half second while it waits, then adopts
+   the real peak and white: the surface describes itself again and mpv takes
+   its new `target-peak` live, with no reload.
+3. **Leaving fullscreen**, the video reloads at once onto the widget,
+   tone-mapped. Hyprland's shader does not tone-map HDR to SDR, so a PQ
+   surface on the screen that is about to be SDR would clip. The screen reads
+   HDR about a second longer; until it reads SDR again that HDR counts as
+   Hyprland's switch, and does not pull the video back.
+4. **No switch** within 5 seconds (a `no_auto_hdr` window rule, say): the
+   video goes back to the widget, and the player does not ask again until the
+   setting is switched.
+
+Moving back to the widget drops the surface's description before hiding it:
+Hyprland finds the HDR surface of a fullscreen window even hidden, and would
+keep the screen in HDR for it. Each way costs one reload: a relay seek
+(0.5-1.8 s on a 4K stream) or the local file again.
 
 ### What mpv does with the metadata
 

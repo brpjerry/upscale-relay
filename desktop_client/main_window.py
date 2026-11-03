@@ -1452,6 +1452,13 @@ class MainWindow(DesktopFeatures, QMainWindow):
         if self.isFullScreen():
             self._fullscreen_settled = True
             self._apply_display_pacing()
+            self._fullscreen_hdr()  # after the slides: a reload mid-transition would hitch
+
+    def _fullscreen_hdr(self) -> None:
+        # On a screen the compositor switches to HDR for a fullscreen HDR
+        # surface (Hyprland), an HDR video moves to the surface or back.
+        if hasattr(self.player, "fullscreen_changed"):
+            self.player.fullscreen_changed()
 
     def toggle_fullscreen(self) -> None:
         entering = not self.isFullScreen()
@@ -1490,6 +1497,9 @@ class MainWindow(DesktopFeatures, QMainWindow):
                 self.showNormal()
             self._slide_toolbar(True)
             self._slide_browser(self.browser_toggle.isChecked())
+            # At once: the compositor puts the screen back in SDR ~1 s after
+            # fullscreen ends, and the HDR surface would clip there.
+            self._fullscreen_hdr()
 
     def keyPressEvent(self, event) -> None:
         # Unhandled keys from the player view propagate up to here.
@@ -2661,6 +2671,9 @@ class MainWindow(DesktopFeatures, QMainWindow):
             text = f"Playing in HDR{peak}."
         elif not hdr_output.presentation_supported():
             text = "HDR output needs a Wayland session with Qt 6.10.2 or later."
+        elif hdr_output.compositor_auto_hdr():
+            text = ("HDR videos play as HDR while the display is in HDR mode, "
+                    "and in fullscreen, where the display switches to HDR.")
         else:
             text = "HDR videos play as HDR while the display is in HDR mode."
         self.hdr_output_hint.setText(text)

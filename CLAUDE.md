@@ -396,7 +396,11 @@ their volume, panscan, tracks and delays.
     overlays mirrored onto it. The surface declares the display's peak, so
     the compositor does not tone-map it again. Everything else stays on the
     widget unchanged.
-  - Hyprland shows it as HDR only with the monitor's `cm = "hdr"`.
+  - Hyprland shows it as HDR with the monitor's `cm = "hdr"`, and in
+    fullscreen on an SDR screen it switches the screen to HDR itself for the
+    surface (`render:cm_auto_hdr`). The player moves an HDR video onto the
+    surface when fullscreen settles and back to the widget when it ends
+    (one reload each way); docs/HDR_OUTPUT.md has the steps.
   - On the laptop the surface matches the widget for steady playback,
     overlay motion, sidebar slides and splitter drags (2026-11-02, 120 Hz).
     Fullscreen transitions run at 101-110 fps entering (the widget: 118) and

@@ -86,7 +86,10 @@ bandwidth. Toggling it restarts only a 10-bit SDR stream.
 
 **Show HDR videos in HDR** (on by default) plays an HDR video as HDR while the
 window's screen is in HDR mode. That works on Wayland with Qt 6.10.2 or later;
-on Hyprland, set the monitor's `cm = "hdr"`. The video then renders on a
+on Hyprland, set the monitor's `cm = "hdr"`, or go fullscreen: Hyprland then
+switches a screen in SDR mode to HDR for the video, and back afterwards
+(`render:cm_auto_hdr`, on by default). Entering and leaving fullscreen each
+reload the video at its position. The video then renders on a
 native PQ surface over the player, with mpv converting it for the display's
 peak brightness. The control bar, the cards and the settings sheet are drawn
 over it at the display's SDR white level. The hint under the switch says when

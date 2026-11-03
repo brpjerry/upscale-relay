@@ -101,6 +101,10 @@ _GL_SCISSOR_TEST = 0x0C11
 # video (a Wayland query is four roundtrips; DXGI a fresh factory).
 _HDR_SURFACE_TIMEOUT_S = 3.0
 _HDR_RECHECK_TICKS = 6  # stats ticks (0.5 s)
+# How long the compositor may take to switch a fullscreen screen to HDR for
+# the HDR surface (Hyprland: ~1.2 s, 2026-11-02) before the video goes back
+# to the widget, tone-mapped.
+_AUTO_HDR_TIMEOUT_S = 5.0
 
 
 def _fit(width: int, height: int, aspect: float) -> tuple[float, float, float, float]:
@@ -468,6 +472,14 @@ class MpvPlayerView(QOpenGLWidget):
         self._hdr_enabled = True  # the "Show HDR videos in HDR" setting
         self._display_hdr = hdr_output.SDR  # as last read
         self._hdr_stale_reported = False
+        # In fullscreen on an SDR screen, Hyprland switches the screen to HDR
+        # itself for an HDR surface (render:cm_auto_hdr). _auto_hdr: the
+        # screen's HDR is that switch (until it reads SDR again);
+        # _auto_hdr_deadline: the switch has yet to come; _auto_hdr_refused:
+        # it did not, so do not ask again.
+        self._auto_hdr = False
+        self._auto_hdr_deadline: float | None = None
+        self._auto_hdr_refused = False
         # mpv's output colour options as last set (its defaults at start).
         self._output_target = {"target-trc": "auto", "target-prim": "auto", "target-peak": "auto"}
 
@@ -993,20 +1005,42 @@ class MpvPlayerView(QOpenGLWidget):
         """The "Show HDR videos in HDR" setting. Applies at the next load;
         during an HDR video hdr_surface_stale asks for one."""
         self._hdr_enabled = bool(enabled)
+        self._auto_hdr_refused = False  # the setting again: the compositor may switch now
+        self._check_hdr_surface()
+
+    def fullscreen_changed(self) -> None:
+        """The window entered fullscreen (and settled) or left it: on an SDR
+        screen whose compositor switches to HDR for a fullscreen HDR surface,
+        an HDR video moves to the surface or back (one reload each way)."""
         self._check_hdr_surface()
 
     def _wanted_surface(self) -> tuple[bool, hdr_output.DisplayHdr]:
         """(play on the HDR surface?, the display's state). RELAY_HDR_SURFACE=
         force puts every video there, on any display (testing the surface and
-        its overlays on an SDR screen); =off never does."""
+        its overlays on an SDR screen); =off never does.
+
+        In fullscreen on an SDR screen of a compositor that switches the
+        screen to HDR for a fullscreen HDR surface (Hyprland), the surface is
+        wanted too, with the HDR state the switch is expected to bring
+        (``DisplayHdr.auto``). Out of fullscreen that HDR state goes, and the
+        video with it, whatever the screen still reports.
+        """
         mode = os.environ.get("RELAY_HDR_SURFACE", "").lower()
         if self.options.headless or mode == "off" or self._presenter_broken:
             return False, hdr_output.SDR
         if mode != "force" and not (
                 self._hdr_enabled and self._source_hdr and hdr_output.presentation_supported()):
             return False, hdr_output.SDR
-        display = hdr_output.query(self.window())
-        return (True if mode == "force" else display.hdr), display
+        window = self.window()
+        display = hdr_output.query(window)
+        if mode == "force":
+            return True, display
+        fullscreen = window is not None and window.isFullScreen()
+        if display.hdr and (fullscreen or not self._auto_hdr):
+            return True, display
+        if fullscreen and not self._auto_hdr_refused and hdr_output.compositor_auto_hdr():
+            return True, hdr_output.expected_hdr(display)
+        return False, display
 
     @staticmethod
     def _pq_for(display: hdr_output.DisplayHdr) -> bool:
@@ -1021,6 +1055,7 @@ class MpvPlayerView(QOpenGLWidget):
             self._hdr_stale_reported = False
             if not want or not await self._move_to_presenter(display):
                 self._move_to_widget()
+            self._follow_auto_hdr(want, display)
         except asyncio.CancelledError:
             raise
         except Exception as error:  # noqa: BLE001 - play on the widget instead
@@ -1030,6 +1065,19 @@ class MpvPlayerView(QOpenGLWidget):
         self._apply_output_target()
         if self.hdr_output != was:
             self.hdr_output_changed.emit(self.hdr_output)
+
+    def _follow_auto_hdr(self, want: bool, display: hdr_output.DisplayHdr) -> None:
+        """Track the compositor's switch to HDR for the fullscreen surface."""
+        if display.auto and self._on_presenter:
+            self._auto_hdr = True
+            if self._auto_hdr_deadline is None:
+                self._auto_hdr_deadline = time.monotonic() + _AUTO_HDR_TIMEOUT_S
+        elif not display.auto:
+            self._auto_hdr_deadline = None  # it came, or is no longer awaited
+        if not want and not display.hdr:
+            # Out of fullscreen the screen reads HDR a moment longer: until
+            # it reads SDR, that HDR stays the switch's, not the user's.
+            self._auto_hdr = False
 
     async def _move_to_presenter(self, display: hdr_output.DisplayHdr) -> bool:
         pq = self._pq_for(display)
@@ -1094,6 +1142,11 @@ class MpvPlayerView(QOpenGLWidget):
             self._ctx = None
             self._on_presenter = False
         if presenter is not None and presenter.isVisible():
+            if hasattr(presenter, "release_description"):
+                # Before the hide, whose commit applies it: Hyprland finds a
+                # fullscreen window's HDR surface even hidden, and would keep
+                # the screen in HDR for it.
+                presenter.release_description()
             presenter.hide()
         context = self.context()
         if self._ctx is None and not self.options.headless and context is not None and context.isValid():
@@ -1162,7 +1215,8 @@ class MpvPlayerView(QOpenGLWidget):
 
     def _check_hdr_surface(self) -> None:
         """During playback, report a surface the display no longer fits
-        (HDR switched on or off, the window on another screen, the setting)."""
+        (HDR switched on or off, the window on another screen, the setting,
+        fullscreen on a screen the compositor switches to HDR)."""
         if self.options.headless or self._hdr_stale_reported:
             return
         if self._task is None and not self._local_playback:
@@ -1176,13 +1230,23 @@ class MpvPlayerView(QOpenGLWidget):
         if not (self._source_hdr or self._on_presenter):
             return
         want, display = self._wanted_surface()
+        if display.auto and self._auto_hdr_deadline is not None and time.monotonic() > self._auto_hdr_deadline:
+            # The compositor kept the screen in SDR (a no_auto_hdr window
+            # rule, say): the video goes back to the widget, tone-mapped.
+            self._auto_hdr_refused = True
+            self.log_message.emit("warn", "relay", "The display did not switch to HDR in fullscreen; "
+                                                   "playing the HDR video tone-mapped")
+            want, display = self._wanted_surface()
+        self._follow_auto_hdr(want, display)
         fits = want == self._on_presenter and (
             not want or (self._presenter is not None and self._presenter.pq == self._pq_for(display)))
         if not fits:
             self._hdr_stale_reported = True
             self.hdr_surface_stale.emit()
         elif want and display != self._display_hdr:
-            # Same surface, other luminances (a brightness setting): adopt them.
+            # Same surface, other luminances (a brightness setting, or the
+            # compositor's switch to HDR the surface was waiting for): adopt
+            # them. mpv takes its new target-peak live.
             self._display_hdr = display
             if display.sdr_white_nits:
                 self._presenter.sdr_white_nits = display.sdr_white_nits
@@ -1190,6 +1254,7 @@ class MpvPlayerView(QOpenGLWidget):
                 self._presenter.peak_nits = display.peak_nits
             self._presenter.update()  # composes, and describes the surface, anew
             self._apply_output_target(asynchronous=True)
+            self.hdr_output_changed.emit(True)  # the hint's peak
 
     # -- public API -----------------------------------------------------------
 
@@ -1711,8 +1776,8 @@ class MpvPlayerView(QOpenGLWidget):
         while True:
             await asyncio.sleep(0.5)
             ticks += 1
-            if ticks % _HDR_RECHECK_TICKS == 0:
-                self._check_hdr_surface()
+            if ticks % _HDR_RECHECK_TICKS == 0 or self._auto_hdr_deadline is not None:
+                self._check_hdr_surface()  # each tick while the switch to HDR is awaited
             if self._reloading:
                 if self.client is not None:
                     self.client.buffered_ms = 0

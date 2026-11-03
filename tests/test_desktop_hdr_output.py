@@ -2,6 +2,7 @@
 overlays drawn over the HDR surface (desktop_client/hdr_view.py)."""
 import asyncio
 import ctypes
+import time
 from fractions import Fraction
 from types import SimpleNamespace
 
@@ -31,9 +32,23 @@ def _player(**fields):
     defaults = dict(
         options=SimpleNamespace(headless=False), _presenter_broken=False, _hdr_enabled=True,
         _source_hdr=True, window=lambda: None,
+        _auto_hdr=False, _auto_hdr_deadline=None, _auto_hdr_refused=False,
     )
     defaults.update(fields)
     return SimpleNamespace(**defaults)
+
+
+def _bind(player, *names):
+    """MpvPlayerView's own methods on a fake, for those that call others."""
+    from desktop_client.mpv_view import MpvPlayerView
+    for name in names:
+        setattr(player, name, getattr(MpvPlayerView, name).__get__(player))
+    player._pq_for = MpvPlayerView._pq_for
+    return player
+
+
+def _window(fullscreen):
+    return lambda: SimpleNamespace(isFullScreen=lambda: fullscreen)
 
 
 @pytest.mark.parametrize(("fields", "env", "display", "expected"), [
@@ -101,8 +116,7 @@ def test_a_display_switching_hdr_during_an_hdr_video_asks_for_one_reload(monkeyp
         _presenter=None, _display_hdr=SDR_DISPLAY, _observed={}, _epoch_released=True,
         hdr_surface_stale=SimpleNamespace(emit=lambda: stale.append(True)),
     )
-    player._wanted_surface = lambda: MpvPlayerView._wanted_surface(player)
-    player._pq_for = MpvPlayerView._pq_for
+    _bind(player, "_wanted_surface", "_follow_auto_hdr")
     MpvPlayerView._check_hdr_surface(player)
     assert not stale  # SDR display, widget surface: fits
     display[0] = HDR_DISPLAY  # the user switched HDR on
@@ -127,8 +141,7 @@ def test_a_stream_mpv_reads_as_hdr_moves_though_the_session_said_sdr(monkeypatch
         _observed={"video-params": {"gamma": gamma, "primaries": "bt.2020"}},
         hdr_surface_stale=SimpleNamespace(emit=lambda: stale.append(True)),
     )
-    player._wanted_surface = lambda: MpvPlayerView._wanted_surface(player)
-    player._pq_for = MpvPlayerView._pq_for
+    _bind(player, "_wanted_surface", "_follow_auto_hdr")
     MpvPlayerView._check_hdr_surface(player)
     assert stale == expected and player._source_hdr is bool(expected)
 
@@ -142,7 +155,8 @@ def test_a_failing_hdr_surface_falls_back_to_the_widget():
         raise RuntimeError("no surface")
 
     player = _player(
-        hdr_output=False, _presenter_broken=False,
+        hdr_output=False, _presenter_broken=False, _on_presenter=False,
+        _follow_auto_hdr=lambda *_: None,
         _wanted_surface=lambda: (True, HDR_DISPLAY), _move_to_presenter=broken,
         _move_to_widget=lambda: moved.append("widget"), _apply_output_target=lambda: None,
         log_message=SimpleNamespace(emit=lambda *args: logged.append(args)),
@@ -150,6 +164,147 @@ def test_a_failing_hdr_surface_falls_back_to_the_widget():
     )
     asyncio.run(MpvPlayerView._prepare_surface(player))
     assert moved == ["widget"] and player._presenter_broken and logged
+
+
+# -- fullscreen on an SDR screen that the compositor switches to HDR ------------------
+
+@pytest.mark.parametrize(("fullscreen", "compositor", "refused", "expected"), [
+    (True, True, False, True),
+    (False, True, False, False),  # windowed: tone-mapped, as before
+    (True, False, False, False),  # a compositor that does not switch
+    (True, True, True, False),    # it did not switch last time
+])
+def test_fullscreen_on_an_sdr_screen_wants_the_surface_where_the_compositor_switches_to_hdr(
+        monkeypatch, fullscreen, compositor, refused, expected):
+    pytest.importorskip("mpv")
+    from desktop_client.mpv_view import MpvPlayerView
+    monkeypatch.setenv("RELAY_HDR_SURFACE", "")
+    monkeypatch.setattr(hdr_output, "presentation_supported", lambda app=None: True)
+    monkeypatch.setattr(hdr_output, "compositor_auto_hdr", lambda: compositor)
+    monkeypatch.setattr(hdr_output, "_seen_hdr", {})
+    monkeypatch.setattr(hdr_output, "query", lambda window=None: SDR_DISPLAY)
+    want, display = MpvPlayerView._wanted_surface(_player(window=_window(fullscreen), _auto_hdr_refused=refused))
+    assert want is expected
+    if expected:  # what the switch is expected to bring, until it does
+        assert display == DisplayHdr(True, 1000.0, 203.0, "test", auto=True)
+
+
+def test_the_expected_hdr_state_is_the_screens_last_hdr_reading(monkeypatch):
+    monkeypatch.setattr(hdr_output, "_seen_hdr", {})
+    monkeypatch.setattr(hdr_output, "platform_kind", lambda app=None: "wayland")
+    monkeypatch.setattr(hdr_output, "_wayland_query", lambda name: DisplayHdr(True, 1107.0, 203.0, "wayland eDP-1"))
+    hdr_output.query(None)
+    sdr = DisplayHdr(False, 80.0, 80.0, "wayland eDP-1")
+    assert hdr_output.expected_hdr(sdr) == DisplayHdr(True, 1107.0, 203.0, "wayland eDP-1", auto=True)
+    assert hdr_output.expected_hdr(DisplayHdr(False, source="wayland DP-1")).peak_nits == 1000.0
+
+
+def _auto_player(monkeypatch, display, fullscreen):
+    from desktop_client.mpv_view import MpvPlayerView  # noqa: F401 - mpv present
+    monkeypatch.setenv("RELAY_HDR_SURFACE", "")
+    monkeypatch.setattr(hdr_output, "presentation_supported", lambda app=None: True)
+    monkeypatch.setattr(hdr_output, "compositor_auto_hdr", lambda: True)
+    monkeypatch.setattr(hdr_output, "_seen_hdr", {})
+    monkeypatch.setattr(hdr_output, "query", lambda window=None: display[0])
+    events = []
+    player = _player(
+        window=lambda: SimpleNamespace(isFullScreen=lambda: fullscreen[0]),
+        _hdr_stale_reported=False, _task=object(), _local_playback=False, _on_presenter=False,
+        _presenter=None, _display_hdr=SDR_DISPLAY, _observed={}, _epoch_released=True,
+        hdr_surface_stale=SimpleNamespace(emit=lambda: events.append("reload")),
+        hdr_output_changed=SimpleNamespace(emit=lambda on: events.append(("hdr_output", on))),
+        log_message=SimpleNamespace(emit=lambda *args: events.append(("log",) + args)),
+        _apply_output_target=lambda asynchronous=False: events.append("target"),
+    )
+    _bind(player, "_wanted_surface", "_follow_auto_hdr")
+    return player, events
+
+
+def _moved_to_surface(player):
+    """What _prepare_surface does after the reload the check asked for."""
+    from desktop_client.mpv_view import MpvPlayerView
+    want, display = player._wanted_surface()
+    player._hdr_stale_reported = False
+    player._display_hdr = display
+    player._on_presenter = want
+    player._presenter = SimpleNamespace(pq=True, peak_nits=display.peak_nits, sdr_white_nits=display.sdr_white_nits,
+                                        update=lambda: None) if want else None
+    MpvPlayerView._follow_auto_hdr(player, want, display)
+
+
+def test_fullscreen_hdr_moves_waits_for_the_switch_adopts_its_peak_and_leaves(monkeypatch):
+    pytest.importorskip("mpv")
+    from desktop_client.mpv_view import MpvPlayerView
+    display, fullscreen = [SDR_DISPLAY], [False]
+    player, events = _auto_player(monkeypatch, display, fullscreen)
+    MpvPlayerView._check_hdr_surface(player)
+    assert events == []  # windowed on SDR: the widget fits
+    fullscreen[0] = True
+    MpvPlayerView._check_hdr_surface(player)
+    assert events == ["reload"]
+    _moved_to_surface(player)
+    assert player._auto_hdr and player._auto_hdr_deadline is not None
+    assert player._presenter.peak_nits == 1000.0  # until the screen says
+    events.clear()
+    MpvPlayerView._check_hdr_surface(player)
+    assert events == []  # still SDR: waiting, on the surface
+    display[0] = HDR_DISPLAY  # Hyprland switched
+    MpvPlayerView._check_hdr_surface(player)
+    assert events == ["target", ("hdr_output", True)]
+    assert player._presenter.peak_nits == 1107.0 and player._auto_hdr_deadline is None
+    events.clear()
+    fullscreen[0] = False  # the screen still reads HDR for a moment
+    MpvPlayerView._check_hdr_surface(player)
+    assert events == ["reload"]
+    _moved_to_surface(player)
+    assert not player._on_presenter and player._auto_hdr  # its HDR is still the switch's
+    events.clear()
+    MpvPlayerView._check_hdr_surface(player)
+    assert events == []  # windowed on the widget: no pull back to the surface
+    display[0] = SDR_DISPLAY
+    MpvPlayerView._check_hdr_surface(player)
+    assert not player._auto_hdr and events == []
+
+
+def test_a_switch_that_never_comes_sends_the_video_back_tone_mapped(monkeypatch):
+    pytest.importorskip("mpv")
+    from desktop_client.mpv_view import MpvPlayerView
+    display, fullscreen = [SDR_DISPLAY], [True]
+    player, events = _auto_player(monkeypatch, display, fullscreen)
+    _moved_to_surface(player)
+    player._auto_hdr_deadline = time.monotonic() - 0.1  # a no_auto_hdr window rule, say
+    MpvPlayerView._check_hdr_surface(player)
+    assert player._auto_hdr_refused and events[-1] == "reload" and events[0][0] == "log"
+    _moved_to_surface(player)
+    assert not player._on_presenter  # and fullscreen again does not ask a second time
+
+
+def test_back_on_the_widget_the_surface_drops_its_description_before_hiding():
+    """Hyprland finds a fullscreen window's HDR surface even hidden."""
+    pytest.importorskip("mpv")
+    from desktop_client.mpv_view import MpvPlayerView
+    calls = []
+    presenter = SimpleNamespace(
+        release_render_context=lambda: calls.append("release_ctx"), isVisible=lambda: True,
+        release_description=lambda: calls.append("release_description"), hide=lambda: calls.append("hide"))
+    player = _player(_presenter=presenter, _on_presenter=True, _ctx=object(),
+                     options=SimpleNamespace(headless=True), context=lambda: None, update=lambda: None)
+    MpvPlayerView._move_to_widget(player)
+    assert calls == ["release_ctx", "release_description", "hide"]
+
+
+def test_hyprland_reports_its_auto_hdr_option(monkeypatch):
+    assert hdr_output._option_value({"option": "render:cm_auto_hdr", "int": 0, "set": False}) == 0
+    assert hdr_output._option_value({"value": 2}) == 2
+    assert hdr_output._option_value({"int": True}) is None and hdr_output._option_value([]) is None
+    monkeypatch.delenv("HYPRLAND_INSTANCE_SIGNATURE", raising=False)
+    assert not hdr_output.compositor_auto_hdr()  # not Hyprland
+    monkeypatch.setenv("HYPRLAND_INSTANCE_SIGNATURE", "abc")
+    monkeypatch.setattr(hdr_output, "platform_kind", lambda app=None: "wayland")
+    monkeypatch.setattr(hdr_output, "_hyprland_option", lambda signature, name: 0)
+    assert not hdr_output.compositor_auto_hdr()  # switched off
+    monkeypatch.setattr(hdr_output, "_hyprland_option", lambda signature, name: None)
+    assert hdr_output.compositor_auto_hdr()  # unknown: Hyprland's default, on
 
 
 def test_hdr_output_is_on_by_default(tmp_path):

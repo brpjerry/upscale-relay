@@ -118,7 +118,9 @@ relay-desktop
 - **HDR**: with Qt 6.10.2 or later and a compositor that implements
   wp_color_management_v1, HDR videos play as HDR while the screen is in HDR
   mode. On Hyprland that is the monitor's `cm = "hdr"`, which `hyprctl` can
-  also set at runtime; switching back needs an explicit `cm = "srgb"`.
+  also set at runtime; switching back needs an explicit `cm = "srgb"`. In
+  fullscreen Hyprland switches a screen in SDR mode to HDR by itself
+  (`render:cm_auto_hdr`, on by default), and the player uses that.
   `python -m desktop_client.hdr_output` prints what each screen reports. See
   [HDR output](HDR_OUTPUT.md).
 - Select a **Nearby servers** result, or enter `<windows-box-ip>:8590`, then Connect.
