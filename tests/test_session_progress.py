@@ -50,6 +50,7 @@ class SlowPipeline:
     bit_depth = 8
     downlink_color = None
     dolby_vision_rpu = False
+    downlink_mapping = None
 
     def __init__(self, *args, **kwargs):
         self.playing = False

@@ -14,7 +14,10 @@ load-bearing), `docs/CLIENT_LINUX.md` (Linux setup), and
   3-thread pipeline per session (decode → infer → fit/encode/mux) in
   `pipeline.py`. TensorRT inference runs in a **separate worker process**
   (`upscale_cli/infer_worker.py`) — do not move it back in-process (heap
-  corruption, see Hard rules). Windows-only tray GUI in `tray.py` +
+  corruption, see Hard rules). Display mapping (`display_mapping.py`,
+  PROTOCOL §3.6) applies Dolby Vision and HDR10+ for a client's SDR display
+  with FFmpeg's libplacebo filter, in an `ffmpeg` subprocess per epoch that
+  stands in for the decoder. Windows-only tray GUI in `tray.py` +
   `gui_settings.py` (qasync, `relay-server-gui`), with `autostart.py`
   (HKCU Run key, GUI-only) and `logo.py` (runtime-drawn icon; regenerate
   `packaging/icon.ico` via `packaging/make_icon.py` after changing it);
@@ -70,7 +73,12 @@ Client flags: `--debug` (faulthandler), `--trace` (consume-loop trace),
 tests MUST set this option or pass the equivalent `DesktopOptions`). Server
 flags: `--seek-discard-max-s S` (seeks land keyframe-accurate rather than
 decoding a keyframe-to-target span longer than S — off by default, see
-`docs/SEEK_LATENCY_PLAN.md`). Server env flag: `RELAY_NVDEC=1` (server hw
+`docs/SEEK_LATENCY_PLAN.md`), `--ffmpeg PATH` (the ffmpeg, with libplacebo
+on Vulkan, that display mapping runs; default `$RELAY_FFMPEG`, else `ffmpeg`
+on PATH; the gyan.dev full build has it: `winget install Gyan.FFmpeg`) and
+`--no-display-mapping`. The server probes that ffmpeg at start-up and
+advertises `capabilities.display_mapping` only when it maps a frame. Server
+env flag: `RELAY_NVDEC=1` (server hw
 source decode — crashed with NVENC concurrently, off by default). Client env
 flags:
 - `RELAY_HDR_SURFACE=force|off` puts every video on the HDR surface, on any
@@ -348,6 +356,25 @@ their volume, panscan, tracks and delays.
   the graph boundary as uint8 byte pairs (`wrap_rgb48_io`, [N,H,W,3,2]) so the
   CPU side only reinterprets buffers; the 10-bit output is exact in fp16.
 - NVDEC decode + NVENC encode concurrently in one process → native AV.
+- Display mapping's libplacebo (Vulkan) runs in an `ffmpeg` subprocess,
+  never in the pipeline process beside NVENC. Each epoch gets its own, and a
+  spare is started for the next seek (device creation is ~0.3 s; first
+  mapped frame ~0.4 s from a spare, ~0.65 s cold; ~90 fps at 4K DV). Packets
+  go in, and 10-bit frames come out, as NUT over localhost TCP:
+  - NUT keeps the source's PTS exactly; Matroska rounds to milliseconds.
+  - A Windows anonymous pipe passes a few KB per read: 4K frames moved at
+    ~1 fps through one.
+  - PyAV cannot give a new stream the source's hvcC, so packets go in as
+    Annex B with the parameter sets in band. The DV RPU decodes without
+    its configuration record.
+  - NUT's muxer needs increasing DTS no later than each PTS (Matroska B-frame
+    sources have none), so the mapper stamps its own decode clock below the
+    PTS.
+  - The child runs with `VK_LOADER_LAYERS_DISABLE=~implicit~`: the box's
+    overlay layers (Steam, OBS, Galaxy, EOS, ASUS) otherwise load into it.
+  - FFmpeg's libplacebo filter takes the target's luminance from the source
+    frame and has no target-peak option (9.0.2 and master), so PQ targets
+    are not fitted to the display: only DV profile 5 is mapped for them.
 - Never open a session while an earlier one may still hold its native
   owners. A teardown the server did not acknowledge (control connection
   already dead: suspend, network drop) leaves that unknown, so clients

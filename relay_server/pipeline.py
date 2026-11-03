@@ -14,6 +14,7 @@ dropped at every stage boundary.
 
 from __future__ import annotations
 
+import contextlib
 import functools
 import logging
 import os
@@ -57,6 +58,15 @@ from upscale_cli.fit import (
     cover_crop_box,
     fit_dimensions,
     interpolation_for_algorithm,
+)
+from .display_mapping import (
+    DisplayMapper,
+    DisplayTarget,
+    EpochMapping,
+    MapperError,
+    MapperProcess,
+    SourceDynamics,
+    decide,
 )
 
 log = logging.getLogger("relay.pipeline")
@@ -195,6 +205,7 @@ class _FlushCmd:
     epoch: int
     target_pts: int
     trace: SeekTrace | None = None
+    mapping: EpochMapping | None = None  # the new epoch's (display mapping)
 
 
 @dataclass(slots=True)
@@ -325,6 +336,8 @@ class VideoConfig:
     bit_depth: int | None = None
     hdr_static: StaticHdr = field(default_factory=StaticHdr)
     dolby_vision: DolbyVisionConfig | None = None
+    # The first keyframe carries HDR10+ (open_session.video.hdr10plus).
+    hdr10plus: bool = False
 
 
 @dataclass
@@ -379,6 +392,8 @@ class Pipeline:
         aux_source_path: str | None = None,
         embed_aux_attachments: bool = True,
         high_bit_depth: str | None = None,
+        display_mapper: DisplayMapper | None = None,
+        display_target: DisplayTarget | None = None,
     ):
         # close() is a native-resource barrier. Install its coordination before
         # constructing any native state so every fully published Pipeline has
@@ -395,6 +410,9 @@ class Pipeline:
         self._aux_template_container = None
         self._aux_streams = {}
         self._decoder = None
+        self._mapper_proc: MapperProcess | None = None
+        self._spare_mapper: MapperProcess | None = None
+        self._closed = threading.Event()
         try:
             if video.width <= 0 or video.height <= 0 or video.time_base <= 0:
                 raise ValueError("source dimensions and time base must be positive")
@@ -409,10 +427,29 @@ class Pipeline:
                 VideoColor.resolve_values(*video.color_tags, video.width, video.height)
                 if video.color_tags is not None else None
             )
-            self._source_color = None if video.color_from_first_frame else self._open_color
+            # The source's own colour (an uplink's from its first frame); an
+            # epoch mapped for a display has the mapping's instead.
+            self._native_color = None if video.color_from_first_frame else self._open_color
+            self._source_color = self._native_color
+            # Display mapping (docs/PROTOCOL.md §3.6), decided here for every
+            # epoch's target: None on a session that is never mapped. The
+            # latest decided (asyncio thread, flush) is what session_opened and
+            # seek_ready report; the decode stage applies it per epoch.
+            self._display_mapper = display_mapper
+            self._dynamics = SourceDynamics(video.codec, video.dolby_vision, video.hdr10plus)
+            self._mapping: EpochMapping | None = (
+                decide(self._dynamics, display_target)
+                if display_mapper is not None and high_bit_depth in HIGH_BIT_DEPTH_MODES
+                else None
+            )
             # Deep colour: 10-bit 4:2:0 out, rgb48 through the model. Decided
             # here, before the encoder, the model's I/O and session_opened.
             self.bit_depth = output_bit_depth(high_bit_depth, self._open_color, video.bit_depth)
+            if self._mapping is not None:
+                # Every epoch stays 10-bit, mapped to SDR or not: one encoder
+                # and model I/O per session. (A profile 5 source may declare
+                # no HDR transfer of its own.)
+                self.bit_depth = 10
             self.lossless_hevc_profile = lossless_hevc_profile
             self.quality_tier = quality_tier
             try:
@@ -507,11 +544,11 @@ class Pipeline:
             self._deep_hevc = self.bit_depth > 8 and self.downlink_codec == "hevc"
             dovi = video.dolby_vision
             # A profile 8 RPU maps whatever base layer it has, SDR (8.2) too.
-            self.dolby_vision_rpu = (
+            self._native_dovi_rpu = (
                 self._deep_hevc and video.codec == "hevc"
                 and dovi is not None and dovi.rpu_survives_reencode
             )
-            if dovi is not None and not dovi.rpu_survives_reencode and (
+            if dovi is not None and not dovi.rpu_survives_reencode and self._mapping is None and (
                 self.bit_depth > 8 or dovi.profile == 5
             ):
                 log.warning(
@@ -520,16 +557,10 @@ class Pipeline:
                     "; profile 5 has no HDR10 or SDR base layer, so colours will be wrong"
                     if dovi.profile == 5 else "",
                 )
-            # Both are decided again on the first frame when the source's
-            # colour comes from it (_put_decoded); until then any HEVC packet
-            # may hold metadata to keep.
-            self._hdr_signalling = self._deep_hevc and (
-                self.dolby_vision_rpu
-                or (self._source_color is not None and self._source_color.is_hdr)
-            )
-            self._dynamic_hdr = self._deep_hevc and video.codec == "hevc" and (
-                self._hdr_signalling or self._source_color is None
-            )
+            # Colour and HDR signalling of epoch 0 (and of each later epoch,
+            # applied as its flush reaches the decode stage).
+            self._epoch_mapping: EpochMapping | None = None
+            self._apply_epoch_mapping(self._mapping)
             self._nal_length_size = hevc_nal_length_size(video.extradata)
             self._pending_dynamic: dict[int, DynamicHdr] = {}  # decode thread
             # (dynamic, static) of each frame handed to the encoder, until
@@ -559,7 +590,8 @@ class Pipeline:
             self._reformatter = av.video.reformatter.VideoReformatter()  # finish thread
             self._crop_reformatter = av.video.reformatter.VideoReformatter()  # finish thread
             self._in_reformatter = av.video.reformatter.VideoReformatter()  # infer thread
-            self._decoder = self._open_decoder()
+            # A mapped epoch decodes in its mapper (_ensure_mapper).
+            self._decoder = None if self._mapped_epoch else self._open_decoder()
             self._epoch = 0  # decode-stage epoch (authoritative for stale drops)
             self._discard_until: int | None = None
             # Post-seek accuracy knob (docs/SEEK_LATENCY_PLAN.md step 2). None keeps
@@ -577,7 +609,6 @@ class Pipeline:
             self._client_buffered_at = time.monotonic()
             self.playing = False  # session mirrors PLAYING state here
             self._flush_pending = threading.Event()
-            self._closed = threading.Event()
             self._threads = [
                 threading.Thread(target=self._guard(self._decode_work), daemon=True, name="pl-decode"),
                 threading.Thread(target=self._guard(self._infer_work), daemon=True, name="pl-infer"),
@@ -668,6 +699,68 @@ class Pipeline:
             ctx.thread_count = 1
             ctx.thread_type = "NONE"
         return ctx
+
+    @property
+    def _mapped_epoch(self) -> bool:
+        """The decode stage's epoch is made by a display mapper."""
+        return self._epoch_mapping is not None and self._epoch_mapping.mapped
+
+    def _ensure_mapper(self, epoch: int) -> MapperProcess:
+        """The mapped epoch's mapper, started with its first packet (decode
+        thread): the spare when it was made for the same mapping. A spare for
+        the next epoch starts meanwhile, so a seek finds its Vulkan device
+        ready (~0.4 s to the first frame instead of ~0.65)."""
+        proc = self._mapper_proc
+        if proc is not None:
+            return proc
+        if self._closed.is_set():
+            raise RuntimeError("pipeline closed")
+        mapping = self._epoch_mapping
+        spare, self._spare_mapper = self._spare_mapper, None
+        if spare is not None and spare.mapping == mapping and spare.alive:
+            proc = spare
+        else:
+            if spare is not None:
+                spare.close()
+            proc = self._spawn_mapper(mapping)
+        self._mapper_proc = proc
+        proc.start(
+            on_frame=lambda frame: self._put_decoded(frame, epoch),
+            on_item=lambda item: self._safe_put(self._q_dec, item),
+            on_error=self._mapper_failed,
+        )
+        self._spare_mapper = self._spawn_mapper(mapping)
+        return proc
+
+    def _spawn_mapper(self, mapping: EpochMapping) -> MapperProcess:
+        return self._display_mapper.spawn(
+            mapping, codec=self.video.codec, extradata=self.video.extradata,
+            width=self.video.width, height=self.video.height, time_base=self.video.time_base,
+        )
+
+    @contextlib.contextmanager
+    def _abandoned_mapper_ok(self):
+        """A mapper that a seek or close killed fails whatever the decode
+        stage was doing with it: that epoch is over, and its flush (or the
+        stop) is next in the queue."""
+        proc = self._mapper_proc
+        try:
+            yield
+        except MapperError:
+            proc = proc or self._mapper_proc
+            if proc is None or not proc.killed:
+                raise
+
+    def _release_mapper(self) -> None:
+        proc, self._mapper_proc = self._mapper_proc, None
+        if proc is not None:
+            proc.close()
+
+    def _mapper_failed(self, message: str) -> None:
+        """A mapper's subprocess failed mid-epoch (its reader thread)."""
+        if not self._closed.is_set():
+            log.error("%s", message)
+            self.on_error(message)
 
     def _describe_source(self, ctx: av.CodecContext) -> None:
         """Give a decoder what a demuxer would: extradata and coded size.
@@ -772,8 +865,13 @@ class Pipeline:
             ms -= (time.monotonic() - self._client_buffered_at) * 1000.0
         return ms
 
-    def flush(self, epoch: int, target_pts: int) -> SeekTrace:
+    def flush(
+        self, epoch: int, target_pts: int, display_target: DisplayTarget | None = None,
+    ) -> SeekTrace:
         """Drain pending input and schedule a reset. Called on seek.
+
+        ``display_target`` (PROTOCOL §3.6) remaps a mapped session from this
+        epoch on when its transfer changes; None keeps the mapping.
 
         Returns the (initially empty) trace the stages fill in; the session
         polls it to narrate progress, and /status reports the last one.
@@ -781,14 +879,25 @@ class Pipeline:
         trace = SeekTrace(epoch=epoch, target_pts=target_pts,
                           requested_at=time.perf_counter())
         self.stats.last_seek = trace
+        if (self._mapping is not None and display_target is not None
+                and display_target.transfer != self._mapping.transfer):
+            self._mapping = decide(self._dynamics, display_target)
+            log.info("display mapping from epoch %d: %s", epoch, self._mapping.to_wire())
         self._flush_pending.set()  # breaks the backpressure wait immediately
         self._epoch = epoch  # downstream stages start dropping stale items now
+        proc = self._mapper_proc
+        if proc is not None:
+            # Its socket and ffmpeg hold seconds of packets already written: a
+            # decode stage waiting to write more would see this flush only
+            # after all of them were mapped (~7 s, on an uplink that runs ahead).
+            proc.kill()
         try:
             while True:
                 self.in_q.get_nowait()
         except queue.Empty:
             pass
-        self.in_q.put(_FlushCmd(epoch=epoch, target_pts=target_pts, trace=trace))
+        self.in_q.put(_FlushCmd(epoch=epoch, target_pts=target_pts, trace=trace,
+                                mapping=self._mapping))
         return trace
 
     @staticmethod
@@ -832,6 +941,12 @@ class Pipeline:
             # queues that were retired here.
             for q in (self.in_q, self._q_dec, self._q_up):
                 self._replace_queue_with_stop(q)
+            # A decode stage writing to a mapper, or its reader handing on a
+            # frame, wakes once the subprocess is gone. Its owner (the
+            # decode thread) releases the rest as it exits.
+            for proc in (self._mapper_proc, self._spare_mapper):
+                if proc is not None:
+                    proc.kill()
 
             for thread in self._threads:
                 remaining = max(0.0, deadline - time.perf_counter())
@@ -905,11 +1020,49 @@ class Pipeline:
 
     @property
     def downlink_color(self) -> dict | None:
-        """Resolved colour of the downlink (``session_opened.downlink_color``):
-        an uplink's as its client described it until its first frame decodes,
+        """Resolved colour of the downlink (``session_opened.downlink_color``)
+        for the latest epoch: a mapped epoch's, else the source's (an
+        uplink's as its client described it until its first frame decodes),
         None while nothing is known."""
-        color = self._source_color or self._open_color
+        mapping = self._mapping
+        if mapping is not None and mapping.mapped:
+            return tags_to_wire(mapping.tags)
+        color = self._native_color or self._open_color
         return tags_to_wire(color.tags) if color is not None else None
+
+    @property
+    def downlink_mapping(self) -> dict | None:
+        """``downlink_mapping`` for the latest epoch (PROTOCOL §3.6): None on a
+        session that is never mapped."""
+        return self._mapping.to_wire() if self._mapping is not None else None
+
+    def _apply_epoch_mapping(self, mapping: EpochMapping | None) -> None:
+        """The colour and HDR signalling of the epoch about to start (decode
+        thread, before its flush goes downstream; or construction). A mapped
+        epoch's frames come from the mapper in the mapping's colour, with
+        nothing dynamic left to carry."""
+        self._epoch_mapping = mapping
+        if mapping is not None and mapping.mapped:
+            self._source_color = VideoColor.resolve_values(
+                *mapping.tags, self.video.width, self.video.height,
+            )
+            self.dolby_vision_rpu = False
+            # Static metadata only: a PQ epoch (profile 5) keeps the source's.
+            self._hdr_signalling = self._deep_hevc and self._source_color.is_hdr
+            self._dynamic_hdr = False
+            return
+        self._source_color = self._native_color
+        self.dolby_vision_rpu = self._native_dovi_rpu
+        # Both are decided again on the first frame when the source's colour
+        # comes from it (_put_decoded); until then any HEVC packet may hold
+        # metadata to keep.
+        self._hdr_signalling = self._deep_hevc and (
+            self.dolby_vision_rpu
+            or (self._source_color is not None and self._source_color.is_hdr)
+        )
+        self._dynamic_hdr = self._deep_hevc and self.video.codec == "hevc" and (
+            self._hdr_signalling or self._source_color is None
+        )
 
     def hdr_metadata_report(self) -> dict | None:
         """HDR metadata written into the downlink, for GET /status."""
@@ -1002,13 +1155,25 @@ class Pipeline:
     # Stage 1: packets -> decoded frames (+ discard window + backpressure)
 
     def _decode_work(self) -> None:
+        try:
+            self._decode_packets()
+        finally:
+            # The decode thread owns the mappers' writers (close() only kills).
+            self._release_mapper()
+            spare, self._spare_mapper = self._spare_mapper, None
+            if spare is not None:
+                spare.close()
+
+    def _decode_packets(self) -> None:
         while True:
             item = self.in_q.get()
             if item is None:
                 self._q_dec.put(None)
                 return
             if isinstance(item, _FlushCmd):
-                self._decoder = self._open_decoder()
+                # The old epoch's mapper delivers nothing more once released,
+                # so the flush goes downstream after all of its frames.
+                self._release_mapper()
                 self._pending_dynamic.clear()
                 self._discard_until = item.target_pts
                 self._seek_trace = item.trace
@@ -1019,22 +1184,35 @@ class Pipeline:
                     ) * 1000.0
                 self._flush_pending.clear()
                 self.stats.paused_for_backpressure = False
+                self._apply_epoch_mapping(item.mapping)
+                self._decoder = None if self._mapped_epoch else self._open_decoder()
                 self._safe_put(self._q_dec, item)
                 continue
 
             if isinstance(item, _AuxPacket):
                 if item.epoch >= self._epoch:
-                    self._safe_put(self._q_dec, item)
+                    if self._mapped_epoch:
+                        # Behind the mapped frames written before it.
+                        with self._abandoned_mapper_ok():
+                            self._ensure_mapper(item.epoch).hold(item)
+                    else:
+                        self._safe_put(self._q_dec, item)
                 continue
 
             pkt: MediaPacket = item
             if pkt.epoch < self._epoch:
                 continue
             if pkt.eos:
-                for frame in self._decoder.decode(None):
-                    self._put_decoded(frame, pkt.epoch)
+                if self._mapped_epoch:
+                    if self._mapper_proc is not None:
+                        with self._abandoned_mapper_ok():
+                            self._mapper_proc.finish()  # its frames are all out
+                        self._release_mapper()
+                else:
+                    for frame in self._decoder.decode(None):
+                        self._put_decoded(frame, pkt.epoch)
+                    self._decoder = self._open_decoder()  # spent after drain
                 self._safe_put(self._q_dec, _Eos(epoch=pkt.epoch))
-                self._decoder = self._open_decoder()  # spent after drain
                 continue
 
             # Backpressure: keep the client buffer topped off (docs/PROTOCOL.md S5).
@@ -1047,6 +1225,23 @@ class Pipeline:
                 ):
                     time.sleep(0.05)
                 self.stats.paused_for_backpressure = False
+
+            if self._mapped_epoch:
+                t0 = time.perf_counter()
+                self.stats.frames_in += 1
+                # Its frames reach _put_decoded on the mapper's reader thread.
+                with self._abandoned_mapper_ok():
+                    self._ensure_mapper(pkt.epoch).send(
+                        pkt.payload, pkt.pts if pkt.pts != NO_TS else None, pkt.keyframe,
+                    )
+                send_ms = (time.perf_counter() - t0) * 1000
+                # Handing a packet over; while the mapper is the slowest stage
+                # this is its time per frame (the write waits for it).
+                self.stats.add_stage_time("map", send_ms)
+                trace = self._seek_trace
+                if trace is not None and trace.first_frame_ms is None:
+                    trace.discard_decode_ms += send_ms
+                continue
 
             if self._dynamic_hdr and pkt.pts != NO_TS:
                 dynamic = extract_dynamic_hdr(
@@ -1136,7 +1331,9 @@ class Pipeline:
             if self.video.color_tags is not None:
                 tags = fill_unspecified(tags, self.video.color_tags)
             # Published before the frame is queued, so later stages see them.
+            # (Never on a mapped epoch: its colour is the mapping's.)
             self._source_color = VideoColor.resolve_values(*tags, self.video.width, self.video.height)
+            self._native_color = self._source_color
             self._hdr_signalling = self._deep_hevc and (
                 self.dolby_vision_rpu or self._source_color.is_hdr
             )

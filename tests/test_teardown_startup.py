@@ -69,6 +69,7 @@ def _closing_pipeline(release: threading.Event | None = None):
     pipeline._aux_streams = {1: object()}
     pipeline._aux_template_container = None
     pipeline._decoder = object()
+    pipeline._mapper_proc = pipeline._spare_mapper = None
     pipeline._reformatter = object()
     pipeline._crop_reformatter = object()
     pipeline._in_reformatter = object()
@@ -369,6 +370,7 @@ def test_cached_attachment_negotiation_omits_epoch_attachment_bodies(monkeypatch
             bit_depth = 8
             downlink_color = None
             dolby_vision_rpu = False
+            downlink_mapping = None
 
             def __init__(self, *_args, **kwargs):
                 pipeline_kwargs.update(kwargs)

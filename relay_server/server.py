@@ -41,6 +41,7 @@ from upscale_cli.encode import (
 from upscale_cli.fit import DEFAULT_RESIZE_ALGORITHM, RESIZE_ALGORITHMS
 from upscale_cli.manifest import ModelManifest
 
+from .display_mapping import DisplayMapper
 from .mdns import MdnsAdvertiser
 from .session import Session, State
 from .library import SORT_KEYS as LIBRARY_SORT_KEYS, LibraryPathError, MediaLibrary
@@ -93,8 +94,12 @@ class RelayServer:
                  mdns: bool = False,
                  seek_discard_max_s: float | None = None,
                  library_roots: Iterable[str | Path] | None = None,
-                 server_id: str | None = None):
+                 server_id: str | None = None,
+                 display_mapper: DisplayMapper | None = None):
         self.port = port
+        # Applies Dolby Vision and HDR10+ for a client's display (PROTOCOL
+        # §3.6); None: capabilities.display_mapping is false.
+        self.display_mapper = display_mapper
         # Persistent install identity (relay_server.server_id); None omits
         # capabilities.server_id and clients key by host:port instead.
         self.server_id = server_id
@@ -309,6 +314,9 @@ class RelayServer:
                         # open_session.high_bit_depth is understood: HDR and
                         # (on request) 10-bit SDR sources stay 10-bit.
                         "high_bit_depth": True,
+                        # open_session/seek display_target is understood
+                        # (PROTOCOL §3.6): a working mapper was found.
+                        "display_mapping": self.display_mapper is not None,
                         "library_sort": (
                             list(LIBRARY_SORT_KEYS) if self.library is not None else []
                         ),
@@ -336,6 +344,7 @@ class RelayServer:
                         default_resize_algorithm=self.resize_algorithm,
                         lossless_hevc_profile=self.lossless_hevc_profile,
                         seek_discard_max_s=self.seek_discard_max_s,
+                        display_mapper=self.display_mapper,
                     )
                     session.media_port = self.media_port
                     self.sessions[session.uplink_token] = session
@@ -604,6 +613,10 @@ async def main_async(args) -> None:
     from .server_id import load_or_create_server_id
 
     server_id = await asyncio.to_thread(load_or_create_server_id)
+    display_mapper = (
+        None if args.no_display_mapping
+        else await asyncio.to_thread(DisplayMapper.detect, args.ffmpeg)
+    )
     server = RelayServer(
         args.models_dir, args.port, ep=args.ep,
         stats_interval=2.0 if args.verbose else None,
@@ -613,6 +626,7 @@ async def main_async(args) -> None:
         mdns=not args.no_mdns,
         seek_discard_max_s=args.seek_discard_max_s,
         server_id=server_id,
+        display_mapper=display_mapper,
     )
     await server.start()
     await asyncio.Event().wait()  # run forever
@@ -643,6 +657,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
              "more than SECONDS before the target, start the new epoch at the "
              "keyframe instead of decoding and dropping the frames in between "
              "(default: off, seeks stay frame-accurate)",
+    )
+    parser.add_argument(
+        "--ffmpeg", metavar="PATH",
+        help="ffmpeg with libplacebo (Vulkan) that applies Dolby Vision and HDR10+ "
+             "for a client's display (default: $RELAY_FFMPEG, else ffmpeg on PATH)",
+    )
+    parser.add_argument(
+        "--no-display-mapping", action="store_true",
+        help="do not offer display mapping (PROTOCOL 3.6), even with an ffmpeg that can",
     )
     parser.add_argument(
         "--no-mdns", action="store_true",

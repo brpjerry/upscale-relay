@@ -356,6 +356,37 @@ def hevc_nal_length_size(extradata: bytes | None) -> int | None:
     return (extradata[21] & 3) + 1
 
 
+def hevc_parameter_sets(extradata: bytes | None) -> list[bytes]:
+    """The NAL units of HEVC extradata: the hvcC arrays (VPS, SPS, PPS and
+    any SEI), or Annex B extradata's units. Malformed tails are dropped."""
+    if not extradata:
+        return []
+    if extradata.startswith((b"\x00\x00\x01", b"\x00\x00\x00\x01")):
+        return list(iter_nals(extradata, None))
+    if len(extradata) < 23:
+        return []
+    nals, pos, end = [], 23, len(extradata)
+    for _ in range(extradata[22]):
+        if pos + 3 > end:
+            break
+        count = int.from_bytes(extradata[pos + 1:pos + 3], "big")
+        pos += 3
+        for _ in range(count):
+            size = int.from_bytes(extradata[pos:pos + 2], "big")
+            pos += 2
+            if size == 0 or pos + size > end:
+                return nals
+            nals.append(extradata[pos:pos + size])
+            pos += size
+    return nals
+
+
+def to_annexb(packet: bytes, length_size: int | None, prefix: list[bytes] = ()) -> bytes:
+    """One access unit in Annex B framing with ``prefix`` NAL units first
+    (parameter sets, for a decoder that has no extradata)."""
+    return b"".join(_START_CODE + nal for nal in (*prefix, *iter_nals(packet, length_size)))
+
+
 def iter_nals(data: bytes, length_size: int | None):
     """NAL units of one packet: length-prefixed, or Annex B when
     ``length_size`` is None. Malformed tails end the iteration."""

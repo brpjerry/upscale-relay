@@ -384,7 +384,7 @@ Dolby Vision and HDR10+ describe each scene for the display that shows it.
 Clients whose renderer uses static HDR10 metadata only (the desktop player:
 libmpv's render API runs mpv's `gpu` renderer) cannot apply them, so a server
 advertising `capabilities.display_mapping: true` applies them for the
-client's display instead, and sends a stream already fitted to it.
+client's display instead, where it can.
 
 The client describes the display it presents on in `open_session` (with
 `high_bit_depth`), and again in any `seek` after it changes:
@@ -398,52 +398,63 @@ display_target: {transfer: "pq" | "sdr", peak_nits: float?, sdr_white_nits: floa
 - `"sdr"`: the client shows SDR. `sdr_white_nits` is the display's white
   level, when known.
 
-The server maps a source that carries dynamic metadata a client cannot use:
-a Dolby Vision RPU (profiles 5, 7 and 8; profile 7's enhancement layer stays
-dropped) or HDR10+ messages. It applies them as Dolby Vision or HDR10+ would
-for the target and encodes the result:
+The sources a server maps carry dynamic metadata a client cannot use: a
+Dolby Vision RPU (profiles 5, 7 and 8; profile 7's enhancement layer stays
+dropped) or HDR10+ messages. What it applies depends on the target:
 
-| `transfer` | downlink |
-|---|---|
-| `"pq"` | 10-bit PQ, BT.2020. Nothing exceeds `peak_nits`: brighter content is tone-mapped using the dynamic metadata, the rest passes through. Its static metadata says so: mastering display max luminance and MaxCLL at most `peak_nits`. No RPU or HDR10+ messages (they are applied) |
-| `"sdr"` | SDR, BT.709 primaries and transfer, tone-mapped using the dynamic metadata; 10-bit under `high_bit_depth` |
+| `transfer` | sources mapped | downlink |
+|---|---|---|
+| `"sdr"` | Dolby Vision whose base layer is HDR (7, 8.1, 8.4) or not displayable (5); HDR10+ | SDR, BT.709 primaries and transfer, tone-mapped by the dynamic metadata (SMPTE ST 2094-10 for Dolby Vision, which wins when a source has both, ST 2094-40 for HDR10+); 10-bit under `high_bit_depth`. No RPU or HDR10+ messages: they are applied |
+| `"pq"` | Dolby Vision profile 5 | 10-bit PQ, BT.2020: the RPU's reshaping applied at the source's own brightness. It is not fitted to `peak_nits`; the client's renderer fits it to the display, as it does HDR10. Static metadata as §3.5 writes it (the source's, when it has any) |
 
-Every other source (HDR10, HLG, SDR) streams as §3.5 says, whatever the
-target: the client's renderer handles static metadata itself. A request
-without `display_target`, or to a server without the capability, is §3.5's.
+Every other source and target pair streams as §3.5 says: HDR10, HLG and SDR
+sources whatever the target, and Dolby Vision 7 and 8 and HDR10+ sources
+for a `"pq"` target, whose HDR10 or HLG base layer the client's renderer fits
+to the display itself (a profile 8 RPU and HDR10+ messages still ride along
+for renderers that use them). A request without `display_target`, or to a
+server without the capability, is §3.5's.
 
-The server decides at `open_session` whether a session is mapped: a mapped
-session decodes through a different stage. Dolby Vision is known from
-`video.dolby_vision`. HDR10+ messages ride in the frames, so an uplink says
-whether its first keyframe carries one in `video.hdr10plus`
+The server decides at `open_session` whether a session is mapped, for any
+target: a mapped epoch decodes through a different stage. Dolby Vision is
+known from `video.dolby_vision`. HDR10+ messages ride in the frames, so an
+uplink says whether its first keyframe carries one in `video.hdr10plus`
 (`relay_media.hdr.has_hdr10plus` reads it from the packet). An uplink
 that omits it is mapped for Dolby Vision only; its HDR10+ streams as §3.5
 says. For `server_file` the server reads both itself.
 
 A server advertises `display_mapping` only when it can map: it needs a
-tone mapper that applies Dolby Vision RPUs and HDR10+, and checks for it at
-start-up.
+tone mapper that applies Dolby Vision RPUs and HDR10+ (FFmpeg with
+libplacebo on Vulkan), and checks for it at start-up.
 
-`session_opened.downlink_mapping` is null when the stream is not mapped, and
-otherwise says what was applied:
+`session_opened.downlink_mapping` is null on a session the server never
+maps: no `display_target`, or a source it maps for no target. On a session
+it maps for some target it is set on every epoch, and says what that epoch
+applied:
 
 ```
 downlink_mapping: {transfer: "pq" | "sdr", peak_nits: float?, sdr_white_nits: float?,
                    applied: ["dolby_vision" | "hdr10plus", ...]}
 ```
 
-`downlink_color` describes the mapped stream (BT.709 for `"sdr"`), so a client
-that knows nothing of §3.6 still tags and plays it correctly.
+- `transfer`: the `display_target.transfer` the epoch was made for.
+- `peak_nits`, `sdr_white_nits`: the luminances the stream was fitted to,
+  null when it was not fitted to the client's (both are null for now).
+- `applied`: the dynamic metadata applied. Empty means that this epoch streams
+  as §3.5 says for that target: a profile 8.1 source for a `"pq"` target.
 
-A `seek` with a different `display_target` remaps from that epoch on: the
-client changed screens, its display switched between SDR and HDR, or it is
-about to show the video fullscreen where the compositor switches to HDR.
-Its `seek_ready` repeats `downlink_color` and `downlink_mapping` for the new
-epoch, which is a fresh Matroska file (§4) and may change between PQ and SDR.
-A `seek` without `display_target`, or one to the same target, keeps the
-mapping. `seek_ready` carries the two fields only on a mapped session. The
-first frame of a mapped epoch comes ~0.5 s later than an unmapped seek's:
-the mapping stage starts again with each epoch.
+`downlink_color` describes the epoch's stream (BT.709 for a mapped `"sdr"`
+one), so a client that knows nothing of §3.6 still tags and plays it
+correctly.
+
+A `seek` whose `display_target` has another `transfer` remaps from that epoch
+on: the client changed screens, its display switched between SDR and HDR,
+or it is about to show the video fullscreen where the compositor switches to
+HDR. Its `seek_ready` repeats `downlink_color` and `downlink_mapping` for the
+new epoch, which is a fresh Matroska file (§4) and may change between PQ and
+SDR, mapped and not. A `seek` without `display_target`, or one with the same
+`transfer`, keeps the mapping. `seek_ready` carries the two fields only on a
+mapped session. The first frame of a mapped epoch comes ~0.5 s later than an
+unmapped seek's: the mapping stage starts again with each epoch.
 
 ## 4. Seek protocol (epochs)
 
