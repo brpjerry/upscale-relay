@@ -159,12 +159,14 @@ def test_no_reload_is_asked_while_the_window_is_hidden(monkeypatch):
     presenting = [False]
     player = _player(
         _presenting=lambda: presenting[0], _hdr_stale_reported=False, _task=object(), _local_playback=False,
+        _auto_hdr_deadline=time.monotonic(),
         _on_presenter=False, _presenter=None, _display_hdr=SDR_DISPLAY, _observed={}, _epoch_released=True,
         hdr_surface_stale=SimpleNamespace(emit=lambda: stale.append(True)),
     )
     _bind(player, "_wanted_surface", "_follow_auto_hdr")
     MpvPlayerView._check_hdr_surface(player)
     assert not stale
+    assert player._auto_hdr_deadline is None  # no switch for a hidden window: the wait starts again
     presenting[0] = True  # shown again: now the reload can start the surface
     MpvPlayerView._check_hdr_surface(player)
     assert stale == [True]
@@ -390,10 +392,13 @@ def test_fullscreen_hdr_moves_waits_for_the_switch_adopts_its_peak_and_leaves(mo
     assert events == []
 
 
-@pytest.mark.parametrize(("preset", "expected"), [(True, True), (None, True), (False, False)])
+@pytest.mark.parametrize(("preset", "expected"), [
+    (True, True), (False, False),
+    (None, False),  # no answer: Hyprland is busy switching the screen back
+])
 def test_hdr_the_monitor_is_set_to_stays_on_the_surface_out_of_fullscreen(monkeypatch, preset, expected):
-    """cm = "hdr" (or a compositor that does not say) is the user's own HDR
-    mode; HDR under an SDR preset is the switch for a fullscreen window."""
+    """cm = "hdr" is the user's own HDR mode; HDR under an SDR preset is the
+    switch for a fullscreen window."""
     pytest.importorskip("mpv")
     from desktop_client.mpv_view import MpvPlayerView
     monkeypatch.setenv("RELAY_HDR_SURFACE", "")

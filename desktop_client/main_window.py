@@ -1282,6 +1282,19 @@ class MainWindow(DesktopFeatures, QMainWindow):
                 self._refresh_action_icons()
             if getattr(self, "_controls_overlay", False):
                 self._apply_overlay_palette()
+        elif (event.type() == QEvent.WindowStateChange and hasattr(self, "_pacing_timer")
+              and bool(event.oldState() & Qt.WindowFullScreen) != self.isFullScreen()):
+            # Fullscreen from the compositor too (a Hyprland binding), not only
+            # toggle_fullscreen: it settles the same way, and on leaving the
+            # player hears at once (a second notice from toggle_fullscreen is
+            # a no-op).
+            self._fullscreen_settled = False
+            self._pacing_timer.stop()
+            self._apply_display_pacing()
+            if self.isFullScreen():
+                self._pacing_timer.start()
+            else:
+                self._fullscreen_hdr()
 
     @staticmethod
     def _bound_track_combo(combo: QComboBox) -> None:

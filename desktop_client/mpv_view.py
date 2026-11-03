@@ -1060,7 +1060,9 @@ class MpvPlayerView(QOpenGLWidget):
                 return True, display
             screen = window.screen() if window is not None else None
             mine = hdr_output.configured_hdr(screen.name() if screen is not None else None)
-            return mine is not False, display
+            # Unknown counts as the switch's: Hyprland answers nothing for
+            # ~1.1 s while it switches the screen back (laptop, 2026-11-02).
+            return mine is True, display
         if fullscreen and auto and display.source not in self._auto_hdr_refused:
             return True, hdr_output.expected_hdr(display)
         return False, display
@@ -1273,7 +1275,9 @@ class MpvPlayerView(QOpenGLWidget):
         if not self._presenting():
             # Hidden or minimised: a new surface is never exposed, so it could
             # not start (each reload would time out and ask again). Decide
-            # once the window shows.
+            # once the window shows. The compositor does not switch for a
+            # hidden window either: the wait for it starts again then.
+            self._auto_hdr_deadline = None
             return
         want, display = self._wanted_surface()
         if display.auto and self._auto_hdr_deadline is not None and time.monotonic() > self._auto_hdr_deadline:

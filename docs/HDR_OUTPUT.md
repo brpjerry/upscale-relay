@@ -195,6 +195,20 @@ A surface that fails (or does not start within 3 s in a shown window) sends
 HDR videos to the widget for the rest of the run, and the hint under the
 switch says so; switching it off and on tries a new surface.
 
+Fullscreen entered from Hyprland (a binding or a window rule) settles the
+same way as the player's own (`MainWindow.changeEvent`). A window hidden
+while the switch is awaited starts the wait again once it shows: Hyprland
+switches only for a visible fullscreen surface.
+
+**Hyprland stalls for ~1.1 s around each switch** (laptop, 2026-11-02): its
+IPC socket and the Wayland connection answer nothing while it changes the
+monitor's mode, in both directions. The player's GUI thread waits with them
+for that long. On leaving, the display query (`hdr_output.query`) waits out
+the switch back, so the leave slides hold still meanwhile; on entering the
+wait falls in the surface's first frames. Hyprland presents nothing during
+the switch either, so little of it shows. A preset query that gets no answer
+reads as SDR. Moving the queries off the GUI thread is an open item.
+
 Verified on the laptop (2026-11-02, the user, Hyprland 0.56.2, the panel in
 SDR mode): a 10000-nit card relayed from the library through the dev server
 switched the panel to HDR in fullscreen.

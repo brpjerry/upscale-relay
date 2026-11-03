@@ -126,6 +126,19 @@ def test_fullscreen_tells_the_player_once_settled_and_at_once_when_it_ends(windo
     window._on_fullscreen_settled()
     assert calls == [True] and window.fullscreen_settled
     window.toggle_fullscreen()
+    assert calls[-1] is False and calls.count(True) == 1 and not window.fullscreen_settled
+
+
+def test_fullscreen_from_the_compositor_settles_the_same_way(window):
+    """A Hyprland binding fullscreens the window without toggle_fullscreen."""
+    calls = []
+    window.player.fullscreen_changed = lambda: calls.append(window.isFullScreen())
+    window.show()
+    window.showFullScreen()
+    assert window._pacing_timer.isActive() and not window.fullscreen_settled
+    window._on_fullscreen_settled()
+    assert calls == [True] and window.fullscreen_settled
+    window.showNormal()
     assert calls == [True, False] and not window.fullscreen_settled
 
 
