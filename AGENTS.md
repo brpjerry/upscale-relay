@@ -14,10 +14,19 @@ load-bearing), `docs/CLIENT_LINUX.md` (Linux setup), and
   3-thread pipeline per session (decode → infer → fit/encode/mux) in
   `pipeline.py`. TensorRT inference runs in a **separate worker process**
   (`upscale_cli/infer_worker.py`) — do not move it back in-process (heap
-  corruption, see Hard rules).
+  corruption, see Hard rules). Display mapping (`display_mapping.py`,
+  PROTOCOL §3.6) applies Dolby Vision and HDR10+ for a client's SDR display
+  with FFmpeg's libplacebo filter, in an `ffmpeg` subprocess per epoch that
+  stands in for the decoder.
 - `relay_client_core/` — demux/uplink/control/downlink library + `relay-client`
   mock CLI (used by the integration tests).
 - `desktop_client/` — PySide6 + qasync + python-mpv player (`relay-desktop`).
+  HDR output (`docs/HDR_OUTPUT.md`) has three modules:
+  - `hdr_view.py`: the native PQ surface over the player, plus the overlay
+    mirror that draws the widgets above the player onto it.
+  - `hdr_output.py`: reads whether a screen is in HDR mode
+    (wp_color_management_v1 on Wayland via ctypes, DXGI on Windows).
+  - `hdr_d3d11.py`: the opt-in Windows prototype.
 - `upscale_cli/` — offline pipeline, ONNX/EP handling, uint8 graph wrapper,
   `upscale-cli` (run/info/sample/bench subcommands).
 
@@ -57,9 +66,26 @@ Client flags: `--debug` (faulthandler), `--trace` (consume-loop trace),
 (force sw decode), `--mpv-scripts` (load mpv's scripts folder — off by default,
 LuaJIT scripts destabilize stream reloads), `--headless` (null vo/ao), and
 `--settings-scope <name>` (isolate QSettings — tests MUST set this option or
-pass the equivalent `DesktopOptions`). Server env flag: `RELAY_NVDEC=1`
+pass the equivalent `DesktopOptions`). Server flags: `--ffmpeg PATH` (the
+ffmpeg, with libplacebo on Vulkan, that display mapping runs; default
+`$RELAY_FFMPEG`, else `ffmpeg` on PATH; the gyan.dev full build has it:
+`winget install Gyan.FFmpeg`) and `--no-display-mapping`. The server probes
+that ffmpeg at start-up and advertises `capabilities.display_mapping` only
+when it maps a frame. Server env flag: `RELAY_NVDEC=1`
 (server hw source decode — crashed with NVENC concurrently, off by default).
-The desktop client loads the user's `input.conf`
+Client env flags:
+- `RELAY_HDR_SURFACE=force|off` puts every video on the HDR surface, on any
+  display (for testing the overlay mirror and its pacing without an HDR
+  screen), or never uses the surface.
+- `RELAY_HDR_WINDOWS=1` enables the Windows D3D11 prototype.
+- `RELAY_HWDEC=<mpv hwdec>` replaces the player's hardware decode mode, for
+  testing: `auto-copy-safe` for copy-back on an Intel laptop, `vaapi` for
+  zero-copy elsewhere (`tools/hwdec_stress.py` drives the window through
+  seeks, restarts and fullscreen with it).
+
+`python -m desktop_client.hdr_output` prints each screen's HDR state.
+`tools/hdr_desktop_check.py` plays an `upscale-cli sample --hdr` clip and times
+the surface. The desktop client loads the user's `input.conf`
 for key bindings only and never reads `mpv.conf`: libmpv runs without its
 configuration, the mpv options the settings sheet offers are QSettings
 (`AppSettings.mpv_defaults`) set on mpv at runtime, and the input.conf path
@@ -124,6 +150,12 @@ their volume, panscan, tracks and delays.
   to a division or a 0 s timestamp. Frames still read `None` when unset.
   `AVRational` does Fraction arithmetic but is not a `Fraction` and is not
   JSON-serializable; send `[numerator, denominator]`.
+- PyAV cannot give an encoder HDR metadata: `CodecContext.coded_side_data`
+  and `decoded_side_data` are read-only, so NVENC/x265 write no mastering
+  display, light level, HDR10+ or Dolby Vision. Deep-colour sessions write it
+  themselves into the encoded Annex B packets (`relay_media/hdr.py`, PROTOCOL
+  §3.5); the Matroska muxer keeps every NAL unit. NVENC takes 10-bit input
+  only as `p010le` (it refuses `yuv420p10le`; `encode.deep_pix_fmt`).
 - For server-file muxed auxiliary tracks, seek the auxiliary container against
   the video stream's keyframe cues. Matroska audio streams are often not
   indexed; using audio as the seek anchor caused a measured 7-second scan.
@@ -139,6 +171,12 @@ their volume, panscan, tracks and delays.
   `to_output`), and tag the encoder before its first encode or mux: a muxed
   audio packet can open the encoder and write the container header before
   any video frame (audit #16).
+- YUV->RGB goes through `VideoColor.to_rgb`, which passes swscale's accurate
+  flags (`_TO_RGB_FLAGS`). At the same size, the default flags pick a table
+  converter that reads 8-bit sources 1-1.5 levels dark and 10-bit ones ~2
+  into rgb24: every 8-bit model session was darker than its source
+  (2026-11-02). Never pair BILINEAR with the full-chroma flags: that writes
+  garbage into rgb48le.
 
 **asyncio / Qt (qasync)**
 - **No modal dialogs / exec() / processEvents from coroutine context** — the
@@ -254,12 +292,32 @@ their volume, panscan, tracks and delays.
   desktop test runs (access violation; 0 of 16 with faulthandler off).
   `tests/conftest.py` and `relay-desktop --debug` limit Windows dumps to
   the faulting thread.
-- On Linux's embedded Qt/OpenGL render path, keep `hwdec=auto-copy-safe`.
-  A real core landed in
-  `paintGL → mpv_render_context_render → vaSyncSurface → iHD` when the user's
-  `hwdec=vaapi` (from `mpv.conf`, read back then) exposed a retired
-  zero-copy Intel surface. Copy-back retains hardware decode; never
-  restore zero-copy VA-API as the default here.
+- Zero-copy VA-API (the Linux default on an Intel GPU,
+  `hwdec=vaapi,auto-copy-safe`) is safe only with `_freeze_picture`. mpv
+  keeps its last frame across `stop`; a redraw once that decoder is gone
+  syncs a retired surface, and iHD crashes in
+  `paintGL → mpv_render_context_render → vaSyncSurface` (a real core in
+  August 2026; reproduced ~5 min into `tools/hwdec_stress.py` with
+  `RELAY_HWDEC=vaapi` on 2026-11-03). From just before every `stop` (and
+  before its input closes) until the playback restart of the entry id the
+  next `loadfile` returned, nothing draws mpv's frames: the widget paints a
+  copy of its last picture and the HDR surface its own framebuffer. Both
+  take each frame with `skip_rendering`, which never maps its surface: mpv
+  waits ~200 ms for a frame to be taken, the new stream's first included,
+  before it reports the restart, and leaving them stalled every load by that
+  much (37 "not being called or stuck" logs in 31 loads). Thawing on any
+  restart crashed the HDR surface within 1.5 minutes: a late restart of the
+  stopped file arrived after the stop. python-mpv's `loadfile()` drops the
+  entry id; `MpvPlayerView._loadfile` keeps it.
+  With the freeze, 35 minutes of stress (~1,330 actions: relay seeks and
+  session restarts, the HDR surface, local loads) ran clean, and so did 333
+  natural ends of file, which no freeze precedes (8- and 10-bit HEVC,
+  `hwdec_stress.py --local FILE --eof`; the unfixed build crashed after ~150
+  stops). Other Linux GPUs keep copy-back (`auto-copy-safe`;
+  their zero-copy paths are untested). Measured in the player on battery
+  (2026-11-03, fullscreen, a 2880x1620 relay stream): zero-copy drew 7.10 W
+  at 8 bits and 7.24 W at 10, copy-back 7.97 and 8.44 W, and the client's
+  CPU fell from 44-54% to 17-18%.
 - Fullscreen transitions resize the video widget at every step of the
   chrome slides. Pinning it at its final size (`_pin_player`) used to
   replace 17-23 resizes per transition (100-200 ms stalls, ~12 drops while
@@ -292,6 +350,41 @@ their volume, panscan, tracks and delays.
   does not always repaint a resized QOpenGLWidget on its own, and without it
   116 frames of one fullscreen test were composited from the freshly
   allocated, unrendered framebuffer.
+- mpv's render context is bound to one GL context. Freeing it while a video
+  plays tears the video down ("Video was forcefully killed"). It moves
+  between the widget and the HDR surface only in `_prepare_surface`, before a
+  `loadfile` and with mpv stopped. When the right surface changes during a
+  video, the player reloads at the position instead (`hdr_surface_stale`).
+- On Wayland every geometry change of a native child window (a subsurface)
+  makes Qt expose the parent window, which repaints and presents it in full
+  at once. An HDR surface that followed the player per Move/Resize event held
+  slides to 15-57 steps a second (the widget: 110-186). On Wayland the
+  surface now spans the window and never moves (`HdrPresenter.cover`): the
+  picture moves within it, and the surface is clear around it, so the window
+  repaints as it does around the widget. Everything the surface paints is on
+  the GUI thread, inside the window's 8.3 ms frame: time it by phase
+  (`HdrPresenter.last_phases`, `tools/hdr_desktop_check.py`) before blaming
+  the compositor.
+- `QWidget.render` draws nothing for a widget that carries a graphics effect.
+  `RenderFlag.DrawWindowBackground` (the default) first fills the widget with
+  its palette's Window colour. The overlay mirror renders with `DrawChildren`
+  only, with the fade's effect switched off, and applies the opacity when
+  compositing. A widget over the player that paints only part of itself
+  names that part (`mirror_rect`). The busy ring spans the player, and
+  mirroring all of it at every resize step cost 1.3-5 ms of each frame.
+- Declare the HDR surface's luminances. Hyprland tone-maps a surface whose
+  range exceeds the output's peak, and Qt's `QColorSpace.Bt2100Pq` tag
+  carries no luminances, so it claimed PQ's 10000 nits. mpv had already
+  mapped the video to the 1107-nit panel, and Hyprland compressed it again:
+  white 203 -> 111 nits, highlights 1107 -> 258 (2026-11-02). On Wayland
+  `HdrPresenter` describes itself (`hdr_output.describe_pq_surface`: peak,
+  SDR white) and its format carries no colour space. Never add one back
+  there: Qt would create a second colour management surface for the same
+  `wl_surface`, a protocol error that ends the connection.
+- On Windows `requestUpdate()` (and every Qt timer, so `asyncio.sleep` too)
+  arrives on a `WM_TIMER`, which Windows generates only once the message
+  queue is empty. A frame-paced animation keeps the queue busy, so a child
+  window's update requests wait until it ends.
 - For external auxiliary media, load the video-only epoch paused, then issue
   exactly one raw-argument `audio-add` after mpv's `playback-restart`; use
   `sub-add` instead only when source metadata confirms subtitles without audio.
@@ -311,7 +404,39 @@ their volume, panscan, tracks and delays.
   subprocess (`SubprocessUpscaler`), restart-once-on-crash. The uint8 graph
   wrapper's tail must stay `Transpose(float) → Cast(uint8)` (3-5x faster TRT
   engines than NCHW-uint8 output; uint8 only legal at network boundaries).
+  TRT has no 16-bit integer tensors: deep-colour sessions' rgb48 frames cross
+  the graph boundary as uint8 byte pairs (`wrap_rgb48_io`, [N,H,W,3,2]) so the
+  CPU side only reinterprets buffers; the 10-bit output is exact in fp16.
 - NVDEC decode + NVENC encode concurrently in one process → native AV.
+- Display mapping's libplacebo (Vulkan) runs in an `ffmpeg` subprocess,
+  never in the pipeline process beside NVENC. Each epoch gets its own, and a
+  spare is started for the next seek (device creation is ~0.3 s; first
+  mapped frame ~0.4 s from a spare, ~0.65 s cold; ~90 fps at 4K DV). Packets
+  go in, and 10-bit frames come out, as NUT over localhost TCP:
+  - NUT keeps the source's PTS exactly; Matroska rounds to milliseconds.
+  - A Windows anonymous pipe passes a few KB per read: 4K frames moved at
+    ~1 fps through one.
+  - PyAV cannot give a new stream the source's hvcC, so packets go in as
+    Annex B with the parameter sets in band. The DV RPU decodes without
+    its configuration record.
+  - NUT's muxer needs increasing DTS no later than each PTS (Matroska B-frame
+    sources have none), so the mapper stamps its own decode clock below the
+    PTS.
+  - NUT carries no colour description, and HEVC's decoder resets what its
+    VUI leaves out: a `setparams` ahead of libplacebo fills those tags from
+    the container (`container_fill`), or a container-only PQ source is
+    mapped as SDR.
+  - Muxed audio and subtitles wait in `hold()` for the frames written
+    before them. When nothing goes in and nothing comes out for 0.25 s they
+    go on regardless (a long audio tail after the last video packet), and
+    `hold()` blocks beyond 4096 items. The reader also checks while it
+    waits for ffmpeg to connect: ffmpeg sends nothing until it has probed
+    its input, and a capped `hold()` deadlocked there.
+  - The child runs with `VK_LOADER_LAYERS_DISABLE=~implicit~`: the box's
+    overlay layers (Steam, OBS, Galaxy, EOS, ASUS) otherwise load into it.
+  - FFmpeg's libplacebo filter takes the target's luminance from the source
+    frame and has no target-peak option (9.0.2 and master), so PQ targets
+    are not fitted to the display: only DV profile 5 is mapped for them.
 - Never open a session while an earlier one may still hold its native
   owners. A teardown the server did not acknowledge (control connection
   already dead: suspend, network drop) leaves that unknown, so clients
@@ -347,6 +472,30 @@ their volume, panscan, tracks and delays.
   laptop client is the intended topology.
 - FFV1 has no hardware decoder anywhere (codec-inherent); lossless-hevc is
   the recommended lossless tier for live playback.
+- **HDR output: Wayland only, Windows a prototype** (`docs/HDR_OUTPUT.md`).
+  - Qt Widgets' backing store is SDR on every platform, QOpenGLWidget
+    included. So an HDR video on a screen in HDR mode plays on a native PQ
+    surface over the player (Qt >= 6.10.2, wp_color_management_v1), with the
+    overlays mirrored onto it. The surface declares the display's peak, so
+    the compositor does not tone-map it again. Everything else stays on the
+    widget unchanged.
+  - Hyprland shows it as HDR with the monitor's `cm = "hdr"`, and in
+    fullscreen on an SDR screen it switches the screen to HDR itself for the
+    surface (`render:cm_auto_hdr`). The player moves an HDR video onto the
+    surface when fullscreen settles and back to the widget when it ends
+    (one reload each way); docs/HDR_OUTPUT.md has the steps.
+  - On the laptop the surface matches the widget for steady playback,
+    overlay motion, sidebar slides and splitter drags (2026-11-02, 120 Hz).
+    Fullscreen transitions run at 101-110 fps entering (the widget: 118) and
+    84-99 leaving (111-112).
+  - Windows (`RELAY_HDR_WINDOWS=1`): a D3D11 HDR10 swap chain fed through
+    `WGL_NV_DX_interop2`. Its transitions run at 60-85% of the widget's rate.
+  - Judged by eye on the laptop panel and on the Windows prototype
+    (2026-11-02): white matches the interface's, highlights reach the
+    display's peak. Screenshots in HDR mode are 8-bit conversions and cannot
+    show that (`tools/hdr_desktop_check.py --hold` keeps a clip up to look at).
+  - The render API is mpv's `gpu` renderer (gpu-next is not available through
+    it), which ignores Dolby Vision and HDR10+.
 - Anamorphic uplinks: when a client sends no
   `open_session.video.sample_aspect_ratio`, the server reads it from the
   H.264 SPS / HEVC parameter sets in `extradata_b64`
