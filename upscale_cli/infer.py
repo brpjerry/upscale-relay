@@ -69,6 +69,8 @@ _EP_ORDER = [
     ("cpu", "CPUExecutionProvider"),
 ]
 _EP_BY_ALIAS = dict(_EP_ORDER)
+# (input bits, output bits) -> how the start-up line names the wrapped I/O.
+_IO_NAMES = {(8, 8): "uint8", (16, 16): "rgb48", (8, 16): "rgb24-in-rgb48-out"}
 
 
 def _trt_options() -> dict:
@@ -160,18 +162,23 @@ class OnnxUpscaler:
 
     def __init__(self, model_path: str, ep: str = "auto",
                  tile_size: int | str | None = None, overlap: int = 16,
-                 io_bits: int = 8):
+                 io_bits: int = 8, input_bits: int | None = None):
         """``io_bits`` 16 takes and returns rgb48le arrays (uint16 HWC) for
-        deep-colour sessions instead of rgb24."""
+        deep-colour sessions instead of rgb24. ``input_bits`` 8 with
+        ``io_bits`` 16 takes rgb24 and returns rgb48le."""
         if overlap < 0 or overlap % 2:
             raise ValueError("tile overlap must be a non-negative even number of pixels")
         if io_bits not in (8, 16):
             raise ValueError("io_bits must be 8 or 16")
+        input_bits = io_bits if input_bits is None else input_bits
+        if input_bits not in (8, io_bits):
+            raise ValueError("input_bits must be 8 or io_bits")
         self.overlap = overlap
         if isinstance(tile_size, int):
             self._check_tile(tile_size)
         self.tile_size = tile_size
         self.io_bits = io_bits
+        self.input_bits = input_bits
         self._reformatter = av.video.reformatter.VideoReformatter()
         self.model_path = model_path
         self.manifest = ModelManifest.load(model_path)
@@ -185,16 +192,22 @@ class OnnxUpscaler:
 
             from .wrap_uint8 import wrap_rgb48_io, wrap_uint8_io
 
-            wrap = wrap_rgb48_io if io_bits == 16 else wrap_uint8_io
-            wrapped = wrap(
-                onnx.load(model_path), self.manifest.value_range, self.manifest.channel_order
-            )
+            if io_bits == 16:
+                wrapped = wrap_rgb48_io(
+                    onnx.load(model_path), self.manifest.value_range,
+                    self.manifest.channel_order, input_bits=input_bits,
+                )
+            else:
+                wrapped = wrap_uint8_io(
+                    onnx.load(model_path), self.manifest.value_range, self.manifest.channel_order
+                )
             # Explicit TRT optimization profile: one engine covers every input
             # size. Without it, a new shape mid-stream triggers ORT's engine
             # rebuild path — observed to die with a native access violation
             # when the first real frame's shape wasn't in the cache.
             wrapped_providers = (
-                _with_trt_profile(providers, "u16wrap_in", "x2") if io_bits == 16
+                _with_trt_profile(providers, "u16wrap_in", "x2" if input_bits == 16 else "")
+                if io_bits == 16
                 else _with_trt_profile(providers, "u8wrap_in")
             )
             self.session = ort.InferenceSession(
@@ -210,7 +223,7 @@ class OnnxUpscaler:
             )
             # Some graphs load but fail at run time on a given EP — probe now
             # (at the profile's min shape) so we can fall back to numpy.
-            probe = np.zeros((1, 64, 64, 3, 2) if io_bits == 16 else (1, 64, 64, 3), dtype=np.uint8)
+            probe = np.zeros((1, 64, 64, 3, 2) if input_bits == 16 else (1, 64, 64, 3), dtype=np.uint8)
             self.session.run(None, {self.session.get_inputs()[0].name: probe})
             self.uint8_io = True
         except Exception as err:
@@ -226,7 +239,7 @@ class OnnxUpscaler:
         self._dtype = np.float16 if self.fp16 else np.float32
         self.scale_factor = self.manifest.scale_factor  # may be None until first frame
 
-        io = f"{'rgb48' if io_bits == 16 else 'uint8'}-wrapped" if self.uint8_io else (
+        io = f"{_IO_NAMES[input_bits, io_bits]}-wrapped" if self.uint8_io else (
             "fp16" if self.fp16 else "fp32")
         print(
             f"model: {Path(model_path).name} | provider: {self.active_provider} | io: {io}",
@@ -247,8 +260,11 @@ class OnnxUpscaler:
         """
         if self.uint8_io and self.io_bits == 16:
             h, w = rgb.shape[:2]
-            pairs = np.ascontiguousarray(rgb, dtype="<u2").view(np.uint8).reshape(1, h, w, 3, 2)
-            y = self.session.run([self.output_name], {self.input_name: pairs})[0]
+            if self.input_bits == 16:
+                x = np.ascontiguousarray(rgb, dtype="<u2").view(np.uint8).reshape(1, h, w, 3, 2)
+            else:
+                x = np.ascontiguousarray(rgb)[None]
+            y = self.session.run([self.output_name], {self.input_name: x})[0]
             oh, ow = y.shape[1:3]
             return np.ascontiguousarray(y[0]).view("<u2").reshape(oh, ow, 3)
         if self.uint8_io:
@@ -257,17 +273,18 @@ class OnnxUpscaler:
             )[0]
             return y[0]  # uint8 HWC straight from the graph
 
+        top_in = 65535.0 if self.input_bits == 16 else 255.0
         top = 65535.0 if self.io_bits == 16 else 255.0
         lo, hi = self.manifest.value_range
         chw = rgb.transpose(2, 0, 1)  # HWC -> CHW view
         if self.manifest.channel_order == "bgr":
             chw = chw[::-1]
-        if self.io_bits == 16 and self.fp16:
+        if self.input_bits == 16 and self.fp16:
             # 65535 overflows float16: scale in float32 on the way in.
-            x = (np.ascontiguousarray(chw).astype(np.float32) * ((hi - lo) / top)).astype(self._dtype)
+            x = (np.ascontiguousarray(chw).astype(np.float32) * ((hi - lo) / top_in)).astype(self._dtype)
         else:
             x = np.ascontiguousarray(chw).astype(self._dtype)  # uint8 copy, then SIMD convert
-            x *= np.asarray((hi - lo) / top, dtype=self._dtype)
+            x *= np.asarray((hi - lo) / top_in, dtype=self._dtype)
         if lo:
             x += np.asarray(lo, dtype=self._dtype)
 
@@ -376,10 +393,11 @@ class OnnxUpscaler:
 
     def process(self, frame: av.VideoFrame) -> Iterable[av.VideoFrame]:
         # Frames from FrameSource carry their resolved colour tags.
+        in_format = "rgb48le" if self.input_bits == 16 else "rgb24"
         rgb_format = "rgb48le" if self.io_bits == 16 else "rgb24"
         rgb = VideoColor.resolve(frame, frame.width, frame.height).to_rgb(
-            self._reformatter, frame, rgb_format,
-        ).to_ndarray(format=rgb_format)
+            self._reformatter, frame, in_format,
+        ).to_ndarray(format=in_format)
         up = self._infer_with_fallback(rgb)
         if self.scale_factor is None:
             self.scale_factor = round(up.shape[0] / rgb.shape[0])

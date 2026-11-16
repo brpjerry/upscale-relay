@@ -16,7 +16,8 @@ Deep-colour (HDR, 10-bit) sessions use ``wrap_rgb48_io`` instead: the same
 contract for rgb48le samples. TensorRT has no 16-bit integer tensor type and
 allows 8-bit ones only at network boundaries, so each 16-bit sample crosses
 as its two little-endian bytes ([N,H,W,3,2] uint8) and the CPU side merely
-reinterprets the buffer -- no conversion pass over a 4K frame.
+reinterprets the buffer -- no conversion pass over a 4K frame. It can also
+take rgb24 in and still return rgb48le (``input_bits=8``).
 """
 
 from __future__ import annotations
@@ -122,15 +123,21 @@ _P16 = "u16wrap_"
 # 10-bit output written as rgb48le by bit replication: v * 64 + (v >> 4),
 # so 1023 becomes 65535 exactly. 1023 is the deepest any encoder here keeps.
 _OUT_MAX = 1023.0
+# swscale's rgb48le puts limited-range white at 65283, not 65535 (rgb24's is
+# 255), and converts back to YUV on that scale: rgb24 input is put on it.
+_RGB48_WHITE = 65283.0
 
 
 def wrap_rgb48_io(model: onnx.ModelProto, value_range: tuple[float, float],
-                  channel_order: str = "rgb") -> onnx.ModelProto:
+                  channel_order: str = "rgb", input_bits: int = 16) -> onnx.ModelProto:
     """Returns a new ModelProto with input 'u16wrap_in' and output
     'u16wrap_out', both uint8 [N,H,W,3,2]: rgb48le samples as their low and
     high bytes. The output carries 10 significant bits, enough for every
     deep-colour encoder and exact in fp16 engines (integers up to 2048 are
-    representable)."""
+    representable). ``input_bits`` 8 takes rgb24 instead (uint8 [N,H,W,3],
+    as ``wrap_uint8_io``) and still returns rgb48le."""
+    if input_bits not in (8, 16):
+        raise ValueError("input_bits must be 8 or 16")
     model = onnx.ModelProto.FromString(model.SerializeToString())  # deep copy
     g = model.graph
     if len(g.input) != 1 or len(g.output) != 1:
@@ -158,20 +165,33 @@ def wrap_rgb48_io(model: onnx.ModelProto, value_range: tuple[float, float],
     ]
     if channel_order == "bgr":
         inits.append(helper.make_tensor(_P16 + "chidx", TensorProto.INT64, [3], [2, 1, 0]))
+    if input_bits == 8:
+        # A new name, not just a new value: ORT's TensorRT engine cache keys
+        # on initializer names, so a changed value under an old name reuses
+        # an engine built with the old one.
+        inits.append(const("w_rgb24", _RGB48_WHITE / 65535.0 / 255.0))
 
     p = _P16
-    pre = [
-        # uint8 byte pairs -> float32 [0, 1] NHWC; Cast must lead (uint8 only
-        # at network boundaries) and Gather with a scalar index drops the axis.
-        helper.make_node("Cast", [p + "in"], [p + "bytes"], name=p + "cast_in", to=f32),
-        helper.make_node("Gather", [p + "bytes", p + "idx0"], [p + "lo_b"], name=p + "lo_b", axis=4),
-        helper.make_node("Gather", [p + "bytes", p + "idx1"], [p + "hi_b"], name=p + "hi_b", axis=4),
-        helper.make_node("Mul", [p + "lo_b", p + "w_lo"], [p + "lo_v"], name=p + "lo_v"),
-        helper.make_node("Mul", [p + "hi_b", p + "w_hi"], [p + "hi_v"], name=p + "hi_v"),
-        helper.make_node("Add", [p + "lo_v", p + "hi_v"], [p + "unit"], name=p + "unit"),
-        helper.make_node("Transpose", [p + "unit"], [p + "nchw"], name=p + "nhwc2nchw",
-                         perm=[0, 3, 1, 2]),
-    ]
+    if input_bits == 8:
+        # uint8 samples -> float32 on rgb48le's scale, NHWC; Cast must lead.
+        pre = [
+            helper.make_node("Cast", [p + "in"], [p + "bytes"], name=p + "cast_in", to=f32),
+            helper.make_node("Mul", [p + "bytes", p + "w_rgb24"], [p + "unit"], name=p + "unit"),
+        ]
+    else:
+        pre = [
+            # uint8 byte pairs -> float32 [0, 1] NHWC; Cast must lead (uint8
+            # only at network boundaries) and Gather with a scalar index
+            # drops the axis.
+            helper.make_node("Cast", [p + "in"], [p + "bytes"], name=p + "cast_in", to=f32),
+            helper.make_node("Gather", [p + "bytes", p + "idx0"], [p + "lo_b"], name=p + "lo_b", axis=4),
+            helper.make_node("Gather", [p + "bytes", p + "idx1"], [p + "hi_b"], name=p + "hi_b", axis=4),
+            helper.make_node("Mul", [p + "lo_b", p + "w_lo"], [p + "lo_v"], name=p + "lo_v"),
+            helper.make_node("Mul", [p + "hi_b", p + "w_hi"], [p + "hi_v"], name=p + "hi_v"),
+            helper.make_node("Add", [p + "lo_v", p + "hi_v"], [p + "unit"], name=p + "unit"),
+        ]
+    pre.append(helper.make_node("Transpose", [p + "unit"], [p + "nchw"], name=p + "nhwc2nchw",
+                                perm=[0, 3, 1, 2]))
     cur = p + "nchw"
     if channel_order == "bgr":
         pre.append(helper.make_node("Gather", [cur, p + "chidx"], [p + "swapped"],
@@ -217,7 +237,8 @@ def wrap_rgb48_io(model: onnx.ModelProto, value_range: tuple[float, float],
         helper.make_node("Cast", [p + "nhwc"], [p + "out"], name=p + "cast_out", to=TensorProto.UINT8),
     ]
 
-    new_in = helper.make_tensor_value_info(p + "in", TensorProto.UINT8, ["batch", "h", "w", 3, 2])
+    in_shape = ["batch", "h", "w", 3] + ([2] if input_bits == 16 else [])
+    new_in = helper.make_tensor_value_info(p + "in", TensorProto.UINT8, in_shape)
     new_out = helper.make_tensor_value_info(p + "out", TensorProto.UINT8, ["batch", "h2", "w2", 3, 2])
     return _finish(model, pre, post, inits, new_in, new_out)
 

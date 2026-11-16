@@ -476,6 +476,14 @@ class Pipeline:
                     quality_tier, lossless_hevc_profile=lossless_hevc_profile,
                 )
             self._rgb_format = "rgb48le" if self.bit_depth > 8 else "rgb24"
+            # The model's input. RELAY_MODEL_INPUT_BITS=8 (an experiment, off
+            # by default) feeds a deep-colour session's model rgb24 and keeps
+            # its rgb48le output: half the bytes in for the same 10-bit out.
+            self._model_input_bits = (
+                8 if self.bit_depth == 8 or os.environ.get("RELAY_MODEL_INPUT_BITS") == "8"
+                else 16
+            )
+            self._model_rgb_format = "rgb48le" if self._model_input_bits == 16 else "rgb24"
             self.emit = emit
             self.on_error = on_error
             self.stats = PipelineStats()
@@ -505,6 +513,7 @@ class Pipeline:
                         max_input_hw=(video.height, video.width),
                         accept_provider=functools.partial(require_gpu_provider, ep=ep),
                         io_bits=16 if self.bit_depth > 8 else 8,
+                        input_bits=self._model_input_bits,
                     )
                 else:
                     from upscale_cli.infer import OnnxUpscaler
@@ -512,6 +521,7 @@ class Pipeline:
                     self.upscaler = OnnxUpscaler(
                         model_path, ep=ep, tile_size=tile,
                         io_bits=16 if self.bit_depth > 8 else 8,
+                        input_bits=self._model_input_bits,
                     )
                 if self.upscaler.scale_factor is None:
                     raise ValueError(f"model {model_path} needs a manifest with scale_factor")
@@ -1387,8 +1397,11 @@ class Pipeline:
                 t0 = time.perf_counter()
                 # Cached swscale context; frame.to_ndarray would rebuild one
                 # per frame (ruinous for 10-bit sources).
-                frame = self._source_color.to_rgb(self._in_reformatter, item.frame, self._rgb_format)
-                rgb = frame.to_ndarray(format=self._rgb_format)
+                frame = self._source_color.to_rgb(
+                    self._in_reformatter, item.frame, self._model_rgb_format,
+                )
+                rgb = frame.to_ndarray(format=self._model_rgb_format)
+                self.stats.add_stage_time("infer_rgb", (time.perf_counter() - t0) * 1000)
                 item.rgb = self.upscaler._infer_with_fallback(rgb)
                 item.frame = None
                 self.stats.add_stage_time("infer", (time.perf_counter() - t0) * 1000)

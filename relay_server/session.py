@@ -857,6 +857,9 @@ class Session:
             "fit_mode": p.fit_mode,
             "resize_algorithm": p.resize_algorithm,
             "bit_depth": p.bit_depth,
+            "model_input_bits": (
+                getattr(p, "_model_input_bits", None) if p.upscaler is not None else None
+            ),
             "color": p.downlink_color,
             "hdr_metadata": p.hdr_metadata_report(),
             "display_mapping": p.downlink_mapping,

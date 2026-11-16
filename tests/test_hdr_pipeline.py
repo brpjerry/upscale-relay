@@ -487,6 +487,7 @@ def test_model_runs_on_16_bit_rgb_for_a_deep_colour_session(tmp_path):
     )
 
     assert pipeline.relayed_with.io_bits == 16 and pipeline.relayed_with.uint8_io
+    assert pipeline.relayed_with.input_bits == 16
     source_luma = _planes(_decode(fed, cfg)[0])[0]
     with av.open(io.BytesIO(downlink)) as relayed:
         frame = next(relayed.decode(video=0))
@@ -527,3 +528,83 @@ def test_8_bit_source_runs_the_16_bit_model_under_all(tmp_path):
     assert np.abs(luma[:, ::2][:, 1:-1] - expected[:, 1:-1]).max() <= 6
     assert abs(luma.mean() - source_luma.mean()) < 0.5
     assert (luma % 4 != 0).any()
+
+
+# Bugs caught: 0, False positives: 0
+def test_frame_stage_api_takes_8_bit_rgb_into_a_16_bit_model(tmp_path):
+    pytest.importorskip("onnxruntime")
+    sys.path.insert(0, str(ROOT))
+    from tools.make_test_model import build
+    from upscale_cli.infer import OnnxUpscaler
+
+    model = tmp_path / "bilinear2x.onnx"
+    build(model)
+    source = tmp_path / "pq.mkv"
+    _write_source(source, frames=1)
+    with av.open(str(source)) as container:
+        frame = next(container.decode(video=0))
+
+    upscaler = OnnxUpscaler(str(model), ep="cpu", io_bits=16, input_bits=8)
+    (out,) = upscaler.process(frame)
+
+    assert upscaler.uint8_io
+    assert (out.width, out.height, out.format.name) == (128, 128, "rgb48le")
+    # A bilinear 2x of 8-bit input lands between its levels: 10-bit output.
+    assert np.unique(out.to_ndarray()[32, :, 1] >> 6).size > 64
+
+
+# Bugs caught: 0, False positives: 0
+def test_the_8_bit_input_wrapper_matches_the_16_bit_one_on_widened_input(tmp_path):
+    ort = pytest.importorskip("onnxruntime")
+    import onnx
+
+    sys.path.insert(0, str(ROOT))
+    from tools.make_test_model import build
+    from upscale_cli.wrap_uint8 import wrap_rgb48_io
+
+    model = tmp_path / "bilinear2x.onnx"
+    build(model)
+    rgb = np.random.default_rng(1).integers(0, 256, (1, 24, 32, 3), dtype=np.uint8)
+
+    def run(input_bits, x):
+        graph = wrap_rgb48_io(onnx.load(str(model)), (0.0, 1.0), input_bits=input_bits)
+        session = ort.InferenceSession(graph.SerializeToString(), providers=["CPUExecutionProvider"])
+        y = session.run(None, {session.get_inputs()[0].name: x})[0]
+        return np.ascontiguousarray(y).view("<u2")[..., 0] >> 6  # 10-bit codes
+
+    # The same picture as swscale's rgb48le, whose white is 65283.
+    widened = np.round(rgb * (65283 / 255)).astype("<u2").view(np.uint8).reshape(1, 24, 32, 3, 2)
+    assert np.abs(run(8, rgb).astype(int) - run(16, widened).astype(int)).max() <= 1
+
+
+# Bugs caught: 0, False positives: 0
+@pytest.mark.parametrize("bits", [8, 10])
+def test_model_input_can_be_8_bit_in_a_deep_colour_session(tmp_path, monkeypatch, bits):
+    pytest.importorskip("onnxruntime")
+    sys.path.insert(0, str(ROOT))
+    from tools.make_test_model import build
+
+    monkeypatch.setenv("RELAY_MODEL_INPUT_BITS", "8")
+    model = tmp_path / "bilinear2x.onnx"
+    build(model)
+    source = tmp_path / f"sdr{bits}.mkv"
+    _write_source(source, tags=(1, 1, 1, 1), x265_params="lossless=1", frames=2, bits=bits)
+
+    downlink, fed, cfg, pipeline = _relay(
+        source, high_bit_depth="all", model=str(model), tier="lossless-ffv1",
+        display=(128, 128), dynamic=False, dolby_vision=None,
+    )
+
+    upscaler = pipeline.relayed_with
+    assert (upscaler.input_bits, upscaler.io_bits, upscaler.uint8_io) == (8, 16, True)
+    planes = _planes_8 if bits == 8 else _planes
+    source_luma = planes(_decode(fed, cfg)[0])[0].astype(int) * (4 if bits == 8 else 1)
+    with av.open(io.BytesIO(downlink)) as relayed:
+        frame = next(relayed.decode(video=0))
+    assert frame.format.name == "yuv420p10le"
+    luma = _planes(frame)[0].astype(int)
+    # 8-bit RGB on the way in costs a 10-bit source up to about two codes.
+    expected = np.repeat(source_luma, 2, axis=0)
+    assert np.abs(luma[:, ::2][:, 1:-1] - expected[:, 1:-1]).max() <= (6 if bits == 8 else 10)
+    assert abs(luma.mean() - source_luma.mean()) < 1
+    assert (luma % 4 != 0).any()  # 10-bit codes in between, as with rgb48 in

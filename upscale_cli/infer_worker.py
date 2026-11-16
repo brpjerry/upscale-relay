@@ -10,7 +10,8 @@ error instead of a dead server.
 Worker protocol (over stdin/stdout pipes, payloads in SharedMemory):
   parent -> worker: 8 bytes <u32 h><u32 w>   frame is in shm_in, rgb24 HWC
   worker -> parent: 8 bytes <u32 h2><u32 w2> result in shm_out, rgb24 HWC
-  (rgb48le, uint16 HWC, both ways for a worker started with --io-bits 16)
+  (rgb48le, uint16 HWC, both ways for a worker started with --io-bits 16;
+  rgb24 in and rgb48le out with --io-bits 16 --input-bits 8)
   h == 0 means shutdown. Worker prints "READY <scale>" on stdout at startup
   (after the session + probe are up, i.e. after any engine build).
 """
@@ -109,14 +110,17 @@ def worker_main(argv: list[str] | None = None) -> int:
     parser.add_argument("--shm-in", required=True)
     parser.add_argument("--shm-out", required=True)
     parser.add_argument("--io-bits", type=int, choices=(8, 16), default=8)
+    parser.add_argument("--input-bits", type=int, choices=(8, 16), default=None)
     args = parser.parse_args(argv)
 
     from upscale_cli.infer import OnnxUpscaler
 
     tile = None if args.tile in ("none", "None") else (
         "auto" if args.tile == "auto" else int(args.tile))
-    up = OnnxUpscaler(args.model, ep=args.ep, tile_size=tile, io_bits=args.io_bits)
+    up = OnnxUpscaler(args.model, ep=args.ep, tile_size=tile, io_bits=args.io_bits,
+                      input_bits=args.input_bits)
     sample = np.dtype("<u2") if args.io_bits == 16 else np.dtype(np.uint8)
+    in_sample = np.dtype("<u2") if up.input_bits == 16 else np.dtype(np.uint8)
 
     shm_in = shared_memory.SharedMemory(name=args.shm_in)
     shm_out = shared_memory.SharedMemory(name=args.shm_out)
@@ -141,7 +145,7 @@ def worker_main(argv: list[str] | None = None) -> int:
             h, w = _HDR.unpack(hdr)
             if h == 0:
                 return 0
-            rgb = np.ndarray((h, w, 3), dtype=sample, buffer=shm_in.buf)
+            rgb = np.ndarray((h, w, 3), dtype=in_sample, buffer=shm_in.buf)
             out = up._infer_with_fallback(rgb)
             oh, ow = out.shape[:2]
             dst = np.ndarray((oh, ow, 3), dtype=sample, buffer=shm_out.buf)
@@ -192,27 +196,35 @@ class SubprocessUpscaler:
     _accept_provider: Callable[[str | None], None] | None = None
     _max_in = _MAX_IN
     io_bits = 8
+    input_bits = 8
     _sample = np.dtype(np.uint8)
+    _in_sample = np.dtype(np.uint8)
 
     def __init__(self, model_path: str, ep: str = "tensorrt",
                  tile_size: int | str | None = None, *,
                  max_input_hw: tuple[int, int] | None = None,
                  accept_provider: Callable[[str | None], None] | None = None,
-                 io_bits: int = 8):
+                 io_bits: int = 8, input_bits: int | None = None):
         """``max_input_hw`` is the largest frame the caller will send, when it
         can exceed the default 2560x1440 capacity.  ``accept_provider`` sees
         the provider of every worker generation, the initial one and each
         crash replacement, and raises to refuse it.  ``io_bits`` 16 exchanges
-        rgb48le (uint16) frames, as ``OnnxUpscaler`` does."""
+        rgb48le (uint16) frames, as ``OnnxUpscaler`` does, and ``input_bits``
+        8 sends rgb24 to such a worker."""
         from upscale_cli.manifest import ModelManifest
 
         if io_bits not in (8, 16):
             raise ValueError("io_bits must be 8 or 16")
+        input_bits = io_bits if input_bits is None else input_bits
+        if input_bits not in (8, io_bits):
+            raise ValueError("input_bits must be 8 or io_bits")
         self.model_path = model_path
         self.ep = ep
         self.tile_size = tile_size
         self.io_bits = io_bits
+        self.input_bits = input_bits
         self._sample = np.dtype("<u2") if io_bits == 16 else np.dtype(np.uint8)
+        self._in_sample = np.dtype("<u2") if input_bits == 16 else np.dtype(np.uint8)
         self._accept_provider = accept_provider
         self.manifest = ModelManifest.load(model_path)
         self.scale_factor = self.manifest.scale_factor
@@ -226,7 +238,7 @@ class SubprocessUpscaler:
             self._max_in = (max(_MAX_IN[0], max_input_hw[0]), max(_MAX_IN[1], max_input_hw[1]))
             in_bytes = self._max_in[0] * self._max_in[1] * 3
             out_bytes = in_bytes * self.scale_factor * self.scale_factor
-        in_bytes *= self._sample.itemsize
+        in_bytes *= self._in_sample.itemsize
         out_bytes *= self._sample.itemsize
         self._lock = threading.Lock()
         self._shm_in: shared_memory.SharedMemory | None = None
@@ -271,6 +283,8 @@ class SubprocessUpscaler:
         )
         if self.io_bits != 8:
             command += ["--io-bits", str(self.io_bits)]
+        if self.input_bits != self.io_bits:
+            command += ["--input-bits", str(self.input_bits)]
         self._proc = subprocess.Popen(
             command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=sys.stderr,
         )
@@ -344,7 +358,7 @@ class SubprocessUpscaler:
 
     def _roundtrip(self, rgb: np.ndarray, timeout: float) -> np.ndarray | None:
         h, w = rgb.shape[:2]
-        dst = np.ndarray((h, w, 3), dtype=self._sample, buffer=self._shm_in.buf)
+        dst = np.ndarray((h, w, 3), dtype=self._in_sample, buffer=self._shm_in.buf)
         np.copyto(dst, rgb)  # handles non-contiguous input, no bytes object
         try:
             self._proc.stdin.write(_HDR.pack(h, w))

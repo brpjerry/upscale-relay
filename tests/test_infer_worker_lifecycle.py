@@ -165,3 +165,27 @@ def test_recovery_keeps_deliberate_cpu_inference(tmp_path, monkeypatch):
         assert worker.active_provider == "CPUExecutionProvider"
     finally:
         worker.close()
+
+
+# Bugs caught: 0, False positives: 0
+def test_a_worker_can_take_rgb24_and_return_rgb48(tmp_path):
+    pytest.importorskip("onnxruntime")
+    pytest.importorskip("onnx")
+    import numpy as np
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from tools.make_test_model import build
+    from upscale_cli.infer import OnnxUpscaler
+
+    model = tmp_path / "bilinear2x.onnx"
+    build(model)
+    rgb = np.random.default_rng(2).integers(0, 256, (20, 36, 3), dtype=np.uint8)
+    worker = infer_worker.SubprocessUpscaler(str(model), ep="cpu", io_bits=16, input_bits=8)
+    try:
+        out = worker._infer_with_fallback(rgb)
+    finally:
+        worker.close()
+    expected = OnnxUpscaler(str(model), ep="cpu", io_bits=16, input_bits=8).infer_array(rgb)
+    assert out.dtype == np.dtype("<u2") and out.shape == (40, 72, 3)
+    assert np.array_equal(out, expected)
