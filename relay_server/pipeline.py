@@ -29,12 +29,14 @@ import av
 
 from relay_media import AuxiliaryPacketInfo
 from relay_protocol import (
+    DEFAULT_BUFFER_TARGET_MS,
     FLAG_DISCONTINUITY,
     FLAG_EOS,
     FLAG_KEYFRAME,
     MAX_PAYLOAD_BYTES,
     NO_TS,
     MediaPacket,
+    clamp_buffer_target_ms,
 )
 from upscale_cli.color import VideoColor, color_tags_of, fill_unspecified
 from upscale_cli.encode import (
@@ -77,8 +79,9 @@ log = logging.getLogger("relay.pipeline")
 # RESUME. The gap is one buffer_report interval (~500 ms) — just enough to
 # stop the pause flag flapping on every report, while keeping the client
 # buffer pinned near HIGH instead of sawtoothing down to a low watermark.
-HIGH_WATERMARK_MS = 10_000
-RESUME_WATERMARK_MS = 9_500
+# HIGH is the client's open_session.buffer_target_ms, or this default.
+HIGH_WATERMARK_MS = DEFAULT_BUFFER_TARGET_MS
+_RESUME_BAND_MS = 500
 
 _QUEUE_DEPTH = 4  # frames buffered between stages
 # Compressed input waiting for the decode stage. A wire packet may carry up to
@@ -392,6 +395,7 @@ class Pipeline:
         high_bit_depth: str | None = None,
         display_mapper: DisplayMapper | None = None,
         display_target: DisplayTarget | None = None,
+        buffer_target_ms: int = HIGH_WATERMARK_MS,
     ):
         # close() is a native-resource barrier. Install its coordination before
         # constructing any native state so every fully published Pipeline has
@@ -614,6 +618,9 @@ class Pipeline:
             self._seek_keyframe_seen = False  # decode thread
             self._need_discontinuity = True
             self.client_buffered_ms = 0  # last buffer_report value (raw)
+            # The client buffer to keep topped off (docs/PROTOCOL.md §5).
+            self.high_watermark_ms = clamp_buffer_target_ms(buffer_target_ms)
+            self.resume_watermark_ms = self.high_watermark_ms - _RESUME_BAND_MS
             self._client_buffered_at = time.monotonic()
             self.playing = False  # session mirrors PLAYING state here
             self._flush_pending = threading.Event()
@@ -1232,10 +1239,10 @@ class Pipeline:
                 continue
 
             # Backpressure: keep the client buffer topped off (docs/PROTOCOL.md S5).
-            if self.buffered_ms_now() > HIGH_WATERMARK_MS:
+            if self.buffered_ms_now() > self.high_watermark_ms:
                 self.stats.paused_for_backpressure = True
                 while (
-                    self.buffered_ms_now() > RESUME_WATERMARK_MS
+                    self.buffered_ms_now() > self.resume_watermark_ms
                     and not self._closed.is_set()
                     and not self._flush_pending.is_set()
                 ):

@@ -57,8 +57,9 @@ one downlink attachment. Server-library sessions omit the uplink attachment.
    through demux, decode, inference, encode, mux, and playback. Epochs isolate
    seeks. These rules are specified in [PROTOCOL.md](PROTOCOL.md).
 3. **Buffer instead of forcing minimum latency.** The server runs ahead until
-   the client reports roughly ten seconds buffered, then pauses and resumes
-   around a narrow watermark.
+   the client reports the buffer it asked for (ten seconds by default; the
+   desktop client's "Network buffer" setting goes to two minutes), then pauses
+   and resumes around a narrow watermark.
 4. **Fit on the server.** Model scale and display size are independent. The
    server applies `fit` or a centered `cover` crop after inference and reports
    the encoded dimensions to the client. Cover no longer sends off-screen

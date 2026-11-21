@@ -32,6 +32,7 @@ import av
 
 from relay_media.hdr import HDR_TRANSFERS
 from relay_protocol import (
+    DEFAULT_BUFFER_TARGET_MS,
     DIR_DOWNLINK,
     DIR_UPLINK,
     FLAG_EOS,
@@ -39,6 +40,7 @@ from relay_protocol import (
     MediaPacket,
     build_handshake,
     encode_packet,
+    parse_buffer_target_ms,
     read_packet_sync,
 )
 
@@ -365,6 +367,21 @@ class SessionConfig:
     # Vision and HDR10+ for it (capabilities.display_mapping, sent with
     # high_bit_depth). None sends nothing: such sources stream as §3.5 says.
     display_target: DisplayTarget | None = None
+    # open_session.buffer_target_ms: how much video the server keeps buffered
+    # here ahead of playback (docs/PROTOCOL.md §5). None sends nothing, and
+    # the server keeps its default.
+    buffer_target_ms: int | None = None
+
+
+def _confirmed_buffer_target_ms(value: object) -> int:
+    """session_opened.buffer_target_ms as the server applies it.
+
+    The server's own clamp is authoritative, so any positive integer counts;
+    a server that predates the field tops off to the default.
+    """
+    if type(value) is int and value > 0:
+        return value
+    return DEFAULT_BUFFER_TARGET_MS
 
 
 @dataclass
@@ -415,6 +432,9 @@ class SessionInfo:
     # downlink_color with them.
     display_target: DisplayTarget | None = None
     downlink_mapping: dict | None = None
+    # The client buffer the server keeps topped off (PROTOCOL §5): the value
+    # it confirmed, or the default for a server that predates the field.
+    buffer_target_ms: int = DEFAULT_BUFFER_TARGET_MS
 
     @property
     def downlink_hdr(self) -> bool:
@@ -617,6 +637,8 @@ class RelayClient:
             raise ValueError("cached attachments require muxed auxiliary tracks")
         if cfg.high_bit_depth not in (None, "hdr", "all"):
             raise ValueError(f"unknown high bit depth mode: {cfg.high_bit_depth}")
+        if cfg.buffer_target_ms is not None and parse_buffer_target_ms(cfg.buffer_target_ms) is None:
+            raise ValueError(f"invalid buffer target: {cfg.buffer_target_ms!r}")
         if self._closing:
             raise ConnectionError("client is closing")
         video, duration_s, chapters = None, None, []
@@ -681,6 +703,8 @@ class RelayClient:
             fields["high_bit_depth"] = cfg.high_bit_depth
         if maps_display:
             fields["display_target"] = cfg.display_target.to_wire()
+        if cfg.buffer_target_ms is not None:
+            fields["buffer_target_ms"] = int(cfg.buffer_target_ms)
         if video is not None:
             fields["video"] = video
         try:
@@ -741,6 +765,7 @@ class RelayClient:
             downlink_mapping=(
                 msg["downlink_mapping"] if isinstance(msg.get("downlink_mapping"), dict) else None
             ),
+            buffer_target_ms=_confirmed_buffer_target_ms(msg.get("buffer_target_ms")),
         )
         return self.session
 

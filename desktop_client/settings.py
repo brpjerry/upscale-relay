@@ -10,6 +10,12 @@ _APP = "desktop-client"
 FAST_FORWARD_DEFAULT_S = 85  # 1:25, a typical opening sequence
 FAST_FORWARD_MAX_S = 3600
 
+# How much video the server keeps buffered here ahead of playback
+# (open_session.buffer_target_ms, docs/PROTOCOL.md §5). The default is the
+# server's own; longer buffers ride out longer network dropouts.
+NETWORK_BUFFER_DEFAULT_S = 10
+NETWORK_BUFFER_CHOICES_S = (10, 20, 30, 60, 120)
+
 
 # The mpv options the settings sheet offers, at mpv's own defaults. The player
 # keeps them itself (it does not read mpv.conf) and sets them on mpv at runtime.
@@ -188,6 +194,17 @@ class AppSettings:
         if value not in MPV_CHOICES.get(name, (value,)):
             raise ValueError(f"{name}={value}")
         self._qs.setValue(f"mpv/{name}", value)
+
+    @property
+    def network_buffer_s(self) -> int:
+        value = self._qs.value("session/network_buffer_s", NETWORK_BUFFER_DEFAULT_S, type=int)
+        return value if value in NETWORK_BUFFER_CHOICES_S else NETWORK_BUFFER_DEFAULT_S
+
+    @network_buffer_s.setter
+    def network_buffer_s(self, v: int) -> None:
+        if int(v) not in NETWORK_BUFFER_CHOICES_S:
+            raise ValueError(f"network buffer {v} s")
+        self._qs.setValue("session/network_buffer_s", int(v))
 
     @property
     def fast_forward_s(self) -> int:

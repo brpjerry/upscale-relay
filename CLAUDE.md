@@ -54,7 +54,7 @@ load-bearing), `docs/CLIENT_LINUX.md` (Linux setup), and
 pip install -e ".[gui]"                       # client machine: this is everything
 python -m pytest tests -q                     # full suite, all green expected
 relay-desktop                                 # the player (Wayland-native; mpv draws via render API)
-relay-client FILE --model NAME --tier TIER --display WxH [--decode]   # headless client
+relay-client FILE --model NAME --tier TIER --display WxH [--decode] [--buffer-s S]   # headless client
 upscale-cli sample out.mkv --frames 240 --size 1920x1080 --fps 24     # make test media
 ```
 

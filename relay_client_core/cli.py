@@ -97,11 +97,13 @@ async def _run_session(args, client, resources: ExitStack) -> int:
         display_w=int(dw), display_h=int(dh), fit_mode=args.fit_mode,
         resize_algorithm=None if args.resize_algorithm == "server-default" else args.resize_algorithm,
         high_bit_depth=args.high_bit_depth, display_target=args.display_target,
+        buffer_target_ms=None if args.buffer_s is None else round(args.buffer_s * 1000),
     ))
     print(f"session {session.session_id}: downlink {session.downlink_codec} "
           f"{session.downlink_width}x{session.downlink_height} {session.downlink_bit_depth}-bit"
           f"{' HDR' if session.downlink_hdr else ''}"
           f"{' + Dolby Vision RPU' if session.downlink_dolby_vision else ''}")
+    print(f"buffer target: {session.buffer_target_ms / 1000:g} s")
     if args.display_target is not None:
         print(f"display mapping: {session.downlink_mapping}"
               f"{'' if session.display_target else ' (not negotiated)'}")
@@ -267,6 +269,10 @@ def main() -> None:
     parser.add_argument(
         "--display-target", type=_display_target, default=None, metavar="pq:PEAK[:WHITE] | sdr[:WHITE]",
         help="the display to map Dolby Vision and HDR10+ for (PROTOCOL §3.6); needs --high-bit-depth",
+    )
+    parser.add_argument(
+        "--buffer-s", type=float, default=None, metavar="SECONDS",
+        help="how much video the server keeps buffered ahead of playback (server default: 10)",
     )
     parser.add_argument("--decode", action="store_true", help="decode downlink and count frames")
     parser.add_argument("--mpv", action="store_true", help="pipe downlink video into mpv")

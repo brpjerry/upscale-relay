@@ -92,6 +92,46 @@ def test_paused_relay_pipe_survives_network_timeout_and_still_delivers_eof(tmp_p
         loop.run_until_complete(scenario())
 
 
+# Bugs caught: 0, False positives: 0
+def test_relay_stream_cache_fits_the_sessions_buffer_target(tmp_path, local_player):
+    """mpv's cache is bounded by bytes. A relay stream the server buffers 30 s
+    ahead gets room for it, per file: local playback keeps the default."""
+    from fractions import Fraction
+    from qt_helpers import playback_loop
+    from upscale_cli.sample import make_sample
+
+    path = tmp_path / "buffer.mkv"
+    make_sample(str(path), frames=48, width=64, height=64, fps=24)
+    player = local_player
+    errors = []
+    player.failed.connect(errors.append)
+    mib = 1024 * 1024
+
+    async def wait_until(predicate):
+        async with asyncio.timeout(8):
+            while not predicate():
+                assert not errors, errors
+                await asyncio.sleep(0.025)
+
+    async def scenario():
+        assert player.mpv.demuxer_max_bytes == 768 * mib
+        queue = asyncio.Queue()
+        queue.put_nowait(MediaPacket(path.read_bytes(), flags=FLAG_DISCONTINUITY))
+        session = SimpleNamespace(downlink_container="matroska", buffer_target_ms=30_000)
+        player.start(session, queue, Fraction(1, 1000))
+        try:
+            await wait_until(lambda: player.mpv.path is not None)
+            assert player.mpv.demuxer_max_bytes == 3 * 768 * mib
+            await player.play_local(str(path), paused=True)
+            assert player.mpv.demuxer_max_bytes == 768 * mib
+        finally:
+            player.stop()
+            await asyncio.sleep(0)
+
+    with playback_loop(QApplication.instance()) as loop:
+        loop.run_until_complete(scenario())
+
+
 @pytest.mark.parametrize("visible,exposed,expect_skip", [
     (True, True, False), (True, False, True), (False, True, True),
 ])

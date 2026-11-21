@@ -103,6 +103,34 @@ def test_restart_preserves_pause_tracks_delays_and_latest_settings(window, monke
     asyncio.run(scenario())
 
 
+# Bugs caught: 0, False positives: 1
+@pytest.mark.parametrize("confirms", [True, False])
+def test_network_buffer_choice_restarts_the_stream_with_its_target(window, monkeypatch, confirms):
+    events, errors = setup_lifecycle(window, monkeypatch)
+    opened = []
+    class Client(LifecycleClient):
+        async def open_session(self, config):
+            opened.append(config.buffer_target_ms)
+            session = await super().open_session(config)
+            if confirms:  # a server that predates the field confirms nothing
+                session.buffer_target_ms = config.buffer_target_ms
+            return session
+    window.client = Client(events)
+    monkeypatch.setattr(main_window, "RelayClient", lambda host, port: Client(events, host, port))
+    async def scenario():
+        await window._start_session("show.mkv", "server_file")
+        window._position_s = 234.5
+        window.network_buffer_combo.setCurrentIndex(window.network_buffer_combo.findData(30))
+        await window.on_network_buffer_changed(window.network_buffer_combo.currentIndex())
+        assert window.settings.network_buffer_s == 30
+        assert opened == [10_000, 30_000]
+        assert ("seek", 234500) in events
+        hint = window.network_buffer_hint.text()
+        assert ("keeps 10 s" in hint) is not confirms
+        assert not errors
+    asyncio.run(scenario())
+
+
 def test_stop_supersedes_pending_open_without_late_player_load(window, monkeypatch):
     events, errors = setup_lifecycle(window, monkeypatch)
     async def scenario():

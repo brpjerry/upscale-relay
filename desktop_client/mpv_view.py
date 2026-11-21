@@ -73,6 +73,19 @@ mpv = _load_mpv()
 # Cache pause remains enabled for recovery; this only reduces its initial wait.
 CACHE_PAUSE_WAIT_S = 0.5
 
+# mpv's demuxer cache, in MiB. With the cache on, mpv reads ahead as far as
+# this allows (cache-secs is effectively unlimited), so for a relay stream the
+# server's buffer target is what bounds it. This holds the default 10 s target
+# at ~600 Mbps; a longer target scales it (_relay_cache_mib), so the bytes stay
+# in mpv, where they play, rather than queueing in front of it.
+_CACHE_MIB = 768
+_CACHE_TARGET_MS = 10_000
+
+
+def _relay_cache_mib(buffer_target_ms: int) -> int:
+    """demuxer-max-bytes for a relay stream the server buffers this far ahead."""
+    return max(_CACHE_MIB, -(-_CACHE_MIB * int(buffer_target_ms) // _CACHE_TARGET_MS))
+
 # Properties the periodic stats read, kept current by mpv's event thread.
 _OBSERVED_PROPERTIES = (
     "time-pos", "duration", "avsync", "frame-drop-count",
@@ -526,7 +539,7 @@ class MpvPlayerView(QOpenGLWidget):
                 "cache_pause": "yes",
                 "cache_pause_wait": CACHE_PAUSE_WAIT_S,
                 "demuxer_readahead_secs": "15",
-                "demuxer_max_bytes": "768MiB",
+                "demuxer_max_bytes": f"{_CACHE_MIB}MiB",
                 "demuxer_max_back_bytes": "0",
             }
         else:
@@ -553,7 +566,7 @@ class MpvPlayerView(QOpenGLWidget):
                 "cache_pause": "yes",
                 "cache_pause_wait": CACHE_PAUSE_WAIT_S,
                 "demuxer_readahead_secs": "15",
-                "demuxer_max_bytes": "768MiB",
+                "demuxer_max_bytes": f"{_CACHE_MIB}MiB",
                 "demuxer_max_back_bytes": "0",
                 # Keep original timestamps: post-seek streams begin at the
                 # seek target's absolute PTS. With rebasing (mpv default) the
@@ -1552,6 +1565,11 @@ class MpvPlayerView(QOpenGLWidget):
         # playback retains the user's network timeout. Transport errors and
         # stop/seek still close the pipe explicitly.
         load_options = "pause=yes,network-timeout=0"
+        # Room for the buffer the server keeps topped off (the "Network
+        # buffer" setting); per file, so local playback keeps the default.
+        target_ms = getattr(self._session, "buffer_target_ms", _CACHE_TARGET_MS)
+        if _relay_cache_mib(target_ms) > _CACHE_MIB:
+            load_options += f",demuxer-max-bytes={_relay_cache_mib(target_ms)}MiB"
         if self._downlink_codec == "ffv1" and self.mpv.mpv_version_tuple < (0, 38, 0):
             # New FFmpeg muxers use V_FFV1. mpv's native Matroska demuxer
             # learned that tag in 0.38; older libmpv can decode it through
