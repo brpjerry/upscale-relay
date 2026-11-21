@@ -159,14 +159,16 @@ def test_server_confirms_the_requested_target(sample_file):
                 # /status reports each live session's target...
                 live = next(iter(server.sessions.values()))
                 assert live.status()["pipeline"]["buffer_target_ms"] == 45_000
-                # ...which a report without one, or with garbage, keeps. Each
-                # report carries its own depth, to know it was handled.
-                for depth, fields in enumerate(({}, {"buffer_target_ms": "x"}), start=1):
+                # ...which a report may replace, and a later report without
+                # one, or with garbage, keeps. Each report carries its own
+                # depth, to know it was handled.
+                reports = ({"buffer_target_ms": 60_000}, {}, {"buffer_target_ms": "x"})
+                for depth, fields in enumerate(reports, start=1):
                     await client._send("buffer_report", buffered_ms=depth, **fields)
                     async with asyncio.timeout(5):
                         while live.pipeline.client_buffered_ms != depth:
                             await asyncio.sleep(0.02)
-                    assert live.status()["pipeline"]["buffer_target_ms"] == 45_000
+                    assert live.status()["pipeline"]["buffer_target_ms"] == 60_000
                 # The periodic reporter carries a new one once media attaches.
                 await client.attach_media()
                 client.buffer_target_ms = 90_000

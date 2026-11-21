@@ -344,6 +344,10 @@ class MainWindow(DesktopFeatures, QMainWindow):
         # (_confirm_previous_release). In memory only, one at a time.
         self._unreleased_session: tuple[str, str, int] | None = None
         self._server_caps: dict = {}
+        # The connected server predates buffer targets (PROTOCOL §5): a
+        # session it opened confirmed none. Kept through the reconnect that
+        # follows each session, cleared by any other connection.
+        self._server_fixed_buffer = False
         self._init_feature_state()
 
         # -- top bar: heading + server connection -----------------------------
@@ -1869,10 +1873,16 @@ class MainWindow(DesktopFeatures, QMainWindow):
         box.setModal(False)
         box.show()
 
-    async def _adopt_connected_client(self, client: RelayClient, caps: dict) -> None:
-        """Install a connected control client and reflect its capabilities."""
+    async def _adopt_connected_client(
+        self, client: RelayClient, caps: dict, *, after_session: bool = False,
+    ) -> None:
+        """Install a connected control client and reflect its capabilities.
+        ``after_session``: the reconnect that follows a confirmed teardown."""
         self._capture_browser()
-        self._browser_endpoint = server_identity(client.host, client.port, caps.get("server_id"))
+        endpoint = server_identity(client.host, client.port, caps.get("server_id"))
+        if not after_session or endpoint != self._browser_endpoint:
+            self._server_fixed_buffer = False
+        self._browser_endpoint = endpoint
         self.client = client
         self._server_caps = dict(caps)
         client.on_progress = self._on_open_progress
@@ -2443,6 +2453,7 @@ class MainWindow(DesktopFeatures, QMainWindow):
         self._set_opening(True, f"opening session for {Path(path).name}…")
         try:
             session = await self.client.open_session(cfg)
+            self._server_fixed_buffer = getattr(session, "buffer_target_ms", None) is None
             self._show_cache_size_hint()
             attachment_root = (
                 Path(QStandardPaths.writableLocation(QStandardPaths.CacheLocation))
@@ -2761,9 +2772,7 @@ class MainWindow(DesktopFeatures, QMainWindow):
 
     def _show_cache_size_hint(self) -> None:
         """How long the chosen cache holds at the chosen quality."""
-        session = getattr(self.client, "session", None)
-        if session is not None and getattr(session, "buffer_target_ms", None) is None:
-            # The connected server predates buffer targets (PROTOCOL §5).
+        if self.client is not None and self._server_fixed_buffer:
             text = "This server keeps only 10 s buffered; update it to fill the cache."
         elif self.client is None or not self._server_caps.get("quality_options"):
             text = ""
@@ -3225,7 +3234,7 @@ class MainWindow(DesktopFeatures, QMainWindow):
                     if unconfirmed:
                         connecting = asyncio.wait_for(connecting, _UNCONFIRMED_RECONNECT_TIMEOUT_S)
                     caps = await connecting
-                    await self._adopt_connected_client(client, caps)
+                    await self._adopt_connected_client(client, caps, after_session=not unconfirmed)
                     return
                 except Exception:
                     await client.close()

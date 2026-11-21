@@ -103,7 +103,7 @@ def test_restart_preserves_pause_tracks_delays_and_latest_settings(window, monke
     asyncio.run(scenario())
 
 
-# Bugs caught: 0, False positives: 1
+# Bugs caught: 0, False positives: 2
 @pytest.mark.parametrize("confirms", [True, False])
 def test_cache_size_sets_the_player_and_the_opening_buffer_target(window, monkeypatch, confirms):
     events, errors = setup_lifecycle(window, monkeypatch)
@@ -115,10 +115,11 @@ def test_cache_size_sets_the_player_and_the_opening_buffer_target(window, monkey
             if confirms:  # a server that predates the field confirms nothing
                 session.buffer_target_ms = config.buffer_target_ms
             return session
-    window.client = Client(events)
     monkeypatch.setattr(main_window, "RelayClient", lambda host, port: Client(events, host, port))
     monkeypatch.setattr(window.player, "set_cache_size", sizes.append, raising=False)
     async def scenario():
+        # Connected the way the window connects, so it knows which server.
+        await window._adopt_connected_client(Client(events), await Client(events).connect())
         await window._start_session("show.mkv", "server_file")
         # No quality bitrate known: 768 MiB at the 400 Mbps lossless guess.
         assert opened == [round(768 * 1024 * 1024 * 8 / 400_000)]
@@ -134,6 +135,15 @@ def test_cache_size_sets_the_player_and_the_opening_buffer_target(window, monkey
         if confirms:
             assert window.cache_size_hint.text() == (
                 "Holds about 2 min at 50 Mbps. Actual length varies with the video.")
+        # Stopping reconnects with a new client to the same server: what its
+        # session showed about the server still holds.
+        first_client = window.client
+        await window.on_stop()
+        assert window.client is not None and window.client is not first_client
+        assert ("keeps only 10 s" in window.cache_size_hint.text()) is not confirms
+        # Any other connection forgets it.
+        await window._adopt_connected_client(Client(events), {"server_name": "test", "models": []})
+        assert "keeps only 10 s" not in window.cache_size_hint.text()
         window.cache_size_combo.setCurrentIndex(window.cache_size_combo.findData(2048))
         window.on_cache_size_changed(window.cache_size_combo.currentIndex())
         assert window.settings.cache_mib == 2048
