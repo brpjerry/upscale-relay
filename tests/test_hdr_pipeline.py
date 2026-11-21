@@ -500,6 +500,7 @@ def test_model_runs_on_16_bit_rgb_for_a_deep_colour_session(tmp_path):
     assert np.unique(luma[32]).size > 64  # the ramp kept its 10-bit steps
 
 
+# Bugs caught: 0, False positives: 1
 def test_8_bit_source_runs_the_16_bit_model_under_all(tmp_path):
     pytest.importorskip("onnxruntime")
     sys.path.insert(0, str(ROOT))
