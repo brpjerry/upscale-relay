@@ -56,7 +56,6 @@ from PySide6.QtWidgets import (
 from qasync import asyncSlot
 
 from relay_client_core import RelayClient, SessionConfig, TeardownNotConfirmedError, is_4k_or_higher
-from relay_protocol import DEFAULT_BUFFER_TARGET_MS
 
 from .chapters import (
     Chapter,
@@ -66,7 +65,7 @@ from .chapters import (
     step_target,
 )
 from . import hdr_output, theme
-from .settings import NETWORK_BUFFER_CHOICES_S, NETWORK_BUFFER_DEFAULT_S, AppSettings, format_skip
+from .settings import CACHE_CHOICES_MIB, CACHE_DEFAULT_MIB, AppSettings, format_cache_size, format_skip
 from .theme import Icons
 from .widgets import (
     AutoHideButton,
@@ -394,21 +393,21 @@ class MainWindow(DesktopFeatures, QMainWindow):
         self.ten_bit_video_check.setChecked(self.settings.ten_bit_video)
         self.tier_combo = QComboBox()
         self.tier_combo.addItem(self.settings.quality_tier, self.settings.quality_tier)
-        # How far ahead the server keeps video buffered here (PROTOCOL §5).
-        self.network_buffer_combo = QComboBox()
-        for seconds in NETWORK_BUFFER_CHOICES_S:
-            label = f"{seconds // 60} min" if seconds % 60 == 0 else f"{seconds} s"
-            if seconds == NETWORK_BUFFER_DEFAULT_S:
+        # mpv's cache; the server keeps it filled (PROTOCOL §5).
+        self.cache_size_combo = QComboBox()
+        for mib in CACHE_CHOICES_MIB:
+            label = format_cache_size(mib)
+            if mib == CACHE_DEFAULT_MIB:
                 label += " (default)"
-            self.network_buffer_combo.addItem(label, seconds)
-        self.network_buffer_combo.setCurrentIndex(
-            max(0, self.network_buffer_combo.findData(self.settings.network_buffer_s)))
-        self.network_buffer_hint = QLabel()
-        self.network_buffer_hint.setWordWrap(True)
-        self.network_buffer_hint.setProperty("role", "faint")
-        # Seconds the open session's server keeps when that is less than it
-        # was asked for (a server that predates the setting keeps 10).
-        self._network_buffer_shortfall_s: float | None = None
+            self.cache_size_combo.addItem(label, mib)
+        self.cache_size_combo.setCurrentIndex(
+            max(0, self.cache_size_combo.findData(self.settings.cache_mib)))
+        self.cache_size_hint = QLabel()
+        self.cache_size_hint.setWordWrap(True)
+        self.cache_size_hint.setProperty("role", "faint")
+        # The open session's server predates buffer targets: it keeps 10 s
+        # however large the cache.
+        self._server_fixed_buffer = False
         # "Fit to screen" letterboxes inside the display; "Crop" requests a
         # frame sized to cover the display and pans/scans off the overflow, so
         # a fullscreen fill shows native (server-upscaled) pixels edge to edge.
@@ -507,9 +506,10 @@ class MainWindow(DesktopFeatures, QMainWindow):
         for label, combo, help_text in (
             ("Upscale model", self.model_combo, "Choose a model available on the server."),
             ("Stream quality", self.tier_combo, "Higher quality can require more network bandwidth."),
-            ("Network buffer", self.network_buffer_combo,
-             "How far ahead of playback video is downloaded. A longer buffer rides out "
-             "longer network dropouts and uses more memory."),
+            ("Cache size", self.cache_size_combo,
+             "How much video is held in memory ahead of playback. The server keeps it "
+             "filled, so lower-bitrate video is buffered further ahead and rides out "
+             "longer network dropouts."),
             ("Framing", self.fit_combo, "Fit keeps the whole image; Crop fills the display."),
             ("Resize filter", self.resize_combo, "Choose how the upscaled image is fitted to the display."),
         ):
@@ -520,8 +520,8 @@ class MainWindow(DesktopFeatures, QMainWindow):
             form.addRow(label, combo)
         form.insertRow(1, self.passthrough_4k_check)  # qualifies the model choice
         form.insertRow(3, self.ten_bit_video_check)  # ... and this the stream quality
-        form.insertRow(5, self.network_buffer_hint)  # below the network buffer
-        self._show_network_buffer_hint()
+        form.insertRow(5, self.cache_size_hint)  # below the cache size
+        self._show_cache_size_hint()
         streaming_layout.addLayout(form)
         streaming_layout.addWidget(self.deband_check)
         streaming_layout.addWidget(self.hdr_output_check)
@@ -640,6 +640,8 @@ class MainWindow(DesktopFeatures, QMainWindow):
         self.video_overlay = PlayerOverlay(self.player)
         if hasattr(self.player, "set_deband"):
             self.player.set_deband(self.settings.deband_enabled)
+        if hasattr(self.player, "set_cache_size"):
+            self.player.set_cache_size(self.settings.cache_mib)
         if hasattr(self.player, "set_hdr_output_enabled"):
             self.player.set_hdr_output_enabled(self.settings.hdr_output)
             self.player.set_auto_hdr_refusals(self.settings.hdr_auto_refused)
@@ -964,7 +966,7 @@ class MainWindow(DesktopFeatures, QMainWindow):
         self.passthrough_4k_check.toggled.connect(self.on_passthrough_4k_changed)
         self.ten_bit_video_check.toggled.connect(self.on_ten_bit_video_changed)
         self.tier_combo.activated.connect(self.on_quality_tier_changed)
-        self.network_buffer_combo.activated.connect(self.on_network_buffer_changed)
+        self.cache_size_combo.activated.connect(self.on_cache_size_changed)
         self.deband_check.toggled.connect(self.on_deband_changed)
         self.hdr_output_check.toggled.connect(self.on_hdr_output_changed)
         if hasattr(self.player, "hdr_surface_stale"):
@@ -1897,7 +1899,7 @@ class MainWindow(DesktopFeatures, QMainWindow):
             tier_index = 0
         self.tier_combo.setCurrentIndex(tier_index)
         self.tier_combo.blockSignals(False)
-        self._show_network_buffer_hint()
+        self._show_cache_size_hint()
         selected_resize = self.settings.resize_algorithm or None
         self.resize_combo.blockSignals(True)
         self.resize_combo.clear()
@@ -2420,7 +2422,8 @@ class MainWindow(DesktopFeatures, QMainWindow):
             # Dolby Vision and HDR10+ are applied on the server for the display
             # the video is shown on (PROTOCOL §3.6); mpv's renderer cannot.
             display_target=self._display_target(),
-            buffer_target_ms=self.settings.network_buffer_s * 1000,
+            # Refined from what arrives once playback starts (MpvPlayerView).
+            buffer_target_ms=self._cache_target_estimate_ms(),
             aux_tracks=(
                 "muxed"
                 if source == "server_file" and self._server_caps.get("muxed_aux_tracks")
@@ -2443,8 +2446,8 @@ class MainWindow(DesktopFeatures, QMainWindow):
         self._set_opening(True, f"opening session for {Path(path).name}…")
         try:
             session = await self.client.open_session(cfg)
-            self._note_network_buffer(
-                cfg.buffer_target_ms, getattr(session, "buffer_target_ms", DEFAULT_BUFFER_TARGET_MS))
+            self._server_fixed_buffer = getattr(session, "buffer_target_ms", None) is None
+            self._show_cache_size_hint()
             attachment_root = (
                 Path(QStandardPaths.writableLocation(QStandardPaths.CacheLocation))
                 / "attachments"
@@ -2730,48 +2733,53 @@ class MainWindow(DesktopFeatures, QMainWindow):
     @asyncSlot(int)
     async def on_quality_tier_changed(self, _index: int) -> None:
         self.settings.quality_tier = self._quality_tier()
-        self._show_network_buffer_hint()
+        self._show_cache_size_hint()
         await self._restart_for_playback_setting()
 
-    @asyncSlot(int)
-    async def on_network_buffer_changed(self, _index: int) -> None:
-        seconds = self.network_buffer_combo.currentData()
-        if seconds == self.settings.network_buffer_s:
+    def on_cache_size_changed(self, _index: int) -> None:
+        mib = self.cache_size_combo.currentData()
+        if mib == self.settings.cache_mib:
             return
-        self.settings.network_buffer_s = seconds
-        self._network_buffer_shortfall_s = None
-        self._show_network_buffer_hint()
-        # The server's buffer target is fixed at open_session.
-        await self._restart_for_playback_setting()
+        self.settings.cache_mib = mib
+        # No restart: mpv resizes as it plays, and the server's buffer target
+        # follows at the next buffer report.
+        if hasattr(self.player, "set_cache_size"):
+            self.player.set_cache_size(mib)
+        self._show_cache_size_hint()
 
-    def _note_network_buffer(self, requested_ms: int | None, confirmed_ms: int) -> None:
-        """Remember whether the server keeps less buffered than was asked."""
-        short = requested_ms is not None and confirmed_ms < requested_ms
-        self._network_buffer_shortfall_s = confirmed_ms / 1000 if short else None
-        self._show_network_buffer_hint()
-
-    def _show_network_buffer_hint(self) -> None:
-        """The memory the chosen buffer can take at the chosen quality."""
-        seconds = self.settings.network_buffer_s
-        if self._network_buffer_shortfall_s is not None:
-            text = (f"This server keeps {self._network_buffer_shortfall_s:g} s buffered; "
-                    "update it for a longer buffer.")
-            self.network_buffer_hint.setText(text)
-            self.network_buffer_hint.setVisible(True)
-            return
+    def _tier_mbps(self) -> float | None:
+        """The chosen quality's coarse P95 bitrate; None for lossless."""
         tier = self._quality_tier()
         options = self._server_caps.get("quality_options") or []
         mbps = next((o.get("p95_mbps") for o in options if o.get("id") == tier), None)
-        if isinstance(mbps, (int, float)) and mbps > 0:
-            megabytes = mbps * seconds / 8
-            size = f"{megabytes / 1000:.1f} GB" if megabytes >= 1000 else f"{round(megabytes, -1):.0f} MB"
-            text = f"Uses up to about {size} of memory at this quality."
-        elif options:
-            text = "Lossless video has no set bitrate: allow about 50 MB of memory per second of buffer."
-        else:
+        return mbps if isinstance(mbps, (int, float)) and mbps > 0 else None
+
+    # Lossless qualities have no set bitrate; this is about where 4K runs.
+    _LOSSLESS_MBPS_GUESS = 400
+
+    def _cache_target_estimate_ms(self) -> int:
+        """How long the cache lasts at the chosen quality, before any video
+        has arrived to measure."""
+        mbps = self._tier_mbps() or self._LOSSLESS_MBPS_GUESS
+        return round(self.settings.cache_mib * 1024 * 1024 * 8 / (mbps * 1000))
+
+    def _show_cache_size_hint(self) -> None:
+        """How long the chosen cache holds at the chosen quality."""
+        if self._server_fixed_buffer:
+            text = "This server keeps only 10 s buffered; update it to fill the cache."
+        elif not self._server_caps.get("quality_options"):
             text = ""
-        self.network_buffer_hint.setText(text)
-        self.network_buffer_hint.setVisible(bool(text))
+        else:
+            seconds = self._cache_target_estimate_ms() / 1000
+            length = f"{seconds:.0f} s" if seconds < 90 else f"{seconds / 60:.0f} min"
+            if self._tier_mbps() is None:
+                text = (f"Holds about {length} of lossless video at "
+                        f"{self._LOSSLESS_MBPS_GUESS} Mbps; lower bitrates hold more.")
+            else:
+                # The quality's bitrate is a P95 figure: most video holds longer.
+                text = f"Holds about {length} or more of video at this quality."
+        self.cache_size_hint.setText(text)
+        self.cache_size_hint.setVisible(bool(text))
 
     @asyncSlot()
     async def on_fit_mode_changed(self) -> None:

@@ -780,6 +780,11 @@ class Session:
     def handle_buffer_report(self, msg: dict) -> None:
         self.last_buffer_report = time.monotonic()
         if self.pipeline:
+            # A client may resize its buffer as it plays (PROTOCOL §5): the
+            # desktop fits it to its cache at the bitrate it receives.
+            target = parse_buffer_target_ms(msg.get("buffer_target_ms"))
+            if target is not None:
+                self.pipeline.set_buffer_target(target)
             self.pipeline.note_buffer_report(int(msg.get("buffered_ms", 0)))
 
     async def close(self) -> None:
@@ -859,7 +864,7 @@ class Session:
             "stage_ms": p.stats.stage_report(),
             "client_buffered_ms": p.client_buffered_ms,
             "client_buffered_ms_est": round(p.buffered_ms_now()),
-            "buffer_target_ms": p.high_watermark_ms,
+            "buffer_target_ms": p.buffer_target_ms,
             "output": f"{p.out_w}x{p.out_h}",
             "codec": p.downlink_codec,
             "encoder": p.encoder_name,

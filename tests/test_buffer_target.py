@@ -1,8 +1,8 @@
 """A client chooses how much video the server keeps buffered for it.
 
-open_session.buffer_target_ms sets the session's backpressure watermark
-(docs/PROTOCOL.md §5); session_opened confirms it, and a server that predates
-the field keeps 10 s.
+open_session.buffer_target_ms sets the session's backpressure watermark and
+buffer_report.buffer_target_ms replaces it (docs/PROTOCOL.md §5);
+session_opened confirms it, and a server that predates the field keeps 10 s.
 """
 
 import asyncio
@@ -24,7 +24,6 @@ from relay_client_core.client import _confirmed_buffer_target_ms
 from relay_protocol import (
     DEFAULT_BUFFER_TARGET_MS,
     FLAG_EOS,
-    MAX_BUFFER_TARGET_MS,
     MIN_BUFFER_TARGET_MS,
     MediaPacket,
     parse_buffer_target_ms,
@@ -42,22 +41,22 @@ def sample_file(tmp_path_factory) -> str:
 
 
 # Bugs caught: 0, False positives: 0
-def test_wire_values_are_clamped_and_non_numbers_rejected():
+def test_wire_values_have_a_floor_and_non_numbers_are_rejected():
     assert parse_buffer_target_ms(30_000) == 30_000
     assert parse_buffer_target_ms(30_000.4) == 30_000
     assert parse_buffer_target_ms(1) == MIN_BUFFER_TARGET_MS
-    assert parse_buffer_target_ms(10**9) == MAX_BUFFER_TARGET_MS
+    assert parse_buffer_target_ms(10**9) == 10**9  # no maximum
     for bad in (True, "30000", None, [30_000], math.nan, math.inf):
         assert parse_buffer_target_ms(bad) is None
 
 
 # Bugs caught: 0, False positives: 0
-def test_client_reads_the_servers_confirmation_or_the_old_default():
+def test_client_reads_the_servers_confirmation():
     assert _confirmed_buffer_target_ms(45_000) == 45_000
-    # A server that predates the field confirms nothing and keeps 10 s.
-    assert _confirmed_buffer_target_ms(None) == DEFAULT_BUFFER_TARGET_MS
-    assert _confirmed_buffer_target_ms(True) == DEFAULT_BUFFER_TARGET_MS
-    assert _confirmed_buffer_target_ms(0) == DEFAULT_BUFFER_TARGET_MS
+    # A server that predates the field confirms nothing (and keeps 10 s).
+    assert _confirmed_buffer_target_ms(None) is None
+    assert _confirmed_buffer_target_ms(True) is None
+    assert _confirmed_buffer_target_ms(0) is None
 
 
 # Bugs caught: 0, False positives: 1
@@ -106,7 +105,7 @@ def test_pipeline_fills_up_to_the_sessions_target(sample_file):
         assert done.wait(30), "the pipeline paused below the session's target"
         assert not errors
         assert not pipeline.stats.paused_for_backpressure
-        assert (pipeline.high_watermark_ms, pipeline.resume_watermark_ms) == (30_000, 29_500)
+        assert pipeline.buffer_target_ms == 30_000
     finally:
         pipeline.close()
 
@@ -119,10 +118,10 @@ def test_pipeline_without_a_target_holds_at_ten_seconds(sample_file):
         while not pipeline.stats.paused_for_backpressure and time.monotonic() < deadline:
             time.sleep(0.02)
         assert pipeline.stats.paused_for_backpressure
-        assert pipeline.high_watermark_ms == DEFAULT_BUFFER_TARGET_MS
+        assert pipeline.buffer_target_ms == DEFAULT_BUFFER_TARGET_MS
         assert not done.is_set()
-        # Once the client buffer drains below the watermark, it resumes.
-        pipeline.note_buffer_report(0)
+        # A longer target from a later report lets it go on.
+        pipeline.set_buffer_target(30_000)
         assert done.wait(30)
         assert not errors
     finally:
@@ -157,16 +156,23 @@ def test_server_confirms_the_requested_target(sample_file):
                     display_w=64, display_h=64, buffer_target_ms=45_000,
                 ))
                 assert session.buffer_target_ms == 45_000
-                # /status reports each live session's target.
-                live = next(iter(server.sessions.values())).status()
-                assert live["pipeline"]["buffer_target_ms"] == 45_000
+                # /status reports each live session's target...
+                live = next(iter(server.sessions.values()))
+                assert live.status()["pipeline"]["buffer_target_ms"] == 45_000
+                # ...which any buffer report may replace.
+                await client._send("buffer_report", buffered_ms=0, buffer_target_ms=90_000)
+                async with asyncio.timeout(5):
+                    while live.status()["pipeline"]["buffer_target_ms"] != 90_000:
+                        await asyncio.sleep(0.02)
+                await client._send("buffer_report", buffered_ms=0)  # absent keeps it
+                await client._send("buffer_report", buffered_ms=0, buffer_target_ms="x")
+                await asyncio.sleep(0.2)
+                assert live.status()["pipeline"]["buffer_target_ms"] == 90_000
             finally:
                 await client.teardown()
-            # No request keeps the default; an excessive one is clamped.
+            # No request keeps the default; there is no maximum.
             assert await _confirmed(server.port, sample_file) == DEFAULT_BUFFER_TARGET_MS
-            assert await _confirmed(
-                server.port, sample_file, buffer_target_ms=10**9,
-            ) == MAX_BUFFER_TARGET_MS
+            assert await _confirmed(server.port, sample_file, buffer_target_ms=10**9) == 10**9
         finally:
             await server.stop()
 
@@ -200,17 +206,34 @@ def test_server_rejects_a_target_that_is_not_a_number(sample_file):
 
 
 # Bugs caught: 0, False positives: 0
-def test_desktop_setting_keeps_to_the_offered_choices():
+def test_desktop_cache_setting_keeps_to_the_offered_choices():
     pytest.importorskip("PySide6")
-    from desktop_client.settings import NETWORK_BUFFER_DEFAULT_S, AppSettings
+    from desktop_client.settings import CACHE_DEFAULT_MIB, AppSettings, format_cache_size
 
     settings = AppSettings("test-buffer-target")
     settings._qs.clear()
-    assert settings.network_buffer_s == NETWORK_BUFFER_DEFAULT_S == DEFAULT_BUFFER_TARGET_MS // 1000
-    settings.network_buffer_s = 60
-    assert settings.network_buffer_s == 60
+    assert settings.cache_mib == CACHE_DEFAULT_MIB == 768
+    settings.cache_mib = 5120
+    assert settings.cache_mib == 5120
     with pytest.raises(ValueError):
-        settings.network_buffer_s = 45
-    settings._qs.setValue("session/network_buffer_s", 45)  # e.g. a later version's choice
-    assert settings.network_buffer_s == NETWORK_BUFFER_DEFAULT_S
+        settings.cache_mib = 6144  # above the 5 GB limit
+    settings._qs.setValue("playback/cache_mib", 1000)  # e.g. a later version's choice
+    assert settings.cache_mib == CACHE_DEFAULT_MIB
     settings._qs.clear()
+    assert [format_cache_size(m) for m in (512, 1024, 1536, 5120)] == ["512 MB", "1 GB", "1.5 GB", "5 GB"]
+
+
+# Bugs caught: 0, False positives: 0
+def test_desktop_target_is_how_long_the_cache_lasts_at_the_held_bitrate():
+    pytest.importorskip("PySide6")
+    from desktop_client.mpv_view import _cache_target_ms
+
+    mib = 1024 * 1024
+    # 25 MiB held for 4 s is 50 Mbps-ish: 768 MiB lasts 30.72 x 4 s.
+    assert _cache_target_ms(768 * mib, 4000, 25 * mib) == 122_880
+    # Twice the bitrate in the same memory, half as long.
+    assert _cache_target_ms(768 * mib, 4000, 50 * mib) == 61_440
+    # Under a second held, or nothing known: keep the target the session has.
+    assert _cache_target_ms(768 * mib, 999, 25 * mib) is None
+    assert _cache_target_ms(768 * mib, 4000, None) is None
+    assert _cache_target_ms(768 * mib, 4000, 0) is None

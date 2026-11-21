@@ -123,7 +123,7 @@ required.
 | `play` | | |
 | `pause` | | |
 | `seek` | `target_pts:int`, `epoch:int`, `display_target:{...}?` | epoch = client's current epoch + 1; see §4. `display_target` (§3.6) applies from this epoch on; absent keeps the current one |
-| `buffer_report` | `buffered_ms:int`, `playing_pts:int?` | send ~every 500 ms while media attached |
+| `buffer_report` | `buffered_ms:int`, `playing_pts:int?`, `buffer_target_ms:int?` | send ~every 500 ms while media attached. `buffer_target_ms` replaces the session's buffer target from this report on (§5); absent keeps it |
 | `teardown` | | graceful close; `closed` is sent only after pipeline workers and native encoder/mux/inference owners have released their resources |
 
 ### server → client
@@ -514,14 +514,20 @@ Rules that make this airtight:
   `RESUME_WATERMARK` (500 ms less). The narrow band keeps the client buffer
   topped off near the watermark — the server must not let it drain
   substantially before resuming.
-- `HIGH_WATERMARK` is the session's buffer target: `open_session.buffer_target_ms`
-  clamped to 2 000..300 000, or 10 000 when the client sends none. The server
-  confirms it in `session_opened.buffer_target_ms` and reports it in
-  `/status` (`pipeline.buffer_target_ms`). A longer target rides out longer
-  network dropouts; the server's own memory does not grow with it, only the
-  client's buffer does. A client sizes its player's cache for the confirmed
-  target. A server that predates the field keeps 10 000 and confirms
-  nothing, so the client reads an absent value as 10 000.
+- `HIGH_WATERMARK` is the session's buffer target: `open_session.buffer_target_ms`,
+  or 10 000 when the client sends none, replaced by any
+  `buffer_report.buffer_target_ms`. The server raises values below 2 000 to
+  2 000 (below that it would pause and resume on every report) and has no
+  maximum: the client holds the buffer, so it sizes the target for its
+  memory, and the server's own memory does not grow with it. The server
+  confirms the opening value in `session_opened.buffer_target_ms` and reports
+  the current one in `/status` (`pipeline.buffer_target_ms`). A server that
+  predates the field keeps 10 000, confirms nothing and ignores updates.
+- The desktop client sizes it to its player's cache (the "Cache size"
+  setting): it opens with the cache's length at the quality's nominal
+  bitrate, then sends the cache size over the bitrate of what its player
+  holds once that is a second or more. Lower-bitrate video is buffered
+  further ahead in the same memory.
 - The estimate is the last reported `buffered_ms` decayed by wall time while
   PLAYING (the client consumes in real time). Pacing must never act on a raw
   stale report: if reports stall (busy client, saturated link, dead reporter),

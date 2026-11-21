@@ -32,7 +32,6 @@ import av
 
 from relay_media.hdr import HDR_TRANSFERS
 from relay_protocol import (
-    DEFAULT_BUFFER_TARGET_MS,
     DIR_DOWNLINK,
     DIR_UPLINK,
     FLAG_EOS,
@@ -373,15 +372,12 @@ class SessionConfig:
     buffer_target_ms: int | None = None
 
 
-def _confirmed_buffer_target_ms(value: object) -> int:
-    """session_opened.buffer_target_ms as the server applies it.
-
-    The server's own clamp is authoritative, so any positive integer counts;
-    a server that predates the field tops off to the default.
-    """
+def _confirmed_buffer_target_ms(value: object) -> int | None:
+    """session_opened.buffer_target_ms as the server applies it; None from a
+    server that predates the field, which keeps DEFAULT_BUFFER_TARGET_MS."""
     if type(value) is int and value > 0:
         return value
-    return DEFAULT_BUFFER_TARGET_MS
+    return None
 
 
 @dataclass
@@ -432,9 +428,10 @@ class SessionInfo:
     # downlink_color with them.
     display_target: DisplayTarget | None = None
     downlink_mapping: dict | None = None
-    # The client buffer the server keeps topped off (PROTOCOL §5): the value
-    # it confirmed, or the default for a server that predates the field.
-    buffer_target_ms: int = DEFAULT_BUFFER_TARGET_MS
+    # The client buffer the server keeps topped off (PROTOCOL §5), as it
+    # confirmed it. None: a server that predates the field, which keeps
+    # DEFAULT_BUFFER_TARGET_MS and ignores updates.
+    buffer_target_ms: int | None = None
 
     @property
     def downlink_hdr(self) -> bool:
@@ -486,6 +483,9 @@ class RelayClient:
         # failed: the message the consumer should show for the ended stream.
         self.source_error: str | None = None
         self.buffered_ms = 0  # consumer updates; buffer_report loop sends it
+        # The buffer the server should keep topped off, when the consumer
+        # resizes it as it plays (PROTOCOL §5); None leaves the session's.
+        self.buffer_target_ms: int | None = None
         # Optional UI hooks: called with each session_progress / seek_progress
         # message dict (from the control-reader task, i.e. on the event-loop
         # thread).
@@ -641,6 +641,7 @@ class RelayClient:
             raise ValueError(f"invalid buffer target: {cfg.buffer_target_ms!r}")
         if self._closing:
             raise ConnectionError("client is closing")
+        self.buffer_target_ms = None  # the consumer sizes it for this session
         video, duration_s, chapters = None, None, []
         capabilities = self.capabilities or {}
         maps_display = bool(cfg.high_bit_depth and cfg.display_target is not None
@@ -1055,7 +1056,10 @@ class RelayClient:
         # state before the pipeline outruns it.
         while True:
             try:
-                await self._send("buffer_report", buffered_ms=int(self.buffered_ms))
+                fields = {"buffered_ms": int(self.buffered_ms)}
+                if self.buffer_target_ms is not None:
+                    fields["buffer_target_ms"] = int(self.buffer_target_ms)
+                await self._send("buffer_report", **fields)
             except (ConnectionResetError, RuntimeError) as err:
                 # Only a dead control WS lands here; the session is over. The
                 # server's pacing decays a silent client's last report, so a

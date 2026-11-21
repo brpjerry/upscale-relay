@@ -73,23 +73,26 @@ mpv = _load_mpv()
 # Cache pause remains enabled for recovery; this only reduces its initial wait.
 CACHE_PAUSE_WAIT_S = 0.5
 
-# mpv's demuxer cache, in MiB. With the cache on, mpv reads ahead as far as
-# this allows (cache-secs is effectively unlimited), so for a relay stream the
-# server's buffer target is what bounds it. This holds the default 10 s target
-# at ~600 Mbps; a longer target scales it (_relay_cache_mib), so the bytes stay
-# in mpv, where they play, rather than queueing in front of it.
+# mpv's demuxer cache until the window sets the user's size (set_cache_size).
+# With the cache on, mpv reads ahead as far as its size allows (cache-secs is
+# effectively unlimited): a local file reads that far ahead, and for a relay
+# stream the player keeps the server's buffer target at the length that fills
+# it (_cache_target_ms).
 _CACHE_MIB = 768
-_CACHE_TARGET_MS = 10_000
+_MIB = 1024 * 1024
 
 
-def _relay_cache_mib(buffer_target_ms: int) -> int:
-    """demuxer-max-bytes for a relay stream the server buffers this far ahead."""
-    return max(_CACHE_MIB, -(-_CACHE_MIB * int(buffer_target_ms) // _CACHE_TARGET_MS))
+def _cache_target_ms(cache_bytes: int, cached_ms: int, cached_bytes: object) -> int | None:
+    """How long a buffer fills ``cache_bytes`` at the bitrate of what mpv holds
+    (``cached_bytes`` over ``cached_ms``); None until it holds a second."""
+    if cached_ms < 1000 or not isinstance(cached_bytes, int) or cached_bytes <= 0:
+        return None
+    return round(cache_bytes * cached_ms / cached_bytes)
 
 # Properties the periodic stats read, kept current by mpv's event thread.
 _OBSERVED_PROPERTIES = (
     "time-pos", "duration", "avsync", "frame-drop-count",
-    "demuxer-cache-duration", "paused-for-cache", "seeking", "path",
+    "demuxer-cache-duration", "demuxer-cache-state", "paused-for-cache", "seeking", "path",
     "volume", "mute", "audio-delay", "sub-delay", "aid", "sid",
     "hwdec-current", "video-params",
 )
@@ -513,6 +516,7 @@ class MpvPlayerView(QOpenGLWidget):
         self._presenter_broken = False
         self._source_hdr = False  # the stream (or file) being played is PQ/HLG
         self._session = None  # the relay session being played (its display mapping)
+        self._cache_bytes = _CACHE_MIB * _MIB  # mpv's demuxer cache (set_cache_size)
         self._hdr_enabled = True  # the "Show HDR videos in HDR" setting
         self._display_hdr = hdr_output.SDR  # as last read
         self._hdr_stale_reported = False
@@ -1565,11 +1569,6 @@ class MpvPlayerView(QOpenGLWidget):
         # playback retains the user's network timeout. Transport errors and
         # stop/seek still close the pipe explicitly.
         load_options = "pause=yes,network-timeout=0"
-        # Room for the buffer the server keeps topped off (the "Network
-        # buffer" setting); per file, so local playback keeps the default.
-        target_ms = getattr(self._session, "buffer_target_ms", _CACHE_TARGET_MS)
-        if _relay_cache_mib(target_ms) > _CACHE_MIB:
-            load_options += f",demuxer-max-bytes={_relay_cache_mib(target_ms)}MiB"
         if self._downlink_codec == "ffv1" and self.mpv.mpv_version_tuple < (0, 38, 0):
             # New FFmpeg muxers use V_FFV1. mpv's native Matroska demuxer
             # learned that tag in 0.38; older libmpv can decode it through
@@ -1773,6 +1772,13 @@ class MpvPlayerView(QOpenGLWidget):
         pos = event.position().toPoint()
         self.mouse_moved.emit(pos.x(), pos.y())
         super().mouseMoveEvent(event)
+
+    def set_cache_size(self, mib: int) -> None:
+        """mpv's demuxer cache: how much is held ahead of playback. mpv applies
+        it to the file playing as soon as playback reads on; a relay stream's
+        server buffer follows it at the next buffer report."""
+        self._cache_bytes = int(mib) * _MIB
+        self.mpv.command("set", "demuxer-max-bytes", f"{int(mib)}MiB")
 
     def apply_defaults(self, values: dict[str, str]) -> None:
         """Apply only the exposed properties, never reload config into a stream."""
@@ -2062,6 +2068,16 @@ class MpvPlayerView(QOpenGLWidget):
             buffered_ms = mpv_buffered_ms + pre_mpv_ms
             if self.client is not None:
                 self.client.buffered_ms = buffered_ms
+                # Keep the server filling the cache, however long that is at
+                # this stream's bitrate; until mpv holds a second, the
+                # session keeps the target it opened with.
+                state = _prop("demuxer-cache-state")
+                target = _cache_target_ms(
+                    self._cache_bytes, mpv_buffered_ms,
+                    state.get("fw-bytes") if isinstance(state, dict) else None,
+                )
+                if target is not None:
+                    self.client.buffer_target_ms = target
             stable = self._epoch_released and not self._reloading and not bool(_prop("seeking", False))
             if stable:
                 self._cached_audio_delay = float(_prop("audio-delay", 0) or 0)

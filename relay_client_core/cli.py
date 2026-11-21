@@ -103,7 +103,10 @@ async def _run_session(args, client, resources: ExitStack) -> int:
           f"{session.downlink_width}x{session.downlink_height} {session.downlink_bit_depth}-bit"
           f"{' HDR' if session.downlink_hdr else ''}"
           f"{' + Dolby Vision RPU' if session.downlink_dolby_vision else ''}")
-    print(f"buffer target: {session.buffer_target_ms / 1000:g} s")
+    if session.buffer_target_ms is None:
+        print("buffer target: 10 s (this server predates choosing one)")
+    else:
+        print(f"buffer target: {session.buffer_target_ms / 1000:g} s")
     if args.display_target is not None:
         print(f"display mapping: {session.downlink_mapping}"
               f"{'' if session.display_target else ' (not negotiated)'}")

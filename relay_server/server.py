@@ -171,7 +171,7 @@ class RelayServer:
                 p.out_w, p.out_h, p.downlink_codec, p.encoder_name, p.quality_tier,
                 cached, depths["decoded"], depths["upscaled"],
                 session.down_q.qsize(), depths["in"],
-                p.client_buffered_ms, p.buffered_ms_now(), p.high_watermark_ms,
+                p.client_buffered_ms, p.buffered_ms_now(), p.buffer_target_ms,
                 "PAUSED(watermark)" if p.stats.paused_for_backpressure else "flowing",
                 p.stats.frames_in, p.stats.frames_out,
             )

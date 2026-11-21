@@ -19,7 +19,7 @@ def test_performance_snapshot_includes_status_fields(caplog):
         queue_depths=lambda: {"in": 2, "decoded": 3, "upscaled": 1},
         client_buffered_ms=8400,
         buffered_ms_now=lambda: 8123.0,
-        high_watermark_ms=30000,
+        buffer_target_ms=30000,
         out_w=3840,
         out_h=2160,
         downlink_codec="hevc",

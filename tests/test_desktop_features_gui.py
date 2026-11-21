@@ -105,9 +105,9 @@ def test_restart_preserves_pause_tracks_delays_and_latest_settings(window, monke
 
 # Bugs caught: 0, False positives: 1
 @pytest.mark.parametrize("confirms", [True, False])
-def test_network_buffer_choice_restarts_the_stream_with_its_target(window, monkeypatch, confirms):
+def test_cache_size_sets_the_player_and_the_opening_buffer_target(window, monkeypatch, confirms):
     events, errors = setup_lifecycle(window, monkeypatch)
-    opened = []
+    opened, sizes = [], []
     class Client(LifecycleClient):
         async def open_session(self, config):
             opened.append(config.buffer_target_ms)
@@ -117,16 +117,19 @@ def test_network_buffer_choice_restarts_the_stream_with_its_target(window, monke
             return session
     window.client = Client(events)
     monkeypatch.setattr(main_window, "RelayClient", lambda host, port: Client(events, host, port))
+    monkeypatch.setattr(window.player, "set_cache_size", sizes.append, raising=False)
     async def scenario():
         await window._start_session("show.mkv", "server_file")
-        window._position_s = 234.5
-        window.network_buffer_combo.setCurrentIndex(window.network_buffer_combo.findData(30))
-        await window.on_network_buffer_changed(window.network_buffer_combo.currentIndex())
-        assert window.settings.network_buffer_s == 30
-        assert opened == [10_000, 30_000]
-        assert ("seek", 234500) in events
-        hint = window.network_buffer_hint.text()
-        assert ("keeps 10 s" in hint) is not confirms
+        # No quality bitrate known: 768 MiB at the 400 Mbps lossless guess.
+        assert opened == [round(768 * 1024 * 1024 * 8 / 400_000)]
+        hint = window.cache_size_hint.text()
+        assert ("keeps only 10 s" in hint) is not confirms
+        window.cache_size_combo.setCurrentIndex(window.cache_size_combo.findData(2048))
+        window.on_cache_size_changed(window.cache_size_combo.currentIndex())
+        assert window.settings.cache_mib == 2048
+        assert sizes == [2048]
+        # The player follows at once and the server at its next report: no restart.
+        assert len(opened) == 1
         assert not errors
     asyncio.run(scenario())
 

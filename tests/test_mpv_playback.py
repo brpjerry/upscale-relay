@@ -92,19 +92,23 @@ def test_paused_relay_pipe_survives_network_timeout_and_still_delivers_eof(tmp_p
         loop.run_until_complete(scenario())
 
 
-# Bugs caught: 0, False positives: 0
-def test_relay_stream_cache_fits_the_sessions_buffer_target(tmp_path, local_player):
-    """mpv's cache is bounded by bytes. A relay stream the server buffers 30 s
-    ahead gets room for it, per file: local playback keeps the default."""
+# Bugs caught: 0, False positives: 1
+def test_relay_buffer_target_fills_the_cache_at_the_streams_bitrate(tmp_path, local_player):
+    """The player asks the server to buffer as long as mpv's cache holds at
+    the bitrate it holds, and follows a cache size change without a reload."""
     from fractions import Fraction
     from qt_helpers import playback_loop
     from upscale_cli.sample import make_sample
 
     path = tmp_path / "buffer.mkv"
-    make_sample(str(path), frames=48, width=64, height=64, fps=24)
+    make_sample(str(path), frames=240, width=64, height=64, fps=24)
     player = local_player
     errors = []
     player.failed.connect(errors.append)
+    client = SimpleNamespace(
+        epoch=0, buffered_ms=0, buffer_target_ms=None,
+        downlink_stats=lambda: {"mbps": 0.0, "queue_packets": 0},
+    )
     mib = 1024 * 1024
 
     async def wait_until(predicate):
@@ -114,18 +118,29 @@ def test_relay_stream_cache_fits_the_sessions_buffer_target(tmp_path, local_play
                 await asyncio.sleep(0.025)
 
     async def scenario():
-        assert player.mpv.demuxer_max_bytes == 768 * mib
+        player.set_cache_size(256)
+        assert player.mpv.demuxer_max_bytes == 256 * mib
         queue = asyncio.Queue()
         queue.put_nowait(MediaPacket(path.read_bytes(), flags=FLAG_DISCONTINUITY))
-        session = SimpleNamespace(downlink_container="matroska", buffer_target_ms=30_000)
-        player.start(session, queue, Fraction(1, 1000))
+        player.client = client
+        player.start(SimpleNamespace(downlink_container="matroska"), queue,
+                     Fraction(1, 1000), paused=True)
         try:
-            await wait_until(lambda: player.mpv.path is not None)
-            assert player.mpv.demuxer_max_bytes == 3 * 768 * mib
-            await player.play_local(str(path), paused=True)
-            assert player.mpv.demuxer_max_bytes == 768 * mib
+            # Paused with the whole file held, the cached bitrate is fixed.
+            await wait_until(lambda: client.buffer_target_ms is not None)
+            state = player.mpv.demuxer_cache_state
+            held_ms = int(player.mpv.demuxer_cache_duration * 1000)
+            assert held_ms >= 1000
+            expected = 256 * mib * held_ms / state["fw-bytes"]
+            assert client.buffer_target_ms == pytest.approx(expected, rel=0.02)
+            first = client.buffer_target_ms
+            player.set_cache_size(512)
+            assert player.mpv.demuxer_max_bytes == 512 * mib
+            await wait_until(lambda: client.buffer_target_ms != first)
+            assert client.buffer_target_ms == pytest.approx(2 * first, rel=0.02)
         finally:
             player.stop()
+            player.client = None
             await asyncio.sleep(0)
 
     with playback_loop(QApplication.instance()) as loop:
