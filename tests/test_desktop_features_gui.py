@@ -135,6 +135,13 @@ def test_cache_size_sets_the_player_and_the_opening_buffer_target(window, monkey
         if confirms:
             assert window.cache_size_hint.text() == (
                 "Holds about 2 min at 50 Mbps. Actual length varies with the video.")
+        # Resized while playing: the player follows at once and the server at
+        # its next report, with no restart.
+        window.cache_size_combo.setCurrentIndex(window.cache_size_combo.findData(2048))
+        window.on_cache_size_changed(window.cache_size_combo.currentIndex())
+        assert window.settings.cache_mib == 2048
+        assert sizes == [2048]
+        assert len(opened) == 1
         # Stopping reconnects with a new client to the same server: what its
         # session showed about the server still holds.
         first_client = window.client
@@ -144,12 +151,6 @@ def test_cache_size_sets_the_player_and_the_opening_buffer_target(window, monkey
         # Any other connection forgets it.
         await window._adopt_connected_client(Client(events), {"server_name": "test", "models": []})
         assert "keeps only 10 s" not in window.cache_size_hint.text()
-        window.cache_size_combo.setCurrentIndex(window.cache_size_combo.findData(2048))
-        window.on_cache_size_changed(window.cache_size_combo.currentIndex())
-        assert window.settings.cache_mib == 2048
-        assert sizes == [2048]
-        # The player follows at once and the server at its next report: no restart.
-        assert len(opened) == 1
         assert not errors
     asyncio.run(scenario())
 
