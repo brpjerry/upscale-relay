@@ -138,7 +138,7 @@ def test_accent_from_frame_follows_the_dominant_colour_and_ignores_grey():
     assert neutral.hslSaturationF() < 0.05 and neutral.lightnessF() > 0.9
 
 
-# Bugs caught: 0, False positives: 3
+# Bugs caught: 0, False positives: 4
 def test_accent_choice_persists_and_restyles(window):
     app = QApplication.instance()
     window.show()
