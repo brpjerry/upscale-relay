@@ -3,6 +3,11 @@
 Used by both the server and all clients; keep dependency-free beyond stdlib.
 """
 
+from .buffer import (  # noqa: F401
+    DEFAULT_BUFFER_TARGET_MS,
+    MIN_BUFFER_TARGET_MS,
+    parse_buffer_target_ms,
+)
 from .framing import (  # noqa: F401
     DIR_DOWNLINK,
     DIR_UPLINK,

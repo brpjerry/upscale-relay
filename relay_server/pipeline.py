@@ -29,12 +29,14 @@ import av
 
 from relay_media import AuxiliaryPacketInfo
 from relay_protocol import (
+    DEFAULT_BUFFER_TARGET_MS,
     FLAG_DISCONTINUITY,
     FLAG_EOS,
     FLAG_KEYFRAME,
     MAX_PAYLOAD_BYTES,
     NO_TS,
     MediaPacket,
+    MIN_BUFFER_TARGET_MS,
 )
 from upscale_cli.color import VideoColor, color_tags_of, fill_unspecified
 from upscale_cli.encode import (
@@ -77,8 +79,10 @@ log = logging.getLogger("relay.pipeline")
 # RESUME. The gap is one buffer_report interval (~500 ms) — just enough to
 # stop the pause flag flapping on every report, while keeping the client
 # buffer pinned near HIGH instead of sawtoothing down to a low watermark.
-HIGH_WATERMARK_MS = 10_000
-RESUME_WATERMARK_MS = 9_500
+# HIGH is the client's buffer target (open_session and buffer_report
+# buffer_target_ms), or this default.
+HIGH_WATERMARK_MS = DEFAULT_BUFFER_TARGET_MS
+_RESUME_BAND_MS = 500
 
 _QUEUE_DEPTH = 4  # frames buffered between stages
 # Compressed input waiting for the decode stage. A wire packet may carry up to
@@ -392,6 +396,7 @@ class Pipeline:
         high_bit_depth: str | None = None,
         display_mapper: DisplayMapper | None = None,
         display_target: DisplayTarget | None = None,
+        buffer_target_ms: int = HIGH_WATERMARK_MS,
     ):
         # close() is a native-resource barrier. Install its coordination before
         # constructing any native state so every fully published Pipeline has
@@ -614,6 +619,9 @@ class Pipeline:
             self._seek_keyframe_seen = False  # decode thread
             self._need_discontinuity = True
             self.client_buffered_ms = 0  # last buffer_report value (raw)
+            # The client buffer to keep topped off (docs/PROTOCOL.md §5).
+            self.buffer_target_ms = HIGH_WATERMARK_MS
+            self.set_buffer_target(buffer_target_ms)
             self._client_buffered_at = time.monotonic()
             self.playing = False  # session mirrors PLAYING state here
             self._flush_pending = threading.Event()
@@ -863,6 +871,11 @@ class Pipeline:
     def feed_aux(self, info: AuxiliaryPacketInfo, epoch: int) -> None:
         """Queue one original audio/subtitle packet for stream-copy muxing."""
         self._safe_put(self.in_q, _AuxPacket(epoch=epoch, info=info))
+
+    def set_buffer_target(self, buffer_target_ms: int) -> None:
+        """The client buffer to keep topped off from now on. One attribute
+        the decode stage reads on each check, so no lock."""
+        self.buffer_target_ms = max(MIN_BUFFER_TARGET_MS, int(buffer_target_ms))
 
     def note_buffer_report(self, buffered_ms: int) -> None:
         self.client_buffered_ms = buffered_ms
@@ -1232,10 +1245,10 @@ class Pipeline:
                 continue
 
             # Backpressure: keep the client buffer topped off (docs/PROTOCOL.md S5).
-            if self.buffered_ms_now() > HIGH_WATERMARK_MS:
+            if self.buffered_ms_now() > self.buffer_target_ms:
                 self.stats.paused_for_backpressure = True
                 while (
-                    self.buffered_ms_now() > RESUME_WATERMARK_MS
+                    self.buffered_ms_now() > self.buffer_target_ms - _RESUME_BAND_MS
                     and not self._closed.is_set()
                     and not self._flush_pending.is_set()
                 ):

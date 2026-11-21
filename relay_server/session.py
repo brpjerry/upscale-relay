@@ -13,7 +13,10 @@ from enum import Enum
 from fractions import Fraction
 from typing import Any
 
-from relay_protocol import DIR_DOWNLINK, DIR_UPLINK, FLAG_EOS, NO_TS, MediaPacket, new_token
+from relay_protocol import (
+    DEFAULT_BUFFER_TARGET_MS, DIR_DOWNLINK, DIR_UPLINK, FLAG_EOS, NO_TS, MediaPacket, new_token,
+    parse_buffer_target_ms,
+)
 from relay_media import AuxiliaryTrack, VideoTrack
 from upscale_cli.encode import DEFAULT_LOSSLESS_HEVC_PROFILE
 from upscale_cli.fit import DEFAULT_RESIZE_ALGORITHM, RESIZE_ALGORITHMS
@@ -360,6 +363,13 @@ class Session:
                 return
             if self.display_mapper is None or high_bit_depth is None:
                 display_target = None  # §3.5's stream: nothing to map for
+        # The client buffer the pipeline keeps topped off (PROTOCOL §5).
+        buffer_target_ms = DEFAULT_BUFFER_TARGET_MS
+        if msg.get("buffer_target_ms") is not None:
+            buffer_target_ms = parse_buffer_target_ms(msg["buffer_target_ms"])
+            if buffer_target_ms is None:
+                await self.send("error", code="bad_message", message="invalid buffer_target_ms", fatal=False)
+                return
         requested_attachments = msg.get("aux_attachments", "embedded")
         if requested_attachments not in ("embedded", "cached"):
             await self.send(
@@ -510,6 +520,7 @@ class Session:
                 high_bit_depth=high_bit_depth,
                 display_mapper=self.display_mapper,
                 display_target=display_target,
+                buffer_target_ms=buffer_target_ms,
             )
         except Exception as err:
             if isinstance(err, PipelineConstructionError):
@@ -571,6 +582,7 @@ class Session:
             downlink_dolby_vision=self.pipeline.dolby_vision_rpu,
             source_bit_depth=cfg.bit_depth,
             downlink_mapping=self.pipeline.downlink_mapping,
+            buffer_target_ms=buffer_target_ms,
             **source_metadata,
         )
 
@@ -768,6 +780,11 @@ class Session:
     def handle_buffer_report(self, msg: dict) -> None:
         self.last_buffer_report = time.monotonic()
         if self.pipeline:
+            # A client may resize its buffer as it plays (PROTOCOL §5): the
+            # desktop fits it to its cache at the bitrate it receives.
+            target = parse_buffer_target_ms(msg.get("buffer_target_ms"))
+            if target is not None:
+                self.pipeline.set_buffer_target(target)
             self.pipeline.note_buffer_report(int(msg.get("buffered_ms", 0)))
 
     async def close(self) -> None:
@@ -847,6 +864,7 @@ class Session:
             "stage_ms": p.stats.stage_report(),
             "client_buffered_ms": p.client_buffered_ms,
             "client_buffered_ms_est": round(p.buffered_ms_now()),
+            "buffer_target_ms": p.buffer_target_ms,
             "output": f"{p.out_w}x{p.out_h}",
             "codec": p.downlink_codec,
             "encoder": p.encoder_name,

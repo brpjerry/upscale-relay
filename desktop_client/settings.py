@@ -10,6 +10,19 @@ _APP = "desktop-client"
 FAST_FORWARD_DEFAULT_S = 85  # 1:25, a typical opening sequence
 FAST_FORWARD_MAX_S = 3600
 
+# mpv's cache, in MiB: how much video is held in memory ahead of playback.
+# For a relay stream the server keeps it filled (the client sizes the
+# server's buffer target to it, docs/PROTOCOL.md §5), so lower-bitrate video
+# is buffered further ahead. The default is the size mpv had before it was
+# a setting.
+CACHE_DEFAULT_MIB = 768
+CACHE_CHOICES_MIB = (256, 512, 768, 1024, 1536, 2048, 3072, 4096, 5120)
+
+
+def format_cache_size(mib: int) -> str:
+    """"768 MB", "1.5 GB" (binary units, as mpv counts them)."""
+    return f"{mib / 1024:g} GB" if mib >= 1024 else f"{mib} MB"
+
 
 # The mpv options the settings sheet offers, at mpv's own defaults. The player
 # keeps them itself (it does not read mpv.conf) and sets them on mpv at runtime.
@@ -188,6 +201,17 @@ class AppSettings:
         if value not in MPV_CHOICES.get(name, (value,)):
             raise ValueError(f"{name}={value}")
         self._qs.setValue(f"mpv/{name}", value)
+
+    @property
+    def cache_mib(self) -> int:
+        value = self._qs.value("playback/cache_mib", CACHE_DEFAULT_MIB, type=int)
+        return value if value in CACHE_CHOICES_MIB else CACHE_DEFAULT_MIB
+
+    @cache_mib.setter
+    def cache_mib(self, v: int) -> None:
+        if int(v) not in CACHE_CHOICES_MIB:
+            raise ValueError(f"cache size {v} MiB")
+        self._qs.setValue("playback/cache_mib", int(v))
 
     @property
     def fast_forward_s(self) -> int:

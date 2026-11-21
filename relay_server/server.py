@@ -164,14 +164,14 @@ class RelayServer:
                 "session %s %s%s epoch=%d source=%s | pipeline %5.1f fps | "
                 "onnx %s fps | %s | output=%dx%d codec=%s encoder=%s tier=%s | "
                 "cached frames: in-flight=%d (dec=%d up=%d down=%d) uplink-pkts=%d | "
-                "client buffer %5d ms (est %5d) | %s | frames %d in / %d out",
+                "client buffer %5d ms (est %5d, target %d) | %s | frames %d in / %d out",
                 session.id[:6], session.state.value, " FINAL" if final else "",
                 session.epoch, session.source_kind,
                 p.stats.fps, infer_fps, stage_str,
                 p.out_w, p.out_h, p.downlink_codec, p.encoder_name, p.quality_tier,
                 cached, depths["decoded"], depths["upscaled"],
                 session.down_q.qsize(), depths["in"],
-                p.client_buffered_ms, p.buffered_ms_now(),
+                p.client_buffered_ms, p.buffered_ms_now(), p.buffer_target_ms,
                 "PAUSED(watermark)" if p.stats.paused_for_backpressure else "flowing",
                 p.stats.frames_in, p.stats.frames_out,
             )

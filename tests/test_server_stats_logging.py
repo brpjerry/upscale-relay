@@ -19,6 +19,7 @@ def test_performance_snapshot_includes_status_fields(caplog):
         queue_depths=lambda: {"in": 2, "decoded": 3, "upscaled": 1},
         client_buffered_ms=8400,
         buffered_ms_now=lambda: 8123.0,
+        buffer_target_ms=30000,
         out_w=3840,
         out_h=2160,
         downlink_codec="hevc",
@@ -43,7 +44,7 @@ def test_performance_snapshot_includes_status_fields(caplog):
     assert "onnx  80.0 fps" in message
     assert "decode=3.2ms infer=12.5ms fit_encode=8.1ms" in message
     assert "output=3840x2160 codec=hevc encoder=hevc_nvenc tier=hevc-qp4" in message
-    assert "client buffer  8400 ms (est  8123)" in message
+    assert "client buffer  8400 ms (est  8123, target 30000)" in message
     assert "frames 120 in / 118 out" in message
 
 

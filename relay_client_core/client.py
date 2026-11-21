@@ -39,6 +39,7 @@ from relay_protocol import (
     MediaPacket,
     build_handshake,
     encode_packet,
+    parse_buffer_target_ms,
     read_packet_sync,
 )
 
@@ -365,6 +366,18 @@ class SessionConfig:
     # Vision and HDR10+ for it (capabilities.display_mapping, sent with
     # high_bit_depth). None sends nothing: such sources stream as §3.5 says.
     display_target: DisplayTarget | None = None
+    # open_session.buffer_target_ms: how much video the server keeps buffered
+    # here ahead of playback (docs/PROTOCOL.md §5). None sends nothing, and
+    # the server keeps its default.
+    buffer_target_ms: int | None = None
+
+
+def _confirmed_buffer_target_ms(value: object) -> int | None:
+    """session_opened.buffer_target_ms as the server applies it; None from a
+    server that predates the field, which keeps DEFAULT_BUFFER_TARGET_MS."""
+    if type(value) is int and value > 0:
+        return value
+    return None
 
 
 @dataclass
@@ -415,6 +428,10 @@ class SessionInfo:
     # downlink_color with them.
     display_target: DisplayTarget | None = None
     downlink_mapping: dict | None = None
+    # The client buffer the server keeps topped off (PROTOCOL §5), as it
+    # confirmed it. None: a server that predates the field, which keeps
+    # DEFAULT_BUFFER_TARGET_MS and ignores updates.
+    buffer_target_ms: int | None = None
 
     @property
     def downlink_hdr(self) -> bool:
@@ -466,6 +483,9 @@ class RelayClient:
         # failed: the message the consumer should show for the ended stream.
         self.source_error: str | None = None
         self.buffered_ms = 0  # consumer updates; buffer_report loop sends it
+        # The buffer the server should keep topped off, when the consumer
+        # resizes it as it plays (PROTOCOL §5); None leaves the session's.
+        self.buffer_target_ms: int | None = None
         # Optional UI hooks: called with each session_progress / seek_progress
         # message dict (from the control-reader task, i.e. on the event-loop
         # thread).
@@ -617,8 +637,12 @@ class RelayClient:
             raise ValueError("cached attachments require muxed auxiliary tracks")
         if cfg.high_bit_depth not in (None, "hdr", "all"):
             raise ValueError(f"unknown high bit depth mode: {cfg.high_bit_depth}")
+        buffer_target_ms = parse_buffer_target_ms(cfg.buffer_target_ms)
+        if cfg.buffer_target_ms is not None and buffer_target_ms is None:
+            raise ValueError(f"invalid buffer target: {cfg.buffer_target_ms!r}")
         if self._closing:
             raise ConnectionError("client is closing")
+        self.buffer_target_ms = None  # the consumer sizes it for this session
         video, duration_s, chapters = None, None, []
         capabilities = self.capabilities or {}
         maps_display = bool(cfg.high_bit_depth and cfg.display_target is not None
@@ -681,6 +705,8 @@ class RelayClient:
             fields["high_bit_depth"] = cfg.high_bit_depth
         if maps_display:
             fields["display_target"] = cfg.display_target.to_wire()
+        if buffer_target_ms is not None:
+            fields["buffer_target_ms"] = buffer_target_ms
         if video is not None:
             fields["video"] = video
         try:
@@ -741,6 +767,7 @@ class RelayClient:
             downlink_mapping=(
                 msg["downlink_mapping"] if isinstance(msg.get("downlink_mapping"), dict) else None
             ),
+            buffer_target_ms=_confirmed_buffer_target_ms(msg.get("buffer_target_ms")),
         )
         return self.session
 
@@ -1030,7 +1057,13 @@ class RelayClient:
         # state before the pipeline outruns it.
         while True:
             try:
-                await self._send("buffer_report", buffered_ms=int(self.buffered_ms))
+                fields = {"buffered_ms": int(self.buffered_ms)}
+                # Normalised like the server reads it; an unusable value is
+                # left out rather than ending the reports.
+                target_ms = parse_buffer_target_ms(self.buffer_target_ms)
+                if target_ms is not None:
+                    fields["buffer_target_ms"] = target_ms
+                await self._send("buffer_report", **fields)
             except (ConnectionResetError, RuntimeError) as err:
                 # Only a dead control WS lands here; the session is over. The
                 # server's pacing decays a silent client's last report, so a

@@ -65,7 +65,7 @@ from .chapters import (
     step_target,
 )
 from . import hdr_output, theme
-from .settings import AppSettings, format_skip
+from .settings import CACHE_CHOICES_MIB, CACHE_DEFAULT_MIB, AppSettings, format_cache_size, format_skip
 from .theme import Icons
 from .widgets import (
     AutoHideButton,
@@ -344,6 +344,10 @@ class MainWindow(DesktopFeatures, QMainWindow):
         # (_confirm_previous_release). In memory only, one at a time.
         self._unreleased_session: tuple[str, str, int] | None = None
         self._server_caps: dict = {}
+        # The connected server predates buffer targets (PROTOCOL §5): a
+        # session it opened confirmed none. Kept through the reconnect that
+        # follows each session, cleared by any other connection.
+        self._server_fixed_buffer = False
         self._init_feature_state()
 
         # -- top bar: heading + server connection -----------------------------
@@ -393,6 +397,18 @@ class MainWindow(DesktopFeatures, QMainWindow):
         self.ten_bit_video_check.setChecked(self.settings.ten_bit_video)
         self.tier_combo = QComboBox()
         self.tier_combo.addItem(self.settings.quality_tier, self.settings.quality_tier)
+        # mpv's cache; the server keeps it filled (PROTOCOL §5).
+        self.cache_size_combo = QComboBox()
+        for mib in CACHE_CHOICES_MIB:
+            label = format_cache_size(mib)
+            if mib == CACHE_DEFAULT_MIB:
+                label += " (default)"
+            self.cache_size_combo.addItem(label, mib)
+        self.cache_size_combo.setCurrentIndex(
+            max(0, self.cache_size_combo.findData(self.settings.cache_mib)))
+        self.cache_size_hint = QLabel()
+        self.cache_size_hint.setWordWrap(True)
+        self.cache_size_hint.setProperty("role", "faint")
         # "Fit to screen" letterboxes inside the display; "Crop" requests a
         # frame sized to cover the display and pans/scans off the overflow, so
         # a fullscreen fill shows native (server-upscaled) pixels edge to edge.
@@ -491,6 +507,10 @@ class MainWindow(DesktopFeatures, QMainWindow):
         for label, combo, help_text in (
             ("Upscale model", self.model_combo, "Choose a model available on the server."),
             ("Stream quality", self.tier_combo, "Higher quality can require more network bandwidth."),
+            ("Cache size", self.cache_size_combo,
+             "How much video is held in memory ahead of playback. The server keeps it "
+             "filled, so lower-bitrate video is buffered further ahead and rides out "
+             "longer network dropouts."),
             ("Framing", self.fit_combo, "Fit keeps the whole image; Crop fills the display."),
             ("Resize filter", self.resize_combo, "Choose how the upscaled image is fitted to the display."),
         ):
@@ -501,6 +521,8 @@ class MainWindow(DesktopFeatures, QMainWindow):
             form.addRow(label, combo)
         form.insertRow(1, self.passthrough_4k_check)  # qualifies the model choice
         form.insertRow(3, self.ten_bit_video_check)  # ... and this the stream quality
+        form.insertRow(5, self.cache_size_hint)  # below the cache size
+        self._show_cache_size_hint()
         streaming_layout.addLayout(form)
         streaming_layout.addWidget(self.deband_check)
         streaming_layout.addWidget(self.hdr_output_check)
@@ -619,6 +641,8 @@ class MainWindow(DesktopFeatures, QMainWindow):
         self.video_overlay = PlayerOverlay(self.player)
         if hasattr(self.player, "set_deband"):
             self.player.set_deband(self.settings.deband_enabled)
+        if hasattr(self.player, "set_cache_size"):
+            self.player.set_cache_size(self.settings.cache_mib)
         if hasattr(self.player, "set_hdr_output_enabled"):
             self.player.set_hdr_output_enabled(self.settings.hdr_output)
             self.player.set_auto_hdr_refusals(self.settings.hdr_auto_refused)
@@ -943,6 +967,7 @@ class MainWindow(DesktopFeatures, QMainWindow):
         self.passthrough_4k_check.toggled.connect(self.on_passthrough_4k_changed)
         self.ten_bit_video_check.toggled.connect(self.on_ten_bit_video_changed)
         self.tier_combo.activated.connect(self.on_quality_tier_changed)
+        self.cache_size_combo.activated.connect(self.on_cache_size_changed)
         self.deband_check.toggled.connect(self.on_deband_changed)
         self.hdr_output_check.toggled.connect(self.on_hdr_output_changed)
         if hasattr(self.player, "hdr_surface_stale"):
@@ -1025,6 +1050,7 @@ class MainWindow(DesktopFeatures, QMainWindow):
 
     def _show_connection(self, text: str, *, connected: bool, warn: bool = False) -> None:
         """Reflect the control connection in the sidebar footer and the Connect button."""
+        self._show_cache_size_hint()  # it speaks for the connected server
         self.conn_label.setText(text)
         self.conn_dot.set_state("warn" if warn else "good" if connected else "text_faint")
         self.connect_btn.setText("Disconnect" if connected else "Connect")
@@ -1847,10 +1873,16 @@ class MainWindow(DesktopFeatures, QMainWindow):
         box.setModal(False)
         box.show()
 
-    async def _adopt_connected_client(self, client: RelayClient, caps: dict) -> None:
-        """Install a connected control client and reflect its capabilities."""
+    async def _adopt_connected_client(
+        self, client: RelayClient, caps: dict, *, after_session: bool = False,
+    ) -> None:
+        """Install a connected control client and reflect its capabilities.
+        ``after_session``: the reconnect that follows a confirmed teardown."""
         self._capture_browser()
-        self._browser_endpoint = server_identity(client.host, client.port, caps.get("server_id"))
+        endpoint = server_identity(client.host, client.port, caps.get("server_id"))
+        if not after_session or endpoint != self._browser_endpoint:
+            self._server_fixed_buffer = False
+        self._browser_endpoint = endpoint
         self.client = client
         self._server_caps = dict(caps)
         client.on_progress = self._on_open_progress
@@ -2397,6 +2429,8 @@ class MainWindow(DesktopFeatures, QMainWindow):
             # Dolby Vision and HDR10+ are applied on the server for the display
             # the video is shown on (PROTOCOL §3.6); mpv's renderer cannot.
             display_target=self._display_target(),
+            # Refined from what arrives once playback starts (MpvPlayerView).
+            buffer_target_ms=self._cache_target_estimate_ms(),
             aux_tracks=(
                 "muxed"
                 if source == "server_file" and self._server_caps.get("muxed_aux_tracks")
@@ -2419,6 +2453,8 @@ class MainWindow(DesktopFeatures, QMainWindow):
         self._set_opening(True, f"opening session for {Path(path).name}…")
         try:
             session = await self.client.open_session(cfg)
+            self._server_fixed_buffer = getattr(session, "buffer_target_ms", None) is None
+            self._show_cache_size_hint()
             attachment_root = (
                 Path(QStandardPaths.writableLocation(QStandardPaths.CacheLocation))
                 / "attachments"
@@ -2704,7 +2740,51 @@ class MainWindow(DesktopFeatures, QMainWindow):
     @asyncSlot(int)
     async def on_quality_tier_changed(self, _index: int) -> None:
         self.settings.quality_tier = self._quality_tier()
+        self._show_cache_size_hint()
         await self._restart_for_playback_setting()
+
+    def on_cache_size_changed(self, _index: int) -> None:
+        mib = self.cache_size_combo.currentData()
+        if mib == self.settings.cache_mib:
+            return
+        self.settings.cache_mib = mib
+        # No restart: mpv resizes as it plays, and the server's buffer target
+        # follows at the next buffer report.
+        if hasattr(self.player, "set_cache_size"):
+            self.player.set_cache_size(mib)
+        self._show_cache_size_hint()
+
+    def _tier_mbps(self) -> float | None:
+        """The chosen quality's coarse P95 bitrate; None for lossless."""
+        tier = self._quality_tier()
+        options = self._server_caps.get("quality_options") or []
+        mbps = next((o.get("p95_mbps") for o in options if o.get("id") == tier), None)
+        return mbps if isinstance(mbps, (int, float)) and mbps > 0 else None
+
+    # Lossless qualities have no set bitrate; this is about where 4K runs.
+    _LOSSLESS_MBPS_GUESS = 400
+
+    def _cache_target_estimate_ms(self) -> int:
+        """How long the cache lasts at the chosen quality, before any video
+        has arrived to measure."""
+        mbps = self._tier_mbps() or self._LOSSLESS_MBPS_GUESS
+        return round(self.settings.cache_mib * 1024 * 1024 * 8 / (mbps * 1000))
+
+    def _show_cache_size_hint(self) -> None:
+        """How long the chosen cache holds at the chosen quality."""
+        if self.client is not None and self._server_fixed_buffer:
+            text = "This server keeps only 10 s buffered; update it to fill the cache."
+        elif self.client is None or not self._server_caps.get("quality_options"):
+            text = ""
+        else:
+            seconds = self._cache_target_estimate_ms() / 1000
+            length = f"{seconds:.0f} s" if seconds < 90 else f"{seconds / 60:.0f} min"
+            # A quality's bitrate is a coarse figure (P95 for 4K-ish animation);
+            # say which, rather than promise a length.
+            mbps = self._tier_mbps() or self._LOSSLESS_MBPS_GUESS
+            text = f"Holds about {length} at {mbps:g} Mbps. Actual length varies with the video."
+        self.cache_size_hint.setText(text)
+        self.cache_size_hint.setVisible(bool(text))
 
     @asyncSlot()
     async def on_fit_mode_changed(self) -> None:
@@ -3154,7 +3234,7 @@ class MainWindow(DesktopFeatures, QMainWindow):
                     if unconfirmed:
                         connecting = asyncio.wait_for(connecting, _UNCONFIRMED_RECONNECT_TIMEOUT_S)
                     caps = await connecting
-                    await self._adopt_connected_client(client, caps)
+                    await self._adopt_connected_client(client, caps, after_session=not unconfirmed)
                     return
                 except Exception:
                     await client.close()

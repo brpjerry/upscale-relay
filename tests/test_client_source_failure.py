@@ -68,6 +68,7 @@ def test_source_read_failure_ends_the_downlink_with_the_error(sample_file, monke
     asyncio.run(scenario())
 
 
+# Bugs caught: 0, False positives: 1
 def test_cli_reports_a_source_read_failure_and_exits_nonzero(sample_file, monkeypatch, capsys, tmp_path):
     monkeypatch.setattr(client_module, "VideoTrack", FailingTrack)
 
@@ -79,6 +80,7 @@ def test_cli_reports_a_source_read_failure_and_exits_nonzero(sample_file, monkey
                 host="127.0.0.1", port=server.port, file=sample_file, display="64x64",
                 model="passthrough", tier="lossless-ffv1", fit_mode="fit",
                 resize_algorithm="server-default", high_bit_depth=None, display_target=None, decode=False, mpv=False, save=None,
+                buffer_s=None,
             )
             return await asyncio.wait_for(cli.run(args), 15)
         finally:

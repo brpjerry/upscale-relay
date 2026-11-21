@@ -103,6 +103,58 @@ def test_restart_preserves_pause_tracks_delays_and_latest_settings(window, monke
     asyncio.run(scenario())
 
 
+# Bugs caught: 0, False positives: 2
+@pytest.mark.parametrize("confirms", [True, False])
+def test_cache_size_sets_the_player_and_the_opening_buffer_target(window, monkeypatch, confirms):
+    events, errors = setup_lifecycle(window, monkeypatch)
+    opened, sizes = [], []
+    class Client(LifecycleClient):
+        async def open_session(self, config):
+            opened.append(config.buffer_target_ms)
+            session = await super().open_session(config)
+            if confirms:  # a server that predates the field confirms nothing
+                session.buffer_target_ms = config.buffer_target_ms
+            return session
+    monkeypatch.setattr(main_window, "RelayClient", lambda host, port: Client(events, host, port))
+    monkeypatch.setattr(window.player, "set_cache_size", sizes.append, raising=False)
+    async def scenario():
+        # Connected the way the window connects, so it knows which server.
+        await window._adopt_connected_client(Client(events), await Client(events).connect())
+        await window._start_session("show.mkv", "server_file")
+        # No quality bitrate known: 768 MiB at the 400 Mbps lossless guess.
+        assert opened == [round(768 * 1024 * 1024 * 8 / 400_000)]
+        hint = window.cache_size_hint.text()
+        assert ("keeps only 10 s" in hint) is not confirms
+        # A quality with an advertised bitrate opens with its length, and the
+        # hint says which bitrate it assumed.
+        window._server_caps["quality_options"] = [{"id": "hevc-qp18", "p95_mbps": 50}]
+        window.tier_combo.addItem("HEVC ~50 Mbps", "hevc-qp18")
+        window.tier_combo.setCurrentIndex(window.tier_combo.findData("hevc-qp18"))
+        assert window._cache_target_estimate_ms() == round(768 * 1024 * 1024 * 8 / 50_000)
+        window._show_cache_size_hint()
+        if confirms:
+            assert window.cache_size_hint.text() == (
+                "Holds about 2 min at 50 Mbps. Actual length varies with the video.")
+        # Resized while playing: the player follows at once and the server at
+        # its next report, with no restart.
+        window.cache_size_combo.setCurrentIndex(window.cache_size_combo.findData(2048))
+        window.on_cache_size_changed(window.cache_size_combo.currentIndex())
+        assert window.settings.cache_mib == 2048
+        assert sizes == [2048]
+        assert len(opened) == 1
+        # Stopping reconnects with a new client to the same server: what its
+        # session showed about the server still holds.
+        first_client = window.client
+        await window.on_stop()
+        assert window.client is not None and window.client is not first_client
+        assert ("keeps only 10 s" in window.cache_size_hint.text()) is not confirms
+        # Any other connection forgets it.
+        await window._adopt_connected_client(Client(events), {"server_name": "test", "models": []})
+        assert "keeps only 10 s" not in window.cache_size_hint.text()
+        assert not errors
+    asyncio.run(scenario())
+
+
 def test_stop_supersedes_pending_open_without_late_player_load(window, monkeypatch):
     events, errors = setup_lifecycle(window, monkeypatch)
     async def scenario():
