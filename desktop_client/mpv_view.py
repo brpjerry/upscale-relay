@@ -28,6 +28,7 @@ from PySide6.QtGui import QGuiApplication, QImage, QOpenGLContext, qRgb
 from PySide6.QtOpenGL import QOpenGLFramebufferObject
 from PySide6.QtOpenGLWidgets import QOpenGLWidget
 
+from relay_client_core.buffering import cache_target_ms
 from relay_client_core.client import DisplayTarget
 
 from . import hdr_output
@@ -77,17 +78,9 @@ CACHE_PAUSE_WAIT_S = 0.5
 # With the cache on, mpv reads ahead as far as its size allows (cache-secs is
 # effectively unlimited): a local file reads that far ahead, and for a relay
 # stream the player keeps the server's buffer target at the length that fills
-# it (_cache_target_ms).
+# it (cache_target_ms).
 _CACHE_MIB = 768
 _MIB = 1024 * 1024
-
-
-def _cache_target_ms(cache_bytes: int, cached_ms: int, cached_bytes: object) -> int | None:
-    """How long a buffer fills ``cache_bytes`` at the bitrate of what mpv holds
-    (``cached_bytes`` over ``cached_ms``); None until it holds a second."""
-    if cached_ms < 1000 or not isinstance(cached_bytes, int) or cached_bytes <= 0:
-        return None
-    return round(cache_bytes * cached_ms / cached_bytes)
 
 # Properties the periodic stats read, kept current by mpv's event thread.
 _OBSERVED_PROPERTIES = (
@@ -549,7 +542,8 @@ class MpvPlayerView(QOpenGLWidget):
         else:
             # Deep readahead: mpv's default is ~1s beyond playback, so any
             # pipeline hiccup >1s stuttered even with plenty buffered client-
-            # side. Let mpv itself hold 15s (sized for ~200 Mbps lossless).
+            # side. With the cache on, mpv holds as much as demuxer-max-bytes
+            # allows (_CACHE_MIB, then the "Cache size" setting).
             extra = {
                 "vo": "libmpv",  # render API drives output; no mpv-owned window
                 # No mpv.conf: libmpv loads no configuration by default, and
@@ -2069,15 +2063,15 @@ class MpvPlayerView(QOpenGLWidget):
             if self.client is not None:
                 self.client.buffered_ms = buffered_ms
                 # Keep the server filling the cache, however long that is at
-                # this stream's bitrate; until mpv holds a second, the
-                # session keeps the target it opened with.
+                # this stream's bitrate; until mpv holds a usable sample, the
+                # session keeps the target it has. Bytes and duration from
+                # the same notification: separate properties update apart.
                 state = _prop("demuxer-cache-state")
-                target = _cache_target_ms(
-                    self._cache_bytes, mpv_buffered_ms,
-                    state.get("fw-bytes") if isinstance(state, dict) else None,
-                )
-                if target is not None:
-                    self.client.buffer_target_ms = target
+                if isinstance(state, dict):
+                    held_ms = round((state.get("cache-duration") or 0) * 1000)
+                    target = cache_target_ms(self._cache_bytes, held_ms, state.get("fw-bytes"))
+                    if target is not None:
+                        self.client.buffer_target_ms = target
             stable = self._epoch_released and not self._reloading and not bool(_prop("seeking", False))
             if stable:
                 self._cached_audio_delay = float(_prop("audio-delay", 0) or 0)

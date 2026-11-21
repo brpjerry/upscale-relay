@@ -45,7 +45,7 @@ def test_wire_values_have_a_floor_and_non_numbers_are_rejected():
     assert parse_buffer_target_ms(30_000) == 30_000
     assert parse_buffer_target_ms(30_000.4) == 30_000
     assert parse_buffer_target_ms(1) == MIN_BUFFER_TARGET_MS
-    assert parse_buffer_target_ms(10**9) == 10**9  # no maximum
+    assert parse_buffer_target_ms(10**400) == 10**400  # no maximum, past a float's range
     for bad in (True, "30000", None, [30_000], math.nan, math.inf):
         assert parse_buffer_target_ms(bad) is None
 
@@ -159,15 +159,20 @@ def test_server_confirms_the_requested_target(sample_file):
                 # /status reports each live session's target...
                 live = next(iter(server.sessions.values()))
                 assert live.status()["pipeline"]["buffer_target_ms"] == 45_000
-                # ...which any buffer report may replace.
-                await client._send("buffer_report", buffered_ms=0, buffer_target_ms=90_000)
+                # ...which a report without one, or with garbage, keeps. Each
+                # report carries its own depth, to know it was handled.
+                for depth, fields in enumerate(({}, {"buffer_target_ms": "x"}), start=1):
+                    await client._send("buffer_report", buffered_ms=depth, **fields)
+                    async with asyncio.timeout(5):
+                        while live.pipeline.client_buffered_ms != depth:
+                            await asyncio.sleep(0.02)
+                    assert live.status()["pipeline"]["buffer_target_ms"] == 45_000
+                # The periodic reporter carries a new one once media attaches.
+                await client.attach_media()
+                client.buffer_target_ms = 90_000
                 async with asyncio.timeout(5):
                     while live.status()["pipeline"]["buffer_target_ms"] != 90_000:
                         await asyncio.sleep(0.02)
-                await client._send("buffer_report", buffered_ms=0)  # absent keeps it
-                await client._send("buffer_report", buffered_ms=0, buffer_target_ms="x")
-                await asyncio.sleep(0.2)
-                assert live.status()["pipeline"]["buffer_target_ms"] == 90_000
             finally:
                 await client.teardown()
             # No request keeps the default; there is no maximum.
@@ -224,16 +229,19 @@ def test_desktop_cache_setting_keeps_to_the_offered_choices():
 
 
 # Bugs caught: 0, False positives: 0
-def test_desktop_target_is_how_long_the_cache_lasts_at_the_held_bitrate():
-    pytest.importorskip("PySide6")
-    from desktop_client.mpv_view import _cache_target_ms
+def test_target_is_how_long_the_cache_lasts_at_the_held_bitrate():
+    from relay_client_core.buffering import cache_target_ms
 
     mib = 1024 * 1024
     # 25 MiB held for 4 s is 50 Mbps-ish: 768 MiB lasts 30.72 x 4 s.
-    assert _cache_target_ms(768 * mib, 4000, 25 * mib) == 122_880
+    assert cache_target_ms(768 * mib, 4000, 25 * mib) == 122_880
     # Twice the bitrate in the same memory, half as long.
-    assert _cache_target_ms(768 * mib, 4000, 50 * mib) == 61_440
+    assert cache_target_ms(768 * mib, 4000, 50 * mib) == 61_440
     # Under a second held, or nothing known: keep the target the session has.
-    assert _cache_target_ms(768 * mib, 999, 25 * mib) is None
-    assert _cache_target_ms(768 * mib, 4000, None) is None
-    assert _cache_target_ms(768 * mib, 4000, 0) is None
+    assert cache_target_ms(768 * mib, 999, 25 * mib) is None
+    assert cache_target_ms(768 * mib, 4000, None) is None
+    assert cache_target_ms(768 * mib, 4000, 0) is None
+    assert cache_target_ms(768 * mib, 0, 25 * mib) is None
+    # A full cache that holds under a second (a stream above ~2 Gbps in
+    # 256 MiB) is the whole story: its length is the target.
+    assert cache_target_ms(256 * mib, 860, 256 * mib) == 860

@@ -129,7 +129,7 @@ def test_relay_buffer_target_fills_the_cache_at_the_streams_bitrate(tmp_path, lo
             # Paused with the whole file held, the cached bitrate is fixed.
             await wait_until(lambda: client.buffer_target_ms is not None)
             state = player.mpv.demuxer_cache_state
-            held_ms = int(player.mpv.demuxer_cache_duration * 1000)
+            held_ms = state["cache-duration"] * 1000
             assert held_ms >= 1000
             expected = 256 * mib * held_ms / state["fw-bytes"]
             assert client.buffer_target_ms == pytest.approx(expected, rel=0.02)

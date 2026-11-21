@@ -526,7 +526,8 @@ Rules that make this airtight:
 - The desktop client sizes it to its player's cache (the "Cache size"
   setting): it opens with the cache's length at the quality's nominal
   bitrate, then sends the cache size over the bitrate of what its player
-  holds once that is a second or more. Lower-bitrate video is buffered
+  holds once that is a second or more, or the whole cache (a stream fast
+  enough to fill it in under a second). Lower-bitrate video is buffered
   further ahead in the same memory.
 - The estimate is the last reported `buffered_ms` decayed by wall time while
   PLAYING (the client consumes in real time). Pacing must never act on a raw

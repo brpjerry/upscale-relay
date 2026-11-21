@@ -405,9 +405,6 @@ class MainWindow(DesktopFeatures, QMainWindow):
         self.cache_size_hint = QLabel()
         self.cache_size_hint.setWordWrap(True)
         self.cache_size_hint.setProperty("role", "faint")
-        # The open session's server predates buffer targets: it keeps 10 s
-        # however large the cache.
-        self._server_fixed_buffer = False
         # "Fit to screen" letterboxes inside the display; "Crop" requests a
         # frame sized to cover the display and pans/scans off the overflow, so
         # a fullscreen fill shows native (server-upscaled) pixels edge to edge.
@@ -1049,6 +1046,7 @@ class MainWindow(DesktopFeatures, QMainWindow):
 
     def _show_connection(self, text: str, *, connected: bool, warn: bool = False) -> None:
         """Reflect the control connection in the sidebar footer and the Connect button."""
+        self._show_cache_size_hint()  # it speaks for the connected server
         self.conn_label.setText(text)
         self.conn_dot.set_state("warn" if warn else "good" if connected else "text_faint")
         self.connect_btn.setText("Disconnect" if connected else "Connect")
@@ -1899,7 +1897,6 @@ class MainWindow(DesktopFeatures, QMainWindow):
             tier_index = 0
         self.tier_combo.setCurrentIndex(tier_index)
         self.tier_combo.blockSignals(False)
-        self._show_cache_size_hint()
         selected_resize = self.settings.resize_algorithm or None
         self.resize_combo.blockSignals(True)
         self.resize_combo.clear()
@@ -2446,7 +2443,6 @@ class MainWindow(DesktopFeatures, QMainWindow):
         self._set_opening(True, f"opening session for {Path(path).name}…")
         try:
             session = await self.client.open_session(cfg)
-            self._server_fixed_buffer = getattr(session, "buffer_target_ms", None) is None
             self._show_cache_size_hint()
             attachment_root = (
                 Path(QStandardPaths.writableLocation(QStandardPaths.CacheLocation))
@@ -2765,19 +2761,19 @@ class MainWindow(DesktopFeatures, QMainWindow):
 
     def _show_cache_size_hint(self) -> None:
         """How long the chosen cache holds at the chosen quality."""
-        if self._server_fixed_buffer:
+        session = getattr(self.client, "session", None)
+        if session is not None and getattr(session, "buffer_target_ms", None) is None:
+            # The connected server predates buffer targets (PROTOCOL §5).
             text = "This server keeps only 10 s buffered; update it to fill the cache."
-        elif not self._server_caps.get("quality_options"):
+        elif self.client is None or not self._server_caps.get("quality_options"):
             text = ""
         else:
             seconds = self._cache_target_estimate_ms() / 1000
             length = f"{seconds:.0f} s" if seconds < 90 else f"{seconds / 60:.0f} min"
-            if self._tier_mbps() is None:
-                text = (f"Holds about {length} of lossless video at "
-                        f"{self._LOSSLESS_MBPS_GUESS} Mbps; lower bitrates hold more.")
-            else:
-                # The quality's bitrate is a P95 figure: most video holds longer.
-                text = f"Holds about {length} or more of video at this quality."
+            # A quality's bitrate is a coarse figure (P95 for 4K-ish animation);
+            # say which, rather than promise a length.
+            mbps = self._tier_mbps() or self._LOSSLESS_MBPS_GUESS
+            text = f"Holds about {length} at {mbps:g} Mbps. Actual length varies with the video."
         self.cache_size_hint.setText(text)
         self.cache_size_hint.setVisible(bool(text))
 

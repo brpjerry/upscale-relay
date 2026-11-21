@@ -124,6 +124,16 @@ def test_cache_size_sets_the_player_and_the_opening_buffer_target(window, monkey
         assert opened == [round(768 * 1024 * 1024 * 8 / 400_000)]
         hint = window.cache_size_hint.text()
         assert ("keeps only 10 s" in hint) is not confirms
+        # A quality with an advertised bitrate opens with its length, and the
+        # hint says which bitrate it assumed.
+        window._server_caps["quality_options"] = [{"id": "hevc-qp18", "p95_mbps": 50}]
+        window.tier_combo.addItem("HEVC ~50 Mbps", "hevc-qp18")
+        window.tier_combo.setCurrentIndex(window.tier_combo.findData("hevc-qp18"))
+        assert window._cache_target_estimate_ms() == round(768 * 1024 * 1024 * 8 / 50_000)
+        window._show_cache_size_hint()
+        if confirms:
+            assert window.cache_size_hint.text() == (
+                "Holds about 2 min at 50 Mbps. Actual length varies with the video.")
         window.cache_size_combo.setCurrentIndex(window.cache_size_combo.findData(2048))
         window.on_cache_size_changed(window.cache_size_combo.currentIndex())
         assert window.settings.cache_mib == 2048

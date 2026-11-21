@@ -20,7 +20,7 @@ from fractions import Fraction
 
 import av
 
-from relay_protocol import NO_TS
+from relay_protocol import NO_TS, parse_buffer_target_ms
 from relay_protocol.video import RESIZE_ALGORITHMS
 
 from .client import DisplayTarget, RelayClient, SessionConfig
@@ -97,7 +97,7 @@ async def _run_session(args, client, resources: ExitStack) -> int:
         display_w=int(dw), display_h=int(dh), fit_mode=args.fit_mode,
         resize_algorithm=None if args.resize_algorithm == "server-default" else args.resize_algorithm,
         high_bit_depth=args.high_bit_depth, display_target=args.display_target,
-        buffer_target_ms=None if args.buffer_s is None else round(args.buffer_s * 1000),
+        buffer_target_ms=None if args.buffer_s is None else parse_buffer_target_ms(args.buffer_s * 1000),
     ))
     print(f"session {session.session_id}: downlink {session.downlink_codec} "
           f"{session.downlink_width}x{session.downlink_height} {session.downlink_bit_depth}-bit"
@@ -281,6 +281,8 @@ def main() -> None:
     parser.add_argument("--mpv", action="store_true", help="pipe downlink video into mpv")
     parser.add_argument("--save", help="write raw downlink bitstream to file")
     args = parser.parse_args()
+    if args.buffer_s is not None and parse_buffer_target_ms(args.buffer_s * 1000) is None:
+        parser.error("--buffer-s must be a finite number of seconds")
     raise SystemExit(asyncio.run(run(args)))
 
 

@@ -23,6 +23,6 @@ def parse_buffer_target_ms(value: object) -> int | None:
     """
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    if not math.isfinite(value):
-        return None
+    if isinstance(value, float) and not math.isfinite(value):
+        return None  # (an int is always finite; isfinite would overflow on a huge one)
     return max(MIN_BUFFER_TARGET_MS, int(round(value)))

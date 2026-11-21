@@ -637,7 +637,8 @@ class RelayClient:
             raise ValueError("cached attachments require muxed auxiliary tracks")
         if cfg.high_bit_depth not in (None, "hdr", "all"):
             raise ValueError(f"unknown high bit depth mode: {cfg.high_bit_depth}")
-        if cfg.buffer_target_ms is not None and parse_buffer_target_ms(cfg.buffer_target_ms) is None:
+        buffer_target_ms = parse_buffer_target_ms(cfg.buffer_target_ms)
+        if cfg.buffer_target_ms is not None and buffer_target_ms is None:
             raise ValueError(f"invalid buffer target: {cfg.buffer_target_ms!r}")
         if self._closing:
             raise ConnectionError("client is closing")
@@ -704,8 +705,8 @@ class RelayClient:
             fields["high_bit_depth"] = cfg.high_bit_depth
         if maps_display:
             fields["display_target"] = cfg.display_target.to_wire()
-        if cfg.buffer_target_ms is not None:
-            fields["buffer_target_ms"] = int(cfg.buffer_target_ms)
+        if buffer_target_ms is not None:
+            fields["buffer_target_ms"] = buffer_target_ms
         if video is not None:
             fields["video"] = video
         try:
@@ -1057,8 +1058,11 @@ class RelayClient:
         while True:
             try:
                 fields = {"buffered_ms": int(self.buffered_ms)}
-                if self.buffer_target_ms is not None:
-                    fields["buffer_target_ms"] = int(self.buffer_target_ms)
+                # Normalised like the server reads it; an unusable value is
+                # left out rather than ending the reports.
+                target_ms = parse_buffer_target_ms(self.buffer_target_ms)
+                if target_ms is not None:
+                    fields["buffer_target_ms"] = target_ms
                 await self._send("buffer_report", **fields)
             except (ConnectionResetError, RuntimeError) as err:
                 # Only a dead control WS lands here; the session is over. The
