@@ -23,7 +23,8 @@ class Client:
     async def open_session(self, config):
         return SimpleNamespace(session_id="test", downlink_codec="ffv1",
                                downlink_width=32, downlink_height=32, downlink_bit_depth=8,
-                               downlink_hdr=False, downlink_dolby_vision=False)
+                               downlink_hdr=False, downlink_dolby_vision=False,
+                               buffer_target_ms=None)
 
     async def attach_media(self):
         pass
@@ -48,9 +49,10 @@ def arguments(**extra):
     return SimpleNamespace(**dict(host="localhost", port=1, file="unused",
         display="32x32", model="passthrough", tier="lossless-ffv1",
         fit_mode="fit", resize_algorithm="server-default", high_bit_depth=None, display_target=None, mpv=False,
-        save=None, **extra))
+        save=None, buffer_s=None, **extra))
 
 
+# Bugs caught: 0, False positives: 1
 def test_playback_memory_does_not_grow_with_received_video(monkeypatch):
     def packets():
         for i in range(64):
@@ -69,6 +71,7 @@ def test_playback_memory_does_not_grow_with_received_video(monkeypatch):
     assert client.closed
 
 
+# Bugs caught: 0, False positives: 1
 def test_decode_spool_keeps_only_latest_epoch_and_is_closed(monkeypatch):
     packets = [MediaPacket(b"old", pts=0),
                MediaPacket(b"new", flags=FLAG_DISCONTINUITY, epoch=1, pts=1),
@@ -101,6 +104,7 @@ def test_decode_spool_keeps_only_latest_epoch_and_is_closed(monkeypatch):
     assert client.closed
 
 
+# Bugs caught: 0, False positives: 1
 def test_consumer_failure_closes_client(monkeypatch):
     client = Client([])  # unexpected iterator exhaustion in the receiver
     monkeypatch.setattr(cli, "RelayClient", lambda *args: client)
