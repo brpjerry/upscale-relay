@@ -87,6 +87,15 @@ def main(argv: list[str] | None = None) -> int:
 
     parser = _build_parser()
     args = parser.parse_args(argv)
+    if sys.platform.startswith("linux") and args.command in ("run", "bench"):
+        # The relay server's managed ONNX Runtime/TensorRT, when installed
+        # (relay-server --install-nvidia-runtime), before onnxruntime imports.
+        try:
+            from relay_server.runtime_bootstrap import activate_runtime
+        except ImportError:
+            pass
+        else:
+            activate_runtime()
 
     if args.command == "info":
         print_info(args.input)

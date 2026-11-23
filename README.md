@@ -16,6 +16,8 @@ subtitle fonts by content hash instead of reopening the full source file.
 - **[Windows setup](docs/CLIENT_WINDOWS.md)** — desktop/libmpv and development
   environment
 - **[Linux setup](docs/CLIENT_LINUX.md)** — desktop client installation
+- **[Linux server](docs/SERVER_LINUX.md)** — Arch package, systemd user
+  service, and the NVIDIA runtime
 - **[Android client](https://github.com/brpjerry/upscale-relay-android)** — Kotlin/Compose client
   (separate repository)
 
@@ -110,6 +112,11 @@ interpreter path left in every other launcher and in the activate scripts:
 `tools/relocate_venv.py` takes `--dry-run` and reports each file it would
 touch. `--no-build-isolation` keeps the reinstall offline by using the
 setuptools already in the venv.
+
+On Arch Linux the server ships as a pacman package with a systemd user unit; it
+takes CUDA and cuDNN from Arch and installs only ONNX Runtime and TensorRT,
+with an explicit `relay-server --install-nvidia-runtime`. See the
+[Linux server setup](docs/SERVER_LINUX.md).
 
 On Windows the server also ships as a double-click tray app: `relay-server-gui`
 (the `upscale-relay-server-gui.exe` release binary, installable from source with

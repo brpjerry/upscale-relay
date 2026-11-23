@@ -46,3 +46,48 @@ def test_tensorrt_wheel_dirs_are_registered_on_windows_only(tmp_path, monkeypatc
         # the helper used to call the Windows-only os.add_dll_directory here.
         assert os.environ["PATH"] == "original"
         assert added == []
+
+
+# Bugs caught: 0, False positives: 0
+def test_active_runtime_goes_first_and_preloads_tensorrt(tmp_path, monkeypatch):
+    # The worker inherits the runtime through the environment. ORT's TensorRT
+    # provider has no RUNPATH, so without the preload a process that started
+    # before LD_LIBRARY_PATH was set silently fell back to the CPU provider.
+    import ctypes
+
+    infer = load_infer(monkeypatch)
+    runtime = tmp_path / "runtime"
+    libs = runtime / "tensorrt_libs"
+    libs.mkdir(parents=True)
+    for name in ("libnvinfer.so.10", "libnvinfer_plugin.so.10", "libnvonnxparser.so.10"):
+        (libs / name).write_bytes(b"")
+    loaded = []
+    monkeypatch.setattr(ctypes, "CDLL", lambda path, mode=0: loaded.append((path, mode)))
+    monkeypatch.setattr(sys, "path", ["/usr/lib/site-packages"])
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setenv("UPSCALE_RELAY_ACTIVE_RUNTIME", str(runtime))
+
+    infer._use_active_runtime()
+
+    assert sys.path == [str(runtime), "/usr/lib/site-packages"]
+    assert [Path(path).name for path, _ in loaded] == [
+        "libnvinfer.so.10", "libnvinfer_plugin.so.10", "libnvonnxparser.so.10",
+    ]
+    assert all(mode == ctypes.RTLD_GLOBAL for _, mode in loaded)
+
+
+def test_no_active_runtime_changes_nothing(tmp_path, monkeypatch):
+    infer = load_infer(monkeypatch)
+    monkeypatch.setattr(sys, "path", ["/usr/lib/site-packages"])
+    monkeypatch.delenv("UPSCALE_RELAY_ACTIVE_RUNTIME", raising=False)
+    infer._use_active_runtime()
+    assert sys.path == ["/usr/lib/site-packages"]
+
+
+def test_tensorrt_cache_follows_the_model(tmp_path, monkeypatch):
+    infer = load_infer(monkeypatch)
+    cache = tmp_path / "models" / ".trt_cache"
+    options = infer._trt_options(cache)
+    assert options["trt_engine_cache_path"] == str(cache)
+    assert options["trt_timing_cache_path"] == str(cache)
+    assert cache.is_dir()

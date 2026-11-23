@@ -1,0 +1,126 @@
+name: Arch packages
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        type: string
+        default: ''
+      tag:
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Install Arch build dependencies
+        run: |
+          pacman -Syu --noconfirm --needed git python-build python-installer \
+            python-setuptools python-wheel
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+      - name: Stage source and build as an unprivileged user
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          args=()
+          if [[ -n "$RELEASE_TAG" ]]; then args+=(--tag "$RELEASE_TAG"); fi
+          python packaging/arch/prepare.py /tmp/arch-packages "${args[@]}"
+          useradd --create-home builder
+          chown -R builder:builder /tmp/arch-packages
+          runuser -u builder -- bash -c 'cd /tmp/arch-packages && makepkg --noconfirm'
+      - name: Collect packages and checksums
+        run: |
+          mkdir -p dist
+          cp /tmp/arch-packages/*.pkg.tar.zst dist/
+          cd dist
+          sha256sum ./*.pkg.tar.zst > SHA256SUMS
+          cat SHA256SUMS
+      - uses: actions/upload-artifact@v7
+        with:
+          name: upscale-relay-pacman
+          path: |
+            dist/*.pkg.tar.zst
+            dist/SHA256SUMS
+          if-no-files-found: error
+
+  client-smoke:
+    needs: build
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+      - uses: actions/download-artifact@v8
+        with:
+          name: upscale-relay-pacman
+          path: dist
+      - name: Install the client packages and their Arch dependencies
+        run: |
+          pacman -Syu --noconfirm desktop-file-utils
+          pacman -U --noconfirm dist/upscale-relay-common-*.pkg.tar.zst \
+            dist/upscale-relay-client-*.pkg.tar.zst
+      - name: Smoke test the installed client
+        timeout-minutes: 2
+        run: |
+          # Run outside the checkout so missing packaged modules cannot be masked.
+          cd /tmp
+          relay-client --help
+          relay-desktop --help
+          python -I "$GITHUB_WORKSPACE/packaging/arch/smoke.py"
+          desktop-file-validate /usr/share/applications/upscale-relay-client.desktop
+          test ! -e /usr/bin/relay-server
+          test ! -e /usr/bin/relay-server-gui
+          test ! -e /usr/bin/upscale-cli
+
+  server-smoke:
+    needs: build
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+      - uses: actions/download-artifact@v8
+        with:
+          name: upscale-relay-pacman
+          path: dist
+      - name: Install the server packages without the NVIDIA stack
+        run: |
+          pacman -Syu --noconfirm python-onnxruntime-cpu
+          # No GPU here: assume CUDA (~3 GB), cuDNN and the driver rather than
+          # download them. The client package brings the tray GUI's theme.
+          pacman -U --noconfirm \
+            --assume-installed 'libcudart.so=13-64' \
+            --assume-installed 'libcublas.so=13-64' \
+            --assume-installed 'cudnn=9' \
+            --assume-installed 'nvidia-utils=999' \
+            dist/upscale-relay-common-*.pkg.tar.zst \
+            dist/upscale-relay-client-*.pkg.tar.zst \
+            dist/upscale-relay-server-*.pkg.tar.zst
+      - name: Smoke test the installed server
+        timeout-minutes: 5
+        run: |
+          cd /tmp
+          relay-server --help
+          upscale-cli --help
+          python -I "$GITHUB_WORKSPACE/packaging/arch/smoke_server.py"

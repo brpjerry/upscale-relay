@@ -671,8 +671,30 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--no-mdns", action="store_true",
         help="do not advertise _upscalerelay._tcp over mDNS/DNS-SD",
     )
+    parser.add_argument(
+        "--install-nvidia-runtime", action="store_true",
+        help="download and verify the pinned ONNX Runtime and TensorRT for model "
+             "sessions (Linux: about 4 GB, into ~/.local/share/upscale-relay/runtimes; "
+             "CUDA and cuDNN come from the system), then exit",
+    )
     parser.add_argument("-v", "--verbose", action="store_true")
     return parser
+
+
+def _activate_linux_runtime() -> None:
+    """Linux: put the managed NVIDIA runtime in place before anything imports
+    onnxruntime, or say how to get one.  Passthrough sessions never need it."""
+    import importlib.util
+
+    from .runtime_bootstrap import activate_runtime, runtime_dir
+
+    if activate_runtime():
+        log.info("NVIDIA runtime: %s", runtime_dir())
+    elif importlib.util.find_spec("onnxruntime") is None:
+        log.warning(
+            "ONNX Runtime is not installed, so only passthrough sessions can run. "
+            "Install the TensorRT runtime with: relay-server --install-nvidia-runtime"
+        )
 
 
 def main() -> None:
@@ -689,8 +711,14 @@ def main() -> None:
         pass
 
     args = build_arg_parser().parse_args()
+    if args.install_nvidia_runtime:
+        from .runtime_bootstrap import install_runtime
+
+        sys.exit(install_runtime())
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
                         format="%(asctime)s %(name)s %(levelname)s %(message)s")
+    if sys.platform.startswith("linux"):
+        _activate_linux_runtime()
     from .instance_lock import AlreadyRunningError, acquire_instance_lock
 
     try:

@@ -7,8 +7,8 @@ on:
   workflow_dispatch:
 
 jobs:
-  client-pacman:
-    uses: ./.github/workflows/client-pacman.yml
+  arch-packages:
+    uses: ./.github/workflows/arch-packages.yml
 
   linux-gui:
     runs-on: ubuntu-latest

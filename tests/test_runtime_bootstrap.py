@@ -6,6 +6,8 @@ import sys
 import tomllib
 from pathlib import Path
 
+import pytest
+
 from relay_server import runtime_bootstrap as runtime
 
 
@@ -53,6 +55,7 @@ def test_runtime_ready_requires_matching_marker(monkeypatch, tmp_path):
 
 def test_install_publishes_only_after_validation(monkeypatch, tmp_path):
     target = _use_temp_runtime(monkeypatch, tmp_path)
+    monkeypatch.setattr(runtime, "missing_system_libraries", lambda: [])
     events = []
 
     def fake_pip(staging):
@@ -76,6 +79,7 @@ def test_install_publishes_only_after_validation(monkeypatch, tmp_path):
 
 def test_failed_install_is_not_activated(monkeypatch, tmp_path):
     target = _use_temp_runtime(monkeypatch, tmp_path)
+    monkeypatch.setattr(runtime, "missing_system_libraries", lambda: [])
     monkeypatch.setattr(runtime, "_run_pip", lambda _target: 9)
 
     assert runtime.install_runtime() == 1
@@ -90,6 +94,7 @@ def _write_dll(path: Path) -> Path:
 
 
 def test_activate_adds_external_packages_and_native_dll_dirs(monkeypatch, tmp_path):
+    monkeypatch.setattr(runtime, "_LINUX", False)
     target = _use_temp_runtime(monkeypatch, tmp_path)
     # cuDNN keeps its libraries directly under bin/, while the CUDA 13 wheels
     # nest theirs one level deeper; both directories must be exposed.
@@ -143,13 +148,13 @@ def test_native_library_check_accepts_per_architecture_builder_resources(tmp_pat
     ):
         target = tmp_path / f"runtime-{len(resources)}"
         _populate_native_libraries(target, resources)
-        assert runtime._native_library_check(target)[1] == []
+        assert runtime._native_library_check(target, linux=False)[1] == []
 
 
 def test_native_library_check_reports_absent_builder_resource(tmp_path):
     target = tmp_path / "runtime"
     _populate_native_libraries(target, ())
-    _, missing = runtime._native_library_check(target)
+    _, missing = runtime._native_library_check(target, linux=False)
     assert len(missing) == 1
     assert "nvinfer_builder_resource" in missing[0]
 
@@ -197,3 +202,130 @@ def test_source_extra_matches_first_run_package_pins():
     assert set(project["project"]["optional-dependencies"]["nvidia"]) == set(
         runtime.NVIDIA_RUNTIME_PACKAGES
     )
+
+
+def test_linux_runtime_pins_match_the_source_extra():
+    # Linux installs two of the same wheels; CUDA and cuDNN are the system's.
+    with open(Path(__file__).parents[1] / "pyproject.toml", "rb") as stream:
+        project = tomllib.load(stream)
+    assert set(runtime.LINUX_RUNTIME_PACKAGES) <= set(
+        project["project"]["optional-dependencies"]["nvidia"]
+    )
+
+
+def _ready_runtime(monkeypatch, tmp_path: Path) -> Path:
+    target = _use_temp_runtime(monkeypatch, tmp_path)
+    target.mkdir()
+    (target / ".runtime-ready.json").write_text(
+        json.dumps({"stack_id": runtime.RUNTIME_STACK_ID}), encoding="utf-8",
+    )
+    return target
+
+
+# Bugs caught: 0, False positives: 0
+def test_linux_activation_puts_the_runtime_first(monkeypatch, tmp_path):
+    # A system python-onnxruntime* must not win over the runtime's TensorRT
+    # build, and the worker learns where TensorRT is only from its environment.
+    monkeypatch.setattr(runtime, "_LINUX", True)
+    target = _ready_runtime(monkeypatch, tmp_path)
+    monkeypatch.setattr(sys, "path", ["/usr/lib/python3/site-packages"])
+    monkeypatch.setenv("LD_LIBRARY_PATH", "/opt/other")
+    monkeypatch.setenv("PATH", "original")
+    monkeypatch.delenv("UPSCALE_RELAY_ACTIVE_RUNTIME", raising=False)
+
+    assert runtime.activate_runtime()
+    assert runtime.activate_runtime()  # idempotent
+
+    assert sys.path == [str(target), "/usr/lib/python3/site-packages"]
+    assert os.environ["LD_LIBRARY_PATH"] == os.pathsep.join(
+        [str(target / "tensorrt_libs"), "/opt/other"]
+    )
+    assert os.environ["UPSCALE_RELAY_ACTIVE_RUNTIME"] == str(target)
+    assert os.environ["PATH"] == "original"
+
+
+# Bugs caught: 0, False positives: 0
+def test_linux_installs_only_ort_and_tensorrt_without_dependencies(monkeypatch, tmp_path):
+    import types
+
+    calls = []
+    fake = types.ModuleType("pip._internal.cli.main")
+    fake.main = lambda args: calls.append(args) or 0
+    monkeypatch.setitem(sys.modules, "pip._internal.cli.main", fake)
+    monkeypatch.setattr(runtime, "_prepare_pip_resources", lambda: None)
+
+    monkeypatch.setattr(runtime, "_LINUX", True)
+    assert runtime._run_pip(tmp_path) == 0
+    assert "--no-deps" in calls[0]
+    assert calls[0][-2:] == list(runtime.LINUX_RUNTIME_PACKAGES)
+
+    monkeypatch.setattr(runtime, "_LINUX", False)
+    assert runtime._run_pip(tmp_path) == 0
+    assert "--no-deps" not in calls[1]
+    assert calls[1][-len(runtime.NVIDIA_RUNTIME_PACKAGES):] == list(
+        runtime.NVIDIA_RUNTIME_PACKAGES
+    )
+
+
+# Bugs caught: 0, False positives: 0
+def test_install_stops_before_downloading_without_system_cuda(monkeypatch, tmp_path, capsys):
+    target = _use_temp_runtime(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        runtime, "missing_system_libraries", lambda: ["libcudnn.so.9 (package cudnn)"],
+    )
+    monkeypatch.setattr(runtime, "_run_pip", lambda *a, **k: pytest.fail("downloaded"))
+
+    assert runtime.install_runtime() == 1
+    assert "libcudnn.so.9 (package cudnn)" in capsys.readouterr().err
+    assert not target.exists()
+
+
+def test_linux_prune_drops_only_windows_builder_resources(monkeypatch, tmp_path):
+    monkeypatch.setattr(runtime, "_LINUX", True)
+    libs = tmp_path / "tensorrt_libs"
+    libs.mkdir()
+    names = (
+        "libnvinfer.so.10",
+        "libnvinfer_builder_resource_sm120.so.10.16.1",
+        "libnvinfer_builder_resource_win_sm120.so.10.16.1",
+        "libnvinfer_builder_resource_win_ptx.so.10.16.1",
+    )
+    for name in names:
+        (libs / name).write_bytes(b"")
+    runtime._prune_runtime(tmp_path)
+    assert sorted(path.name for path in libs.iterdir()) == sorted(names[:2])
+
+
+def test_linux_native_library_check(tmp_path):
+    libs = tmp_path / "tensorrt_libs"
+    libs.mkdir()
+    for name in (*runtime._TENSORRT_LINUX_LIBRARIES,
+                 "libnvinfer_builder_resource_sm120.so.10.16.1"):
+        (libs / name).write_bytes(b"")
+    capi = tmp_path / "onnxruntime" / "capi"
+    capi.mkdir(parents=True)
+    (capi / "libonnxruntime_providers_tensorrt.so").write_bytes(b"")
+    libraries, missing = runtime._native_library_check(tmp_path, linux=True)
+    assert missing == []
+    assert libraries[0].name == "libnvinfer.so.10"
+
+    (libs / "libnvinfer_builder_resource_sm120.so.10.16.1").unlink()
+    (libs / "libnvonnxparser.so.10").unlink()
+    _, missing = runtime._native_library_check(tmp_path, linux=True)
+    assert len(missing) == 2
+
+
+def test_missing_system_libraries_names_the_arch_package(monkeypatch):
+    import ctypes
+
+    monkeypatch.setattr(runtime, "_LINUX", True)
+
+    def fake_cdll(name, *args, **kwargs):
+        if name == "libcudnn.so.9":
+            raise OSError(name)
+        return object()
+
+    monkeypatch.setattr(ctypes, "CDLL", fake_cdll)
+    assert runtime.missing_system_libraries() == ["libcudnn.so.9 (package cudnn)"]
+    monkeypatch.setattr(runtime, "_LINUX", False)
+    assert runtime.missing_system_libraries() == []

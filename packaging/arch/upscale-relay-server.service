@@ -1,0 +1,17 @@
+[Unit]
+Description=Upscale Relay server
+Documentation=https://github.com/brpjerry/upscale-relay/blob/main/docs/SERVER_LINUX.md
+
+[Service]
+Type=exec
+# Extra relay-server options, e.g. RELAY_SERVER_ARGS=--library /srv/video --ep tensorrt
+# (split on whitespace: use `systemctl --user edit` for paths with spaces).
+Environment=RELAY_SERVER_ARGS=
+EnvironmentFile=-%E/upscale-relay/server.env
+ExecStartPre=/usr/bin/mkdir -p %h/.local/share/upscale-relay/models
+ExecStart=/usr/bin/relay-server --models-dir %h/.local/share/upscale-relay/models $RELAY_SERVER_ARGS
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

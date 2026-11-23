@@ -7,25 +7,29 @@ binaries are built on 3.14, but the client is not tied to that version.
 
 ## Arch Linux release package
 
-Download `upscale-relay-client-<version>-1-any.pkg.tar.zst` and `SHA256SUMS`
-from the [GitHub release](https://github.com/brpjerry/upscale-relay/releases).
-In the download directory, verify and install it with yay:
+Download `upscale-relay-common-<version>-1-any.pkg.tar.zst`,
+`upscale-relay-client-<version>-1-any.pkg.tar.zst` and `SHA256SUMS` from the
+[GitHub release](https://github.com/brpjerry/upscale-relay/releases).
+In the download directory, verify and install them with yay:
 
 ```bash
-sha256sum -c SHA256SUMS
-yay -U ./upscale-relay-client-*.pkg.tar.zst
+sha256sum -c --ignore-missing SHA256SUMS
+yay -U ./upscale-relay-common-*.pkg.tar.zst ./upscale-relay-client-*.pkg.tar.zst
 relay-desktop
 ```
 
 This installs the desktop player, an application-menu entry, and the headless
-`relay-client` command. Pacman installs the client dependencies from Arch's
-repositories, including libmpv and Qt's native Wayland plugin. The package
-contains no server, offline upscale CLI, models, or NVIDIA inference runtime.
+`relay-client` command. `upscale-relay-common` holds the protocol and media
+modules the client shares with the server package; upgrade the two together.
+Pacman installs the client dependencies from Arch's repositories, including
+libmpv and Qt's native Wayland plugin. The client packages contain no server,
+offline upscale CLI, models, or NVIDIA inference runtime; the server is
+`upscale-relay-server` from the same release ([Linux server](SERVER_LINUX.md)).
 No virtualenv or pip installation is needed. Continue with the connection and
 firewall instructions below; the source-install steps are unnecessary.
 
-The pure-Python package is built on x86_64 Arch and uses the build's Python
-minor version. After an Arch Python minor-version upgrade it must be rebuilt
+The pure-Python packages are built on x86_64 Arch and use the build's Python
+minor version. After an Arch Python minor-version upgrade they must be rebuilt
 for that interpreter (or replaced with a release built for it).
 
 To build from a checkout on Arch:
@@ -37,10 +41,13 @@ cd dist/pacman
 makepkg --syncdeps
 ```
 
-The build stages only client modules and takes its version, Python dependencies,
-and command entry points from the root `pyproject.toml`. CI runs the same build
-in an Arch container, installs the result, and checks startup outside the source
-tree, including an offscreen GUI/libmpv smoke with isolated settings.
+The build produces the common, client and server packages; `--syncdeps` also
+installs the server's dependencies (CUDA among them), so on a client-only
+machine use `makepkg --nodeps` and install the two client packages. The build
+takes each package's version, Python dependencies, and command entry points
+from the root `pyproject.toml`. CI runs the same build in an Arch container,
+installs the client packages in a fresh one, and checks startup outside the
+source tree, including an offscreen GUI/libmpv smoke with isolated settings.
 
 ## 1. System packages
 
