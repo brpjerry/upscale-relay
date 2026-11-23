@@ -76,6 +76,7 @@ def test_active_runtime_goes_first_and_preloads_tensorrt(tmp_path, monkeypatch):
     assert all(mode == ctypes.RTLD_GLOBAL for _, mode in loaded)
 
 
+# Bugs caught: 0, False positives: 0
 def test_no_active_runtime_changes_nothing(tmp_path, monkeypatch):
     infer = load_infer(monkeypatch)
     monkeypatch.setattr(sys, "path", ["/usr/lib/site-packages"])
@@ -84,6 +85,7 @@ def test_no_active_runtime_changes_nothing(tmp_path, monkeypatch):
     assert sys.path == ["/usr/lib/site-packages"]
 
 
+# Bugs caught: 0, False positives: 0
 def test_tensorrt_cache_follows_the_model(tmp_path, monkeypatch):
     infer = load_infer(monkeypatch)
     cache = tmp_path / "models" / ".trt_cache"

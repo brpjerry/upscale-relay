@@ -6,7 +6,7 @@ import time
 from multiprocessing import shared_memory
 
 
-# Bugs caught: 0, False positives: 0
+# Bugs caught: 1, False positives: 0
 def test_worker_attach_survives_worker_exit():
     # On Linux a plain attach handed the block to the worker's resource
     # tracker, which unlinked it when the worker exited, so a replacement

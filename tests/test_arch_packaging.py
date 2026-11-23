@@ -30,6 +30,7 @@ _EXPECTED = {
 }
 
 
+# Bugs caught: 0, False positives: 1
 def test_each_package_contains_only_its_code_and_metadata(tmp_path):
     upstream = tomllib.loads((ROOT / "pyproject.toml").read_text())["project"]
     prepare_arch.prepare(tmp_path, f"v{upstream['version']}")
@@ -69,6 +70,7 @@ def test_each_package_contains_only_its_code_and_metadata(tmp_path):
     assert (tmp_path / "upscale-relay-server.install").is_file()
 
 
+# Bugs caught: 0, False positives: 0
 def test_server_package_depends_on_system_cuda():
     # The Linux runtime installs only ONNX Runtime and TensorRT; CUDA 13 and
     # cuDNN 9 are the sonames its providers link against.

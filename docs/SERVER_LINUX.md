@@ -54,8 +54,9 @@ with the same instruction.
 The runtime is per Python minor version and stack. After Arch moves to a new
 Python minor version, or a package update changes the pinned stack, the server
 logs that ONNX Runtime is missing: run the command again. The wheels link CUDA
-13 by soname, which is why the package depends on `libcudart.so=13`: pacman
-holds a CUDA 14 `cuda` update back until a new runtime stack is pinned.
+13 by soname, which is why the package depends on `libcudart.so=13`: once
+Arch ships CUDA 14, `pacman -Syu` stops on that dependency (rather than
+leaving a runtime that cannot load) until a release pins a new runtime stack.
 
 ### Running it
 

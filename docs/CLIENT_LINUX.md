@@ -41,9 +41,10 @@ cd dist/pacman
 makepkg --syncdeps
 ```
 
-The build produces the common, client and server packages; `--syncdeps` also
-installs the server's dependencies (CUDA among them), so on a client-only
-machine use `makepkg --nodeps` and install the two client packages. The build
+The build produces the common, client and server packages. `--syncdeps`
+installs only the build tools (makepkg resolves a split package's
+dependencies when pacman installs it), so a client-only machine installs the
+common and client packages with `yay -U` as above and never pulls in CUDA. The build
 takes each package's version, Python dependencies, and command entry points
 from the root `pyproject.toml`. CI runs the same build in an Arch container,
 installs the client packages in a fresh one, and checks startup outside the

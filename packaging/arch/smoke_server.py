@@ -84,7 +84,10 @@ def main():
 
         # Setup is explicit, and stops before a 4 GB download that could not
         # load: CUDA and cuDNN are only assumed here.
-        result = run("relay-server", "--install-nvidia-runtime", env=env, check=False)
+        # PIP_NO_INDEX: on a machine that does have CUDA this must still not
+        # start the real download.
+        result = run("relay-server", "--install-nvidia-runtime",
+                     env=dict(env, PIP_NO_INDEX="1"), check=False)
         assert result.returncode == 1, result.stdout + result.stderr
         assert "(package cuda)" in result.stderr, result.stderr
         assert not (home / "data" / "upscale-relay" / "runtimes").exists()

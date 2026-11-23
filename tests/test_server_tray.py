@@ -159,6 +159,7 @@ def test_config_dialog_autostart_checkbox(app, settings):
 
 
 @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="XDG autostart")
+# Bugs caught: 0, False positives: 0
 def test_linux_autostart_entry_roundtrip(tmp_path):
     entry = tmp_path / "config" / "autostart" / "upscale-relay-server.desktop"
     assert autostart.is_enabled() is False

@@ -204,6 +204,7 @@ def test_source_extra_matches_first_run_package_pins():
     )
 
 
+# Bugs caught: 0, False positives: 0
 def test_linux_runtime_pins_match_the_source_extra():
     # Linux installs two of the same wheels; CUDA and cuDNN are the system's.
     with open(Path(__file__).parents[1] / "pyproject.toml", "rb") as stream:
@@ -280,6 +281,7 @@ def test_install_stops_before_downloading_without_system_cuda(monkeypatch, tmp_p
     assert not target.exists()
 
 
+# Bugs caught: 0, False positives: 0
 def test_linux_prune_drops_only_windows_builder_resources(monkeypatch, tmp_path):
     monkeypatch.setattr(runtime, "_LINUX", True)
     libs = tmp_path / "tensorrt_libs"
@@ -296,6 +298,7 @@ def test_linux_prune_drops_only_windows_builder_resources(monkeypatch, tmp_path)
     assert sorted(path.name for path in libs.iterdir()) == sorted(names[:2])
 
 
+# Bugs caught: 0, False positives: 0
 def test_linux_native_library_check(tmp_path):
     libs = tmp_path / "tensorrt_libs"
     libs.mkdir()
@@ -315,6 +318,7 @@ def test_linux_native_library_check(tmp_path):
     assert len(missing) == 2
 
 
+# Bugs caught: 0, False positives: 0
 def test_missing_system_libraries_names_the_arch_package(monkeypatch):
     import ctypes
 

@@ -378,7 +378,7 @@ def _container_only(tmp_path, frames=4):
     return path
 
 
-# Bugs caught: 0, False positives: 1
+# Bugs caught: 0, False positives: 0
 def test_container_only_colour_reaches_the_mapper(tmp_path):
     mapper = _FakeMapper()
     relay = _Relay(_container_only(tmp_path, frames=2), mapper, DisplayTarget("sdr"),

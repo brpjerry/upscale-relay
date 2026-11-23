@@ -356,7 +356,11 @@ class SubprocessUpscaler:
                 raise RuntimeError("inference worker reader did not stop")
         for pipe in (proc.stdin, proc.stdout):
             if pipe is not None:
-                pipe.close()
+                # A header written to a worker that had already died is still
+                # in stdin's buffer: close() fails flushing it to the broken
+                # pipe, but closes the descriptor regardless.
+                with suppress(OSError):
+                    pipe.close()
         self._proc = None
         self._reader = None
 
