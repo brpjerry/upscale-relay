@@ -2358,8 +2358,12 @@ class MainWindow(DesktopFeatures, QMainWindow):
         self.client_log.record("release_wait", session=session_id, host=client.host, port=client.port)
         self.statusBar().showMessage(_RELEASE_WAIT_NOTE)
         try:
+            # The resume token is a credential for that session: it goes to
+            # the server that issued it, never to another name for it.
+            same_endpoint = (client.host, client.port) == (host, port)
             await client.wait_session_released(
-                session_id, resume_token=self._unreleased_resume_token)
+                session_id,
+                resume_token=self._unreleased_resume_token if same_endpoint else None)
         except TeardownNotConfirmedError as err:
             # Still held, restart required, or /status cannot say. A manual
             # Connect clears this stop, not the question: the next open asks again.

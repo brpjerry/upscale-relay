@@ -7,6 +7,7 @@ its token takes it over. Media connections are left alone throughout.
 """
 import asyncio
 import json
+import threading
 
 import aiohttp
 import pytest
@@ -16,7 +17,9 @@ from ports import free_port_pair
 from relay_client_core import RelayClient, SessionConfig
 from relay_client_core.client import TeardownNotConfirmedError
 from relay_protocol import PROTOCOL_VERSION
+from relay_server.pipeline import Pipeline, PipelineCloseError
 from relay_server.server import RelayServer
+from relay_server.session import Session
 from upscale_cli.sample import make_sample
 
 
@@ -176,6 +179,10 @@ def test_an_unreachable_server_releases_the_held_session_after_its_grace(source,
             await _until(lambda: "disconnected" in events)
             assert events == ["reconnecting", "disconnected"]
             assert not client.connected and not client.resuming
+            # A consumer waiting on the half-open downlink wakes up.
+            while await client.downlink_queue().get() is not None:
+                pass
+            assert client.source_error == "The connection to the server was lost"
             with pytest.raises(TeardownNotConfirmedError) as unconfirmed:
                 await client.teardown()
             assert unconfirmed.value.session_id == info.session_id
@@ -361,3 +368,165 @@ def test_the_client_tries_for_as_long_as_the_server_may_hold_the_session():
     from relay_server import server as server_module
     assert client_module.CONTROL_HEARTBEAT_S >= server_module.CONTROL_HEARTBEAT_S
     assert server_module.SESSION_RESUME_GRACE_S == 120.0  # as PROTOCOL.md §1.1 says
+
+
+# Bugs caught: 0, False positives: 0
+def test_an_attempt_whose_reply_is_late_does_not_end_the_session(source, monkeypatch):
+    # The server took the session over and its reply is late: the client gives
+    # the attempt up, which must leave the session held for the next one.
+    monkeypatch.setattr(client_module, "RESUME_ATTEMPT_TIMEOUT_S", 0.5)
+    monkeypatch.setattr(client_module, "RESUME_RETRY_DELAYS_S", (0.1,))
+    send = Session.send
+    delayed = []
+
+    async def late_first_reply(self, type_, **fields):
+        if type_ == "session_resumed" and not delayed:
+            delayed.append(True)
+            await asyncio.sleep(1.0)
+        return await send(self, type_, **fields)
+
+    monkeypatch.setattr(Session, "send", late_first_reply)
+
+    async def scenario():
+        server = RelayServer("models", free_port_pair())
+        await server.start()
+        client = None
+        try:
+            client, info = await _playing_client(server, source)
+            held = server.sessions[info.session_id]
+            reconnected = asyncio.Event()
+            client.on_reconnected = reconnected.set
+            client._ws._conn.transport.abort()
+            await reconnected.wait()
+            assert delayed and server.sessions[info.session_id] is held
+            assert held.ws is not None and not held.closing.is_set()
+            await client.teardown()
+        finally:
+            if client is not None:
+                await client.close()
+            await server.stop()
+
+    _run(scenario)
+
+
+# Bugs caught: 0, False positives: 0
+def test_a_media_connection_lost_with_the_control_one_ends_playback(source):
+    # Not re-attached (PROTOCOL §1.2): the consumer must not wait forever.
+    async def scenario():
+        server = RelayServer("models", free_port_pair())
+        await server.start()
+        client = None
+        try:
+            client, info = await _playing_client(server, source)
+            client._uplink_writer.transport.abort()
+            await _until(lambda: not server.sessions[info.session_id].uplink_attached)
+            reconnected = asyncio.Event()
+            client.on_reconnected = reconnected.set
+            client._ws._conn.transport.abort()
+            await reconnected.wait()
+            while await client.downlink_queue().get() is not None:
+                pass
+            assert client.source_error == "A media connection to the server was lost"
+        finally:
+            if client is not None:
+                await client.close()
+            await server.stop()
+
+    _run(scenario)
+
+
+# Bugs caught: 0, False positives: 0
+def test_a_seek_written_as_the_connection_dies_is_sent_once_resumed(source):
+    # The write fails before the reader has seen the connection end.
+    async def scenario():
+        server = RelayServer("models", free_port_pair())
+        await server.start()
+        client = None
+        try:
+            client, info = await _playing_client(server, source)
+            client._ws._conn.transport.abort()
+            await client.seek(target_pts=0)
+            assert server.sessions[info.session_id].epoch == client.epoch == 1
+            await client.teardown()
+        finally:
+            if client is not None:
+                await client.close()
+            await server.stop()
+
+    _run(scenario)
+
+
+# Bugs caught: 0, False positives: 0
+def test_a_takeover_reports_a_seek_only_once_it_is_flushed(source, tmp_path, monkeypatch):
+    flushing, release = threading.Event(), threading.Event()
+    flush = Pipeline.flush
+
+    def slow_flush(self, *args, **kwargs):
+        flushing.set()
+        assert release.wait(10)
+        return flush(self, *args, **kwargs)
+
+    monkeypatch.setattr(Pipeline, "flush", slow_flush)
+
+    async def scenario():
+        server = RelayServer("models", free_port_pair(), library_root=str(tmp_path))
+        await server.start()
+        sockets = []
+        try:
+            http, old = await _control(server.port)
+            sockets.append(http)
+            await old.send_str(json.dumps({
+                "type": "open_session", "source": {"type": "server_file", "path": "a.mkv"},
+                "model": "passthrough", "quality_tier": "lossless-ffv1",
+                "display": {"w": 64, "h": 64}, "resume": True,
+            }))
+            opened = await _receive(old, "session_opened")
+            await old.send_str(json.dumps({"type": "seek", "target_pts": 0, "epoch": 1}))
+            assert await asyncio.to_thread(flushing.wait, 10)
+
+            http, new = await _control(server.port)
+            sockets.append(http)
+            await new.send_str(json.dumps({
+                "type": "resume_session", "session_id": opened["session_id"],
+                "resume_token": opened["resume_token"],
+            }))
+            reply = asyncio.ensure_future(_receive(new, "session_resumed"))
+            await asyncio.sleep(0.3)
+            assert not reply.done()  # the seek is still flushing
+            release.set()
+            assert (await reply)["epoch"] == 1
+        finally:
+            release.set()
+            for http in sockets:
+                await http.close()
+            await server.stop()
+
+    _run(scenario)
+
+
+# Bugs caught: 0, False positives: 1
+def test_shutdown_reports_a_held_session_that_failed_to_close(source, monkeypatch):
+    real_close = Pipeline.close
+
+    def failing_close(self, *args, **kwargs):
+        real_close(self, *args, **kwargs)  # its workers stop; it reports failure
+        raise PipelineCloseError("fake-finish survived")
+
+    async def scenario():
+        server = RelayServer("models", free_port_pair())
+        await server.start()
+        client = None
+        try:
+            client, info = await _playing_client(server, source)
+            client.port = free_port_pair()  # its resume goes nowhere
+            client._ws._conn.transport.abort()
+            await _until(lambda: server.sessions[info.session_id].ws is None)
+            monkeypatch.setattr(Pipeline, "close", failing_close)
+            with pytest.raises(RuntimeError, match="held session"):
+                await server.stop()
+            assert server.native_teardown_error["session_id"] == info.session_id
+        finally:
+            if client is not None:
+                await client.close()
+
+    _run(scenario)

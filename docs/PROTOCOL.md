@@ -112,14 +112,21 @@ its session through one instead. Additive: no protocol version change.
 5. The client retries with backoff, each attempt bounded (a blackholed path
    hangs rather than refuses), until the server refuses or the grace period
    has certainly ended: `resume_grace_s` plus the server's heartbeat window
-   (30 s) after the client noticed the loss. A client torn down meanwhile
-   releases the session through §1.1 step 0.
+   (30 s) after the client noticed the loss. It closes an attempt it gives
+   up on with a code other than 1000 (`relay_client_core` uses 4000): the server
+   may already have handed the session to that connection, and a normal
+   close would end it. A client torn down meanwhile releases the session
+   through §1.1 step 0.
 
-A media connection that died during the dropout is not re-attached: the epoch's
-Matroska stream cannot continue on a new connection. That playback ends as a
-dropped downlink always has. On Linux, TCP keeps retrying an unacknowledged
-send for about 15 minutes, so the media connections of a held session outlive
-any dropout its grace period covers.
+A session therefore survives a dropout when two things hold: the client takes
+it over before its hold ends (the hold starts when the server notices the
+loss, so a dropout of at least `resume_grace_s` is covered), and its media
+connections survived. A media connection that died is not re-attached, since
+the epoch's Matroska stream cannot continue on a new one. When the
+`session_resumed` flags show one gone, the client ends that playback as a
+dropped downlink always has. TCP usually keeps such connections through a
+dropout of minutes (Linux retries an unacknowledged send for about 15
+minutes by default), but a middlebox or a peer may reset them sooner.
 
 Design invariants:
 - **Video PTS is never rewritten.** Outer packet timestamps and pipeline video

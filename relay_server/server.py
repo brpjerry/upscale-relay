@@ -15,6 +15,7 @@ import functools
 import hmac
 import json
 import logging
+import math
 import re
 import signal
 import sys
@@ -108,7 +109,9 @@ class RelayServer:
                  resume_grace_s: float = SESSION_RESUME_GRACE_S):
         self.port = port
         # 0 turns resume off: capabilities.session_resume is false.
-        self.resume_grace_s = resume_grace_s
+        if not (0 <= resume_grace_s and math.isfinite(resume_grace_s)):
+            raise ValueError(f"resume_grace_s must be finite and >= 0: {resume_grace_s!r}")
+        self.resume_grace_s = float(resume_grace_s)
         # Sessions held for a resume, by id: each task closes its session
         # when the grace period ends without one.
         self._held: dict[str, asyncio.Task] = {}
@@ -397,12 +400,20 @@ class RelayServer:
                         continue
                     session = resumed
                     log.info("session %s resumed from %s", session.id, peer_ip)
-                    await session.send("session_resumed", **session.resume_report())
+                    # After a seek the old connection had in flight: the
+                    # snapshot must not report an epoch still being flushed.
+                    async with session.seek_lock:
+                        report = session.resume_report()
+                    await session.send("session_resumed", **report)
                 elif session is None:
                     await ws.send_str(json.dumps({
                         "type": "error", "code": "bad_message",
                         "message": f"'{mtype}' before open_session", "fatal": False,
                     }))
+                elif session.ws is not ws:
+                    # A resume took the session over (PROTOCOL §1.2): what is
+                    # still queued on this connection is no longer its to say.
+                    break
                 elif mtype == "play":
                     starting = session.state == State.OPEN
                     await session.set_state(State.PLAYING)
@@ -465,11 +476,12 @@ class RelayServer:
         closed, and its handler leaves the session alone.
         """
         session_id, token = msg.get("session_id"), msg.get("resume_token")
-        if not isinstance(session_id, str) or not isinstance(token, str):
+        if (not isinstance(session_id, str) or not isinstance(token, str)
+                or not token.isascii()):  # tokens are hex; compare_digest needs ASCII
             return None
         session = self.sessions.get(session_id)
         if (session is None or session.id != session_id or session.resume_token is None
-                or not hmac.compare_digest(session.resume_token.encode(), token.encode())
+                or not hmac.compare_digest(session.resume_token, token)
                 or not session.resumable or self._stop_task is not None):
             return None
         held = self._held.pop(session.id, None)
@@ -683,7 +695,10 @@ class RelayServer:
         for session in {s.id: s for s in self.sessions.values()}.values():
             if session.ws is None:
                 # Held for a resume: no handler owns it to retire it.
-                await self._close_control_session(session, None, False)
+                if not await self._close_control_session(session, None, False):
+                    errors.append(RuntimeError(
+                        f"held session {session.id} did not close: "
+                        f"{(self.native_teardown_error or {}).get('error')}"))
                 continue
             try:
                 await session.close()

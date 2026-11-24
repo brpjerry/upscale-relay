@@ -95,6 +95,11 @@ def _sample_aspect_ratio(video: dict) -> Fraction:
     return Fraction(1)
 
 
+# How much longer a stalled downlink waits when buffer reports stopped too:
+# the server's control heartbeat notices a dead connection within 30 s.
+_DETACH_WAIT_S = 30.0
+
+
 class State(str, Enum):
     OPEN = "open"
     PLAYING = "playing"
@@ -190,6 +195,8 @@ class Session:
         self._open_task: asyncio.Task | None = None
         self._close_task: asyncio.Task | None = None
         self._closing = asyncio.Event()
+        # Held through a seek: a resume's snapshot waits for it (PROTOCOL §1.2).
+        self.seek_lock = asyncio.Lock()
         self._seek_progress_task: asyncio.Task | None = None
         self.state = State.OPEN
         self.epoch = 0
@@ -298,16 +305,18 @@ class Session:
                 report["downlink_mapping"] = pipeline.downlink_mapping
         return report
 
-    async def send(self, type_: str, **fields: Any) -> None:
+    async def send(self, type_: str, **fields: Any) -> bool:
+        """Whether the message was written; callers may ignore it."""
         ws = self.ws
         if ws is None:
-            return  # held for a resume: session_resumed carries the state
+            return False  # held for a resume: session_resumed carries the state
         try:
             await ws.send_str(json.dumps({"type": type_, **fields}))
+            return True
         except (ConnectionResetError, RuntimeError):
             # RuntimeError: aiohttp's "closing transport" — reachable now that
             # a backgrounded open can outlive its WS.
-            pass
+            return False
 
     async def set_state(self, state: State) -> None:
         if self.state == state:
@@ -340,11 +349,19 @@ class Session:
                     delivery.result(timeout=0.1)
                     return
                 except concurrent.futures.TimeoutError:
+                    now = time.monotonic()
                     if self.ws is None:
                         # Held for a resume: the network may be down. The
                         # grace period bounds the hold, not this deadline.
-                        deadline = time.monotonic() + 30.0
-                    elif time.monotonic() >= deadline:
+                        deadline = now + 30.0
+                    elif (now >= deadline and self.resumable
+                          and self.last_buffer_report < deadline - 30.0
+                          and now < deadline + _DETACH_WAIT_S):
+                        # Reports stopped as well: the control connection is
+                        # likely dead too, and its heartbeat detaches the
+                        # session within this window (it is then held).
+                        continue
+                    elif now >= deadline:
                         log.warning("session %s: downlink stalled >30s, dropping session", self.id)
                         asyncio.run_coroutine_threadsafe(self.close(), self._loop)
                         return
@@ -622,7 +639,7 @@ class Session:
             }
             if self.source_track is not None else {}
         )
-        await self.send(
+        sent = await self.send(
             "session_opened",
             session_id=self.id,
             media_port=self.media_port,
@@ -661,11 +678,17 @@ class Session:
                 if self.resume_token is not None else {}
             ),
         )
-        self.opened = True
+        # Only a delivered token can be resumed with: a session whose
+        # session_opened could not be written ends with its connection.
+        self.opened = sent
 
     media_port: int = 0  # set by server at construction
 
     async def handle_seek(self, msg: dict) -> None:
+        async with self.seek_lock:
+            await self._handle_seek(msg)
+
+    async def _handle_seek(self, msg: dict) -> None:
         new_epoch = int(msg["epoch"])
         if new_epoch <= self.epoch or self.pipeline is None:
             return  # stale or premature
