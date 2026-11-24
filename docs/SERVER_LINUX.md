@@ -15,8 +15,11 @@ sha256sum -c --ignore-missing SHA256SUMS
 yay -U ./upscale-relay-common-*.pkg.tar.zst ./upscale-relay-server-*.pkg.tar.zst
 ```
 
-Add `./upscale-relay-client-*.pkg.tar.zst` to the same command for the player,
-or for the optional tray GUI (below). The packages are:
+Include `./upscale-relay-client-*.pkg.tar.zst` in the same command if the client
+is already installed (the 0.25 single-package client too), or for the player or
+the optional tray GUI (below). Always upgrade every installed relay package in
+one command: each requires the exact matching `upscale-relay-common`, and the
+older client owns files that move to it. The packages are:
 
 | Package | Contents |
 |---|---|
@@ -49,14 +52,19 @@ when the system CUDA libraries do not load, and names the package missing.
 
 The server works without it: passthrough sessions need no inference, and it
 logs at startup how to install the runtime. A model session without it fails
-with the same instruction.
+with the same instruction. A server that was already running picks the runtime
+up only when it restarts: `systemctl --user restart upscale-relay-server`, or
+quit and relaunch `relay-server-gui`.
 
-The runtime is per Python minor version and stack. After Arch moves to a new
-Python minor version, or a package update changes the pinned stack, the server
-logs that ONNX Runtime is missing: run the command again. The wheels link CUDA
-13 by soname, which is why the package depends on `libcudart.so=13`: once
-Arch ships CUDA 14, `pacman -Syu` stops on that dependency (rather than
-leaving a runtime that cannot load) until a release pins a new runtime stack.
+The runtime is per Python minor version and stack. When Arch moves to a new
+Python minor version, first rebuild or replace every installed relay package
+for that interpreter (their Python dependency stops the upgrade otherwise),
+then run the command again; the same goes for a release that changes the pinned
+stack, which the server reports at startup as ONNX Runtime missing. The wheels
+link CUDA 13 and cuDNN 9 by soname, which is why the package depends on
+`libcudart.so=13` and `cudnn<10`: once Arch ships CUDA 14 or cuDNN 10,
+`pacman -Syu` stops on that dependency (rather than leaving a runtime that
+cannot load) until a release pins a new runtime stack.
 
 ### Running it
 
@@ -69,7 +77,9 @@ journalctl --user -u upscale-relay-server -f
 The user unit runs `relay-server --models-dir
 ~/.local/share/upscale-relay/models`. TensorRT engines are cached beside the
 models, in `models/.trt_cache` (build them with an idle GPU: engines built
-under load stay slow). Further options go in
+under load stay slow); with a read-only models folder the engine is rebuilt
+at every session start instead. `systemctl --user stop` (SIGTERM) shuts the
+server down cleanly: sessions close and the mDNS advertisement is withdrawn. Further options go in
 `~/.config/upscale-relay/server.env`:
 
 ```bash
@@ -100,10 +110,13 @@ with a StatusNotifierItem tray (KDE, GNOME with the AppIndicator extension,
 waybar's `tray` module on Hyprland and Sway). It borrows the player's theme,
 so it needs `upscale-relay-client` installed too. It runs the server itself,
 so stop the user unit first (`systemctl --user disable --now
-upscale-relay-server`): only one server runs per user. Unlike on Windows it
+upscale-relay-server`): only one server runs per user. Its models folder
+defaults to the unit's, `~/.local/share/upscale-relay/models`, and its
+settings (port, library folders) are its own. Unlike on Windows it
 asks before downloading the NVIDIA runtime, and "Not now" still starts the
 server for passthrough. "Start automatically when I sign in" writes an XDG
-autostart entry, `~/.config/autostart/upscale-relay-server.desktop`.
+autostart entry, `~/.config/autostart/upscale-relay-server.desktop`; at sign-in
+the tray waits up to a minute for the desktop's tray to appear.
 
 ## Building the packages
 

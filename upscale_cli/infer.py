@@ -101,20 +101,32 @@ _EP_BY_ALIAS = dict(_EP_ORDER)
 def _trt_options(cache: Path | None = None) -> dict:
     """``cache`` is the engine and timing cache directory: ``.trt_cache``
     beside the model (``models/.trt_cache`` for a model in ./models)."""
+    import os
+
     cache = Path("models") / ".trt_cache" if cache is None else cache
-    cache.mkdir(parents=True, exist_ok=True)
-    return {
+    # Models on a read-only share still run, building their engine at every
+    # session start instead of failing to create the cache.
+    try:
+        cache.mkdir(parents=True, exist_ok=True)
+        writable = os.access(cache, os.W_OK)
+    except OSError:
+        writable = False
+    if not writable:
+        print(f"TensorRT engine cache disabled: {cache} is not writable", file=sys.stderr)
+    options = {
         "trt_fp16_enable": True,
-        "trt_engine_cache_enable": True,
-        "trt_engine_cache_path": str(cache),
-        "trt_timing_cache_enable": True,
-        "trt_timing_cache_path": str(cache),
+        "trt_engine_cache_enable": writable,
+        "trt_timing_cache_enable": writable,
         # No auxiliary CUDA streams: with them enabled, output DMA can land
         # after run() returns and scribble freed host memory — observed as
         # native crashes in *other* threads (the libav decoder was the usual
         # victim) seconds into streaming.
         "trt_auxiliary_streams": "0",
     }
+    if writable:
+        options["trt_engine_cache_path"] = str(cache)
+        options["trt_timing_cache_path"] = str(cache)
+    return options
 
 
 def _with_trt_profile(providers: list, input_name: str, sample_dims: str = "") -> list:

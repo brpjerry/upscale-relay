@@ -15,6 +15,7 @@ import functools
 import json
 import logging
 import re
+import signal
 import sys
 import weakref
 from collections.abc import Callable
@@ -612,6 +613,14 @@ class RelayServer:
 async def main_async(args) -> None:
     from .server_id import load_or_create_server_id
 
+    stopping = asyncio.Event()
+    if sys.platform != "win32":
+        # systemctl stop sends SIGTERM, whose default action ends the process
+        # at once: no mDNS goodbye, no session teardown, temporary subtitle
+        # indexes left behind. Installed first, so a stop during start-up
+        # (mDNS registration takes a second) is handled too.
+        asyncio.get_running_loop().add_signal_handler(signal.SIGTERM, stopping.set)
+
     server_id = await asyncio.to_thread(load_or_create_server_id)
     display_mapper = (
         None if args.no_display_mapping
@@ -628,8 +637,13 @@ async def main_async(args) -> None:
         server_id=server_id,
         display_mapper=display_mapper,
     )
-    await server.start()
-    await asyncio.Event().wait()  # run forever
+    try:
+        await server.start()
+        await stopping.wait()
+    finally:
+        # Also on Ctrl-C, which asyncio.run delivers as a cancellation.
+        await server.stop()
+        log.info("server stopped")
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -671,12 +685,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--no-mdns", action="store_true",
         help="do not advertise _upscalerelay._tcp over mDNS/DNS-SD",
     )
-    parser.add_argument(
-        "--install-nvidia-runtime", action="store_true",
-        help="download and verify the pinned ONNX Runtime and TensorRT for model "
-             "sessions (Linux: about 4 GB, into ~/.local/share/upscale-relay/runtimes; "
-             "CUDA and cuDNN come from the system), then exit",
-    )
+    if sys.platform.startswith("linux"):
+        # Windows source installs use the .[nvidia] extra, and the Windows
+        # release binaries set up their runtime themselves at first launch.
+        parser.add_argument(
+            "--install-nvidia-runtime", action="store_true",
+            help="download and verify the pinned ONNX Runtime and TensorRT for model "
+                 "sessions (about 4 GB, into ~/.local/share/upscale-relay/runtimes; "
+                 "CUDA and cuDNN come from the system), then exit. Restart a "
+                 "running server afterwards",
+        )
     parser.add_argument("-v", "--verbose", action="store_true")
     return parser
 
@@ -693,7 +711,8 @@ def _activate_linux_runtime() -> None:
     elif importlib.util.find_spec("onnxruntime") is None:
         log.warning(
             "ONNX Runtime is not installed, so only passthrough sessions can run. "
-            "Install the TensorRT runtime with: relay-server --install-nvidia-runtime"
+            "Install the TensorRT runtime with: relay-server --install-nvidia-runtime, "
+            "then restart the server"
         )
 
 
@@ -711,7 +730,7 @@ def main() -> None:
         pass
 
     args = build_arg_parser().parse_args()
-    if args.install_nvidia_runtime:
+    if getattr(args, "install_nvidia_runtime", False):
         from .runtime_bootstrap import install_runtime
 
         sys.exit(install_runtime())

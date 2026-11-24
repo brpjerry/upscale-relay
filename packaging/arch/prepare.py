@@ -55,7 +55,10 @@ PARTS = {
 
 def _dependencies(project: dict, part: str) -> list[str]:
     """Python metadata only; pacman's depends are in PKGBUILD.in."""
-    dependencies = list(project["dependencies"])
+    if part == "common":
+        # relay_protocol and relay_media import only PyAV beyond the stdlib.
+        return [dep for dep in project["dependencies"] if re.match(r"av\b", dep)]
+    dependencies = [*project["dependencies"], f"upscale-relay-common=={project['version']}"]
     if part == "client":
         dependencies += project["optional-dependencies"]["gui"]
     return dependencies

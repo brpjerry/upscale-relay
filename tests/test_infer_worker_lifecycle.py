@@ -169,7 +169,7 @@ def test_recovery_keeps_deliberate_cpu_inference(tmp_path, monkeypatch):
 
 _IDLE_DEATH_WORKER = r'''
 import struct, sys
-from multiprocessing import shared_memory
+from upscale_cli.infer_worker import attach_shared_memory
 generation, shm_out_name, die_after = sys.argv[1], sys.argv[2], int(sys.argv[3])
 print("READY 2 CPUExecutionProvider", flush=True)
 served = 0
@@ -180,7 +180,7 @@ while served < die_after:
     h, w = struct.unpack("<II", header)
     if not h:
         break
-    block = shared_memory.SharedMemory(name=shm_out_name, track=False)
+    block = attach_shared_memory(shm_out_name)
     block.buf[:h * w * 12] = bytes([127]) * (h * w * 12)
     block.close()
     sys.stdout.buffer.write(struct.pack("<II", h * 2, w * 2))

@@ -19,6 +19,7 @@ import functools
 import logging
 import os
 import queue
+import sys
 import threading
 import time
 from dataclasses import dataclass, field
@@ -132,9 +133,12 @@ class PipelineConstructionError(PipelineCloseError):
         self.pipeline = pipeline  # retain ownership until the server restarts
 
 
-# relay_server.runtime_bootstrap.RUNTIME_INSTALL_ARG, spelled out to keep that
-# module out of the pipeline's imports.
-_INSTALL_RUNTIME_ARG = "--install-nvidia-runtime"
+def _runtime_setup_hint() -> str:
+    if sys.platform.startswith("linux"):
+        return ("Run relay-server --install-nvidia-runtime, then restart the server "
+                "(or quit and relaunch relay-server-gui).")
+    return ("Re-run the first-launch NVIDIA setup or install the .[nvidia] "
+            "source extra.")
 
 
 def _should_use_tensorrt(ep: str, available_providers: set[str]) -> bool:
@@ -142,9 +146,8 @@ def _should_use_tensorrt(ep: str, available_providers: set[str]) -> bool:
     if ep == "tensorrt" and provider not in available_providers:
         raise RuntimeError(
             "TensorRT execution provider is not available in this build; "
-            f"installed providers: {sorted(available_providers)}. Re-run the "
-            f"first-launch NVIDIA setup (relay-server {_INSTALL_RUNTIME_ARG}) "
-            "or install the .[nvidia] source extra."
+            f"installed providers: {sorted(available_providers)}. "
+            + _runtime_setup_hint()
         )
     return ep == "tensorrt" or (ep == "auto" and provider in available_providers)
 
@@ -505,7 +508,7 @@ class Pipeline:
                 except ModuleNotFoundError as error:
                     raise RuntimeError(
                         "ONNX Runtime is not installed; model sessions need it. "
-                        f"Run: relay-server {_INSTALL_RUNTIME_ARG}"
+                        + _runtime_setup_hint()
                     ) from error
 
                 use_trt = _should_use_tensorrt(ep, set(_ort.get_available_providers()))

@@ -66,9 +66,13 @@ def stream(sample: Path, model: str, env) -> None:
 
 
 def main():
+    # --with-client: the client package is installed too, so relay-client can
+    # drive sessions and the tray GUI (which borrows the player's theme) runs.
+    with_client = "--with-client" in sys.argv[1:]
     for module in ("relay_server", "upscale_cli", "relay_protocol", "relay_media"):
         spec = importlib.util.find_spec(module)
         assert spec is not None and Path(spec.origin).is_relative_to("/usr/lib"), module
+    assert (importlib.util.find_spec("desktop_client") is not None) == with_client
     unit = Path("/usr/lib/systemd/user/upscale-relay-server.service")
     assert "ExecStart=/usr/bin/relay-server" in unit.read_text()
 
@@ -92,7 +96,8 @@ def main():
         assert "(package cuda)" in result.stderr, result.stderr
         assert not (home / "data" / "upscale-relay" / "runtimes").exists()
 
-        run("relay-server-gui", "--check", env=env)
+        if with_client:
+            run("relay-server-gui", "--check", env=env)
 
         models = home / "models"
         models.mkdir()
@@ -101,11 +106,13 @@ def main():
         run("upscale-cli", "sample", str(sample), "--frames", "48", "--size", "320x180",
             "--fps", "24", env=env)
 
-        server = subprocess.Popen(
-            ["relay-server", "--models-dir", str(models), "--port", str(PORT),
-             "--ep", "cpu", "--no-mdns"],
-            env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-        )
+        log_path = home / "server.log"
+        with open(log_path, "w") as log:
+            server = subprocess.Popen(
+                ["relay-server", "--models-dir", str(models), "--port", str(PORT),
+                 "--ep", "cpu", "--no-mdns"],
+                env=env, stdout=log, stderr=subprocess.STDOUT,
+            )
         try:
             deadline = time.monotonic() + 60
             while True:
@@ -113,17 +120,33 @@ def main():
                     info = status()
                     break
                 except OSError:
-                    if server.poll() is not None or time.monotonic() > deadline:
-                        raise AssertionError(server.stdout.read())
+                    if server.poll() is not None:
+                        raise AssertionError(
+                            f"relay-server exited with status {server.returncode}:\n"
+                            + log_path.read_text())
+                    if time.monotonic() > deadline:
+                        raise AssertionError(
+                            "relay-server did not answer /status within 60 s:\n"
+                            + log_path.read_text())
                     time.sleep(0.25)
             assert set(info["models"]) == {"passthrough", "smoke_2x"}, info["models"]
-            stream(sample, "passthrough", env)
-            stream(sample, "smoke_2x", env)
+            if with_client:
+                stream(sample, "passthrough", env)
+                stream(sample, "smoke_2x", env)
         finally:
+            # What systemctl --user stop sends: the server must shut down
+            # cleanly (mDNS goodbye, session teardown), not just die.
             server.terminate()
-            output, _ = server.communicate(timeout=30)
+            try:
+                server.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                server.kill()
+                server.wait()
+        output = log_path.read_text()
         print(output[-3000:])
-    print("Installed server: setup guard, tray import, passthrough and model sessions passed")
+        assert server.returncode == 0, f"exit status {server.returncode}"
+        assert "server stopped" in output
+    print("Installed server smoke passed" + (" (with client)" if with_client else ""))
 
 
 if __name__ == "__main__":

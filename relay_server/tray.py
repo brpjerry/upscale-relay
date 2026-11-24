@@ -882,6 +882,21 @@ def setup_diagnostics(file_logging: bool = True) -> None:
     except Exception:
         pass
 
+def _tray_available(*, autostarted: bool, wait_s: float = 60.0) -> bool:
+    """At sign-in the session may start this before its tray host
+    (StatusNotifierWatcher) is up: an autostarted launch waits for it.
+    Called before the asyncio loop exists, so blocking here is safe."""
+    import time
+
+    deadline = time.monotonic() + (wait_s if autostarted else 0.0)
+    while True:
+        if QSystemTrayIcon.isSystemTrayAvailable():
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.5)
+
+
 def main() -> None:
     # Frozen-build smoke hook: reaching here means the entry script imported
     # relay_server.tray (and its deps) successfully, so exit 0 without any UI.
@@ -913,7 +928,7 @@ def main() -> None:
         QMessageBox.critical(None, _APP_NAME, str(error))
         sys.exit(1)
 
-    if not QSystemTrayIcon.isSystemTrayAvailable():
+    if not _tray_available(autostarted=autostart.AUTOSTART_ARG in sys.argv[1:]):
         QMessageBox.critical(
             None, _APP_NAME,
             "No system tray is available on this desktop.\n"
@@ -925,7 +940,9 @@ def main() -> None:
     asyncio.set_event_loop(loop)
 
     with loop:
-        runtime_ok, setup_dialog = loop.run_until_complete(ensure_runtime_gui(settings.ep))
+        runtime_ok, setup_dialog = loop.run_until_complete(
+            ensure_runtime_gui(settings.requested_ep)
+        )
         if not runtime_ok:
             return
 

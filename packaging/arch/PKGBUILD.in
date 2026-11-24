@@ -50,8 +50,8 @@ package_upscale-relay-server() {
   pkgdesc='Upscale Relay server: ONNX upscaling with TensorRT and NVENC'
   # CUDA and cuDNN come from Arch; relay-server --install-nvidia-runtime adds
   # the ONNX Runtime and TensorRT wheels no Arch package provides (Arch's
-  # onnxruntime has no TensorRT provider). Those wheels link CUDA 13 by
-  # soname, so a CUDA 14 cuda package waits for a new runtime stack.
+  # onnxruntime has no TensorRT provider). Those wheels link CUDA 13 and
+  # cuDNN 9 by soname, so CUDA 14 or cuDNN 10 waits for a new runtime stack.
   depends=(
     "${_python[@]}" "upscale-relay-common=$pkgver-$pkgrel"
     'python-av' 'python-numpy' 'python-aiohttp' 'python-zeroconf' 'python-onnx'
@@ -61,7 +61,7 @@ package_upscale-relay-server() {
     'python-pip'
     # NVENC and display mapping (libplacebo on Vulkan)
     'ffmpeg' 'vulkan-icd-loader' 'nvidia-utils'
-    'cudnn' 'libcudart.so=13-64' 'libcublas.so=13-64'
+    'cudnn>=9' 'cudnn<10' 'libcudart.so=13-64' 'libcublas.so=13-64'
   )
   optdepends=(
     'upscale-relay-client: tray GUI (relay-server-gui), which wears the player'"'"'s theme'

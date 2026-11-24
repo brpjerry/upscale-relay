@@ -20,7 +20,9 @@ relay-desktop
 
 This installs the desktop player, an application-menu entry, and the headless
 `relay-client` command. `upscale-relay-common` holds the protocol and media
-modules the client shares with the server package; upgrade the two together.
+modules the client shares with the server package. Upgrade every installed
+relay package in one command: if `upscale-relay-server` is installed too, add
+its matching package to the same `yay -U`.
 Pacman installs the client dependencies from Arch's repositories, including
 libmpv and Qt's native Wayland plugin. The client packages contain no server,
 offline upscale CLI, models, or NVIDIA inference runtime; the server is

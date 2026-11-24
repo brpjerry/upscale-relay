@@ -172,6 +172,81 @@ def test_linux_autostart_entry_roundtrip(tmp_path):
     autostart.set_enabled(False)  # disabling twice must not raise
 
 
+# Bugs caught: 0, False positives: 0
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="XDG autostart")
+def test_linux_autostart_entry_quotes_exec_and_marks_sign_in(tmp_path, monkeypatch):
+    # The desktop Exec grammar is not a shell's: double quotes, and % is a
+    # field code. Sign-in launches carry --autostart so they wait for the tray.
+    monkeypatch.setattr(autostart.shutil, "which", lambda _name: "/opt/my apps/100%/relay-server-gui")
+    autostart.set_enabled(True)
+    entry = (tmp_path / "config" / "autostart" / "upscale-relay-server.desktop").read_text()
+    assert 'Exec="/opt/my apps/100%%/relay-server-gui" --autostart\n' in entry
+
+
+# Bugs caught: 0, False positives: 0
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="XDG autostart")
+def test_linux_autostart_respects_an_entry_the_desktop_disabled(tmp_path):
+    # Applying unrelated settings rewrote, and so re-enabled, an entry a
+    # startup-apps manager had disabled.
+    autostart.set_enabled(True)
+    entry = tmp_path / "config" / "autostart" / "upscale-relay-server.desktop"
+    disabled = entry.read_text() + "Hidden=true\n"
+    entry.write_text(disabled)
+    assert autostart.is_enabled() is False
+    autostart.set_enabled(False)
+    assert entry.read_text() == disabled  # left for the desktop to manage
+    entry.write_text(entry.read_text().replace("Hidden=true\n", "").replace(
+        "X-GNOME-Autostart-enabled=true", "X-GNOME-Autostart-enabled=false"))
+    assert autostart.is_enabled() is False
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="XDG autostart")
+def test_relative_xdg_config_home_is_ignored(monkeypatch, tmp_path):
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("XDG_CONFIG_HOME", "relative")
+    assert autostart._desktop_entry() == tmp_path / "home/.config/autostart/upscale-relay-server.desktop"
+
+
+def test_autostart_launch_command_marks_sign_in():
+    assert autostart.launch_command().endswith(autostart.AUTOSTART_ARG)
+
+
+# Bugs caught: 0, False positives: 0
+def test_autostarted_tray_waits_for_the_tray_host(monkeypatch):
+    # At sign-in the tray host can start after us; a manual launch still
+    # reports a missing tray at once.
+    from relay_server import tray
+
+    calls = []
+    monkeypatch.setattr(tray.QSystemTrayIcon, "isSystemTrayAvailable",
+                        staticmethod(lambda: calls.append(1) or len(calls) >= 3))
+    monkeypatch.setattr("time.sleep", lambda _s: None)
+    assert tray._tray_available(autostarted=True)
+    calls.clear()
+    assert not tray._tray_available(autostarted=False)
+    assert len(calls) == 1
+
+
+# Bugs caught: 0, False positives: 0
+def test_saved_provider_is_read_without_onnxruntime(settings, monkeypatch):
+    from relay_server import gui_settings
+
+    monkeypatch.setattr(gui_settings, "available_ep_choices",
+                        lambda: pytest.fail("asked onnxruntime"))
+    settings.ep = "tensorrt"
+    assert settings.requested_ep == "tensorrt"
+    settings.ep = "bogus"
+    assert settings.requested_ep == "auto"
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux default")
+def test_linux_tray_models_default_matches_the_service(monkeypatch, tmp_path):
+    from relay_server import gui_settings
+
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    assert gui_settings.default_models_dir() == str(tmp_path / "data/upscale-relay/models")
+
+
 def test_runtime_setup_close_cancels_installer(app):
     class FakeProcess:
         terminated = False

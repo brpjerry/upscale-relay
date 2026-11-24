@@ -12,8 +12,8 @@ will actually do at sign-in (including an entry the user deleted by hand).
 
 from __future__ import annotations
 
+import configparser
 import os
-import shlex
 import shutil
 import sys
 from pathlib import Path
@@ -21,6 +21,9 @@ from pathlib import Path
 _RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 _VALUE_NAME = "Upscale Relay Server"
 _DESKTOP_NAME = "upscale-relay-server.desktop"
+# Marks a sign-in launch, which waits for the tray host instead of failing
+# when the session has not started it yet.
+AUTOSTART_ARG = "--autostart"
 
 
 def is_supported() -> bool:
@@ -34,45 +37,77 @@ def sign_in_label() -> str:
 
 
 def launch_command() -> str:
-    """The command to run at sign-in, quoted for the Run key or Exec=."""
+    """The command Windows runs at sign-in, quoted for the Run key."""
     if getattr(sys, "frozen", False):
         # PyInstaller build: sys.executable is upscale-relay-server-gui.exe.
-        return f'"{sys.executable}"'
+        return f'"{sys.executable}" {AUTOSTART_ARG}'
     script = shutil.which("relay-server-gui")
     if script:
-        return f'"{script}"'
-    return f'"{sys.executable}" -m relay_server.tray'
+        return f'"{script}" {AUTOSTART_ARG}'
+    return f'"{sys.executable}" -m relay_server.tray {AUTOSTART_ARG}'
 
 
 def _desktop_entry() -> Path:
-    config = os.environ.get("XDG_CONFIG_HOME")
-    root = Path(config) if config else Path.home() / ".config"
-    return root / "autostart" / _DESKTOP_NAME
+    # XDG base directories must be absolute; a relative value is ignored.
+    config = Path(os.environ.get("XDG_CONFIG_HOME") or "")
+    if not config.is_absolute():
+        config = Path.home() / ".config"
+    return config / "autostart" / _DESKTOP_NAME
+
+
+def _exec_argument(argument: str) -> str:
+    """Quote one argument for a desktop entry's Exec key.
+
+    The Desktop Entry spec quotes with double quotes and backslash-escapes
+    ``"`$\\`` inside them; the key's string value then escapes backslashes
+    once more, and ``%`` (field codes) is written ``%%``.
+    """
+    quoted = "".join("\\" + c if c in '"`$\\' else c for c in argument)
+    quoted = quoted.replace("\\", "\\\\").replace("%", "%%")
+    return f'"{quoted}"'
 
 
 def _desktop_contents() -> str:
     script = shutil.which("relay-server-gui")
     command = (
-        shlex.quote(script) if script
-        else f"{shlex.quote(sys.executable)} -m relay_server.tray"
+        [script] if script else [sys.executable, "-m", "relay_server.tray"]
     )
+    exec_line = " ".join(_exec_argument(part) for part in command)
     return (
         "[Desktop Entry]\n"
         "Type=Application\n"
         f"Name={_VALUE_NAME}\n"
         "Comment=Upscale Relay server in the system tray\n"
-        f"Exec={command}\n"
+        f"Exec={exec_line} {AUTOSTART_ARG}\n"
         "Icon=video-display\n"
         "Terminal=false\n"
         "X-GNOME-Autostart-enabled=true\n"
     )
 
 
+def _desktop_entry_enabled() -> bool:
+    """An entry a startup-apps manager disabled (Hidden=true, or GNOME's
+    X-GNOME-Autostart-enabled=false) stays on disk but does not start."""
+    entry_path = _desktop_entry()
+    if not entry_path.is_file():
+        return False
+    parser = configparser.ConfigParser(interpolation=None, strict=False)
+    parser.optionxform = str  # desktop entry keys are case-sensitive
+    try:
+        parser.read(entry_path, encoding="utf-8")
+        entry = parser["Desktop Entry"]
+        if entry.getboolean("Hidden", fallback=False):
+            return False
+        return entry.getboolean("X-GNOME-Autostart-enabled", fallback=True)
+    except (KeyError, ValueError, configparser.Error):
+        return False
+
+
 def is_enabled() -> bool:
     if not is_supported():
         return False
     if sys.platform != "win32":
-        return _desktop_entry().is_file()
+        return _desktop_entry_enabled()
     import winreg
 
     try:
@@ -88,6 +123,10 @@ def set_enabled(enabled: bool) -> None:
     if not is_supported():
         return
     if sys.platform != "win32":
+        # Applying unrelated settings must not rewrite (and so re-enable) an
+        # entry the user's desktop manages.
+        if enabled == is_enabled():
+            return
         entry = _desktop_entry()
         if enabled:
             entry.parent.mkdir(parents=True, exist_ok=True)

@@ -114,8 +114,10 @@ def runtime_base_dir() -> Path:
     if override:
         return Path(override)
     if _LINUX:
-        data_home = os.environ.get("XDG_DATA_HOME")
-        root = Path(data_home) if data_home else Path.home() / ".local" / "share"
+        # XDG base directories must be absolute; a relative value is ignored.
+        root = Path(os.environ.get("XDG_DATA_HOME") or "")
+        if not root.is_absolute():
+            root = Path.home() / ".local" / "share"
         return root / "upscale-relay" / "runtimes"
     local_app_data = os.environ.get("LOCALAPPDATA")
     if local_app_data:
@@ -302,8 +304,10 @@ def _validate_runtime(target: Path) -> None:
     verify_native_runtime(target)
     if _LINUX:
         # The provider list is compiled in and says nothing about whether the
-        # system CUDA libraries load: build a real TensorRT session.
+        # system CUDA libraries load: build real TensorRT and CUDA sessions
+        # (--ep cuda uses the second without TensorRT).
         _validate_source_runtime("tensorrt")
+        _validate_source_runtime("cuda")
 
 
 def missing_system_libraries() -> list[str]:
@@ -435,6 +439,13 @@ def _validate_source_runtime(ep: str) -> None:
     session = ort.InferenceSession(model.SerializeToString(), providers=providers)
     if session.get_providers()[0] != providers[0]:
         raise RuntimeError(f"execution provider {providers[0]} failed to initialize")
+    if _LINUX:
+        # The pipeline refuses CPU inference unless --ep cpu asked for it, so
+        # a system CPU-only onnxruntime must not count as a usable runtime:
+        # the tray would then skip offering the GPU setup.
+        from upscale_cli.infer_worker import require_gpu_provider
+
+        require_gpu_provider(session.get_providers()[0], ep)
     session.run(None, {"input": np.zeros((1, 3, 8, 8), dtype=np.float32)})
 
 

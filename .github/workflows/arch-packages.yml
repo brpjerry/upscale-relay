@@ -108,19 +108,24 @@ jobs:
         run: |
           pacman -Syu --noconfirm python-onnxruntime-cpu
           # No GPU here: assume CUDA (~3 GB), cuDNN and the driver rather than
-          # download them. The client package brings the tray GUI's theme.
+          # download them.
           pacman -U --noconfirm \
             --assume-installed 'libcudart.so=13-64' \
             --assume-installed 'libcublas.so=13-64' \
             --assume-installed 'cudnn=9' \
             --assume-installed 'nvidia-utils=999' \
             dist/upscale-relay-common-*.pkg.tar.zst \
-            dist/upscale-relay-client-*.pkg.tar.zst \
             dist/upscale-relay-server-*.pkg.tar.zst
-      - name: Smoke test the installed server
+      - name: Smoke test the server alone
         timeout-minutes: 5
         run: |
           cd /tmp
           relay-server --help
           upscale-cli --help
           python -I "$GITHUB_WORKSPACE/packaging/arch/smoke_server.py"
+      - name: Add the client and smoke test sessions and the tray GUI
+        timeout-minutes: 5
+        run: |
+          pacman -U --noconfirm dist/upscale-relay-client-*.pkg.tar.zst
+          cd /tmp
+          python -I "$GITHUB_WORKSPACE/packaging/arch/smoke_server.py" --with-client

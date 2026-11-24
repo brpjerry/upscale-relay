@@ -53,10 +53,18 @@ def test_each_package_contains_only_its_code_and_metadata(tmp_path):
                 name: upstream["scripts"][name] for name in commands
             }
             assert "optional-dependencies" not in project
-            if part == "client":
+            common = f"upscale-relay-common=={upstream['version']}"
+            if part == "common":
+                assert project["dependencies"] == [
+                    dep for dep in upstream["dependencies"] if re.match(r"av\b", dep)
+                ]
+            elif part == "client":
                 assert project["dependencies"] == (
-                    upstream["dependencies"] + upstream["optional-dependencies"]["gui"]
+                    [*upstream["dependencies"], common]
+                    + upstream["optional-dependencies"]["gui"]
                 )
+            else:
+                assert project["dependencies"] == [*upstream["dependencies"], common]
         # Every importable package of the project is in exactly one pacman package.
         assert sorted(packaged_modules) == sorted(
             prefix.rstrip("*") for prefix in tomllib.loads(
@@ -76,7 +84,7 @@ def test_server_package_depends_on_system_cuda():
     # cuDNN 9 are the sonames its providers link against.
     recipe = (ROOT / "packaging/arch/PKGBUILD.in").read_text()
     server = recipe.split("package_upscale-relay-server()", 1)[1]
-    for dependency in ("'cudnn'", "'libcudart.so=13-64'", "'libcublas.so=13-64'",
+    for dependency in ("'cudnn>=9'", "'cudnn<10'", "'libcudart.so=13-64'", "'libcublas.so=13-64'",
                        "'python-pip'", "'nvidia-utils'", "'ffmpeg'"):
         assert dependency in server
 
