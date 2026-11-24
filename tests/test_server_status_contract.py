@@ -45,6 +45,9 @@ class _Session:
     def __init__(self, release: asyncio.Event, error: BaseException | None = None):
         self._release, self._error = release, error
 
+    def mark_closing(self):
+        pass
+
     async def close(self):
         await self._release.wait()
         if self._error is not None:
@@ -62,6 +65,7 @@ def _bare_server(session) -> RelayServer:
     return server
 
 
+# Bugs caught: 0, False positives: 1
 @pytest.mark.parametrize("failure", [None, PipelineCloseError("fake-finish survived")])
 def test_cancelled_control_handler_keeps_the_session_listed_until_close_returns(failure):
     # Cancelling the control handler (server shutdown) does not stop the
@@ -91,6 +95,7 @@ def test_cancelled_control_handler_keeps_the_session_listed_until_close_returns(
     asyncio.run(scenario())
 
 
+# Bugs caught: 0, False positives: 1
 @pytest.mark.parametrize("fails", [False, True])
 def test_status_after_an_abrupt_control_drop(sample_file, monkeypatch, fails):
     """What a client sees polling /status after its control connection died."""
@@ -113,9 +118,10 @@ def test_status_after_an_abrupt_control_drop(sample_file, monkeypatch, fails):
         seen = []
         try:
             await client.connect()
+            # Not resumable: the server ends the session with its connection.
             info = await client.open_session(SessionConfig(
                 path=sample_file, model="passthrough", quality_tier="lossless-ffv1",
-                display_w=320, display_h=180,
+                display_w=320, display_h=180, resume=False,
             ))
             async with aiohttp.ClientSession() as http:
                 async def status() -> dict:
@@ -157,7 +163,11 @@ def test_status_after_an_abrupt_control_drop(sample_file, monkeypatch, fails):
             # The control connection was dropped on purpose: no acknowledgement.
             with contextlib.suppress(TeardownNotConfirmedError):
                 await client.teardown()
-            await server.stop()
+            if fails:
+                with pytest.raises(RuntimeError, match="native session teardown"):
+                    await server.stop()
+            else:
+                await server.stop()
         # Never "gone" without the failure being visible in the same response.
         assert all(still_listed or restart == fails for still_listed, restart in seen)
 
@@ -180,6 +190,7 @@ def test_documented_release_time_covers_the_servers_timeouts():
     assert DOCUMENTED_WORST_CASE_S < CLIENT_POLL_BOUND_S
 
 
+# Bugs caught: 0, False positives: 1
 def test_restart_required_is_derived_from_the_recorded_teardown_error():
     async def scenario():
         server = RelayServer(str(ROOT / "models"), free_port_pair())
@@ -200,6 +211,12 @@ def test_restart_required_is_derived_from_the_recorded_teardown_error():
                 assert failed["restart_required"] is True
                 assert failed["native_teardown_error"]["session_id"] == "abc"
         finally:
-            await server.stop()
+            if server.native_teardown_error is None:
+                await server.stop()
+            else:
+                # A failed native close fails the stop too: the process, not
+                # a new server in it, is what has to restart.
+                with pytest.raises(RuntimeError, match="native session teardown"):
+                    await server.stop()
 
     asyncio.run(scenario())

@@ -41,6 +41,7 @@ class World:
         self.status_error = None  # what asking /status raises
         self.opened = 0
         self.violations = []
+        self.tokens = []  # (host, resume token) each release wait was given
 
     def count(self, kind):
         return sum(1 for event in self.events if event[0] == kind)
@@ -95,7 +96,8 @@ class WorldClient(FakeSessionClient):
                 raise main_window.TeardownNotConfirmedError(UNCONFIRMED)
             self.world.held.add((self.host, self.port, session.session_id))
             raise main_window.TeardownNotConfirmedError(
-                UNCONFIRMED, session_id=session.session_id)
+                UNCONFIRMED, session_id=session.session_id,
+                resume_token=f"token-{session.session_id}")
         self.world.events.append(("closed",))
 
     async def close(self):
@@ -103,7 +105,10 @@ class WorldClient(FakeSessionClient):
         self.connected = False
 
     async def wait_session_released(self, session_id, **kwargs):
-        assert not kwargs  # the core's bound and interval, not the window's
+        # The core's bound and interval, not the window's; the resume token
+        # the unacknowledged teardown named (PROTOCOL §1.2), or None.
+        assert set(kwargs) == {"resume_token", "resume_server_id"}, kwargs
+        self.world.tokens.append((self.host, kwargs["resume_token"]))
         self.world.events.append(("wait", session_id, self.host))
         while True:
             if self.world.status_error is not None:
@@ -140,6 +145,7 @@ def run(scenario):
     asyncio.run(scenario())
 
 
+# Bugs caught: 0, False positives: 1
 def test_dead_control_at_stop_recovers_once_the_server_releases(window, world):
     async def scenario():
         await window._start_session("show.mkv", "server_file")
@@ -441,6 +447,7 @@ def test_reconnect_that_never_answers_is_bounded(window, world, monkeypatch):
     run(scenario)
 
 
+# Bugs caught: 0, False positives: 0
 def test_another_server_does_not_answer_for_the_first(window, world):
     async def scenario():
         await window._start_session("show.mkv", "server_file")
@@ -457,6 +464,8 @@ def test_another_server_does_not_answer_for_the_first(window, world):
                                      ("released", "session-1", "other-server"),
                                      ("open", "there.mkv", "other-server")]
         assert window._unreleased_session == ("session-1", *HOME)
+        # The resume token is a credential: never handed to another server.
+        assert world.tokens == [("other-server", None)]
         await window.on_stop()
         await window.on_connect()  # disconnect
 
@@ -470,6 +479,7 @@ def test_another_server_does_not_answer_for_the_first(window, world):
         await opening
         assert world.events[-1] == ("open", "here.mkv", HOME[0])
         assert window._unreleased_session is None
+        assert world.tokens[-1] == (HOME[0], "token-session-1")
         assert not world.violations and not world.errors
 
     run(scenario)

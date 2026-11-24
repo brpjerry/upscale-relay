@@ -210,6 +210,7 @@ def test_seek_storm(sample_file):
     asyncio.run(scenario())
 
 
+# Bugs caught: 1, False positives: 0
 def test_midplay_disconnect_cleans_up(sample_file):
     async def scenario():
         server = await start_server()

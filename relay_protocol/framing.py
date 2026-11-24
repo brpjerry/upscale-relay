@@ -121,3 +121,12 @@ def parse_handshake(data: bytes) -> tuple[int, str]:
         raise ValueError("bad direction")
     token = data[len(MAGIC) + 1 :].decode("ascii")
     return direction, token
+
+
+# Control WebSocket close codes (docs/PROTOCOL.md §1.2). A client closes a
+# resume attempt it abandons with RESUME_ABANDONED: any code but a normal
+# close (1000) keeps the server holding the session. The server closes a
+# connection whose session another one resumed with SESSION_TAKEN_OVER: its
+# client must not try to take the session back.
+CLOSE_RESUME_ABANDONED = 4000
+CLOSE_SESSION_TAKEN_OVER = 4001

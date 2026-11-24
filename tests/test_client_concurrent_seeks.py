@@ -10,6 +10,7 @@ from relay_client_core.client import RelayClient
 
 class ControlSocket:
     closed = False
+    close_code = None  # as aiohttp has it before a close
 
     def __init__(self):
         self.incoming = asyncio.Queue()
@@ -58,7 +59,10 @@ def test_only_latest_overlapping_seek_restarts_uplink(replies):
             assert restarted == [{"from_pts": 2000, "discontinuity": True, "epoch": 2}]
             assert client._pending == {}
         finally:
+            reader = client._reader_task
             await client.close()
+            # It ended by cancellation, not by failing in its cleanup.
+            assert reader.cancelled()
 
     asyncio.run(scenario())
 

@@ -95,6 +95,12 @@ def _sample_aspect_ratio(video: dict) -> Fraction:
     return Fraction(1)
 
 
+# How much longer a stalled downlink waits when buffer reports stopped too:
+# the server's control heartbeat notices a dead connection within 30 s, and
+# the margin covers an event loop that runs the heartbeat late.
+_DETACH_WAIT_S = 45.0
+
+
 class State(str, Enum):
     OPEN = "open"
     PLAYING = "playing"
@@ -157,9 +163,19 @@ class Session:
                  default_resize_algorithm: str = DEFAULT_RESIZE_ALGORITHM,
                  lossless_hevc_profile: str = DEFAULT_LOSSLESS_HEVC_PROFILE,
                  seek_discard_max_s: float | None = None,
-                 display_mapper: DisplayMapper | None = None):
+                 display_mapper: DisplayMapper | None = None,
+                 resume_grace_s: float = 0.0):
         self.id = uuid.uuid4().hex[:12]
+        # The control connection; None while the session is held for a resume
+        # (PROTOCOL §1.2), when everything it would send is dropped.
         self.ws = ws
+        # Resume (PROTOCOL §1.2): how long the server holds this session after
+        # its control connection ends, and the secret a new connection proves
+        # itself with. The token stays None unless open_session asked for it.
+        self.resume_grace_s = resume_grace_s
+        self.resume_token: str | None = None
+        # session_opened has been sent: the client can know the token.
+        self.opened = False
         self.models = models  # name -> path
         self.ep = ep
         self.library = library
@@ -179,6 +195,11 @@ class Session:
         self._source_task: asyncio.Task | None = None
         self._open_task: asyncio.Task | None = None
         self._close_task: asyncio.Task | None = None
+        self._closing = asyncio.Event()
+        # No downlink stall closes the session before this (attach()).
+        self._stall_grace_until = 0.0
+        # Held through a seek: a resume's snapshot waits for it (PROTOCOL §1.2).
+        self.seek_lock = asyncio.Lock()
         self._seek_progress_task: asyncio.Task | None = None
         self.state = State.OPEN
         self.epoch = 0
@@ -235,13 +256,74 @@ class Session:
         self._media_connections.clear()
         self.uplink_attached = self.downlink_attached = False
 
-    async def send(self, type_: str, **fields: Any) -> None:
+    @property
+    def resumable(self) -> bool:
+        """Hold this session for a resume when its control connection ends."""
+        return (
+            self.resume_token is not None and self.opened and self.resume_grace_s > 0
+            and self.state != State.CLOSED and not self._closing.is_set()
+        )
+
+    @property
+    def closing(self) -> asyncio.Event:
+        """Set once the session is being closed: no resume can take it."""
+        return self._closing
+
+    def mark_closing(self) -> None:
+        """Refuse resumes from now on, ahead of a close() still to start."""
+        self._closing.set()
+
+    def detach(self) -> None:
+        """The control connection ended and the session is held for a resume.
+
+        Production holds at the watermark: no buffer report can arrive, and
+        the client may be paused. The media connections stay as they are.
+        """
+        self.ws = None
+        if self.pipeline is not None:
+            self.pipeline.client_detached = True
+        log.info("session %s held for %.0f s for a resume", self.id, self.resume_grace_s)
+
+    def attach(self, ws) -> None:
+        """A resumed control connection takes the session over."""
+        self.ws = ws
+        # A downlink still blocked from the dropout gets a fresh stall
+        # window: TCP backs its retransmissions off, and may take a while to
+        # drain once the network is back.
+        self._stall_grace_until = time.monotonic() + 30.0
+        if self.pipeline is not None:
+            self.pipeline.client_detached = False
+
+    def resume_report(self) -> dict:
+        """session_resumed's fields: what the client missed while detached."""
+        report: dict[str, Any] = {
+            "session_id": self.id,
+            "state": self.state.value,
+            "epoch": self.epoch,
+            "uplink_attached": self.uplink_attached,
+            "downlink_attached": self.downlink_attached,
+        }
+        pipeline = self.pipeline
+        if pipeline is not None:
+            report["buffer_target_ms"] = pipeline.buffer_target_ms
+            if pipeline.downlink_mapping is not None:
+                # As seek_ready would have said for this epoch (§3.6).
+                report["downlink_color"] = pipeline.downlink_color
+                report["downlink_mapping"] = pipeline.downlink_mapping
+        return report
+
+    async def send(self, type_: str, **fields: Any) -> bool:
+        """Whether the message was written; callers may ignore it."""
+        ws = self.ws
+        if ws is None:
+            return False  # held for a resume: session_resumed carries the state
         try:
-            await self.ws.send_str(json.dumps({"type": type_, **fields}))
+            await ws.send_str(json.dumps({"type": type_, **fields}))
+            return True
         except (ConnectionResetError, RuntimeError):
             # RuntimeError: aiohttp's "closing transport" — reachable now that
             # a backgrounded open can outlive its WS.
-            pass
+            return False
 
     async def set_state(self, state: State) -> None:
         if self.state == state:
@@ -274,7 +356,21 @@ class Session:
                     delivery.result(timeout=0.1)
                     return
                 except concurrent.futures.TimeoutError:
-                    if time.monotonic() >= deadline:
+                    now = time.monotonic()
+                    deadline = max(deadline, self._stall_grace_until)
+                    if self.ws is None:
+                        # Held for a resume: the network may be down. The
+                        # grace period bounds the hold, not this deadline.
+                        deadline = now + 30.0
+                    elif (now >= deadline and self.resumable
+                          and self.last_buffer_report < deadline
+                          and now < deadline + _DETACH_WAIT_S):
+                        # No report since the deadline: the control connection
+                        # may be dead too, and its heartbeat detaches the
+                        # session within this window (it is then held). A
+                        # live client reports within 500 ms and is dropped.
+                        continue
+                    elif now >= deadline:
                         log.warning("session %s: downlink stalled >30s, dropping session", self.id)
                         asyncio.run_coroutine_threadsafe(self.close(), self._loop)
                         return
@@ -341,6 +437,8 @@ class Session:
             await self.send("error", code="bad_message", message="invalid source", fatal=False)
             return
         self.source_kind = source_kind
+        if msg.get("resume") is True and self.resume_grace_s > 0:
+            self.resume_token = new_token()
         requested_aux = msg.get("aux_tracks", "external")
         if requested_aux not in ("external", "muxed"):
             await self.send("error", code="bad_message", message="invalid aux_tracks", fatal=False)
@@ -550,7 +648,7 @@ class Session:
             }
             if self.source_track is not None else {}
         )
-        await self.send(
+        sent = await self.send(
             "session_opened",
             session_id=self.id,
             media_port=self.media_port,
@@ -584,14 +682,39 @@ class Session:
             downlink_mapping=self.pipeline.downlink_mapping,
             buffer_target_ms=buffer_target_ms,
             **source_metadata,
+            **(
+                {"resume_token": self.resume_token, "resume_grace_s": self.resume_grace_s}
+                if self.resume_token is not None else {}
+            ),
         )
+        # Only a delivered token can be resumed with: a session whose
+        # session_opened could not be written ends with its connection.
+        self.opened = sent
 
     media_port: int = 0  # set by server at construction
 
     async def handle_seek(self, msg: dict) -> None:
+        async with self.seek_lock:
+            epoch = self.epoch
+            try:
+                await self._handle_seek(msg)
+            except Exception:
+                if self.epoch != epoch:
+                    # It published an epoch the pipeline may never have
+                    # installed: a resume must not report it. The session
+                    # closes, as the handler's failure would have closed it.
+                    self.mark_closing()
+                raise
+
+    async def _handle_seek(self, msg: dict) -> None:
         new_epoch = int(msg["epoch"])
         if new_epoch <= self.epoch or self.pipeline is None:
             return  # stale or premature
+        # Read before the epoch changes: a malformed seek must not leave an
+        # epoch published that the pipeline never installed.
+        target_pts = int(msg["target_pts"])
+        # A malformed or absent display_target keeps the mapping (§3.6).
+        display_target = DisplayTarget.from_wire(msg.get("display_target"))
         self.epoch = new_epoch
         await self._stop_seek_progress()
         # Drop everything queued for the downlink writer.
@@ -602,12 +725,10 @@ class Session:
             pass
         self.pipeline.note_buffer_report(0)
         await self._stop_server_source()
-        # A malformed or absent display_target keeps the mapping (§3.6).
-        display_target = DisplayTarget.from_wire(msg.get("display_target"))
         trace = await asyncio.to_thread(
-            self.pipeline.flush, new_epoch, int(msg["target_pts"]), display_target)
+            self.pipeline.flush, new_epoch, target_pts, display_target)
         if self.downlink_attached:
-            await self.start_server_source(int(msg["target_pts"]), discontinuity=True)
+            await self.start_server_source(target_pts, discontinuity=True)
         # seek_ready is only an ack that the epoch switched — the first media
         # for it may be seconds away (docs/SEEK_LATENCY_PLAN.md). The ticker is
         # what tells the client the server is working rather than wedged.
@@ -789,6 +910,7 @@ class Session:
 
     async def close(self) -> None:
         """Idempotent resource-release barrier for the control connection."""
+        self._closing.set()
         if self._close_task is None:
             self._close_task = asyncio.create_task(self._close_impl(asyncio.current_task()))
         await asyncio.shield(self._close_task)
@@ -892,6 +1014,8 @@ class Session:
             "epoch": self.epoch,
             "uplink_attached": self.uplink_attached,
             "downlink_attached": self.downlink_attached,
+            # False while held for a resume (PROTOCOL §1.2). Diagnostic.
+            "control_attached": self.ws is not None,
             "source": self.source_kind,
             "aux_tracks": self.aux_track_mode,
             "aux_attachments": self.aux_attachment_mode,

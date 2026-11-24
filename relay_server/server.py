@@ -12,8 +12,10 @@ from __future__ import annotations
 import argparse
 import asyncio
 import functools
+import hmac
 import json
 import logging
+import math
 import re
 import signal
 import sys
@@ -25,6 +27,7 @@ from typing import Iterable
 from aiohttp import WSCloseCode, WSMsgType, web, web_fileresponse
 
 from relay_protocol import (
+    CLOSE_SESSION_TAKEN_OVER,
     DIR_DOWNLINK,
     DIR_UPLINK,
     HANDSHAKE_LEN,
@@ -84,6 +87,13 @@ def discover_models(models_dir: str) -> dict[str, dict]:
 # PIPELINE_CLOSE_TIMEOUT_S is the documented 45 s worst case, and clients poll
 # for 60 s); tests/test_server_status_contract.py holds the numbers together.
 CONTROL_HEARTBEAT_S = 20.0
+# How long a session whose client asked for resume (open_session.resume,
+# PROTOCOL §1.2) is held after its control connection ends, for that client
+# to reconnect and take it over. Production holds at the watermark meanwhile,
+# so a held session costs GPU memory and its encoder, not GPU time. With the
+# heartbeat and the pipeline close, a client that never comes back has its
+# session released within CONTROL_HEARTBEAT_S x 1.5 + this + 15 s.
+SESSION_RESUME_GRACE_S = 120.0
 
 
 class RelayServer:
@@ -96,8 +106,17 @@ class RelayServer:
                  seek_discard_max_s: float | None = None,
                  library_roots: Iterable[str | Path] | None = None,
                  server_id: str | None = None,
-                 display_mapper: DisplayMapper | None = None):
+                 display_mapper: DisplayMapper | None = None,
+                 resume_grace_s: float = SESSION_RESUME_GRACE_S):
         self.port = port
+        # 0 turns resume off: capabilities.session_resume is false.
+        if not (0 <= resume_grace_s and math.isfinite(resume_grace_s)):
+            raise ValueError(f"resume_grace_s must be finite and >= 0: {resume_grace_s!r}")
+        self.resume_grace_s = float(resume_grace_s)
+        # Sessions held for a resume, by id: each task closes its session
+        # when the grace period ends without one.
+        self._held: dict[str, asyncio.Task] = {}
+        self._background: set[asyncio.Task] = set()
         # Applies Dolby Vision and HDR10+ for a client's display (PROTOCOL
         # §3.6); None: capabilities.display_mapping is false.
         self.display_mapper = display_mapper
@@ -227,10 +246,13 @@ class RelayServer:
         return error is None
 
     async def _close_control_session(
-        self, session: Session, ws: web.WebSocketResponse,
+        self, session: Session, ws: web.WebSocketResponse | None,
         acknowledge: bool,
     ) -> bool:
         """Release a session and optionally publish the teardown barrier."""
+        # At once: the close below starts on the next loop turn, and a resume
+        # must not take the session over in between.
+        session.mark_closing()
         self._log_session_stats(session, final=True)
         closing = asyncio.ensure_future(session.close())
         try:
@@ -247,6 +269,8 @@ class RelayServer:
         except Exception:
             pass  # read back from the finished close below
         cleanup_ok = self._retire_session(session, closing)
+        if ws is None:
+            return cleanup_ok
         if acknowledge and cleanup_ok and not ws.closed:
             try:
                 await ws.send_str(json.dumps({"type": "closed"}))
@@ -274,6 +298,10 @@ class RelayServer:
             log.info("control connection from %s", peer_ip)
         session: Session | None = None
         teardown_ack_requested = False
+        # The connection ended under the loop (lost, or closed by the peer),
+        # not by a teardown, an error or this handler failing: only then is a
+        # resumable session held.
+        connection_ended = False
         try:
             async for raw in ws:
                 if raw.type != WSMsgType.TEXT:
@@ -318,6 +346,9 @@ class RelayServer:
                         # open_session/seek display_target is understood
                         # (PROTOCOL §3.6): a working mapper was found.
                         "display_mapping": self.display_mapper is not None,
+                        # open_session.resume and resume_session are understood
+                        # (PROTOCOL §1.2).
+                        "session_resume": self.resume_grace_s > 0,
                         "library_sort": (
                             list(LIBRARY_SORT_KEYS) if self.library is not None else []
                         ),
@@ -346,6 +377,7 @@ class RelayServer:
                         lossless_hevc_profile=self.lossless_hevc_profile,
                         seek_discard_max_s=self.seek_discard_max_s,
                         display_mapper=self.display_mapper,
+                        resume_grace_s=self.resume_grace_s,
                     )
                     session.media_port = self.media_port
                     self.sessions[session.uplink_token] = session
@@ -357,11 +389,45 @@ class RelayServer:
                     # minutes — awaiting it here left client pings unanswered
                     # (OkHttp drops the socket after 10 s without a pong).
                     session.begin_open(msg)
+                elif mtype == "resume_session":
+                    if session is not None:
+                        await ws.send_str(json.dumps({
+                            "type": "error", "code": "bad_message",
+                            "message": "session already open", "fatal": False,
+                        }))
+                        continue
+                    resumed = self._take_over_session(msg, ws)
+                    if resumed is None:
+                        await ws.send_str(json.dumps({
+                            "type": "error", "code": "resume_failed",
+                            "message": "no session to resume", "fatal": False,
+                        }))
+                        continue
+                    session = resumed
+                    log.info("session %s resumed from %s", session.id, peer_ip)
+                    # After a seek the old connection had in flight: the
+                    # snapshot must not report an epoch still being flushed.
+                    async with session.seek_lock:
+                        report = session.resume_report()
+                    if session.ws is not ws:
+                        break  # resumed again meanwhile: the newer one answers
+                    if session.closing.is_set():
+                        # The seek it waited for failed; the session is ending.
+                        await ws.send_str(json.dumps({
+                            "type": "error", "code": "resume_failed",
+                            "message": "the session is closing", "fatal": False,
+                        }))
+                        break
+                    await session.send("session_resumed", **report)
                 elif session is None:
                     await ws.send_str(json.dumps({
                         "type": "error", "code": "bad_message",
                         "message": f"'{mtype}' before open_session", "fatal": False,
                     }))
+                elif session.ws is not ws:
+                    # A resume took the session over (PROTOCOL §1.2): what is
+                    # still queued on this connection is no longer its to say.
+                    break
                 elif mtype == "play":
                     starting = session.state == State.OPEN
                     await session.set_state(State.PLAYING)
@@ -381,12 +447,85 @@ class RelayServer:
                     break
                 else:
                     await session.send("error", code="bad_message", message=mtype, fatal=False)
+            else:
+                connection_ended = True
         finally:
-            if session is not None:
-                await self._close_control_session(
-                    session, ws, teardown_ack_requested,
-                )
+            if session is not None and session.ws is not ws and not ws.closed:
+                # Taken over, and leaving before the background close: say
+                # so, or the displaced client reads a normal close and tries
+                # to take the session back.
+                await self._close_superseded(ws)
+            # A session that a resume took over belongs to its new connection.
+            if session is not None and session.ws is ws:
+                # Held only when the connection was lost: a client that closed
+                # it normally is there, and chose to end.
+                if (connection_ended and session.resumable
+                        and ws.close_code != WSCloseCode.OK and self._stop_task is None):
+                    self._hold_session(session)
+                else:
+                    await self._close_control_session(
+                        session, ws, teardown_ack_requested,
+                    )
         return ws
+
+    # -- resume (PROTOCOL §1.2) ---------------------------------------------------
+
+    def _hold_session(self, session: Session) -> None:
+        session.detach()
+        self._held[session.id] = asyncio.create_task(self._expire_held(session))
+
+    async def _expire_held(self, session: Session) -> None:
+        """Close a held session when its grace period ends without a resume,
+        or as soon as it closed itself (a pipeline error) meanwhile."""
+        try:
+            await asyncio.wait_for(session.closing.wait(), session.resume_grace_s)
+        except asyncio.TimeoutError:
+            pass
+        if session.ws is not None:
+            return  # resumed (the resume cancels this task too)
+        self._held.pop(session.id, None)
+        if not session.closing.is_set():
+            log.info("session %s: no resume within %.0f s; closing it",
+                     session.id, session.resume_grace_s)
+        await self._close_control_session(session, None, False)
+
+    def _take_over_session(self, msg: dict, ws: web.WebSocketResponse) -> Session | None:
+        """The session ``resume_session`` names, now on ``ws``; None if refused.
+
+        The session may still be on a connection this server has not yet
+        noticed is dead (the client gave up on it first): that connection is
+        closed, and its handler leaves the session alone.
+        """
+        session_id, token = msg.get("session_id"), msg.get("resume_token")
+        if (not isinstance(session_id, str) or not isinstance(token, str)
+                or not token.isascii()):  # tokens are hex; compare_digest needs ASCII
+            return None
+        session = self.sessions.get(session_id)
+        if (session is None or session.id != session_id or session.resume_token is None
+                or not hmac.compare_digest(session.resume_token, token)
+                or not session.resumable or self._stop_task is not None):
+            return None
+        held = self._held.pop(session.id, None)
+        if held is not None:
+            held.cancel()
+        previous = session.ws
+        session.attach(ws)
+        if previous is not None and previous is not ws:
+            task = asyncio.create_task(self._close_superseded(previous))
+            self._background.add(task)
+            task.add_done_callback(self._background.discard)
+        return session
+
+    @staticmethod
+    async def _close_superseded(ws: web.WebSocketResponse) -> None:
+        try:
+            await asyncio.wait_for(
+                ws.close(code=CLOSE_SESSION_TAKEN_OVER,
+                         message=b"session resumed on another connection"),
+                2.0,
+            )
+        except Exception:  # most likely the dead connection the client left
+            pass
 
     # -- media sockets -----------------------------------------------------------
 
@@ -570,7 +709,18 @@ class RelayServer:
                 await self._mdns.stop()
             except Exception as error:
                 errors.append(error)
+        held, self._held = list(self._held.values()), {}
+        for task in held:
+            task.cancel()
+        await asyncio.gather(*held, return_exceptions=True)
         for session in {s.id: s for s in self.sessions.values()}.values():
+            if session.ws is None:
+                # Held for a resume: no handler owns it to retire it.
+                if not await self._close_control_session(session, None, False):
+                    errors.append(RuntimeError(
+                        f"held session {session.id} did not close: "
+                        f"{(self.native_teardown_error or {}).get('error')}"))
+                continue
             try:
                 await session.close()
             except Exception as error:
@@ -606,6 +756,13 @@ class RelayServer:
                 await runner.cleanup()
             except Exception as error:
                 errors.append(error)
+        if not errors and self.native_teardown_error is not None:
+            # A native owner may still be alive, whenever its close failed
+            # (a held session can expire during this stop): a new server in
+            # this process would start with restart_required clear.
+            errors.append(RuntimeError(
+                "a native session teardown did not complete; restart the process: "
+                f"{self.native_teardown_error.get('error')}"))
         if errors:
             raise errors[0]
 

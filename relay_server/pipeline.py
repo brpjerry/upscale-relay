@@ -639,6 +639,10 @@ class Pipeline:
             self.set_buffer_target(buffer_target_ms)
             self._client_buffered_at = time.monotonic()
             self.playing = False  # session mirrors PLAYING state here
+            # Set while the session has no control connection and is held for
+            # a resume (PROTOCOL §1.2): no reports arrive, so production holds
+            # at the watermark rather than refilling a buffer it cannot see.
+            self.client_detached = False
             self._flush_pending = threading.Event()
             self._threads = [
                 threading.Thread(target=self._guard(self._decode_work), daemon=True, name="pl-decode"),
@@ -1260,10 +1264,11 @@ class Pipeline:
                 continue
 
             # Backpressure: keep the client buffer topped off (docs/PROTOCOL.md S5).
-            if self.buffered_ms_now() > self.buffer_target_ms:
+            if self.client_detached or self.buffered_ms_now() > self.buffer_target_ms:
                 self.stats.paused_for_backpressure = True
                 while (
-                    self.buffered_ms_now() > self.buffer_target_ms - _RESUME_BAND_MS
+                    (self.client_detached
+                     or self.buffered_ms_now() > self.buffer_target_ms - _RESUME_BAND_MS)
                     and not self._closed.is_set()
                     and not self._flush_pending.is_set()
                 ):
