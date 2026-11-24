@@ -60,17 +60,60 @@ def _client(outputs):
         ({"name": "DP-3", "mode": (3840, 2160), "swap_axes": False}, (3840, 2160)),
         # Rotated 90 or 270 degrees: the mode is reported unrotated.
         ({"name": "DP-3", "mode": (3840, 2160), "swap_axes": True}, (2160, 3840)),
-        # No current mode yet, or a nameless (pre-v4) output: no answer.
+        # No current mode yet, a v4 output without its name, another output.
         ({"name": "DP-3"}, None),
         ({"name": None, "mode": (3840, 2160)}, None),
         ({"name": "HDMI-A-1", "mode": (3840, 2160)}, None),
+        # A pre-v4 output has no name, but as the sole output it is the screen.
+        ({"version": 3, "name": None, "mode": (3840, 2160)}, (3840, 2160)),
     ],
 )
 def test_wayland_output_pixels_match_the_screen_by_name(monkeypatch, output, expected):
     monkeypatch.setattr(hdr_output, "platform_kind", lambda app=None: "wayland")
-    monkeypatch.setattr(hdr_output, "_wayland_client", lambda display=None: _client({7: output}))
+    client = _client({7: {"version": 4, **output}})
+    monkeypatch.setattr(hdr_output, "_wayland_client", lambda display=None: client)
     screen = SimpleNamespace(name=lambda: "DP-3")
     assert hdr_output.wayland_output_pixels(screen) == expected
+
+
+# Bugs caught: 0, False positives: 0
+def test_wayland_output_pixels_ignore_unnamed_outputs_beside_others(monkeypatch):
+    monkeypatch.setattr(hdr_output, "platform_kind", lambda app=None: "wayland")
+    client = _client({
+        7: {"version": 3, "name": None, "mode": (1920, 1080)},
+        8: {"version": 3, "name": None, "mode": (3840, 2160)},
+    })
+    monkeypatch.setattr(hdr_output, "_wayland_client", lambda display=None: client)
+    assert hdr_output.wayland_output_pixels(SimpleNamespace(name=lambda: "DP-3")) is None
+
+
+# Bugs caught: 0, False positives: 0
+def test_wayland_output_pixels_wait_for_a_new_outputs_events(monkeypatch):
+    # The lookup's roundtrip binds a monitor plugged in since the last one;
+    # its name and mode arrive on the following roundtrip.
+    monkeypatch.setattr(hdr_output, "platform_kind", lambda app=None: "wayland")
+    outputs = {}
+    events = [
+        lambda: outputs.update({9: {"version": 4, "name": None}}),
+        lambda: outputs[9].update(name="DP-3", mode=(3840, 2160)),
+    ]
+    client = SimpleNamespace(outputs=outputs, roundtrip=lambda: events.pop(0)())
+    monkeypatch.setattr(hdr_output, "_wayland_client", lambda display=None: client)
+    assert hdr_output.wayland_output_pixels(SimpleNamespace(name=lambda: "DP-3")) == (3840, 2160)
+    assert events == []
+
+
+# Bugs caught: 0, False positives: 0
+def test_output_events_keep_the_current_mode_and_rotation():
+    output = {}
+    hdr_output._output_mode(output, 3, 3840, 2160)  # current | preferred
+    hdr_output._output_mode(output, 2, 1920, 1080)  # preferred only
+    hdr_output._output_mode(output, 0, 2560, 1440)  # another supported mode
+    hdr_output._output_geometry(output, 1)  # 90 degrees
+    assert output == {"mode": (3840, 2160), "swap_axes": True}
+    for transform, swapped in ((0, False), (2, False), (3, True), (4, False), (5, True), (7, True)):
+        hdr_output._output_geometry(output, transform)
+        assert output["swap_axes"] is swapped, transform
 
 
 # Bugs caught: 0, False positives: 0
