@@ -2660,14 +2660,21 @@ class MainWindow(DesktopFeatures, QMainWindow):
     def _display_pixels(self) -> tuple[int, int]:
         """The window's screen in physical pixels.
 
-        QScreen.size() is logical (a 4K panel at 150% reports 2560x1440, and
-        we'd negotiate a too-small output). Scale it by the window's ratio,
-        not QScreen.devicePixelRatio(): on Wayland that is the output's
-        integer scale (2 at 150%), and a 4K panel was sent as 5120x2880. The
-        window's ratio is the fractional scale it is drawn at (1.5), and the
-        screen's own ratio everywhere else.
+        On Wayland, the output's current mode. Otherwise QScreen.size(),
+        which is logical (a 4K panel at 150% reports 2560x1440, and we'd
+        negotiate a too-small output), scaled by the window's ratio, not
+        QScreen.devicePixelRatio(): on Wayland that is the output's integer
+        scale (2 at 150%), and a 4K panel was sent as 5120x2880. The window's
+        ratio is the fractional scale it is drawn at (1.5), but on Wayland
+        that is the compositor's choice for the whole surface, which can be
+        another output's scale while the window spans two; elsewhere it is
+        the screen's own ratio.
         """
-        size = self.screen().size()
+        screen = self.screen()
+        pixels = hdr_output.wayland_output_pixels(screen)
+        if pixels is not None:
+            return pixels
+        size = screen.size()
         dpr = self.devicePixelRatioF()
         return round(size.width() * dpr), round(size.height() * dpr)
 

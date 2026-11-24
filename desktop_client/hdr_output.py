@@ -402,7 +402,16 @@ class _WaylandOutputs:
             proxy = self.bind(name, self.output_interface, version)
             output = self.outputs[name] = {"proxy": proxy, "version": version, "name": None}
             signatures = ["iiiiissi", "uiii", "", "i", "s", "s"][:6 if version >= 4 else 4 if version >= 2 else 2]
-            handlers = [ignore, ignore, ignore, ignore,
+
+            def geometry(_d, _p, _x, _y, _mm_w, _mm_h, _subpixel, _make, _model, transform):
+                # 90 and 270 degrees, flipped or not, put the mode on its side.
+                output["swap_axes"] = transform in (1, 3, 5, 7)
+
+            def mode(_d, _p, flags, width, height, _refresh):
+                if flags & 1:  # WL_OUTPUT_MODE_CURRENT
+                    output["mode"] = (width, height)
+
+            handlers = [geometry, mode, ignore, ignore,
                         lambda _d, _p, value: output.update(name=(value or b"").decode()), ignore]
             self.listen(proxy, signatures, handlers[:len(signatures)], self.callbacks)
             if self.manager is not None:
@@ -544,6 +553,29 @@ def _wayland_client(display: int | None = None) -> _WaylandOutputs:
     if _outputs is None or _outputs.display != display:
         _outputs = _WaylandOutputs(display)
     return _outputs
+
+
+def wayland_output_pixels(screen) -> tuple[int, int] | None:
+    """A Wayland screen's size in pixels, from its output's current mode.
+
+    Upright: a portrait output's mode is rotated to match the screen. None
+    off Wayland, or when the output does not say (a wl_output older than
+    version 4 has no name to match the screen by).
+    """
+    if platform_kind() != "wayland":
+        return None
+    try:
+        name = screen.name()
+        client = _wayland_client()
+        client.roundtrip()  # mode changes, and outputs that came or went
+    except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
+        return None
+    for output in list(client.outputs.values()):
+        if name and output.get("name") == name and output.get("mode"):
+            width, height = output["mode"]
+            if width > 0 and height > 0:
+                return (height, width) if output.get("swap_axes") else (width, height)
+    return None
 
 
 def wayland_outputs(display: int | None = None) -> list[dict]:
