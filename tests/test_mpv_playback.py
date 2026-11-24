@@ -243,6 +243,7 @@ def test_user_input_conf_is_found_where_mpv_looks(tmp_path):
     assert user_input_conf({"MPV_HOME": str(tmp_path / "missing")}, "linux") is None
 
 
+# Bugs caught: 0, False positives: 0
 def test_local_playback_ignores_standalone_mpv_resume_entries(tmp_path):
     """mpv's own resume read standalone mpv's watch-later entry for a local
     file: it deleted the entry and applied its volume, panscan and delays."""
