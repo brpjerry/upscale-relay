@@ -432,9 +432,8 @@ def _validate_source_runtime(ep: str, *, saved_choice: bool = False) -> None:
     from upscale_cli.infer import ort, _EP_ORDER
 
     available = set(ort.get_available_providers())
-    substituted = False
     if saved_choice and ep not in {alias for alias, name in _EP_ORDER if name in available}:
-        ep, substituted = "auto", True
+        ep = "auto"
     providers = [name for alias, name in _EP_ORDER
                  if name in available and (ep == "auto" or alias == ep)]
     if not providers:
@@ -449,11 +448,13 @@ def _validate_source_runtime(ep: str, *, saved_choice: bool = False) -> None:
     session = ort.InferenceSession(model.SerializeToString(), providers=providers)
     if session.get_providers()[0] != providers[0]:
         raise RuntimeError(f"execution provider {providers[0]} failed to initialize")
-    if _LINUX or substituted:
+    if _LINUX:
         # The pipeline refuses CPU inference unless --ep cpu asked for it, so
         # a CPU-only onnxruntime must not count as a usable runtime: the tray
-        # would then skip offering the GPU setup (on Linux any CPU-only build;
-        # elsewhere when a stale preference was replaced by auto).
+        # would then skip offering the GPU setup. Linux only: there the
+        # managed runtime goes first on sys.path once installed. A Windows
+        # source environment keeps its own onnxruntime ahead of a managed
+        # runtime, so offering one there could never take effect.
         from upscale_cli.infer_worker import require_gpu_provider
 
         require_gpu_provider(session.get_providers()[0], ep)

@@ -213,15 +213,27 @@ def test_saved_provider_missing_from_this_build_probes_as_auto(monkeypatch):
 
     monkeypatch.setattr(ort, "get_available_providers", lambda: available)
     monkeypatch.setattr(ort, "InferenceSession", session)
-    monkeypatch.setattr(runtime, "_LINUX", False)
-    runtime._validate_source_runtime("tensorrt", saved_choice=True)
-    with pytest.raises(RuntimeError, match="unavailable"):
-        runtime._validate_source_runtime("tensorrt")
-
-    available.remove("DmlExecutionProvider")
-    with pytest.raises(RuntimeError, match="GPU inference"):
+    for linux in (False, True):
+        monkeypatch.setattr(runtime, "_LINUX", linux)
+        available[:] = ["DmlExecutionProvider", "CPUExecutionProvider"]
         runtime._validate_source_runtime("tensorrt", saved_choice=True)
-    runtime._validate_source_runtime("cpu", saved_choice=True)
+        with pytest.raises(RuntimeError, match="unavailable"):
+            runtime._validate_source_runtime("tensorrt")
+
+        available.remove("DmlExecutionProvider")
+        runtime._validate_source_runtime("cpu", saved_choice=True)
+        if linux:
+            # Auto must land on a GPU there, or the tray skips the setup
+            # offer and every model session fails.
+            for ep in ("tensorrt", "auto"):
+                with pytest.raises(RuntimeError, match="GPU inference"):
+                    runtime._validate_source_runtime(ep, saved_choice=True)
+        else:
+            # As before this change on Windows: a source environment's own
+            # onnxruntime stays ahead of a managed runtime, so a download
+            # could not help; the default auto must not trigger one.
+            runtime._validate_source_runtime("tensorrt", saved_choice=True)
+            runtime._validate_source_runtime("auto", saved_choice=True)
 
 
 def test_a_marker_of_the_wrong_type_is_not_ready(monkeypatch, tmp_path):
