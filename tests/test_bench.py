@@ -75,7 +75,8 @@ def test_benchmark_still_writes_report_without_nvenc(tmp_path, monkeypatch):
         raise RuntimeError("NVENC unavailable")
 
     monkeypatch.setattr(bench, "select_encoder", select)
-    report = tmp_path / "report.md"
+    # A folder that does not exist yet, like ./docs outside a checkout.
+    report = tmp_path / "docs" / "report.md"
     bench.run_bench(str(tmp_path), str(report), frames=3, ep="cpu")
     text = report.read_text()
     assert "e2e fps (hevc-qp18)" in text

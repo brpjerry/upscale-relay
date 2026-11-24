@@ -1,4 +1,4 @@
-"""Persisted relay-server settings for the Windows tray GUI (QSettings-backed).
+"""Persisted relay-server settings for the tray GUI (QSettings-backed).
 
 Kept separate from the tray widgets so the persistence layer is importable and
 testable without constructing any Qt windows. Mirrors
@@ -7,6 +7,9 @@ server and desktop client never share a settings tree.
 """
 
 from __future__ import annotations
+
+import sys
+from pathlib import Path
 
 from PySide6.QtCore import QSettings
 
@@ -32,9 +35,23 @@ def available_ep_choices() -> tuple[str, ...]:
     return ("auto", *(alias for alias, name in _PROVIDER_ALIASES if name in available))
 
 
-# Backward-compatible snapshot for callers that only need import-time choices.
-# The GUI itself calls available_ep_choices() after first-run setup completes.
-EP_CHOICES: tuple[str, ...] = available_ep_choices()
+def __getattr__(name: str):
+    # EP_CHOICES used to be computed at import, which imported onnxruntime
+    # before the tray could activate the managed runtime: on Linux a system
+    # python-onnxruntime then won for the whole process.
+    if name == "EP_CHOICES":
+        return available_ep_choices()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def default_models_dir() -> str:
+    """Linux: the folder the packaged systemd unit serves
+    (``%h/.local/share/upscale-relay/models``, which the unit cannot take
+    from XDG_DATA_HOME), so switching between the unit and the tray keeps
+    the same models.  Elsewhere the historical ./models."""
+    if not sys.platform.startswith("linux"):
+        return "models"
+    return str(Path.home() / ".local" / "share" / "upscale-relay" / "models")
 
 
 class ServerSettings:
@@ -45,7 +62,7 @@ class ServerSettings:
 
     @property
     def models_dir(self) -> str:
-        return str(self._qs.value("server/models_dir", "models"))
+        return str(self._qs.value("server/models_dir", default_models_dir()))
 
     @models_dir.setter
     def models_dir(self, v: str) -> None:
@@ -86,8 +103,15 @@ class ServerSettings:
         self._qs.setValue("server/port", int(v))
 
     @property
-    def ep(self) -> str:
+    def requested_ep(self) -> str:
+        """The saved provider, without asking onnxruntime whether it exists:
+        safe before the runtime is activated."""
         value = str(self._qs.value("server/ep", "auto"))
+        return value if any(value == alias for alias, _ in _PROVIDER_ALIASES) else "auto"
+
+    @property
+    def ep(self) -> str:
+        value = self.requested_ep
         return value if value in available_ep_choices() else "auto"
 
     @ep.setter

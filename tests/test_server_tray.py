@@ -30,17 +30,19 @@ from relay_server.tray import (
 )
 
 _TEST_RUN_KEY = r"Software\upscale-relay-tests\Run"
+_REAL_PLATFORM = sys.platform
 
 
 @pytest.fixture(autouse=True)
-def isolated_autostart(monkeypatch):
-    """Point every test at a private Run key.
+def isolated_autostart(monkeypatch, tmp_path):
+    """Point every test at a private Run key and autostart folder.
 
     ConfigDialog._on_apply() writes the autostart registration, so without
     this the dialog tests would edit the user's real
-    HKCU\\...\\CurrentVersion\\Run entry.
+    HKCU\\...\\CurrentVersion\\Run entry or ~/.config/autostart.
     """
     monkeypatch.setattr(autostart, "_RUN_KEY", _TEST_RUN_KEY)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
     yield
     if sys.platform == "win32":
         import winreg
@@ -140,7 +142,7 @@ def test_autostart_registry_roundtrip():
     autostart.set_enabled(False)  # disabling twice must not raise
 
 
-@pytest.mark.skipif(sys.platform != "win32", reason="Windows registry only")
+@pytest.mark.skipif(not autostart.is_supported(), reason="Windows and Linux only")
 def test_config_dialog_autostart_checkbox(app, settings):
     autostart.set_enabled(True)
     dialog = ConfigDialog(settings)
@@ -155,6 +157,140 @@ def test_config_dialog_autostart_checkbox(app, settings):
         assert autostart.is_enabled() is True
     finally:
         dialog.deleteLater()
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="XDG autostart")
+# Bugs caught: 0, False positives: 0
+def test_linux_autostart_entry_roundtrip(tmp_path):
+    entry = tmp_path / "config" / "autostart" / "upscale-relay-server.desktop"
+    assert autostart.is_enabled() is False
+    autostart.set_enabled(True)
+    assert autostart.is_enabled() is True
+    text = entry.read_text(encoding="utf-8")
+    assert "[Desktop Entry]" in text and "\nExec=" in text
+    autostart.set_enabled(False)
+    assert not entry.exists()
+    autostart.set_enabled(False)  # disabling twice must not raise
+
+
+# Bugs caught: 0, False positives: 0
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="XDG autostart")
+def test_linux_autostart_entry_quotes_exec_and_marks_sign_in(tmp_path, monkeypatch):
+    # The desktop Exec grammar is not a shell's: double quotes, and % is a
+    # field code. Sign-in launches carry --autostart so they wait for the tray.
+    monkeypatch.setattr(autostart.shutil, "which", lambda _name: "/opt/my apps/100%/relay-server-gui")
+    autostart.set_enabled(True)
+    entry = (tmp_path / "config" / "autostart" / "upscale-relay-server.desktop").read_text()
+    assert 'Exec="/opt/my apps/100%%/relay-server-gui" --autostart\n' in entry
+
+
+# Bugs caught: 0, False positives: 0
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="XDG autostart")
+def test_linux_autostart_respects_an_entry_the_desktop_disabled(tmp_path):
+    # Applying unrelated settings rewrote, and so re-enabled, an entry a
+    # startup-apps manager had disabled.
+    autostart.set_enabled(True)
+    entry = tmp_path / "config" / "autostart" / "upscale-relay-server.desktop"
+    disabled = entry.read_text() + "Hidden=true\n"
+    entry.write_text(disabled)
+    assert autostart.is_enabled() is False
+    autostart.set_enabled(False)
+    assert entry.read_text() == disabled  # left for the desktop to manage
+    entry.write_text(entry.read_text().replace("Hidden=true\n", "").replace(
+        "X-GNOME-Autostart-enabled=true", "X-GNOME-Autostart-enabled=false"))
+    assert autostart.is_enabled() is False
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="XDG autostart")
+def test_relative_xdg_config_home_is_ignored(monkeypatch, tmp_path):
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("XDG_CONFIG_HOME", "relative")
+    assert autostart._desktop_entry() == tmp_path / "home/.config/autostart/upscale-relay-server.desktop"
+
+
+def test_autostart_launch_command_marks_sign_in():
+    assert autostart.launch_command().endswith(autostart.AUTOSTART_ARG)
+
+
+# Bugs caught: 0, False positives: 0
+def test_autostarted_tray_waits_for_the_tray_host(monkeypatch):
+    # At sign-in the tray host can start after us; a manual launch still
+    # reports a missing tray at once.
+    from relay_server import tray
+
+    calls = []
+    monkeypatch.setattr(tray.QSystemTrayIcon, "isSystemTrayAvailable",
+                        staticmethod(lambda: calls.append(1) or len(calls) >= 3))
+    monkeypatch.setattr("time.sleep", lambda _s: None)
+    assert tray._tray_available(autostarted=True)
+    calls.clear()
+    assert not tray._tray_available(autostarted=False)
+    assert len(calls) == 1
+
+
+# Bugs caught: 0, False positives: 0
+def test_saved_provider_is_read_without_onnxruntime(settings, monkeypatch):
+    from relay_server import gui_settings
+
+    monkeypatch.setattr(gui_settings, "available_ep_choices",
+                        lambda: pytest.fail("asked onnxruntime"))
+    settings.ep = "tensorrt"
+    assert settings.requested_ep == "tensorrt"
+    settings.ep = "bogus"
+    assert settings.requested_ep == "auto"
+
+
+# Bugs caught: 0, False positives: 0
+def test_linux_sign_in_without_runtime_starts_passthrough_unasked(app, monkeypatch):
+    # An unattended sign-in waited on the download question, so passthrough
+    # stayed offline until someone answered it.
+    from relay_server import runtime_bootstrap, tray
+
+    monkeypatch.setattr(tray, "_setup_is_explicit", lambda: True)
+    monkeypatch.delattr(sys, "frozen", raising=False)
+    monkeypatch.setattr(sys, "argv", ["relay-server-gui", autostart.AUTOSTART_ARG])
+    monkeypatch.setattr(runtime_bootstrap, "activate_runtime", lambda: False)
+    monkeypatch.setattr(runtime_bootstrap, "source_runtime_ready", lambda ep: False)
+    created = _record_setup_dialogs(monkeypatch)
+    assert asyncio.run(ensure_runtime_gui()) == (True, None)
+    assert created == []
+
+
+# Bugs caught: 0, False positives: 0
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="XDG autostart")
+def test_apply_keeps_an_entry_disabled_while_the_pane_was_open(app, settings, tmp_path):
+    autostart.set_enabled(True)
+    dialog = ConfigDialog(settings)
+    try:
+        assert dialog.autostart_check.isChecked()
+        entry = tmp_path / "config" / "autostart" / "upscale-relay-server.desktop"
+        entry.write_text(entry.read_text() + "Hidden=true\n")  # a startup-apps manager
+        dialog.port_spin.setValue(dialog.port_spin.value() + 1)  # an unrelated change
+        dialog._on_apply()
+        assert autostart.is_enabled() is False
+        assert "Hidden=true" in entry.read_text()
+    finally:
+        dialog.deleteLater()
+
+
+# Bugs caught: 0, False positives: 0
+def test_unchanged_autostart_is_rewritten_only_on_windows(app, settings, monkeypatch):
+    # Windows: an Apply from a moved or upgraded copy must re-register its own
+    # path. Linux: an unchanged switch must leave the desktop's entry alone.
+    writes = []
+    monkeypatch.setattr(autostart, "is_supported", lambda: True)
+    monkeypatch.setattr(autostart, "is_enabled", lambda: True)
+    monkeypatch.setattr(autostart, "set_enabled", writes.append)
+    for platform, expected in (("win32", [True]), ("linux", [])):
+        writes.clear()
+        dialog = ConfigDialog(settings)
+        try:
+            monkeypatch.setattr(sys, "platform", platform)
+            dialog._on_apply()
+        finally:
+            monkeypatch.setattr(sys, "platform", _REAL_PLATFORM)
+            dialog.deleteLater()
+        assert writes == expected, platform
 
 
 def test_runtime_setup_close_cancels_installer(app):
@@ -230,8 +366,12 @@ def test_runtime_setup_failure_shows_detail_and_closes(app):
     assert not dialog.isVisible()
 
 
+# Bugs caught: 0, False positives: 1
 def test_runtime_setup_failure_coroutine_returns_after_close(app, monkeypatch):
-    from relay_server import runtime_bootstrap
+    from relay_server import runtime_bootstrap, tray
+
+    monkeypatch.setattr(tray, "_setup_is_explicit", lambda: False)
+    created = _record_setup_dialogs(monkeypatch)
 
     monkeypatch.setattr(runtime_bootstrap, "activate_runtime", lambda: False)
     monkeypatch.setattr(runtime_bootstrap, "source_runtime_ready", lambda ep: False)
@@ -247,10 +387,7 @@ def test_runtime_setup_failure_coroutine_returns_after_close(app, monkeypatch):
         dialog = None
         for _ in range(100):
             await asyncio.sleep(0.01)
-            dialog = next((
-                widget for widget in QApplication.topLevelWidgets()
-                if isinstance(widget, RuntimeSetupDialog) and widget.failed
-            ), None)
+            dialog = next((widget for widget in created if widget.failed), None)
             if dialog is not None:
                 break
         assert dialog is not None
@@ -264,7 +401,9 @@ def test_runtime_setup_failure_coroutine_returns_after_close(app, monkeypatch):
 
 
 def test_usable_source_runtime_skips_managed_installation(app, monkeypatch):
-    from relay_server import runtime_bootstrap
+    from relay_server import runtime_bootstrap, tray
+
+    monkeypatch.setattr(tray, "_setup_is_explicit", lambda: False)
     monkeypatch.delattr(sys, "frozen", raising=False)
     checked = []
     monkeypatch.setattr(runtime_bootstrap, "source_runtime_ready", lambda ep: checked.append(ep) or True)
@@ -279,6 +418,91 @@ def test_frozen_gui_always_uses_managed_runtime(app, monkeypatch):
     monkeypatch.setattr(runtime_bootstrap, "source_runtime_ready", lambda ep: pytest.fail("source check in frozen app"))
     monkeypatch.setattr(runtime_bootstrap, "activate_runtime", lambda: True)
     assert asyncio.run(ensure_runtime_gui("auto")) == (True, None)
+
+
+def _record_setup_dialogs(monkeypatch) -> list:
+    """The dialogs ensure_runtime_gui creates, in order. Scanning
+    QApplication.topLevelWidgets() instead found stale dialogs left by
+    earlier tests whenever they had not been garbage-collected yet."""
+    from relay_server import tray
+
+    created = []
+
+    class Recording(tray.RuntimeSetupDialog):
+        def __init__(self):
+            super().__init__()
+            created.append(self)
+
+    monkeypatch.setattr(tray, "RuntimeSetupDialog", Recording)
+    return created
+
+
+# Bugs caught: 0, False positives: 1
+def test_linux_setup_asks_and_runs_passthrough_when_declined(app, monkeypatch):
+    # Linux setup is explicit: nothing downloads until Install, and "Not now"
+    # still starts the server, which runs passthrough without the runtime.
+    from relay_server import runtime_bootstrap, tray
+
+    monkeypatch.setattr(tray, "_setup_is_explicit", lambda: True)
+    monkeypatch.delattr(sys, "frozen", raising=False)
+    created = _record_setup_dialogs(monkeypatch)
+    monkeypatch.setattr(runtime_bootstrap, "activate_runtime", lambda: False)
+    monkeypatch.setattr(runtime_bootstrap, "source_runtime_ready", lambda ep: False)
+    monkeypatch.setattr(
+        runtime_bootstrap, "run_installer_process",
+        lambda *_args: pytest.fail("installed without being asked"),
+    )
+
+    async def scenario():
+        setup = asyncio.create_task(ensure_runtime_gui())
+        dialog = None
+        for _ in range(100):
+            await asyncio.sleep(0.01)
+            dialog = created[0] if created else None
+            if dialog is not None and dialog.install_button.isVisible():
+                break
+        assert dialog is not None and dialog.install_button.isVisible()
+        assert "4 GB" in dialog.label.text()
+        assert dialog.close()  # the title-bar close means "Not now"
+        assert await asyncio.wait_for(setup, timeout=1) == (True, None)
+        assert not dialog.isVisible()
+
+    asyncio.run(scenario())
+
+
+# Bugs caught: 0, False positives: 1
+def test_linux_setup_installs_after_install_is_chosen(app, monkeypatch):
+    from relay_server import runtime_bootstrap, tray
+
+    monkeypatch.setattr(tray, "_setup_is_explicit", lambda: True)
+    monkeypatch.delattr(sys, "frozen", raising=False)
+    created = _record_setup_dialogs(monkeypatch)
+    installed = []
+    monkeypatch.setattr(runtime_bootstrap, "activate_runtime", lambda: bool(installed))
+    monkeypatch.setattr(runtime_bootstrap, "source_runtime_ready", lambda ep: False)
+
+    def installer(on_line, _on_process):
+        installed.append(True)
+        on_line("NVIDIA runtime is ready")
+        return 0
+
+    monkeypatch.setattr(runtime_bootstrap, "run_installer_process", installer)
+
+    async def scenario():
+        setup = asyncio.create_task(ensure_runtime_gui())
+        dialog = None
+        for _ in range(100):
+            await asyncio.sleep(0.01)
+            dialog = created[0] if created else None
+            if dialog is not None and dialog.install_button.isVisible():
+                break
+        assert dialog is not None
+        assert installed == []
+        dialog.install_button.click()
+        assert await asyncio.wait_for(setup, timeout=2) == (True, None)
+        assert installed == [True]
+
+    asyncio.run(scenario())
 
 
 def test_config_dialog_load_and_apply_persists(app, settings):

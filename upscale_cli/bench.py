@@ -206,6 +206,8 @@ def run_bench(models_dir: str, out_path: str, frames: int = 48, ep: str = "auto"
     if not models:
         raise SystemExit(f"no .onnx models in {models_dir}")
 
+    # Before the measurements: a packaged install has no ./docs to write to.
+    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="upscale-bench-") as directory:
         _run_bench(models, out_path, frames, ep, fit, Path(directory))
 

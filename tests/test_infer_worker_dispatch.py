@@ -52,9 +52,15 @@ def test_packaged_onnx_check(monkeypatch):
     assert infer_worker.worker_main(["--onnx-check"]) == 0
 
 
-def test_frozen_release_reports_unavailable_tensorrt_clearly():
-    with pytest.raises(RuntimeError, match="first-launch NVIDIA setup"):
-        _should_use_tensorrt("tensorrt", {"DmlExecutionProvider", "CPUExecutionProvider"})
+# Bugs caught: 0, False positives: 1
+def test_frozen_release_reports_unavailable_tensorrt_clearly(monkeypatch):
+    # Each platform names its own way to install the runtime.
+    for platform, advice in (("win32", "first-launch NVIDIA setup"),
+                             ("linux", "relay-server --install-nvidia-runtime, then restart")):
+        monkeypatch.setattr(sys, "platform", platform)
+        with pytest.raises(RuntimeError, match=advice):
+            _should_use_tensorrt("tensorrt", {"DmlExecutionProvider", "CPUExecutionProvider"})
+    monkeypatch.undo()
 
     assert _should_use_tensorrt("auto", {"DmlExecutionProvider"}) is False
     assert _should_use_tensorrt("auto", {"TensorrtExecutionProvider"}) is True

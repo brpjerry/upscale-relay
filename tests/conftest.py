@@ -1,8 +1,19 @@
 """Session-wide test setup."""
 import faulthandler
+import os
 import sys
 
 import pytest
+
+# libmpv's mpv_create() returns NULL unless LC_NUMERIC is "C", and
+# python-mpv then segfaults in mpv_set_option. QApplication's constructor
+# adopts the environment's locale, so tests that build their own
+# QApplication crashed under en_US.UTF-8 (CI's C.UTF-8 hid it). relay-desktop
+# resets LC_NUMERIC after creating its QApplication (desktop_client/app.py).
+# LC_ALL would override it, so it becomes the general default (LANG).
+if locale_override := os.environ.pop("LC_ALL", None):
+    os.environ["LANG"] = locale_override
+os.environ["LC_NUMERIC"] = "C"
 
 
 @pytest.hookimpl(trylast=True)

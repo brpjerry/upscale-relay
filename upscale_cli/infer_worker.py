@@ -49,6 +49,24 @@ _GPU_PROVIDERS = frozenset({
 })
 
 
+def attach_shared_memory(name: str) -> shared_memory.SharedMemory:
+    """Attach to a block the parent created, which only the parent unlinks.
+
+    On POSIX a plain attach registers the block with this process's resource
+    tracker, which unlinks it when the worker exits.  A replacement worker
+    attaches to the same names, so after a crash it found them gone, and every
+    worker exit logged the parent's blocks as leaked.  Windows has no tracker.
+    """
+    if sys.version_info >= (3, 13):
+        return shared_memory.SharedMemory(name=name, track=False)
+    block = shared_memory.SharedMemory(name=name)
+    if os.name == "posix":
+        from multiprocessing import resource_tracker
+
+        resource_tracker.unregister(block._name, "shared_memory")
+    return block
+
+
 def is_gpu_provider(name: str | None) -> bool:
     """True when `name` executes on the GPU.
 
@@ -118,8 +136,8 @@ def worker_main(argv: list[str] | None = None) -> int:
     up = OnnxUpscaler(args.model, ep=args.ep, tile_size=tile, io_bits=args.io_bits)
     sample = np.dtype("<u2") if args.io_bits == 16 else np.dtype(np.uint8)
 
-    shm_in = shared_memory.SharedMemory(name=args.shm_in)
-    shm_out = shared_memory.SharedMemory(name=args.shm_out)
+    shm_in = attach_shared_memory(args.shm_in)
+    shm_out = attach_shared_memory(args.shm_out)
     # PyInstaller's --windowed bootloader may leave the Python stream objects
     # as None even though Popen attached OS pipe handles. Open the inherited
     # descriptors directly in that case so the GUI binary can host a worker.
@@ -338,7 +356,11 @@ class SubprocessUpscaler:
                 raise RuntimeError("inference worker reader did not stop")
         for pipe in (proc.stdin, proc.stdout):
             if pipe is not None:
-                pipe.close()
+                # A header written to a worker that had already died is still
+                # in stdin's buffer: close() fails flushing it to the broken
+                # pipe, but closes the descriptor regardless.
+                with suppress(OSError):
+                    pipe.close()
         self._proc = None
         self._reader = None
 

@@ -17,6 +17,7 @@ read from the filename; filenames without one default to 2x.
 
 from __future__ import annotations
 
+import functools
 import sys
 from pathlib import Path
 from typing import Iterable
@@ -57,7 +58,47 @@ def _add_nvidia_dll_dirs() -> None:
             os.add_dll_directory(d)
 
 
+def _use_active_runtime() -> None:
+    """Linux: take ONNX Runtime from a managed runtime.
+
+    ``relay_server.runtime_bootstrap.activate_runtime`` names it in
+    ``UPSCALE_RELAY_ACTIVE_RUNTIME``, which the inference worker and the
+    setup's validation process inherit.  Its onnxruntime must win over a
+    system one, so it goes first on sys.path (moved there if a .pth file
+    already listed it later).  TensorRT is preloaded only when a TensorRT
+    session is set up (``_trt_options``).
+    """
+    import os
+
+    if not sys.platform.startswith("linux"):
+        return
+    active = os.environ.get("UPSCALE_RELAY_ACTIVE_RUNTIME")
+    if not active:
+        return
+    if active in sys.path:
+        sys.path.remove(active)
+    sys.path.insert(0, active)
+
+
+@functools.cache
+def _preload_tensorrt(active: str) -> None:
+    """Load the runtime's TensorRT by path, before a TensorRT session.
+
+    ORT's TensorRT provider has no RUNPATH, so it finds libnvinfer.so.10 only
+    already loaded or on the ``LD_LIBRARY_PATH`` this process started with.
+    Deferred to here so a CPU or CUDA session never depends on TensorRT
+    loading.
+    """
+    import ctypes
+
+    libs = Path(active) / "tensorrt_libs"
+    for name in ("libnvinfer.so.10", "libnvinfer_plugin.so.10", "libnvonnxparser.so.10"):
+        if (libs / name).is_file():
+            ctypes.CDLL(str(libs / name), mode=ctypes.RTLD_GLOBAL)
+
+
 _add_nvidia_dll_dirs()
+_use_active_runtime()
 
 import onnxruntime as ort  # noqa: E402
 
@@ -71,21 +112,42 @@ _EP_ORDER = [
 _EP_BY_ALIAS = dict(_EP_ORDER)
 
 
-def _trt_options() -> dict:
-    cache = Path("models") / ".trt_cache"
-    cache.mkdir(parents=True, exist_ok=True)
-    return {
+def _trt_options(cache: Path | None = None) -> dict:
+    """``cache`` is the engine and timing cache directory: ``.trt_cache``
+    beside the model (``models/.trt_cache`` for a model in ./models)."""
+    import os
+    import tempfile
+
+    active = os.environ.get("UPSCALE_RELAY_ACTIVE_RUNTIME")
+    if active and sys.platform.startswith("linux"):
+        _preload_tensorrt(active)
+    cache = Path("models") / ".trt_cache" if cache is None else cache
+    # Models on a read-only share still run, building their engine at every
+    # session start instead of failing to create the cache.
+    # A real write: os.access misses Windows ACLs and a missing search bit.
+    try:
+        cache.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryFile(dir=cache):
+            pass
+        writable = True
+    except OSError:
+        writable = False
+    if not writable:
+        print(f"TensorRT engine cache disabled: {cache} is not writable", file=sys.stderr)
+    options = {
         "trt_fp16_enable": True,
-        "trt_engine_cache_enable": True,
-        "trt_engine_cache_path": str(cache),
-        "trt_timing_cache_enable": True,
-        "trt_timing_cache_path": str(cache),
+        "trt_engine_cache_enable": writable,
+        "trt_timing_cache_enable": writable,
         # No auxiliary CUDA streams: with them enabled, output DMA can land
         # after run() returns and scribble freed host memory — observed as
         # native crashes in *other* threads (the libav decoder was the usual
         # victim) seconds into streaming.
         "trt_auxiliary_streams": "0",
     }
+    if writable:
+        options["trt_engine_cache_path"] = str(cache)
+        options["trt_timing_cache_path"] = str(cache)
+    return options
 
 
 def _with_trt_profile(providers: list, input_name: str, sample_dims: str = "") -> list:
@@ -110,13 +172,13 @@ def _with_trt_profile(providers: list, input_name: str, sample_dims: str = "") -
     return out
 
 
-def resolve_providers(ep: str = "auto") -> list:
+def resolve_providers(ep: str = "auto", trt_cache: Path | None = None) -> list:
     """Provider list for InferenceSession; TensorRT entries carry options
     (fp16 engines + on-disk engine cache — first build per shape takes ~20 s,
     cached builds load in seconds)."""
 
     def entry(name: str):
-        return (name, _trt_options()) if name == "TensorrtExecutionProvider" else name
+        return (name, _trt_options(trt_cache)) if name == "TensorrtExecutionProvider" else name
 
     available = set(ort.get_available_providers())
     if ep != "auto":
@@ -175,7 +237,9 @@ class OnnxUpscaler:
         self._reformatter = av.video.reformatter.VideoReformatter()
         self.model_path = model_path
         self.manifest = ModelManifest.load(model_path)
-        providers = resolve_providers(ep)
+        # Beside the model, so launchers with different working directories
+        # (the service, the tray, a shell) share one cache.
+        providers = resolve_providers(ep, Path(model_path).parent / ".trt_cache")
 
         # Prefer a graph wrapped with GPU-side pre/post (uint8 NHWC IO) — the
         # CPU float passes it replaces were the pipeline's largest cost.

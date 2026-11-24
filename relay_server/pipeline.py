@@ -19,6 +19,7 @@ import functools
 import logging
 import os
 import queue
+import sys
 import threading
 import time
 from dataclasses import dataclass, field
@@ -132,13 +133,21 @@ class PipelineConstructionError(PipelineCloseError):
         self.pipeline = pipeline  # retain ownership until the server restarts
 
 
+def _runtime_setup_hint() -> str:
+    if sys.platform.startswith("linux"):
+        return ("Run relay-server --install-nvidia-runtime, then restart the server "
+                "(or quit and relaunch relay-server-gui).")
+    return ("Re-run the first-launch NVIDIA setup or install the .[nvidia] "
+            "source extra.")
+
+
 def _should_use_tensorrt(ep: str, available_providers: set[str]) -> bool:
     provider = "TensorrtExecutionProvider"
     if ep == "tensorrt" and provider not in available_providers:
         raise RuntimeError(
             "TensorRT execution provider is not available in this build; "
-            f"installed providers: {sorted(available_providers)}. Re-run the "
-            "first-launch NVIDIA setup or install the .[nvidia] source extra."
+            f"installed providers: {sorted(available_providers)}. "
+            + _runtime_setup_hint()
         )
     return ep == "tensorrt" or (ep == "auto" and provider in available_providers)
 
@@ -494,7 +503,13 @@ class Pipeline:
                 # Fixed tiling decision from known input dims: no "auto" probing
                 # (which shells out to nvidia-smi) in the streaming hot path.
                 tile = None if (video.height <= 1440 and video.width <= 2560) else 1024
-                import onnxruntime as _ort
+                try:
+                    import onnxruntime as _ort
+                except ModuleNotFoundError as error:
+                    raise RuntimeError(
+                        "ONNX Runtime is not installed; model sessions need it. "
+                        + _runtime_setup_hint()
+                    ) from error
 
                 use_trt = _should_use_tensorrt(ep, set(_ort.get_available_providers()))
                 if use_trt:

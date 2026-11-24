@@ -46,6 +46,8 @@ instructions remain at the root.
   and the server-only distinction.
 - [Linux client setup](CLIENT_LINUX.md) — dependencies, installation, flags,
   firewall setup, and bandwidth guidance.
+- [Linux server setup](SERVER_LINUX.md) — the Arch packages, the NVIDIA
+  runtime over Arch's CUDA, the systemd user unit, and the optional tray GUI.
 
 ## Measurements
 

@@ -1,7 +1,9 @@
-"""Windows system-tray front end for the relay server.
+"""System-tray front end for the relay server (Windows, and Linux desktops
+with a StatusNotifierItem tray).
 
-Double-clicking the frozen ``upscale-relay-server-gui.exe`` starts the server
-with the last-saved configuration and drops an icon in the notification area.
+Double-clicking the frozen ``upscale-relay-server-gui.exe`` (or running
+``relay-server-gui``) starts the server with the last-saved configuration and
+drops an icon in the notification area.
 The tray menu opens a configuration pane (execution provider, control port,
 media library folders, models folder, mDNS) that restarts the listeners in place
 when applied.
@@ -86,7 +88,7 @@ QProgressBar::chunk {{ background: palette(highlight); border-radius: 3px; }}
 
 
 def apply_theme(app: QApplication) -> theme.Theme:
-    """Install the client theme, following the Windows light/dark setting."""
+    """Install the client theme, following the system light/dark setting."""
     t = theme.apply_theme(app, "auto")
     # A light/dark switch installs a fresh client style sheet; ours rides on it.
     sheet = app.styleSheet()
@@ -131,6 +133,10 @@ class RuntimeSetupDialog(QDialog):
         self.progress.setTextVisible(False)
         self.cancel_button = QPushButton("Cancel")
         self.cancel_button.clicked.connect(self.cancel)
+        self.install_button = QPushButton("Install")
+        self.install_button.clicked.connect(self._install)
+        self.install_button.hide()
+        self._choice: asyncio.Future | None = None
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(22, 20, 22, 18)
@@ -138,8 +144,49 @@ class RuntimeSetupDialog(QDialog):
         layout.addWidget(heading)
         layout.addWidget(self.label)
         layout.addWidget(self.progress)
-        layout.addWidget(self.cancel_button, alignment=Qt.AlignRight)
+        buttons = QHBoxLayout()
+        buttons.addStretch(1)
+        buttons.addWidget(self.install_button)
+        buttons.addWidget(self.cancel_button)
+        layout.addLayout(buttons)
         self.status.connect(self._set_status)
+
+    def ask(self) -> asyncio.Future:
+        """Offer the download rather than start it; resolves True to install.
+
+        Linux, where setup is an explicit choice: CUDA and cuDNN come from
+        the system, and passthrough sessions run without the runtime.
+        """
+        from .runtime_bootstrap import runtime_dir
+
+        self._choice = asyncio.get_running_loop().create_future()
+        self.label.setText(
+            "Model sessions need ONNX Runtime and TensorRT: a one-time download "
+            f"of about 4 GB into {runtime_dir()}. Passthrough sessions work "
+            "without it."
+        )
+        self.progress.hide()
+        self.install_button.show()
+        self.cancel_button.setText("Not now")
+        return self._choice
+
+    def _install(self, _checked: bool = False) -> None:
+        self._answer(True)
+
+    def _answer(self, install: bool) -> None:
+        if self._choice is None or self._choice.done():
+            return
+        self._choice.set_result(install)
+        self.install_button.hide()
+        if install:
+            self.label.setText(
+                "Installing the pinned ONNX Runtime and TensorRT. This one-time "
+                "download is about 4 GB and may take a while."
+            )
+            self.progress.show()
+            self.cancel_button.setText("Cancel")
+        else:
+            self.hide()
 
     def _set_status(self, line: str) -> None:
         if line:
@@ -157,6 +204,9 @@ class RuntimeSetupDialog(QDialog):
             terminate_process_tree(self._process)
 
     def cancel(self) -> None:
+        if self._choice is not None and not self._choice.done():
+            self._answer(False)
+            return
         self.cancelled = True
         self.label.setText("Cancelling setup…")
         self.cancel_button.setEnabled(False)
@@ -192,17 +242,40 @@ class RuntimeSetupDialog(QDialog):
         self.closed.emit()
 
 
+def _setup_is_explicit() -> bool:
+    """Linux asks before the runtime download and runs passthrough without it;
+    Windows installs at first launch and needs it."""
+    return sys.platform.startswith("linux")
+
+
 async def ensure_runtime_gui(ep: str = "auto") -> tuple[bool, RuntimeSetupDialog | None]:
     """Install the external runtime without blocking Qt's event loop."""
     from .runtime_bootstrap import activate_runtime, run_installer_process, source_runtime_ready
 
+    linux = _setup_is_explicit()
+    # Linux: the managed runtime goes first, so the source check below sees it.
+    if linux and activate_runtime():
+        return True, None
     if not getattr(sys, "frozen", False) and await asyncio.to_thread(source_runtime_ready, ep):
         return True, None
     if activate_runtime():
         return True, None
 
+    if linux and autostart.AUTOSTART_ARG in sys.argv[1:]:
+        # Unattended sign-in: serve passthrough now rather than wait on a
+        # question nobody may be there to answer. A manual launch asks.
+        log.warning(
+            "NVIDIA runtime not installed: only passthrough sessions can run. Run "
+            "relay-server --install-nvidia-runtime and relaunch the tray for models."
+        )
+        return True, None
+
     dialog = RuntimeSetupDialog()
     dialog.show()
+    if linux and not await dialog.ask():
+        log.warning("NVIDIA runtime not installed: only passthrough sessions can run")
+        dialog.deleteLater()
+        return True, None
     last_line = ""
 
     def report(line: str) -> None:
@@ -231,6 +304,9 @@ async def ensure_runtime_gui(ep: str = "auto") -> tuple[bool, RuntimeSetupDialog
 
         dialog.closed.connect(finish_close)
         await closed
+    if linux:
+        # The server still runs passthrough sessions without the runtime.
+        return True, dialog
     return False, dialog
 
 
@@ -508,7 +584,7 @@ class ConfigDialog(QDialog):
         self.mdns_check = FlatSwitch("Advertise on the LAN via mDNS/DNS-SD")
         self.logging_check = FlatSwitch("Write a server log")
         self.logging_check.setToolTip(str(diagnostics_log_path()))
-        self.autostart_check = FlatSwitch("Start automatically when I sign in to Windows")
+        self.autostart_check = FlatSwitch(autostart.sign_in_label())
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(22, 20, 22, 18)
@@ -591,7 +667,8 @@ class ConfigDialog(QDialog):
         self.models_edit.setText(s.models_dir)
         self.mdns_check.setChecked(s.mdns)
         self.logging_check.setChecked(s.file_logging)
-        self.autostart_check.setChecked(autostart.is_enabled())
+        self._autostart_loaded = autostart.is_enabled()
+        self.autostart_check.setChecked(self._autostart_loaded)
 
     def _add_library_folder(self) -> None:
         selected = self.library_list.currentItem()
@@ -625,11 +702,17 @@ class ConfigDialog(QDialog):
         s.models_dir = self.models_edit.text().strip()
         s.mdns = self.mdns_check.isChecked()
         s.file_logging = self.logging_check.isChecked()
-        if autostart.is_supported():
+        # Linux: only a change made here, since the desktop may have disabled
+        # the entry while the pane was open. Windows: always, as before, so an
+        # Apply from a moved or upgraded copy re-registers its own path (a
+        # disabled Startup entry lives in a separate key the Run value keeps).
+        changed = self.autostart_check.isChecked() != self._autostart_loaded
+        if autostart.is_supported() and (changed or sys.platform == "win32"):
             try:
                 autostart.set_enabled(self.autostart_check.isChecked())
+                self._autostart_loaded = self.autostart_check.isChecked()
             except OSError as err:
-                log.warning("could not update Windows autostart: %r", err)
+                log.warning("could not update autostart: %r", err)
         self.applied.emit()
 
 
@@ -815,6 +898,21 @@ def setup_diagnostics(file_logging: bool = True) -> None:
     except Exception:
         pass
 
+def _tray_available(*, autostarted: bool, wait_s: float = 60.0) -> bool:
+    """At sign-in the session may start this before its tray host
+    (StatusNotifierWatcher) is up: an autostarted launch waits for it.
+    Called before the asyncio loop exists, so blocking here is safe."""
+    import time
+
+    deadline = time.monotonic() + (wait_s if autostarted else 0.0)
+    while True:
+        if QSystemTrayIcon.isSystemTrayAvailable():
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.5)
+
+
 def main() -> None:
     # Frozen-build smoke hook: reaching here means the entry script imported
     # relay_server.tray (and its deps) successfully, so exit 0 without any UI.
@@ -846,7 +944,7 @@ def main() -> None:
         QMessageBox.critical(None, _APP_NAME, str(error))
         sys.exit(1)
 
-    if not QSystemTrayIcon.isSystemTrayAvailable():
+    if not _tray_available(autostarted=autostart.AUTOSTART_ARG in sys.argv[1:]):
         QMessageBox.critical(
             None, _APP_NAME,
             "No system tray is available on this desktop.\n"
@@ -858,7 +956,9 @@ def main() -> None:
     asyncio.set_event_loop(loop)
 
     with loop:
-        runtime_ok, setup_dialog = loop.run_until_complete(ensure_runtime_gui(settings.ep))
+        runtime_ok, setup_dialog = loop.run_until_complete(
+            ensure_runtime_gui(settings.requested_ep)
+        )
         if not runtime_ok:
             return
 

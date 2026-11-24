@@ -1,10 +1,17 @@
-"""First-run installer for the frozen Windows NVIDIA inference runtime.
+"""Installer for the per-user NVIDIA inference runtime.
 
-The release executable deliberately does not contain the multi-gigabyte CUDA,
-cuDNN, TensorRT, and ONNX Runtime wheels.  It carries pip's installer code and
-uses it to build a versioned, per-user runtime on first launch.  Keeping the
-runtime outside the application directory also means a new small server build
-can reuse it while the pinned stack identifier is unchanged.
+Windows: the release executable deliberately does not contain the
+multi-gigabyte CUDA, cuDNN, TensorRT, and ONNX Runtime wheels.  It carries
+pip's installer code and uses it to build a versioned, per-user runtime on
+first launch.  Keeping the runtime outside the application directory also
+means a new small server build can reuse it while the pinned stack identifier
+is unchanged.
+
+Linux: CUDA and cuDNN come from the system (Arch's ``cuda`` and ``cudnn``
+packages, which the server package depends on).  Arch's ONNX Runtime is built
+without the TensorRT provider and the AUR's TensorRT is a major version ORT
+1.31 cannot load, so only those two wheels are installed, without their
+dependencies, by ``relay-server --install-nvidia-runtime``.
 
 This module must remain importable without numpy, ONNX Runtime, or TensorRT:
 the frozen entry points activate the external runtime before importing any of
@@ -28,7 +35,11 @@ RUNTIME_INSTALL_CHECK_ARG = "--check-nvidia-runtime-installer"
 RUNTIME_INSTALL_SMOKE_ARG = "--smoke-nvidia-runtime-installer"
 RUNTIME_VALIDATE_ARG = "--validate-nvidia-runtime"
 SOURCE_VALIDATE_ARG = "--validate-source-runtime"
+_LINUX = sys.platform.startswith("linux")
 RUNTIME_STACK_ID = (
+    f"ort1.31.0-trt10.16.1-syscuda13-"
+    f"py{sys.version_info.major}{sys.version_info.minor}-linux-v1"
+    if _LINUX else
     f"ort1.31.0-trt10.16.1-cuda13.4-"
     f"py{sys.version_info.major}{sys.version_info.minor}-v1"
 )
@@ -56,8 +67,36 @@ NVIDIA_RUNTIME_PACKAGES = (
     "nvidia-nvjitlink==13.4.92",
 )
 
+# Linux takes CUDA and cuDNN from the system, so it installs only the two
+# wheels no Arch package provides, with --no-deps: their Python dependencies
+# (numpy, protobuf, flatbuffers, packaging) are the system's too, and a numpy
+# in the runtime would shadow the one python-av was built against.
+LINUX_RUNTIME_PACKAGES = (
+    "onnxruntime-gpu==1.31.0",
+    "tensorrt-cu13-libs==10.16.1.11",
+)
+
+# The system libraries the Linux ORT providers link against (readelf -d of
+# libonnxruntime_providers_tensorrt.so and _cuda.so), and the Arch package
+# that provides each.  The wheels were built against CUDA 13.0 / cuDNN 9; any
+# later 13.x / 9.x keeps these sonames.
+_SYSTEM_LIBRARIES = {
+    "libcuda.so.1": "nvidia-utils",
+    "libcudart.so.13": "cuda",
+    "libcublas.so.13": "cuda",
+    "libcublasLt.so.13": "cuda",
+    "libcurand.so.10": "cuda",
+    "libcudnn.so.9": "cudnn",
+}
+
 # TensorRT's soname major, which its Windows DLLs carry in their file names.
 _TENSORRT_MAJOR = "10"
+# Loaded in this order: the plugin and parser libraries need nvinfer.
+_TENSORRT_LINUX_LIBRARIES = (
+    f"libnvinfer.so.{_TENSORRT_MAJOR}",
+    f"libnvinfer_plugin.so.{_TENSORRT_MAJOR}",
+    f"libnvonnxparser.so.{_TENSORRT_MAJOR}",
+)
 
 _REQUIRED_PROVIDERS = {
     "TensorrtExecutionProvider", "CUDAExecutionProvider", "CPUExecutionProvider",
@@ -65,11 +104,21 @@ _REQUIRED_PROVIDERS = {
 _dll_directory_handles: list[object] = []
 
 
+def runtime_packages() -> tuple[str, ...]:
+    return LINUX_RUNTIME_PACKAGES if _LINUX else NVIDIA_RUNTIME_PACKAGES
+
+
 def runtime_base_dir() -> Path:
     """Return the user-writable root for managed inference runtimes."""
     override = os.environ.get("UPSCALE_RELAY_RUNTIME_DIR")
     if override:
         return Path(override)
+    if _LINUX:
+        # XDG base directories must be absolute; a relative value is ignored.
+        root = Path(os.environ.get("XDG_DATA_HOME") or "")
+        if not root.is_absolute():
+            root = Path.home() / ".local" / "share"
+        return root / "upscale-relay" / "runtimes"
     local_app_data = os.environ.get("LOCALAPPDATA")
     if local_app_data:
         return Path(local_app_data) / "upscale-relay" / "runtimes"
@@ -90,7 +139,7 @@ def runtime_ready(path: Path | None = None) -> bool:
         data = json.loads(_marker(target).read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return False
-    return data.get("stack_id") == RUNTIME_STACK_ID
+    return isinstance(data, dict) and data.get("stack_id") == RUNTIME_STACK_ID
 
 
 def _native_dll_dirs(target: Path) -> list[Path]:
@@ -112,9 +161,18 @@ def _native_dll_dirs(target: Path) -> list[Path]:
 def activate_runtime(path: Path | None = None, *, require_ready: bool = True) -> bool:
     """Expose an installed runtime to this process before importing ORT.
 
-    The directory is appended, rather than prepended, so lightweight packages
-    already frozen into the executable (notably numpy) remain authoritative.
-    Windows DLL directory handles must be retained for the process lifetime.
+    Windows: the directory is appended, rather than prepended, so lightweight
+    packages already frozen into the executable (notably numpy) remain
+    authoritative.  Windows DLL directory handles must be retained for the
+    process lifetime.
+
+    Linux: the directory goes first, so its onnxruntime wins over a system
+    ``python-onnxruntime*`` (it holds nothing else that could shadow a system
+    package).  TensorRT's directory goes on ``LD_LIBRARY_PATH`` for the
+    inference worker and validation children: ORT's TensorRT provider has no
+    RUNPATH, and the loader reads that variable only when a process starts.
+    A process that runs TensorRT itself preloads the libraries instead
+    (``upscale_cli.infer``).
     """
     target = runtime_dir() if path is None else path
     if require_ready and not runtime_ready(target):
@@ -123,6 +181,17 @@ def activate_runtime(path: Path | None = None, *, require_ready: bool = True) ->
         return False
 
     target_text = str(target)
+    if _LINUX:
+        # First, even if a .pth file already listed it after a system build.
+        if target_text in sys.path:
+            sys.path.remove(target_text)
+        sys.path.insert(0, target_text)
+        libs = str(target / "tensorrt_libs")
+        existing = os.environ.get("LD_LIBRARY_PATH", "")
+        if libs not in existing.split(os.pathsep):
+            os.environ["LD_LIBRARY_PATH"] = libs + (os.pathsep + existing if existing else "")
+        os.environ["UPSCALE_RELAY_ACTIVE_RUNTIME"] = target_text
+        return True
     if target_text not in sys.path:
         sys.path.append(target_text)
 
@@ -152,15 +221,22 @@ def _prepare_pip_resources() -> None:
 
 def _run_pip(
     target: Path,
-    packages: tuple[str, ...] = NVIDIA_RUNTIME_PACKAGES,
+    packages: tuple[str, ...] | None = None,
     *,
     ignore_installed: bool = False,
 ) -> int:
     # pip is deliberately collected into the frozen release.  Invoking its CLI
     # in this short-lived internal installer process avoids requiring Python on
     # the user's machine and keeps imports out of the long-running server.
+    # On Linux it is the system's pip (python-pip); --target installs are
+    # outside PEP 668's externally-managed check.
     from pip._internal.cli.main import main as pip_main
 
+    if packages is None:
+        packages = runtime_packages()
+        no_deps = _LINUX
+    else:
+        no_deps = False
     _prepare_pip_resources()
     args = [
         "install",
@@ -172,6 +248,8 @@ def _run_pip(
     ]
     if ignore_installed:
         args.append("--ignore-installed")
+    if no_deps:
+        args.append("--no-deps")
     args.extend(packages)
     return int(pip_main(args))
 
@@ -226,15 +304,63 @@ def _validate_runtime(target: Path) -> None:
             f"available providers: {sorted(available)}"
         )
     verify_native_runtime(target)
+    if _LINUX:
+        # The provider list is compiled in and says nothing about whether the
+        # system CUDA libraries load: build real TensorRT and CUDA sessions
+        # (--ep cuda uses the second without TensorRT).
+        _validate_source_runtime("tensorrt")
+        _validate_source_runtime("cuda")
 
 
-def _native_library_check(target: Path) -> tuple[list[Path], list[str]]:
+def missing_system_libraries() -> list[str]:
+    """Linux: the system CUDA libraries the runtime needs that do not load,
+    each with the Arch package that provides it."""
+    if not _LINUX:
+        return []
+    import ctypes
+
+    missing = []
+    for soname, package in _SYSTEM_LIBRARIES.items():
+        try:
+            ctypes.CDLL(soname)
+        except OSError:
+            missing.append(f"{soname} (package {package})")
+    return missing
+
+
+def _prune_runtime(target: Path) -> None:
+    """Linux: drop TensorRT's builder resources for Windows-targeted engines.
+
+    The Linux wheel carries them (1.8 GB of its 4.6) for cross-building
+    engines that run on Windows, which this server never does.
+    """
+    if not _LINUX:
+        return
+    for path in (target / "tensorrt_libs").glob("libnvinfer_builder_resource_win_*"):
+        path.unlink()
+
+
+def _native_library_check(
+    target: Path, *, linux: bool | None = None,
+) -> tuple[list[Path], list[str]]:
     """Return the libraries to load and the names that are absent.
 
     Kept separate from loading so the required-file set stays testable on
-    hosts that cannot load the Windows DLLs.
+    hosts that cannot load the platform's libraries.
     """
+    linux = _LINUX if linux is None else linux
     tensorrt_libs = target / "tensorrt_libs"
+    if linux:
+        libraries = [tensorrt_libs / name for name in _TENSORRT_LINUX_LIBRARIES]
+        libraries.append(
+            target / "onnxruntime" / "capi" / "libonnxruntime_providers_tensorrt.so"
+        )
+        missing = [str(library) for library in libraries if not library.is_file()]
+        # Linux names carry the full version: libnvinfer_builder_resource_sm120.so.10.16.1.
+        pattern = f"libnvinfer_builder_resource*.so.{_TENSORRT_MAJOR}*"
+        if not any(tensorrt_libs.glob(pattern)):
+            missing.append(str(tensorrt_libs / pattern))
+        return libraries, missing
     libraries = [
         tensorrt_libs / f"nvinfer_{_TENSORRT_MAJOR}.dll",
         tensorrt_libs / f"nvinfer_plugin_{_TENSORRT_MAJOR}.dll",
@@ -262,7 +388,7 @@ def verify_native_runtime(path: Path | None = None) -> None:
         if not active:
             return  # Source environments manage their own native library paths.
         target = Path(active)
-    if os.name != "nt":
+    if os.name != "nt" and not _LINUX:
         return
 
     import ctypes
@@ -270,6 +396,13 @@ def verify_native_runtime(path: Path | None = None) -> None:
     libraries, missing = _native_library_check(target)
     if missing:
         raise RuntimeError(f"NVIDIA runtime is missing native libraries: {missing}")
+    if _LINUX:
+        absent = missing_system_libraries()
+        if absent:
+            raise RuntimeError(f"system CUDA libraries do not load: {absent}")
+        for library in libraries:
+            ctypes.CDLL(str(library), mode=ctypes.RTLD_GLOBAL)
+        return
     for library in libraries:
         ctypes.WinDLL(str(library))
 
@@ -287,13 +420,20 @@ def _run_validation_process(target: Path) -> int:
     return subprocess.run(_validation_command(target), check=False).returncode
 
 
-def _validate_source_runtime(ep: str) -> None:
-    """Exercise the source environment in a disposable process, including DLLs."""
+def _validate_source_runtime(ep: str, *, saved_choice: bool = False) -> None:
+    """Exercise the source environment in a disposable process, including DLLs.
+
+    ``saved_choice``: ``ep`` is the tray's saved preference, which the server
+    itself replaces with auto when this build lacks it; probe it the same way
+    rather than offering a multi-gigabyte download.
+    """
     import numpy as np
     import onnx
     from upscale_cli.infer import ort, _EP_ORDER
 
     available = set(ort.get_available_providers())
+    if saved_choice and ep not in {alias for alias, name in _EP_ORDER if name in available}:
+        ep = "auto"
     providers = [name for alias, name in _EP_ORDER
                  if name in available and (ep == "auto" or alias == ep)]
     if not providers:
@@ -308,6 +448,16 @@ def _validate_source_runtime(ep: str) -> None:
     session = ort.InferenceSession(model.SerializeToString(), providers=providers)
     if session.get_providers()[0] != providers[0]:
         raise RuntimeError(f"execution provider {providers[0]} failed to initialize")
+    if _LINUX:
+        # The pipeline refuses CPU inference unless --ep cpu asked for it, so
+        # a CPU-only onnxruntime must not count as a usable runtime: the tray
+        # would then skip offering the GPU setup. Linux only: there the
+        # managed runtime goes first on sys.path once installed. A Windows
+        # source environment keeps its own onnxruntime ahead of a managed
+        # runtime, so offering one there could never take effect.
+        from upscale_cli.infer_worker import require_gpu_provider
+
+        require_gpu_provider(session.get_providers()[0], ep)
     session.run(None, {"input": np.zeros((1, 3, 8, 8), dtype=np.float32)})
 
 
@@ -332,6 +482,16 @@ def install_runtime() -> int:
         print(f"NVIDIA runtime already installed: {final}", flush=True)
         return 0
 
+    absent = missing_system_libraries()
+    if absent:
+        # Fail before a multi-gigabyte download that could not load anyway.
+        print(
+            "The NVIDIA runtime needs these system libraries, which do not load: "
+            + ", ".join(absent),
+            file=sys.stderr, flush=True,
+        )
+        return 1
+
     base = runtime_base_dir()
     base.mkdir(parents=True, exist_ok=True)
     with _install_lock(base):
@@ -345,19 +505,24 @@ def install_runtime() -> int:
         staging = base / f".{RUNTIME_STACK_ID}.installing-{os.getpid()}"
         staging.mkdir()
 
-        print("Installing the pinned TensorRT/CUDA runtime (several GB)...", flush=True)
+        if _LINUX:
+            print("Installing the pinned ONNX Runtime and TensorRT (about 4 GB to download)...",
+                  flush=True)
+        else:
+            print("Installing the pinned TensorRT/CUDA runtime (several GB)...", flush=True)
         print(f"Destination: {final}", flush=True)
         try:
             result = _run_pip(staging)
             if result:
                 raise RuntimeError(f"pip exited with status {result}")
+            _prune_runtime(staging)
             print("Verifying TensorRT, CUDA, and CPU providers...", flush=True)
             result = _run_validation_process(staging)
             if result:
                 raise RuntimeError(f"runtime validation exited with status {result}")
             _marker(staging).write_text(json.dumps({
                 "stack_id": RUNTIME_STACK_ID,
-                "packages": NVIDIA_RUNTIME_PACKAGES,
+                "packages": runtime_packages(),
             }, indent=2), encoding="utf-8")
             if final.exists():
                 shutil.rmtree(final)
@@ -375,7 +540,7 @@ def maybe_run_runtime_installer(argv: list[str] | None = None) -> int | None:
     args = sys.argv[1:] if argv is None else argv
     if len(args) == 2 and args[0] == SOURCE_VALIDATE_ARG:
         try:
-            _validate_source_runtime(args[1])
+            _validate_source_runtime(args[1], saved_choice=True)
         except Exception as err:
             print(f"Source runtime validation failed: {err}", file=sys.stderr, flush=True)
             return 1

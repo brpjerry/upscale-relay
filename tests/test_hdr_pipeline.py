@@ -50,6 +50,12 @@ def _write_source(path, *, tags=PQ_TAGS, x265_params=X265_HDR10, frames=8, size=
     """A 10-bit (or 8-bit) x265 source with a different gradient in every frame."""
     width, height = size
     pix_fmt, dtype, step = ("yuv420p10le", np.uint16, 4) if bits == 10 else ("yuv420p", np.uint8, 1)
+    if frames < 3:
+        # libx265 flushes a 2-frame clip with garbage DTS about one time in
+        # four (B-frame delay longer than the clip; uninitialized, a new value
+        # every run), and Matroska's muxer now and then rejects it with
+        # EINVAL: the intermittent CI failures of the 2-frame fixtures.
+        x265_params += ":bframes=0"
     with av.open(str(path), "w") as output:
         stream = output.add_stream("libx265", rate=24, options={
             "x265-params": x265_params, "preset": "ultrafast",
@@ -500,7 +506,7 @@ def test_model_runs_on_16_bit_rgb_for_a_deep_colour_session(tmp_path):
     assert np.unique(luma[32]).size > 64  # the ramp kept its 10-bit steps
 
 
-# Bugs caught: 0, False positives: 1
+# Bugs caught: 0, False positives: 2
 def test_8_bit_source_runs_the_16_bit_model_under_all(tmp_path):
     pytest.importorskip("onnxruntime")
     sys.path.insert(0, str(ROOT))

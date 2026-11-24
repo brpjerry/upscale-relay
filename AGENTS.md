@@ -46,8 +46,13 @@ needs `mpv-dev/libmpv-2.dll` at the repository root. Get it from the
 client adds that directory to its DLL search path automatically. See
 `docs/CLIENT_WINDOWS.md`. Server-only release binaries do not need libmpv.
 
-Server (runs on the Windows box, not the laptop):
-`relay-server --models-dir models --ep tensorrt` from `.venv-cuda`.
+Server (runs on the RTX 5090 box, not the laptop; that box is Arch Linux since
+2026-11, see `docs/SERVER_LINUX.md`): the Arch package's systemd user unit
+(`systemctl --user start upscale-relay-server`, models in
+`~/.local/share/upscale-relay/models`), or from a checkout
+`relay-server --models-dir models --ep tensorrt` (Windows: from `.venv-cuda`;
+Linux: system Python plus the managed runtime that
+`relay-server --install-nvidia-runtime` installs over Arch's CUDA/cuDNN).
 `http://<server>:8590/status` returns per-session pipeline fps + per-stage ms —
 first stop for any performance question.
 Release binaries stay small and use `relay_server/runtime_bootstrap.py` to
@@ -399,7 +404,20 @@ their volume, panscan, tracks and delays.
   the first `loadfile`, then re-enumerate and remap track choices after every
   fresh epoch. Requested mode alone is not authoritative.
 
-**GPU stacks (server box: RTX 5090 "Blackwell", Windows)**
+**GPU stacks (server box: RTX 5090 "Blackwell"; Windows until 2026-11, now Arch
+Linux — the rules below were found on Windows unless they say Linux)**
+- Linux: CUDA and cuDNN come from Arch (`cuda`, `cudnn`); only
+  `onnxruntime-gpu` and `tensorrt-cu13-libs` live in the managed runtime
+  (`--no-deps`; Arch's onnxruntime has no TensorRT provider, the AUR's
+  TensorRT 11 is too new for ORT 1.31). ORT's TensorRT provider `.so` has
+  no RUNPATH: `libnvinfer.so.10` must be preloaded or on the
+  `LD_LIBRARY_PATH` the process started with, or TensorRT sessions
+  silently land on CPU (`activate_runtime` sets the variable for the
+  worker; `upscale_cli.infer` preloads).
+- Linux: the inference worker attaches the parent's shared memory with
+  `attach_shared_memory` (no resource tracker). A plain attach let the
+  worker's tracker unlink the parent's blocks at worker exit, so the
+  restart-once-on-crash replacement could not attach.
 - ORT TensorRT EP corrupts the process heap under streaming → it lives in a
   subprocess (`SubprocessUpscaler`), restart-once-on-crash. The uint8 graph
   wrapper's tail must stay `Transpose(float) → Cast(uint8)` (3-5x faster TRT
@@ -446,7 +464,8 @@ their volume, panscan, tracks and delays.
   in `_open_session`; do not add an open path around it.
 - TRT builds engines from *live timing measurements*: engines built while the
   GPU is busy (user games on this box) are permanently slow — delete
-  `models/.trt_cache` and rebuild with an idle GPU.
+  `<models-dir>/.trt_cache` (it sits beside the models) and rebuild with an
+  idle GPU.
 - **Reproduce any playback bug on the `passthrough` model first.** This GPU is
   shared with whatever the owner is doing on the box, so a model that normally
   keeps up can quietly fall under realtime — and a starved pipeline produces

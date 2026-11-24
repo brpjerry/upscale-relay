@@ -13,8 +13,8 @@ permissions:
   contents: write
 
 jobs:
-  client-pacman:
-    uses: ./.github/workflows/client-pacman.yml
+  arch-packages:
+    uses: ./.github/workflows/arch-packages.yml
     with:
       ref: refs/tags/${{ github.event.inputs.tag || github.ref_name }}
       tag: ${{ github.event.inputs.tag || github.ref_name }}
@@ -105,7 +105,7 @@ jobs:
           if-no-files-found: error
 
   publish:
-    needs: [windows-server, client-pacman]
+    needs: [windows-server, arch-packages]
     runs-on: ubuntu-latest
     env:
       TAG: ${{ github.event.inputs.tag || github.ref_name }}
@@ -119,7 +119,7 @@ jobs:
           path: dist
       - uses: actions/download-artifact@v8
         with:
-          name: upscale-relay-client-pacman
+          name: upscale-relay-pacman
           path: dist
       - name: Publish GitHub Release
         env:

@@ -165,3 +165,81 @@ def test_recovery_keeps_deliberate_cpu_inference(tmp_path, monkeypatch):
         assert worker.active_provider == "CPUExecutionProvider"
     finally:
         worker.close()
+
+
+_IDLE_DEATH_WORKER = r'''
+import struct, sys
+from upscale_cli.infer_worker import attach_shared_memory
+generation, shm_out_name, die_after = sys.argv[1], sys.argv[2], int(sys.argv[3])
+print("READY 2 CPUExecutionProvider", flush=True)
+served = 0
+while served < die_after:
+    header = sys.stdin.buffer.read(8)
+    if len(header) < 8:
+        break
+    h, w = struct.unpack("<II", header)
+    if not h:
+        break
+    block = attach_shared_memory(shm_out_name)
+    block.buf[:h * w * 12] = bytes([127]) * (h * w * 12)
+    block.close()
+    sys.stdout.buffer.write(struct.pack("<II", h * 2, w * 2))
+    sys.stdout.buffer.flush()
+    served += 1
+sys.exit(9)  # dies while idle, not mid-frame
+'''
+
+
+def _idle_death_workers(monkeypatch, serve_counts):
+    monkeypatch.setattr(infer_worker, "_MAX_IN_BYTES", 48)
+    monkeypatch.setattr(infer_worker, "_MAX_OUT_BYTES", 768)
+    generations = []
+
+    def command(_model, _ep, _tile, _shm_in, shm_out):
+        generations.append(len(generations) + 1)
+        serve = serve_counts[len(generations) - 1]
+        return [sys.executable, "-c", _IDLE_DEATH_WORKER, str(generations[-1]), shm_out, str(serve)]
+
+    monkeypatch.setattr(infer_worker, "build_worker_command", command)
+    return generations
+
+
+def _wait_for_exit(worker):
+    worker._proc.wait(timeout=10)
+
+
+# Bugs caught: 1, False positives: 0
+def test_worker_that_died_between_frames_is_replaced(tmp_path, monkeypatch):
+    # A worker that is already gone when the next frame is written leaves
+    # that frame's header in the stdin buffer; closing the pipe flushed it
+    # again and the BrokenPipeError escaped the restart (seen on Linux by
+    # SIGKILLing a TensorRT worker between frames).
+    import numpy as np
+
+    generations = _idle_death_workers(monkeypatch, [0, 100])
+    worker = infer_worker.SubprocessUpscaler(str(tmp_path / "model2x.onnx"), ep="cpu")
+    try:
+        dead = worker._proc
+        _wait_for_exit(worker)
+        out = worker.infer_array(np.zeros((4, 4, 3), dtype=np.uint8))
+        assert out.shape == (8, 8, 3) and int(out.min()) == 127
+        assert generations == [1, 2]
+        assert dead.stdin.closed and dead.stdout.closed
+    finally:
+        worker.close()
+
+
+# Bugs caught: 1, False positives: 0
+def test_close_after_the_worker_already_exited(tmp_path, monkeypatch):
+    # Teardown must still confirm release when the worker is already gone:
+    # an escaping BrokenPipeError marked the server "restart required".
+    import numpy as np
+
+    _idle_death_workers(monkeypatch, [1])
+    worker = infer_worker.SubprocessUpscaler(str(tmp_path / "model2x.onnx"), ep="cpu")
+    proc = worker._proc
+    worker.infer_array(np.zeros((4, 4, 3), dtype=np.uint8))
+    proc.wait(timeout=10)
+    worker.close()
+    assert worker._proc is None
+    assert proc.stdin.closed and proc.stdout.closed

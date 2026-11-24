@@ -1,0 +1,21 @@
+[Unit]
+Description=Upscale Relay server
+Documentation=https://github.com/brpjerry/upscale-relay/blob/main/docs/SERVER_LINUX.md
+
+[Service]
+Type=exec
+# Extra relay-server options, e.g. RELAY_SERVER_ARGS=--library "/srv/My Videos" --ep tensorrt
+# (split on whitespace; quote a path that contains spaces).
+Environment=RELAY_SERVER_ARGS=
+EnvironmentFile=-%E/upscale-relay/server.env
+ExecStartPre=/usr/bin/mkdir -p %h/.local/share/upscale-relay/models
+ExecStart=/usr/bin/relay-server --models-dir %h/.local/share/upscale-relay/models $RELAY_SERVER_ARGS
+# SIGTERM to relay-server alone: it closes its sessions, and with them its
+# inference worker and ffmpeg children, before systemd kills what remains. A
+# worker killed alongside it mid-frame was restarted during the teardown.
+KillMode=mixed
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
