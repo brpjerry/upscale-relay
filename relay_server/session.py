@@ -98,6 +98,8 @@ def _sample_aspect_ratio(video: dict) -> Fraction:
 # How much longer a stalled downlink waits when buffer reports stopped too:
 # the server's control heartbeat notices a dead connection within 30 s.
 _DETACH_WAIT_S = 30.0
+# Clients report every 500 ms: this long without one, reports have stopped.
+_REPORTS_STOPPED_S = 2.0
 
 
 class State(str, Enum):
@@ -355,7 +357,7 @@ class Session:
                         # grace period bounds the hold, not this deadline.
                         deadline = now + 30.0
                     elif (now >= deadline and self.resumable
-                          and self.last_buffer_report < deadline - 30.0
+                          and now - self.last_buffer_report > _REPORTS_STOPPED_S
                           and now < deadline + _DETACH_WAIT_S):
                         # Reports stopped as well: the control connection is
                         # likely dead too, and its heartbeat detaches the
@@ -689,7 +691,9 @@ class Session:
             await self._handle_seek(msg)
 
     async def _handle_seek(self, msg: dict) -> None:
-        new_epoch = int(msg["epoch"])
+        # Both read before the epoch changes: a malformed seek must not leave
+        # an epoch published that the pipeline never installed.
+        new_epoch, target_pts = int(msg["epoch"]), int(msg["target_pts"])
         if new_epoch <= self.epoch or self.pipeline is None:
             return  # stale or premature
         self.epoch = new_epoch
@@ -705,9 +709,9 @@ class Session:
         # A malformed or absent display_target keeps the mapping (§3.6).
         display_target = DisplayTarget.from_wire(msg.get("display_target"))
         trace = await asyncio.to_thread(
-            self.pipeline.flush, new_epoch, int(msg["target_pts"]), display_target)
+            self.pipeline.flush, new_epoch, target_pts, display_target)
         if self.downlink_attached:
-            await self.start_server_source(int(msg["target_pts"]), discontinuity=True)
+            await self.start_server_source(target_pts, discontinuity=True)
         # seek_ready is only an ack that the epoch switched — the first media
         # for it may be seconds away (docs/SEEK_LATENCY_PLAN.md). The ticker is
         # what tells the client the server is working rather than wedged.

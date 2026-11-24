@@ -2355,6 +2355,15 @@ class MainWindow(DesktopFeatures, QMainWindow):
         if pending is None:
             return True
         session_id, host, port = pending
+        if (self._unreleased_resume_token is not None
+                and (client.host, client.port) == (host, port)
+                and not getattr(client, "connected", True)):
+            # A held session (PROTOCOL §1.2) is released over a control
+            # connection, and outlasts the /status poll: get a live one first.
+            await self._replace_lost_client(client)
+            client = self.client
+            if client is None:
+                return False
         self.client_log.record("release_wait", session=session_id, host=client.host, port=client.port)
         self.statusBar().showMessage(_RELEASE_WAIT_NOTE)
         try:

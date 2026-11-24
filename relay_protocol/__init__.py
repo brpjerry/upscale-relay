@@ -9,6 +9,8 @@ from .buffer import (  # noqa: F401
     parse_buffer_target_ms,
 )
 from .framing import (  # noqa: F401
+    CLOSE_RESUME_ABANDONED,
+    CLOSE_SESSION_TAKEN_OVER,
     DIR_DOWNLINK,
     DIR_UPLINK,
     FLAG_DISCONTINUITY,

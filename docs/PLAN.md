@@ -21,7 +21,7 @@ contract and [SERVER_LIBRARY.md](SERVER_LIBRARY.md) for server-hosted media.
 | Server-side media library | **Implemented** | Repeatable `--library`, sandboxed single/multi-root listing and Range compatibility delivery, server demux/seek, capability-driven Server tab, negotiated in-band audio/subtitles, and cached subtitle fonts |
 | Server-side framing and resize filters | **Implemented** | Fit preserves the full frame; Cover center-crops before encode; the final post-ONNX downscale is selectable per server or session |
 | Shared-mount path mapping | **Planned** | Negotiated clients use muxed tracks; mapping one relative path to different client/server mount roots for legacy/external or direct-access workflows is not implemented |
-| Polish phase | **Partial** | model discovery/picker, metrics, manual/discovered hosts, history/resume, autoplay, library sorting/restoration, subtitle/sync defaults, optional diagnostics/logging, mounted shares, and fallback exist; pairing, hot model reload, and automatic reconnect remain |
+| Polish phase | **Partial** | model discovery/picker, metrics, manual/discovered hosts, history/resume, autoplay, library sorting/restoration, subtitle/sync defaults, optional diagnostics/logging, mounted shares, fallback, and session resume through control-connection dropouts exist; pairing, hot model reload, and re-attaching lost media connections remain |
 | Android client | **Phase 5.5 and muxed auxiliary tracks implemented** | Server/local playback, recovery, discovery, adaptive UI, background media, and system controls; negotiated muxed audio/subtitles and verified font caching are implemented, with external compatibility fallback |
 
 ## Architecture
@@ -233,9 +233,11 @@ path mapping remains planned; see
 - **Model management:** discovery, selection, and mid-play switching work now.
   Add directory watching, manifest validation UX, and benchmark metadata in
   capabilities.
-- **Recovery:** cleanup, saved-position reopening, and manual local fallback work
-  now. Add automatic reconnect with session resume, keepalives/timeouts, and
-  chaos coverage for network outages. Actionable desktop performance warnings,
+- **Recovery:** cleanup, saved-position reopening, manual local fallback,
+  keepalives, and session resume through a lost control connection
+  (PROTOCOL §1.2, desktop and `relay-client`) work now. Add re-attaching a
+  media connection that died in a dropout (a new epoch at the playing
+  position), resume on Android, and chaos coverage for network outages. Actionable desktop performance warnings,
   recents, settings/history backup, and fullscreen settings access remain open.
 - **Performance/endurance:** continue per-stage profiling, two-hour drift and
   memory tests, quality-tier network measurements, and native crash diagnosis.

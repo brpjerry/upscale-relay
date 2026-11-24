@@ -53,12 +53,16 @@ control connection to that server, before any `open_session`, it polls
 
 0. If the session was opened for a resume (§1.2) and the server still
    advertises `session_resume`, first send `resume_session` with its
-   `resume_token`, then `teardown`. `closed` answers the question at once,
-   and the server then ends that connection, as after any teardown. A
-   `resume_failed` error means the session is gone or already closing (within
-   the 15 s close bound): continue with the polling below. A connection lost
-   before `closed` is no answer, as for a failed request below. Without this
-   step a held session stays listed for its whole grace period, past the 60 s.
+   `resume_token`, then `teardown`, and close the connection once `closed`
+   arrives (the server ends it too, as after any teardown). Then poll as
+   below: after `closed` the first poll no longer lists the session, and it
+   still says whether the server needs a restart. A `resume_failed` error
+   means the session is gone or already closing (within the 15 s close
+   bound), and the polling says which. A connection lost before `closed` is
+   no answer, as for a failed request below. Send the token only to the
+   host and port that issued it, never to another name for the server.
+   Without this step a held session stays listed for its whole grace period,
+   past the 60 s.
 1. `restart_required: true`: stop; the server must be restarted (checked first).
 2. Its session id absent from `sessions[].id`: released; proceed.
 3. Still listed after 60 s: stop.
@@ -98,7 +102,9 @@ its session through one instead. Additive: no protocol version change.
    server answers `session_resumed` and the new connection is the session's
    from then on, `teardown` included. A resume may arrive before the server
    has noticed the old connection is dead (the client's heartbeat fired
-   first): the server closes the old connection and the session stays. A
+   first): the server closes the old connection with code 4001 and the
+   session stays. A client whose connection closes with 4001 lost its
+   session to another connection and does not try to resume it. A
    resume of an unknown, closed or closing session, or with the wrong token,
    gets the non-fatal error `resume_failed`; the session is then lost and the
    client ends playback as before.
@@ -112,16 +118,20 @@ its session through one instead. Additive: no protocol version change.
 5. The client retries with backoff, each attempt bounded (a blackholed path
    hangs rather than refuses), until the server refuses or the grace period
    has certainly ended: `resume_grace_s` plus the server's heartbeat window
-   (30 s) after the client noticed the loss. It closes an attempt it gives
+   (30 s) after the client noticed the loss. It sends the token only once
+   the reconnect's `capabilities` still advertise `session_resume`; a server
+   that does not is a refusal. It closes an attempt it gives
    up on with a code other than 1000 (`relay_client_core` uses 4000): the server
    may already have handed the session to that connection, and a normal
    close would end it. A client torn down meanwhile releases the session
    through §1.1 step 0.
 
 A session therefore survives a dropout when two things hold: the client takes
-it over before its hold ends (the hold starts when the server notices the
-loss, so a dropout of at least `resume_grace_s` is covered), and its media
-connections survived. A media connection that died is not re-attached, since
+it over before its hold ends, and its media connections survived. The hold
+starts when the server notices the loss, up to 30 s into it, and lasts
+`resume_grace_s`. The client's backoff (at most 5 s between attempts) and
+the attempt itself come on top of the dropout, so a dropout as long as
+`resume_grace_s` can still miss the hold. A media connection that died is not re-attached, since
 the epoch's Matroska stream cannot continue on a new one. When the
 `session_resumed` flags show one gone, the client ends that playback as a
 dropped downlink always has. TCP usually keeps such connections through a

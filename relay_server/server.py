@@ -27,6 +27,7 @@ from typing import Iterable
 from aiohttp import WSCloseCode, WSMsgType, web, web_fileresponse
 
 from relay_protocol import (
+    CLOSE_SESSION_TAKEN_OVER,
     DIR_DOWNLINK,
     DIR_UPLINK,
     HANDSHAKE_LEN,
@@ -297,6 +298,10 @@ class RelayServer:
             log.info("control connection from %s", peer_ip)
         session: Session | None = None
         teardown_ack_requested = False
+        # The connection ended under the loop (lost, or closed by the peer),
+        # not by a teardown, an error or this handler failing: only then is a
+        # resumable session held.
+        connection_ended = False
         try:
             async for raw in ws:
                 if raw.type != WSMsgType.TEXT:
@@ -404,6 +409,8 @@ class RelayServer:
                     # snapshot must not report an epoch still being flushed.
                     async with session.seek_lock:
                         report = session.resume_report()
+                    if session.ws is not ws:
+                        break  # resumed again meanwhile: the newer one answers
                     await session.send("session_resumed", **report)
                 elif session is None:
                     await ws.send_str(json.dumps({
@@ -433,12 +440,14 @@ class RelayServer:
                     break
                 else:
                     await session.send("error", code="bad_message", message=mtype, fatal=False)
+            else:
+                connection_ended = True
         finally:
             # A session that a resume took over belongs to its new connection.
             if session is not None and session.ws is ws:
                 # Held only when the connection was lost: a client that closed
                 # it normally is there, and chose to end.
-                if (not teardown_ack_requested and session.resumable
+                if (connection_ended and session.resumable
                         and ws.close_code != WSCloseCode.OK and self._stop_task is None):
                     self._hold_session(session)
                 else:
@@ -499,7 +508,7 @@ class RelayServer:
     async def _close_superseded(ws: web.WebSocketResponse) -> None:
         try:
             await asyncio.wait_for(
-                ws.close(code=WSCloseCode.POLICY_VIOLATION,
+                ws.close(code=CLOSE_SESSION_TAKEN_OVER,
                          message=b"session resumed on another connection"),
                 2.0,
             )
@@ -735,6 +744,13 @@ class RelayServer:
                 await runner.cleanup()
             except Exception as error:
                 errors.append(error)
+        if not errors and self.native_teardown_error is not None:
+            # A native owner may still be alive, whenever its close failed
+            # (a held session can expire during this stop): a new server in
+            # this process would start with restart_required clear.
+            errors.append(RuntimeError(
+                "a native session teardown did not complete; restart the process: "
+                f"{self.native_teardown_error.get('error')}"))
         if errors:
             raise errors[0]
 

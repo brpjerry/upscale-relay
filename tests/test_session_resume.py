@@ -530,3 +530,222 @@ def test_shutdown_reports_a_held_session_that_failed_to_close(source, monkeypatc
                 await client.close()
 
     _run(scenario)
+
+
+# Bugs caught: 0, False positives: 0
+def test_release_by_resume_still_reports_a_server_that_needs_a_restart(source):
+    # `closed` settles this session; /status still says whether the server
+    # must restart because another session's close failed.
+    async def scenario():
+        server = RelayServer("models", free_port_pair())
+        await server.start()
+        lost = replacement = None
+        try:
+            lost, info = await _playing_client(server, source)
+            lost._ws._conn.transport.abort()
+            with pytest.raises(TeardownNotConfirmedError) as unconfirmed:
+                await lost.teardown()
+            await _until(lambda: server.sessions[info.session_id].ws is None)
+            server.native_teardown_error = {
+                "session_id": "other", "error": "boom", "restart_required": True}
+            replacement = RelayClient("127.0.0.1", server.port)
+            await replacement.connect()
+            with pytest.raises(TeardownNotConfirmedError, match="restart"):
+                await replacement.wait_session_released(
+                    info.session_id, resume_token=unconfirmed.value.resume_token)
+            assert info.session_id not in server.sessions  # released all the same
+        finally:
+            for client in (lost, replacement):
+                if client is not None:
+                    await client.close()
+            with pytest.raises(RuntimeError, match="native session teardown"):
+                await server.stop()
+
+    _run(scenario)
+
+
+# Bugs caught: 0, False positives: 0
+def test_a_client_reconnected_after_a_release_resumes_its_next_session(source):
+    async def scenario():
+        server = RelayServer("models", free_port_pair())
+        await server.start()
+        lost = client = None
+        try:
+            lost, info = await _playing_client(server, source)
+            lost._ws._conn.transport.abort()
+            with pytest.raises(TeardownNotConfirmedError) as unconfirmed:
+                await lost.teardown()
+            client = RelayClient("127.0.0.1", server.port)
+            await client.connect()
+            await client.wait_session_released(
+                info.session_id, resume_token=unconfirmed.value.resume_token)
+            # The same client, connected again, plays and loses its connection.
+            await client.connect()
+            await client.open_session(_config(source))
+            await client.attach_media()
+            await client.start_uplink()
+            await client.play()
+            reconnected = asyncio.Event()
+            client.on_reconnected = reconnected.set
+            client._ws._conn.transport.abort()
+            await reconnected.wait()
+            await client.teardown()
+        finally:
+            for each in (lost, client):
+                if each is not None:
+                    await each.close()
+            await server.stop()
+
+    _run(scenario)
+
+
+# Bugs caught: 0, False positives: 0
+def test_a_held_session_that_fails_is_released_at_once(source):
+    async def scenario():
+        server = RelayServer("models", free_port_pair())
+        await server.start()
+        client = None
+        try:
+            client, info = await _playing_client(server, source)
+            client.port = free_port_pair()  # its resume goes nowhere
+            client._ws._conn.transport.abort()
+            held = server.sessions[info.session_id]
+            await _until(lambda: held.ws is None)
+            held._pipeline_error("the encoder failed")
+            async with asyncio.timeout(5):  # not the 120 s grace period
+                await _until(lambda: info.session_id not in server.sessions)
+            assert server.native_teardown_error is None
+        finally:
+            if client is not None:
+                await client.close()
+            await server.stop()
+
+    _run(scenario)
+
+
+# Bugs caught: 0, False positives: 0
+def test_a_client_whose_session_another_connection_resumed_does_not_take_it_back(source):
+    async def scenario():
+        server = RelayServer("models", free_port_pair())
+        await server.start()
+        client = None
+        http = aiohttp.ClientSession()
+        try:
+            client, info = await _playing_client(server, source)
+            events = []
+            client.on_reconnecting = lambda: events.append("reconnecting")
+            client.on_disconnected = lambda: events.append("disconnected")
+            other = await http.ws_connect(f"http://127.0.0.1:{server.port}/control")
+            await other.send_str(json.dumps({"type": "hello", "protocol_version": PROTOCOL_VERSION}))
+            await _receive(other, "capabilities")
+            await other.send_str(json.dumps({
+                "type": "resume_session", "session_id": info.session_id,
+                "resume_token": info.resume_token,
+            }))
+            await _receive(other, "session_resumed")
+            await _until(lambda: events)
+            assert events == ["disconnected"] and not client.resuming
+            assert server.sessions[info.session_id].ws is not None
+            await other.send_str(json.dumps({"type": "teardown"}))
+            await _receive(other, "closed")
+        finally:
+            await http.close()
+            if client is not None:
+                await client.close()
+            await server.stop()
+
+    _run(scenario)
+
+
+# Bugs caught: 0, False positives: 0
+def test_a_server_that_no_longer_resumes_gets_no_token(source):
+    async def scenario():
+        server = RelayServer("models", free_port_pair())
+        await server.start()
+        client = None
+        try:
+            client, info = await _playing_client(server, source)
+            server.resume_grace_s = 0.0  # as if rolled back: no session_resume
+            sent = []
+            resume_once = client._resume_once
+
+            async def watched(session):
+                try:
+                    return await resume_once(session)
+                finally:
+                    sent.append(client.capabilities.get("session_resume"))
+
+            client._resume_once = watched
+            events = []
+            client.on_disconnected = lambda: events.append("disconnected")
+            client._ws._conn.transport.abort()
+            async with asyncio.timeout(5):
+                await _until(lambda: events)
+            assert sent == [False]  # one attempt, refused before the token went out
+        finally:
+            if client is not None:
+                await client.close()
+            await server.stop()
+
+    _run(scenario)
+
+
+async def _serve_control(handler):
+    from aiohttp import web
+    app = web.Application()
+    app.router.add_get("/control", handler)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = free_port_pair()
+    await web.TCPSite(runner, "127.0.0.1", port).start()
+    return runner, port
+
+
+# Bugs caught: 0, False positives: 0
+def test_a_connection_lost_right_after_session_opened_is_resumed(source):
+    # session_opened and the end of the connection arrive back to back: the
+    # token in that reply must still decide that the loss is resumed.
+    from aiohttp import web
+    attempts = []
+
+    async def handler(request):
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+        async for raw in ws:
+            msg = json.loads(raw.data)
+            if msg["type"] == "hello":
+                await ws.send_str(json.dumps({
+                    "type": "capabilities", "models": [], "session_resume": True}))
+            elif msg["type"] == "open_session":
+                await ws.send_str(json.dumps({
+                    "type": "session_opened", "session_id": "s1", "media_port": 1,
+                    "uplink_token": "u" * 34, "downlink_token": "d" * 34,
+                    "downlink_codec": "ffv1", "downlink_width": 64, "downlink_height": 64,
+                    "resume_token": "t" * 34, "resume_grace_s": 1.0,
+                }))
+                await ws.close(code=1011)  # in the same breath
+                return ws
+            elif msg["type"] == "resume_session":
+                attempts.append(msg["resume_token"])
+                await ws.send_str(json.dumps({
+                    "type": "error", "code": "resume_failed", "message": "gone",
+                    "fatal": False}))
+        return ws
+
+    async def scenario():
+        runner, port = await _serve_control(handler)
+        client = RelayClient("127.0.0.1", port)
+        try:
+            await client.connect()
+            events = []
+            client.on_reconnecting = lambda: events.append("reconnecting")
+            client.on_disconnected = lambda: events.append("disconnected")
+            await client.open_session(_config(source))
+            await _until(lambda: "disconnected" in events)
+            assert events == ["reconnecting", "disconnected"]
+            assert attempts == ["t" * 34]
+        finally:
+            await client.close()
+            await runner.cleanup()
+
+    _run(scenario)
