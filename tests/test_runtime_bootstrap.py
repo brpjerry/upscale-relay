@@ -115,6 +115,8 @@ def test_activate_adds_external_packages_and_native_dll_dirs(monkeypatch, tmp_pa
         raising=False,
     )
     monkeypatch.setattr(sys, "path", list(sys.path))
+    monkeypatch.setenv("PATH", os.environ.get("PATH", ""))
+    monkeypatch.setenv("UPSCALE_RELAY_ACTIVE_RUNTIME", "")
     runtime._dll_directory_handles.clear()
 
     assert runtime.activate_runtime()
@@ -234,7 +236,8 @@ def test_linux_activation_puts_the_runtime_first(monkeypatch, tmp_path):
     monkeypatch.setattr(sys, "path", ["/usr/lib/python3/site-packages"])
     monkeypatch.setenv("LD_LIBRARY_PATH", "/opt/other")
     monkeypatch.setenv("PATH", "original")
-    monkeypatch.delenv("UPSCALE_RELAY_ACTIVE_RUNTIME", raising=False)
+    # Recorded, so teardown removes what activation sets for later tests.
+    monkeypatch.setenv("UPSCALE_RELAY_ACTIVE_RUNTIME", "")
 
     assert runtime.activate_runtime()
     assert runtime.activate_runtime()  # idempotent

@@ -30,6 +30,7 @@ from relay_server.tray import (
 )
 
 _TEST_RUN_KEY = r"Software\upscale-relay-tests\Run"
+_REAL_PLATFORM = sys.platform
 
 
 @pytest.fixture(autouse=True)
@@ -270,6 +271,26 @@ def test_apply_keeps_an_entry_disabled_while_the_pane_was_open(app, settings, tm
         assert "Hidden=true" in entry.read_text()
     finally:
         dialog.deleteLater()
+
+
+# Bugs caught: 0, False positives: 0
+def test_unchanged_autostart_is_rewritten_only_on_windows(app, settings, monkeypatch):
+    # Windows: an Apply from a moved or upgraded copy must re-register its own
+    # path. Linux: an unchanged switch must leave the desktop's entry alone.
+    writes = []
+    monkeypatch.setattr(autostart, "is_supported", lambda: True)
+    monkeypatch.setattr(autostart, "is_enabled", lambda: True)
+    monkeypatch.setattr(autostart, "set_enabled", writes.append)
+    for platform, expected in (("win32", [True]), ("linux", [])):
+        writes.clear()
+        dialog = ConfigDialog(settings)
+        try:
+            monkeypatch.setattr(sys, "platform", platform)
+            dialog._on_apply()
+        finally:
+            monkeypatch.setattr(sys, "platform", _REAL_PLATFORM)
+            dialog.deleteLater()
+        assert writes == expected, platform
 
 
 def test_runtime_setup_close_cancels_installer(app):

@@ -195,18 +195,33 @@ def test_unwritable_models_folder_disables_the_engine_cache(tmp_path):
     assert "trt_engine_cache_path" not in options
 
 
-# Bugs caught: 0, False positives: 0
+# Bugs caught: 1, False positives: 0
 def test_saved_provider_missing_from_this_build_probes_as_auto(monkeypatch):
     # The tray hands the probe its saved preference. A saved "tensorrt" in a
     # build without it used to fail the probe, and the tray then offered (on
     # Windows, started) the multi-gigabyte runtime download although the
-    # server would simply run auto on what is installed.
-    pytest.importorskip("onnxruntime")
+    # server would simply run auto on what is installed. Auto still has to
+    # land on a GPU, or model sessions fail after the tray skipped setup.
+    from types import SimpleNamespace
+
+    ort = pytest.importorskip("onnxruntime")
     pytest.importorskip("onnx")
+    available = ["DmlExecutionProvider", "CPUExecutionProvider"]
+
+    def session(_model, providers):
+        return SimpleNamespace(get_providers=lambda: providers, run=lambda *_args: None)
+
+    monkeypatch.setattr(ort, "get_available_providers", lambda: available)
+    monkeypatch.setattr(ort, "InferenceSession", session)
     monkeypatch.setattr(runtime, "_LINUX", False)
-    runtime._validate_source_runtime("dml", saved_choice=True)
+    runtime._validate_source_runtime("tensorrt", saved_choice=True)
     with pytest.raises(RuntimeError, match="unavailable"):
-        runtime._validate_source_runtime("dml")
+        runtime._validate_source_runtime("tensorrt")
+
+    available.remove("DmlExecutionProvider")
+    with pytest.raises(RuntimeError, match="GPU inference"):
+        runtime._validate_source_runtime("tensorrt", saved_choice=True)
+    runtime._validate_source_runtime("cpu", saved_choice=True)
 
 
 def test_a_marker_of_the_wrong_type_is_not_ready(monkeypatch, tmp_path):
@@ -225,7 +240,9 @@ def test_activation_moves_a_listed_runtime_first(monkeypatch, tmp_path):
     target.mkdir()
     (target / ".runtime-ready.json").write_text(json.dumps({"stack_id": runtime.RUNTIME_STACK_ID}))
     monkeypatch.setattr(sys, "path", ["/usr/lib/site-packages", str(target)])
-    monkeypatch.delenv("LD_LIBRARY_PATH", raising=False)
+    # Recorded, so teardown restores (or removes) what activation sets.
+    monkeypatch.setenv("LD_LIBRARY_PATH", "")
+    monkeypatch.setenv("UPSCALE_RELAY_ACTIVE_RUNTIME", "")
     assert runtime.activate_runtime()
     assert sys.path == [str(target), "/usr/lib/site-packages"]
 

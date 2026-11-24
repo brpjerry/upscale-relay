@@ -702,9 +702,12 @@ class ConfigDialog(QDialog):
         s.models_dir = self.models_edit.text().strip()
         s.mdns = self.mdns_check.isChecked()
         s.file_logging = self.logging_check.isChecked()
-        # Only a change made here: the desktop may have changed the entry
-        # since the pane opened, and an unrelated Apply must not undo that.
-        if autostart.is_supported() and self.autostart_check.isChecked() != self._autostart_loaded:
+        # Linux: only a change made here, since the desktop may have disabled
+        # the entry while the pane was open. Windows: always, as before, so an
+        # Apply from a moved or upgraded copy re-registers its own path (a
+        # disabled Startup entry lives in a separate key the Run value keeps).
+        changed = self.autostart_check.isChecked() != self._autostart_loaded
+        if autostart.is_supported() and (changed or sys.platform == "win32"):
             try:
                 autostart.set_enabled(self.autostart_check.isChecked())
                 self._autostart_loaded = self.autostart_check.isChecked()
