@@ -45,6 +45,9 @@ class _Session:
     def __init__(self, release: asyncio.Event, error: BaseException | None = None):
         self._release, self._error = release, error
 
+    def mark_closing(self):
+        pass
+
     async def close(self):
         await self._release.wait()
         if self._error is not None:
@@ -62,6 +65,7 @@ def _bare_server(session) -> RelayServer:
     return server
 
 
+# Bugs caught: 0, False positives: 1
 @pytest.mark.parametrize("failure", [None, PipelineCloseError("fake-finish survived")])
 def test_cancelled_control_handler_keeps_the_session_listed_until_close_returns(failure):
     # Cancelling the control handler (server shutdown) does not stop the
@@ -113,9 +117,10 @@ def test_status_after_an_abrupt_control_drop(sample_file, monkeypatch, fails):
         seen = []
         try:
             await client.connect()
+            # Not resumable: the server ends the session with its connection.
             info = await client.open_session(SessionConfig(
                 path=sample_file, model="passthrough", quality_tier="lossless-ffv1",
-                display_w=320, display_h=180,
+                display_w=320, display_h=180, resume=False,
             ))
             async with aiohttp.ClientSession() as http:
                 async def status() -> dict:

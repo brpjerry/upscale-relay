@@ -126,10 +126,12 @@ def test_session_dropped_without_teardown_is_confirmed_released(tmp_path, monkey
         replacement = RelayClient("127.0.0.1", server.port)
         try:
             await lost.connect()
+            # Not resumable: the server ends the session with its connection.
             session = await lost.open_session(SessionConfig(
                 path=str(source), model="passthrough", quality_tier="lossless-ffv1",
-                display_w=64, display_h=64,
+                display_w=64, display_h=64, resume=False,
             ))
+            assert session.resume_token is None
             await lost.attach_media()
             await lost.start_uplink()
             await lost.play()

@@ -2,8 +2,10 @@
 
 Real server, real client core and real (headless) mpv: the control WebSocket
 is dropped under a playing session, the way a suspend/resume or a Wi-Fi drop
-leaves it. The teardown that follows cannot be acknowledged; the window used
-to stop at "server teardown unconfirmed" until the user connected again.
+leaves it. A server that holds sessions for a resume (PROTOCOL §1.2) keeps
+the session, and playback goes on. One that does not ends it: the teardown
+that follows cannot be acknowledged, and the window used to stop at "server
+teardown unconfirmed" until the user connected again.
 """
 import asyncio
 import os
@@ -26,7 +28,9 @@ from ports import free_port_pair
 from qt_helpers import playback_loop
 
 
-def test_control_loss_mid_playback_ends_connected_and_usable(tmp_path, monkeypatch):
+# Bugs caught: 0, False positives: 1
+@pytest.mark.parametrize("resume", [True, False], ids=["resumed", "no-resume"])
+def test_control_loss_mid_playback_ends_connected_and_usable(tmp_path, monkeypatch, resume):
     source_path = tmp_path / "a.mkv"
     make_sample(str(source_path), frames=1200, width=64, height=64, fps=10)
     app = QApplication.instance() or QApplication([])
@@ -52,7 +56,8 @@ def test_control_loss_mid_playback_ends_connected_and_usable(tmp_path, monkeypat
                 await asyncio.sleep(0.05)
 
     async def scenario():
-        server = RelayServer(str(tmp_path / "models"), free_port_pair())
+        server = RelayServer(str(tmp_path / "models"), free_port_pair(),
+                             resume_grace_s=120.0 if resume else 0.0)
         await server.start()
         try:
             window.host_edit.setText(f"127.0.0.1:{server.port}")
@@ -64,6 +69,22 @@ def test_control_loss_mid_playback_ends_connected_and_usable(tmp_path, monkeypat
             assert [s.id for s in server.sessions.values()].count(session_id)
             # No close frame, no teardown message: the socket just goes away.
             lost._ws._conn.transport.abort()
+            if resume:
+                # The same session goes on over a new control connection.
+                await wait_for(lambda: ("control_resumed", session_id) in logged)
+                assert ("control_resuming", session_id) in logged
+                position = window._position_s
+                await wait_for(lambda: window._position_s > position + 0.5)
+                assert window.client is lost and lost.connected
+                assert lost.session.session_id == session_id
+                assert server.sessions[session_id].ws is not None
+                assert errors == []
+                await window.on_stop()  # acknowledged
+                assert session_id not in server.sessions
+                assert window._unreleased_session is None
+                assert [entry for entry in logged
+                        if entry[0] in ("teardown_unconfirmed", "release_wait")] == []
+                return
             await wait_for(lambda: errors)
             assert errors[0][0] == "Playback failed"
             await wait_for(lambda: window._session_path is None and not window._transitioning)

@@ -159,6 +159,21 @@ STATUS_REQUEST_TIMEOUT_S = 10.0
 # looking connected until the next request; with a heartbeat aiohttp closes
 # the socket after a missed pong and the control reader ends.
 CONTROL_HEARTBEAT_S = 20.0
+# Resuming a session over a new control connection when the old one is lost
+# (docs/PROTOCOL.md §1.2). Each attempt (connect, hello, resume_session) is
+# bounded: during a dropout a connect hangs rather than fails. Attempts go on
+# until the server's grace period has certainly ended, or it refuses.
+RESUME_ATTEMPT_TIMEOUT_S = 10.0
+RESUME_RETRY_DELAYS_S = (0.5, 1.0, 2.0, 4.0)
+RESUME_RETRY_MAX_S = 5.0
+
+
+class ServerError(RuntimeError):
+    """The server answered a request with an ``error`` message."""
+
+    def __init__(self, code: str | None, message: str):
+        super().__init__(f"{code}: {message}")
+        self.code = code
 
 
 class TeardownNotConfirmedError(RuntimeError):
@@ -168,12 +183,16 @@ class TeardownNotConfirmedError(RuntimeError):
     when a later connection can still settle it through
     ``RelayClient.wait_session_released``. It is None when nothing the server
     lists can: the session id never arrived, the server said it needs a
-    restart, or a local owner failed to close.
+    restart, or a local owner failed to close. ``resume_token`` comes with it
+    for a resumable session: the next connection can then take the session
+    over and tear it down (``wait_session_released``).
     """
 
-    def __init__(self, message: str, *, session_id: str | None = None):
+    def __init__(self, message: str, *, session_id: str | None = None,
+                 resume_token: str | None = None):
         super().__init__(message)
         self.session_id = session_id
+        self.resume_token = resume_token if session_id is not None else None
 
 
 def _unreadable_status(session_id: str, detail: str) -> TeardownNotConfirmedError:
@@ -370,6 +389,18 @@ class SessionConfig:
     # here ahead of playback (docs/PROTOCOL.md §5). None sends nothing, and
     # the server keeps its default.
     buffer_target_ms: int | None = None
+    # Ask a capable server to hold the session when the control connection
+    # drops, and resume it over a new one (docs/PROTOCOL.md §1.2).
+    resume: bool = True
+
+
+def _confirmed_resume(msg: dict, *, asked: bool) -> dict:
+    """session_opened's resume_token and resume_grace_s, both or neither."""
+    token, grace = msg.get("resume_token"), msg.get("resume_grace_s")
+    if (not asked or not isinstance(token, str) or not token
+            or type(grace) not in (int, float) or not grace > 0):
+        return {}
+    return {"resume_token": token, "resume_grace_s": float(grace)}
 
 
 def _confirmed_buffer_target_ms(value: object) -> int | None:
@@ -432,6 +463,11 @@ class SessionInfo:
     # confirmed it. None: a server that predates the field, which keeps
     # DEFAULT_BUFFER_TARGET_MS and ignores updates.
     buffer_target_ms: int | None = None
+    # Resume (docs/PROTOCOL.md §1.2): the secret a new control connection
+    # takes the session over with, and how long the server holds it after
+    # the old one ends. None: the session ends with its control connection.
+    resume_token: str | None = None
+    resume_grace_s: float | None = None
 
     @property
     def downlink_hdr(self) -> bool:
@@ -447,6 +483,16 @@ class SessionInfo:
 
 
 class RelayClient:
+    # Class defaults: some tests build a client without __init__.
+    _resume_task: asyncio.Task | None = None
+    _tearing_down = False
+    _released_by_resume = False
+    # (epoch, seek fields) of the newest seek, to send again after a resume
+    # if it never reached the server.
+    _last_seek: tuple[int, dict] | None = None
+    on_reconnecting = None
+    on_reconnected = None
+
     def __init__(self, host: str, port: int):
         self._loop = asyncio.get_running_loop()
         self.host = host
@@ -492,8 +538,14 @@ class RelayClient:
         self.on_progress = None
         self.on_seek_progress = None
         # Called with no arguments (same task/thread) when the control
-        # connection ends without close()/teardown() having been requested.
+        # connection ends without close()/teardown() having been requested,
+        # and for a resumable session only once resuming it failed.
         self.on_disconnected = None
+        # Called with no arguments when a resumable session lost its control
+        # connection and the client starts resuming it, and when it has
+        # (docs/PROTOCOL.md §1.2). Media keeps flowing meanwhile if it can.
+        self.on_reconnecting = None
+        self.on_reconnected = None
         self._last_activity = time.monotonic()
         self._attachment_view_dir: Path | None = None
 
@@ -503,6 +555,12 @@ class RelayClient:
     def has_server_session(self) -> bool:
         """Also true during an open whose server allocation is not yet known."""
         return self._has_server_session
+
+    @property
+    def resuming(self) -> bool:
+        """The control connection was lost and the session is being resumed."""
+        task = self._resume_task
+        return task is not None and not task.done()
 
     @property
     def connected(self) -> bool:
@@ -532,6 +590,13 @@ class RelayClient:
         return self.capabilities
 
     async def _send(self, type_: str, **fields) -> None:
+        task = self._resume_task
+        if task is not None and not task.done() and asyncio.current_task() is not task:
+            # Sent once the session is resumed on a new connection (a seek
+            # made during a dropout, a buffer report), or failed with it.
+            await asyncio.wait([task])
+            if not self.connected:
+                raise ConnectionError("control connection lost")
         assert self._ws is not None
         await self._ws.send_str(json.dumps({"type": type_, **fields}))
 
@@ -604,7 +669,7 @@ class RelayClient:
                     for fut in self._pending.values():
                         if not fut.done():
                             fut.set_exception(
-                                RuntimeError(f"{msg.get('code')}: {msg.get('message', '')}")
+                                ServerError(msg.get("code"), msg.get("message", ""))
                             )
                     self._pending.clear()
                 key = (mtype, msg.get("epoch")) if mtype == "seek_ready" else mtype
@@ -612,17 +677,151 @@ class RelayClient:
                 if fut is not None and not fut.done():
                     fut.set_result(msg)
         finally:
-            # Wake a teardown/open/seek request immediately when the control
-            # connection disappears instead of stranding it until timeout.
-            for fut in self._pending.values():
+            self._control_ended()
+
+    def _control_ended(self) -> None:
+        """The control reader has ended: the connection is gone.
+
+        Wakes a teardown/open/seek request at once instead of stranding it
+        until its timeout. A resumable session is resumed on a new connection
+        instead (docs/PROTOCOL.md §1.2); a pending seek then waits for it.
+        """
+        resuming = self.resuming
+        resume = not resuming and self._can_resume()
+        for key, fut in list(self._pending.items()):
+            if (resuming or resume) and isinstance(key, tuple) and key[0] == "seek_ready":
+                continue  # answered or sent again once resumed (_resumed)
+            if not fut.done():
+                fut.set_exception(ConnectionError("control connection closed"))
+            del self._pending[key]
+        if self._closing or resuming or self._released_by_resume:
+            # Resuming: this was an attempt's connection, and the attempt
+            # reports it. Released: the server ends a connection after a
+            # teardown, and wait_session_released expects that.
+            return
+        if resume:
+            self._resume_task = asyncio.create_task(self._resume_loop())
+            self._notify("on_reconnecting")
+            return
+        self._notify("on_disconnected")
+
+    def _notify(self, hook: str) -> None:
+        callback = getattr(self, hook, None)
+        if callback is None:
+            return
+        try:
+            callback()
+        except Exception:
+            log.exception("%s callback failed", hook)
+
+    # -- resume (docs/PROTOCOL.md §1.2) ------------------------------------------
+
+    def _can_resume(self) -> bool:
+        session = self.session
+        return (
+            session is not None and session.resume_token is not None
+            and self._has_server_session and not self._closing and not self._tearing_down
+        )
+
+    async def _resume_loop(self) -> None:
+        session = self.session
+        assert session is not None
+        loop = asyncio.get_running_loop()
+        # The server holds the session for its grace period from when it
+        # notices the loss: at most a heartbeat window after this end did.
+        deadline = loop.time() + (session.resume_grace_s or 0.0) + CONTROL_HEARTBEAT_S * 1.5
+        delays = iter(RESUME_RETRY_DELAYS_S)
+        log.warning("control connection lost; resuming session %s", session.session_id)
+        while True:
+            self._last_activity = time.monotonic()  # keeps a pending seek waiting
+            try:
+                reply = await asyncio.wait_for(
+                    self._resume_once(session), RESUME_ATTEMPT_TIMEOUT_S)
+            except ServerError as err:
+                log.warning("server refused to resume session %s: %s", session.session_id, err)
+                break
+            except (OSError, aiohttp.ClientError, asyncio.TimeoutError, RuntimeError,
+                    ValueError) as err:
+                log.info("resume attempt failed: %r", err)
+            else:
+                await self._resumed(reply)
+                return
+            await self._drop_control()
+            delay = next(delays, RESUME_RETRY_MAX_S)
+            if loop.time() + delay >= deadline:
+                break
+            await asyncio.sleep(delay)
+        await self._drop_control()
+        log.warning("could not resume session %s", session.session_id)
+        # On the next loop turn, when `resuming` already reads False.
+        loop.call_soon(self._resume_failed)
+
+    async def _resume_once(self, session: SessionInfo) -> dict:
+        self._ws = await self._http.ws_connect(
+            f"{self.base_url}/control", heartbeat=CONTROL_HEARTBEAT_S,
+        )
+        self._reader_task = asyncio.create_task(self._control_reader())
+        self.capabilities = await self._request(
+            "capabilities", "hello",
+            protocol_version=PROTOCOL_VERSION, client_name="relay-client-core",
+            display={"w": 0, "h": 0},
+        )
+        return await self._request(
+            "session_resumed", "resume_session",
+            session_id=session.session_id, resume_token=session.resume_token,
+        )
+
+    async def _drop_control(self) -> None:
+        """Close a failed attempt's connection and wait for its reader."""
+        ws, reader = self._ws, self._reader_task
+        if ws is not None and not ws.closed:
+            try:
+                # A blackholed peer never answers the close handshake.
+                await asyncio.wait_for(ws.close(), 2.0)
+            except (asyncio.TimeoutError, OSError, aiohttp.ClientError, RuntimeError):
+                pass
+        if reader is not None:
+            if not reader.done():
+                reader.cancel()
+            await asyncio.gather(reader, return_exceptions=True)
+
+    async def _resumed(self, reply: dict) -> None:
+        """Catch up with what the server said while the connection was gone."""
+        if isinstance(reply.get("state"), str):
+            self.state = reply["state"]
+        self._last_activity = time.monotonic()
+        self._apply_epoch_mapping(reply)  # when it describes the current epoch
+        server_epoch = reply.get("epoch")
+        for key, fut in list(self._pending.items()):
+            if not (isinstance(key, tuple) and key[0] == "seek_ready"):
+                continue
+            epoch = key[1]
+            if type(server_epoch) is int and epoch <= server_epoch:
+                # It arrived; its seek_ready did not.
+                self._pending.pop(key)
                 if not fut.done():
-                    fut.set_exception(ConnectionError("control connection closed"))
-            self._pending.clear()
-            if not self._closing and self.on_disconnected is not None:
+                    fut.set_result({
+                        "type": "seek_ready", "epoch": epoch,
+                        **{field: reply[field] for field in ("downlink_color", "downlink_mapping")
+                           if field in reply and epoch == server_epoch},
+                    })
+            elif self._last_seek is not None and self._last_seek[0] == epoch:
+                # It never arrived. A seek still waiting to be sent sends it
+                # too; the server ignores an epoch it already has.
                 try:
-                    self.on_disconnected()
-                except Exception:
-                    log.exception("on_disconnected callback failed")
+                    await self._send("seek", epoch=epoch, **self._last_seek[1])
+                except (ConnectionError, RuntimeError) as err:
+                    log.info("could not send the seek again: %r", err)
+        log.info("resumed session %s", self.session.session_id if self.session else "?")
+        self._notify("on_reconnected")
+
+    def _resume_failed(self) -> None:
+        for fut in self._pending.values():
+            if not fut.done():
+                fut.set_exception(ConnectionError("control connection lost"))
+        self._pending.clear()
+        if not self._closing and not self._tearing_down:
+            self._notify("on_disconnected")
 
     async def open_session(self, cfg: SessionConfig) -> SessionInfo:
         if cfg.source not in ("uplink", "server_file"):
@@ -707,6 +906,8 @@ class RelayClient:
             fields["display_target"] = cfg.display_target.to_wire()
         if buffer_target_ms is not None:
             fields["buffer_target_ms"] = buffer_target_ms
+        if cfg.resume and capabilities.get("session_resume") is True:
+            fields["resume"] = True
         if video is not None:
             fields["video"] = video
         try:
@@ -768,6 +969,7 @@ class RelayClient:
                 msg["downlink_mapping"] if isinstance(msg.get("downlink_mapping"), dict) else None
             ),
             buffer_target_ms=_confirmed_buffer_target_ms(msg.get("buffer_target_ms")),
+            **_confirmed_resume(msg, asked="resume" in fields),
         )
         return self.session
 
@@ -1064,13 +1266,28 @@ class RelayClient:
                 if target_ms is not None:
                     fields["buffer_target_ms"] = target_ms
                 await self._send("buffer_report", **fields)
-            except (ConnectionResetError, RuntimeError) as err:
-                # Only a dead control WS lands here; the session is over. The
-                # server's pacing decays a silent client's last report, so a
-                # lost reporter no longer wedges it — but make the exit loud.
+            except (ConnectionError, RuntimeError) as err:
+                # Only a dead control WS lands here. A resumed session goes on
+                # reporting on its new connection; otherwise the session is
+                # over. The server's pacing decays a silent client's last
+                # report, so a lost reporter no longer wedges it, but make the
+                # exit loud.
+                if await self._control_resumed():
+                    continue
                 log.warning("buffer report loop exiting: %r", err)
                 return
             await asyncio.sleep(0.5)
+
+    async def _control_resumed(self) -> bool:
+        """After a failed send: whether the control connection came back."""
+        reader = self._reader_task
+        if reader is not None and not reader.done() and not self.resuming:
+            # The send saw the connection end before its reader did.
+            await asyncio.wait([reader], timeout=CONTROL_HEARTBEAT_S * 1.5)
+        task = self._resume_task
+        if task is not None and not task.done():
+            await asyncio.wait([task])
+        return task is not None and self.connected and not self._closing
 
     def downlink_queue(self) -> _ThreadBridgeQueue:
         return self._down_q
@@ -1128,7 +1345,11 @@ class RelayClient:
         except asyncio.QueueEmpty:
             pass
         self.buffered_ms = 0
-        msg = await self._request("seek_ready", "seek", target_pts=target_pts, epoch=epoch, **fields)
+        self._last_seek = (epoch, {"target_pts": target_pts, **fields})
+        # keepalive: during a dropout the seek waits for the session to be
+        # resumed, and each resume attempt refreshes the deadline.
+        msg = await self._request("seek_ready", "seek", keepalive=True,
+                                  target_pts=target_pts, epoch=epoch, **fields)
         if msg["epoch"] < self.epoch:
             return  # superseded by a newer seek
         if session is not None and session is self.session:
@@ -1160,6 +1381,7 @@ class RelayClient:
             session.downlink_color = msg["downlink_color"]
 
     async def teardown(self) -> None:
+        self._tearing_down = True
         for task in (self._uplink_task, getattr(self, "_report_task", None)):
             if task is not None:
                 task.cancel()
@@ -1167,7 +1389,16 @@ class RelayClient:
         session = getattr(self, "session", None)
         session_id = session.session_id if session is not None else None
         barrier_error: BaseException | None = None
-        if self._has_server_session and self._ws is not None and not self._ws.closed:
+        resume = self._resume_task
+        if resume is not None and not resume.done():
+            # Not waited for: the next connection takes the session over and
+            # tears it down (wait_session_released with the resume token).
+            resume.cancel()
+            await asyncio.gather(resume, return_exceptions=True)
+            barrier_error = ConnectionError(
+                "control connection was lost and the session not yet resumed"
+            )
+        elif self._has_server_session and self._ws is not None and not self._ws.closed:
             try:
                 await self._request(
                     "closed", "teardown", timeout=TEARDOWN_TIMEOUT_S,
@@ -1206,12 +1437,14 @@ class RelayClient:
                     session_id=(
                         None if local_close_failed or restart_required else session_id
                     ),
+                    resume_token=session.resume_token if session is not None else None,
                 ) from barrier_error
 
     async def wait_session_released(
         self, session_id: str, *, timeout: float = SESSION_RELEASE_TIMEOUT_S,
         interval: float = SESSION_RELEASE_POLL_S,
         request_timeout: float = STATUS_REQUEST_TIMEOUT_S,
+        resume_token: str | None = None,
     ) -> None:
         """Return once the server's /status no longer lists ``session_id``.
 
@@ -1230,7 +1463,55 @@ class RelayClient:
         ConnectionError when the request itself failed (refused, reset, timed
         out): that is no verdict, and the question stays open for the next
         connection.
+
+        With the session's ``resume_token`` (a resumable session, PROTOCOL
+        §1.2), this connection first takes the session over and tears it
+        down: a session the server holds for a resume would otherwise stay
+        listed past ``timeout``. The server then ends this connection, as
+        after any teardown. A refused resume means the session is gone or
+        closing, and /status says which.
         """
+        if (resume_token is not None and self.connected
+                and (self.capabilities or {}).get("session_resume") is True):
+            if await self._release_by_resume(session_id, resume_token):
+                return
+        await self._poll_session_released(
+            session_id, timeout=timeout, interval=interval, request_timeout=request_timeout)
+
+    async def _release_by_resume(self, session_id: str, resume_token: str) -> bool:
+        """Resume and tear down: True once the server sent ``closed``."""
+        try:
+            await self._request(
+                "session_resumed", "resume_session",
+                session_id=session_id, resume_token=resume_token,
+            )
+        except ServerError:
+            return False
+        except (asyncio.TimeoutError, ConnectionError) as err:
+            raise ConnectionError(
+                f"could not ask the server to release session {session_id}: "
+                f"{str(err) or type(err).__name__}"
+            ) from err
+        self._released_by_resume = True
+        try:
+            await self._request("closed", "teardown", timeout=TEARDOWN_TIMEOUT_S)
+        except (asyncio.TimeoutError, ConnectionError, RuntimeError) as err:
+            # No verdict: if the teardown never arrived, the server holds the
+            # session again, and the next connection asks again.
+            raise ConnectionError(
+                f"the server did not confirm releasing session {session_id}: "
+                f"{str(err) or type(err).__name__}"
+            ) from err
+        reader = self._reader_task
+        if reader is not None:
+            # The server ends the connection next: let `connected` say so.
+            await asyncio.wait([reader], timeout=5.0)
+        return True
+
+    async def _poll_session_released(
+        self, session_id: str, *, timeout: float, interval: float, request_timeout: float,
+    ) -> None:
+        """Poll /status for wait_session_released."""
         loop = asyncio.get_running_loop()
         started = loop.time()
         while True:
@@ -1300,7 +1581,7 @@ class RelayClient:
         await asyncio.shield(self._begin_close())
 
     async def _close(self) -> None:
-        tasks = [t for t in (self._uplink_task, self._reader_task,
+        tasks = [t for t in (self._resume_task, self._uplink_task, self._reader_task,
                              getattr(self, "_report_task", None)) if t is not None]
         for task in tasks:
             task.cancel()

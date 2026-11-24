@@ -198,6 +198,7 @@ def test_client_teardown_waits_for_closed_before_local_close():
     asyncio.run(scenario())
 
 
+# Bugs caught: 0, False positives: 1
 def test_server_closed_ack_waits_for_session_cleanup_barrier():
     async def scenario():
         release = asyncio.Event()
@@ -207,6 +208,9 @@ def test_server_closed_ack_waits_for_session_cleanup_barrier():
             uplink_token = "up"
             downlink_token = "down"
             pipeline = None
+
+            def mark_closing(self):
+                pass
 
             async def close(self):
                 await release.wait()
@@ -235,6 +239,7 @@ def test_server_closed_ack_waits_for_session_cleanup_barrier():
     asyncio.run(scenario())
 
 
+# Bugs caught: 0, False positives: 1
 def test_server_does_not_ack_failed_native_cleanup():
     async def scenario():
         class FakeSession:
@@ -242,6 +247,9 @@ def test_server_does_not_ack_failed_native_cleanup():
             uplink_token = "up"
             downlink_token = "down"
             pipeline = None
+
+            def mark_closing(self):
+                pass
 
             async def close(self):
                 raise PipelineCloseError("fake-finish survived")

@@ -109,6 +109,7 @@ _SERVER_CURSOR_ROLE = Qt.UserRole + 3
 _SERVER_PAGE_SIZE = 100
 _RECONNECT_DELAYS_S = (0.0, 2.0, 5.0)
 _RELEASE_WAIT_NOTE = "Waiting for the server to release the previous session…"
+_RESUMING_NOTE = "Lost the connection to the server; reconnecting while the buffer plays…"
 # The reconnect after a teardown the server never acknowledged runs inside the
 # uninterruptible teardown: bound each attempt like one /status request.
 _UNCONFIRMED_RECONNECT_TIMEOUT_S = 10.0
@@ -343,6 +344,9 @@ class MainWindow(DesktopFeatures, QMainWindow):
         # acknowledged; no session opens until /status reports it released
         # (_confirm_previous_release). In memory only, one at a time.
         self._unreleased_session: tuple[str, str, int] | None = None
+        # Its resume token, when the session was resumable (PROTOCOL §1.2):
+        # the next connection then takes it over and tears it down.
+        self._unreleased_resume_token: str | None = None
         self._server_caps: dict = {}
         # The connected server predates buffer targets (PROTOCOL §5): a
         # session it opened confirmed none. Kept through the reconnect that
@@ -1888,6 +1892,8 @@ class MainWindow(DesktopFeatures, QMainWindow):
         client.on_progress = self._on_open_progress
         client.on_seek_progress = self._on_seek_progress
         client.on_disconnected = lambda: self._on_control_lost(client)
+        client.on_reconnecting = lambda: self._on_control_resuming(client)
+        client.on_reconnected = lambda: self._on_control_resumed(client)
         self.settings.server_host, self.settings.server_port = client.host, client.port
         current = self.model_combo.currentText()
         self.model_combo.clear()
@@ -2159,9 +2165,10 @@ class MainWindow(DesktopFeatures, QMainWindow):
         if lost is not self.client or self._closing:
             return
         if self._session_source not in (None, "local"):
-            # The server ends a session with its control connection. After a
-            # suspend or a silent network drop the media sockets can stay
-            # half-open instead, and playback would buffer forever.
+            # The session could not be resumed (or was not resumable), and the
+            # server ends it with its control connection. After a suspend or a
+            # silent network drop the media sockets can stay half-open
+            # instead, and playback would buffer forever.
             asyncio.get_running_loop().call_later(
                 _CONTROL_LOSS_GRACE_S, self._fail_orphaned_session, lost)
             return
@@ -2169,6 +2176,28 @@ class MainWindow(DesktopFeatures, QMainWindow):
             return
         self.client_log.record("control_lost", host=lost.host, port=lost.port)
         asyncio.ensure_future(self._run_transition(lambda: self._replace_lost_client(lost)))
+
+    def _on_control_resuming(self, client) -> None:
+        """The control connection of a resumable session was lost: the
+        client is resuming it (PROTOCOL §1.2) while playback goes on from
+        what is buffered."""
+        if client is not self.client or self._closing:
+            return
+        session = getattr(client, "session", None)
+        self.client_log.record(
+            "control_resuming", host=client.host, port=client.port,
+            session=getattr(session, "session_id", None))
+        self.statusBar().showMessage(_RESUMING_NOTE)
+
+    def _on_control_resumed(self, client) -> None:
+        if client is not self.client or self._closing:
+            return
+        session = getattr(client, "session", None)
+        self.client_log.record(
+            "control_resumed", host=client.host, port=client.port,
+            session=getattr(session, "session_id", None))
+        if self.statusBar().currentMessage() == _RESUMING_NOTE:
+            self.statusBar().showMessage("Reconnected to the server", 4000)
 
     def _fail_orphaned_session(self, lost) -> None:
         if (lost is not self.client or self._closing
@@ -2300,6 +2329,7 @@ class MainWindow(DesktopFeatures, QMainWindow):
         if session_id is None:
             return False
         self._unreleased_session = (session_id, host, port)
+        self._unreleased_resume_token = getattr(err, "resume_token", None)
         self.client_log.record("teardown_unconfirmed", session=session_id, host=host, port=port)
         return True
 
@@ -2328,7 +2358,8 @@ class MainWindow(DesktopFeatures, QMainWindow):
         self.client_log.record("release_wait", session=session_id, host=client.host, port=client.port)
         self.statusBar().showMessage(_RELEASE_WAIT_NOTE)
         try:
-            await client.wait_session_released(session_id)
+            await client.wait_session_released(
+                session_id, resume_token=self._unreleased_resume_token)
         except TeardownNotConfirmedError as err:
             # Still held, restart required, or /status cannot say. A manual
             # Connect clears this stop, not the question: the next open asks again.
@@ -2355,6 +2386,7 @@ class MainWindow(DesktopFeatures, QMainWindow):
             return False
         if (client.host, client.port) == (host, port) and self._unreleased_session is pending:
             self._unreleased_session = None
+            self._unreleased_resume_token = None
         self.client_log.record("release_confirmed", session=session_id, host=client.host, port=client.port)
         if self.statusBar().currentMessage() == _RELEASE_WAIT_NOTE:
             self.statusBar().clearMessage()

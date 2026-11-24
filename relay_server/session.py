@@ -157,9 +157,19 @@ class Session:
                  default_resize_algorithm: str = DEFAULT_RESIZE_ALGORITHM,
                  lossless_hevc_profile: str = DEFAULT_LOSSLESS_HEVC_PROFILE,
                  seek_discard_max_s: float | None = None,
-                 display_mapper: DisplayMapper | None = None):
+                 display_mapper: DisplayMapper | None = None,
+                 resume_grace_s: float = 0.0):
         self.id = uuid.uuid4().hex[:12]
+        # The control connection; None while the session is held for a resume
+        # (PROTOCOL §1.2), when everything it would send is dropped.
         self.ws = ws
+        # Resume (PROTOCOL §1.2): how long the server holds this session after
+        # its control connection ends, and the secret a new connection proves
+        # itself with. The token stays None unless open_session asked for it.
+        self.resume_grace_s = resume_grace_s
+        self.resume_token: str | None = None
+        # session_opened has been sent: the client can know the token.
+        self.opened = False
         self.models = models  # name -> path
         self.ep = ep
         self.library = library
@@ -179,6 +189,7 @@ class Session:
         self._source_task: asyncio.Task | None = None
         self._open_task: asyncio.Task | None = None
         self._close_task: asyncio.Task | None = None
+        self._closing = asyncio.Event()
         self._seek_progress_task: asyncio.Task | None = None
         self.state = State.OPEN
         self.epoch = 0
@@ -235,9 +246,64 @@ class Session:
         self._media_connections.clear()
         self.uplink_attached = self.downlink_attached = False
 
+    @property
+    def resumable(self) -> bool:
+        """Hold this session for a resume when its control connection ends."""
+        return (
+            self.resume_token is not None and self.opened and self.resume_grace_s > 0
+            and self.state != State.CLOSED and not self._closing.is_set()
+        )
+
+    @property
+    def closing(self) -> asyncio.Event:
+        """Set once the session is being closed: no resume can take it."""
+        return self._closing
+
+    def mark_closing(self) -> None:
+        """Refuse resumes from now on, ahead of a close() still to start."""
+        self._closing.set()
+
+    def detach(self) -> None:
+        """The control connection ended and the session is held for a resume.
+
+        Production holds at the watermark: no buffer report can arrive, and
+        the client may be paused. The media connections stay as they are.
+        """
+        self.ws = None
+        if self.pipeline is not None:
+            self.pipeline.client_detached = True
+        log.info("session %s held for %.0f s for a resume", self.id, self.resume_grace_s)
+
+    def attach(self, ws) -> None:
+        """A resumed control connection takes the session over."""
+        self.ws = ws
+        if self.pipeline is not None:
+            self.pipeline.client_detached = False
+
+    def resume_report(self) -> dict:
+        """session_resumed's fields: what the client missed while detached."""
+        report: dict[str, Any] = {
+            "session_id": self.id,
+            "state": self.state.value,
+            "epoch": self.epoch,
+            "uplink_attached": self.uplink_attached,
+            "downlink_attached": self.downlink_attached,
+        }
+        pipeline = self.pipeline
+        if pipeline is not None:
+            report["buffer_target_ms"] = pipeline.buffer_target_ms
+            if pipeline.downlink_mapping is not None:
+                # As seek_ready would have said for this epoch (§3.6).
+                report["downlink_color"] = pipeline.downlink_color
+                report["downlink_mapping"] = pipeline.downlink_mapping
+        return report
+
     async def send(self, type_: str, **fields: Any) -> None:
+        ws = self.ws
+        if ws is None:
+            return  # held for a resume: session_resumed carries the state
         try:
-            await self.ws.send_str(json.dumps({"type": type_, **fields}))
+            await ws.send_str(json.dumps({"type": type_, **fields}))
         except (ConnectionResetError, RuntimeError):
             # RuntimeError: aiohttp's "closing transport" — reachable now that
             # a backgrounded open can outlive its WS.
@@ -274,7 +340,11 @@ class Session:
                     delivery.result(timeout=0.1)
                     return
                 except concurrent.futures.TimeoutError:
-                    if time.monotonic() >= deadline:
+                    if self.ws is None:
+                        # Held for a resume: the network may be down. The
+                        # grace period bounds the hold, not this deadline.
+                        deadline = time.monotonic() + 30.0
+                    elif time.monotonic() >= deadline:
                         log.warning("session %s: downlink stalled >30s, dropping session", self.id)
                         asyncio.run_coroutine_threadsafe(self.close(), self._loop)
                         return
@@ -341,6 +411,8 @@ class Session:
             await self.send("error", code="bad_message", message="invalid source", fatal=False)
             return
         self.source_kind = source_kind
+        if msg.get("resume") is True and self.resume_grace_s > 0:
+            self.resume_token = new_token()
         requested_aux = msg.get("aux_tracks", "external")
         if requested_aux not in ("external", "muxed"):
             await self.send("error", code="bad_message", message="invalid aux_tracks", fatal=False)
@@ -584,7 +656,12 @@ class Session:
             downlink_mapping=self.pipeline.downlink_mapping,
             buffer_target_ms=buffer_target_ms,
             **source_metadata,
+            **(
+                {"resume_token": self.resume_token, "resume_grace_s": self.resume_grace_s}
+                if self.resume_token is not None else {}
+            ),
         )
+        self.opened = True
 
     media_port: int = 0  # set by server at construction
 
@@ -789,6 +866,7 @@ class Session:
 
     async def close(self) -> None:
         """Idempotent resource-release barrier for the control connection."""
+        self._closing.set()
         if self._close_task is None:
             self._close_task = asyncio.create_task(self._close_impl(asyncio.current_task()))
         await asyncio.shield(self._close_task)
@@ -892,6 +970,8 @@ class Session:
             "epoch": self.epoch,
             "uplink_attached": self.uplink_attached,
             "downlink_attached": self.downlink_attached,
+            # False while held for a resume (PROTOCOL §1.2). Diagnostic.
+            "control_attached": self.ws is not None,
             "source": self.source_kind,
             "aux_tracks": self.aux_track_mode,
             "aux_attachments": self.aux_attachment_mode,

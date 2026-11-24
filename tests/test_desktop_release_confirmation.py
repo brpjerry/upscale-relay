@@ -95,7 +95,8 @@ class WorldClient(FakeSessionClient):
                 raise main_window.TeardownNotConfirmedError(UNCONFIRMED)
             self.world.held.add((self.host, self.port, session.session_id))
             raise main_window.TeardownNotConfirmedError(
-                UNCONFIRMED, session_id=session.session_id)
+                UNCONFIRMED, session_id=session.session_id,
+                resume_token=f"token-{session.session_id}")
         self.world.events.append(("closed",))
 
     async def close(self):
@@ -103,7 +104,9 @@ class WorldClient(FakeSessionClient):
         self.connected = False
 
     async def wait_session_released(self, session_id, **kwargs):
-        assert not kwargs  # the core's bound and interval, not the window's
+        # The core's bound and interval, not the window's; the resume token
+        # the unacknowledged teardown named (PROTOCOL §1.2).
+        assert kwargs == {"resume_token": f"token-{session_id}"}, kwargs
         self.world.events.append(("wait", session_id, self.host))
         while True:
             if self.world.status_error is not None:
@@ -140,6 +143,7 @@ def run(scenario):
     asyncio.run(scenario())
 
 
+# Bugs caught: 0, False positives: 1
 def test_dead_control_at_stop_recovers_once_the_server_releases(window, world):
     async def scenario():
         await window._start_session("show.mkv", "server_file")

@@ -441,6 +441,16 @@ Linux — the rules below were found on Windows unless they say Linux)**
   `open_session` (`docs/PROTOCOL.md` §1.1; 60 s against the server's 45 s
   worst case). On the desktop `_confirm_previous_release` is the one gate,
   in `_open_session`; do not add an open path around it.
+- A session opened with `resume` (`docs/PROTOCOL.md` §1.2; the desktop
+  client and `relay-client` ask for it) outlives its control connection by
+  the server's grace period (`SESSION_RESUME_GRACE_S`, 120 s) and is listed
+  in `/status` all that time, past the 60 s poll. The release gate therefore
+  resumes and tears it down first (`wait_session_released(resume_token=)`);
+  keep the token with the session id wherever an unacknowledged teardown is
+  remembered. While held, the server's pipeline holds at the watermark and
+  `_emit_downlink`'s 30 s stall deadline is suspended: the grace period alone
+  ends the session. A handler whose session a resume took over
+  (`session.ws is not ws`) must leave it alone.
 - TRT builds engines from *live timing measurements*: engines built while the
   GPU is busy (user games on this box) are permanently slow — delete
   `<models-dir>/.trt_cache` (it sits beside the models) and rebuild with an

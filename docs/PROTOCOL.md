@@ -40,8 +40,8 @@ means it must not open a replacement session until the server is restarted.
 Timing: the server notices a dead control connection through its WebSocket
 heartbeat (a ping every 20 s and 10 s for the pong, so within 30 s), and the
 pipeline close that follows is bounded at 15 s, after which it counts as
-failed. A session that had finished opening is therefore gone, or
-`restart_required` is set, within 45 s; it stays listed until then, so a
+failed. A session that had finished opening, and was not opened for a resume
+(§1.2), is therefore gone, or `restart_required` is set, within 45 s; it stays listed until then, so a
 listed session means "keep polling", not "stuck". One case takes longer: a
 session whose `open_session` was still running (a first-use TensorRT engine
 build) is closed only after that build returns, which can take minutes.
@@ -51,6 +51,14 @@ Recovery procedure both clients implement: a client that did not receive
 control connection to that server, before any `open_session`, it polls
 `GET /status` at once and then every second, for 60 s:
 
+0. If the session was opened for a resume (§1.2) and the server still
+   advertises `session_resume`, first send `resume_session` with its
+   `resume_token`, then `teardown`. `closed` answers the question at once,
+   and the server then ends that connection, as after any teardown. A
+   `resume_failed` error means the session is gone or already closing (within
+   the 15 s close bound): continue with the polling below. A connection lost
+   before `closed` is no answer, as for a failed request below. Without this
+   step a held session stays listed for its whole grace period, past the 60 s.
 1. `restart_required: true`: stop; the server must be restarted (checked first).
 2. Its session id absent from `sessions[].id`: released; proceed.
 3. Still listed after 60 s: stop.
@@ -60,9 +68,58 @@ control connection to that server, before any `open_session`, it polls
 
 The server's worst case for an opened session is 45 s, the sum of the two
 timeouts above (`CONTROL_HEARTBEAT_S` x 1.5 and `PIPELINE_CLOSE_TIMEOUT_S`).
+A session opened for a resume adds its grace period (`resume_grace_s`, 120 s
+today) to that, which is why step 0 comes first for one.
 Clients poll for 60 s so that one which reconnects the moment its connection
 died still sees the release. A server change to either timeout must stay
 within 45 s, which `tests/test_server_status_contract.py` checks.
+
+### 1.2 Resuming a session on a new control connection
+
+A dropout longer than the heartbeat window (§2) ends the control connection
+however much video the client has buffered. A client that asks for it keeps
+its session through one instead. Additive: no protocol version change.
+
+1. The server advertises `capabilities.session_resume: true`. The client sends
+   `open_session.resume: true`. `session_opened` then carries `resume_token`
+   (a fresh secret: session ids are public in `/status`) and `resume_grace_s`.
+   Without the request nothing changes, so older clients (Android v0.24) keep
+   the 45 s release of §1.1.
+2. When that session's control connection is lost (it ends without
+   `teardown` and without a normal close, code 1000), the server holds the session for `resume_grace_s` seconds instead of closing it. Its
+   pipeline holds at the watermark (no buffer report can arrive), nothing it
+   would send on the control connection is kept, and its media connections
+   stay as they are: TCP carries them through a dropout, and they resume by
+   themselves. `/status` lists it with `control_attached: false`
+   (diagnostic). When the grace period ends, or the session fails meanwhile,
+   it is closed exactly as a session whose connection dropped (§1.1 ordering).
+3. The client keeps playing from its buffer and reconnects: `hello`, then
+   `resume_session{session_id, resume_token}` in place of `open_session`. The
+   server answers `session_resumed` and the new connection is the session's
+   from then on, `teardown` included. A resume may arrive before the server
+   has noticed the old connection is dead (the client's heartbeat fired
+   first): the server closes the old connection and the session stays. A
+   resume of an unknown, closed or closing session, or with the wrong token,
+   gets the non-fatal error `resume_failed`; the session is then lost and the
+   client ends playback as before.
+4. `session_resumed` says what the client missed: `state`, `epoch`, the
+   current epoch's `downlink_color`/`downlink_mapping` (mapped sessions,
+   §3.6), `buffer_target_ms`, `uplink_attached` and `downlink_attached`.
+   A `seek` sent before the drop whose `seek_ready` never came was applied if
+   `epoch` is the seek's; if it is lower, the seek never arrived and the
+   client sends it again (the server ignores an epoch it already has). The
+   client resumes its `buffer_report`s at once.
+5. The client retries with backoff, each attempt bounded (a blackholed path
+   hangs rather than refuses), until the server refuses or the grace period
+   has certainly ended: `resume_grace_s` plus the server's heartbeat window
+   (30 s) after the client noticed the loss. A client torn down meanwhile
+   releases the session through §1.1 step 0.
+
+A media connection that died during the dropout is not re-attached: the epoch's
+Matroska stream cannot continue on a new connection. That playback ends as a
+dropped downlink always has. On Linux, TCP keeps retrying an unacknowledged
+send for about 15 minutes, so the media connections of a held session outlive
+any dropout its grace period covers.
 
 Design invariants:
 - **Video PTS is never rewritten.** Outer packet timestamps and pipeline video
@@ -99,7 +156,8 @@ IDLE ──────open_session────► OPEN ──play──► PLAY
   the client buffer up to the watermark in both states.
 - Any fatal error ⇒ server sends `error{fatal:true}` and moves to CLOSED.
 - WS disconnect at any point ⇒ server tears down the pipeline and closes media
-  sockets.
+  sockets, except for a session opened for a resume, which it holds for its
+  grace period first (§1.2).
 
 ## 2. Control channel (JSON over WebSocket)
 
@@ -119,25 +177,27 @@ required.
 | type | fields | notes |
 |---|---|---|
 | `hello` | `protocol_version:int`, `client_name:str`, `display:{w:int,h:int}` | first message; server replies `capabilities` |
-| `open_session` | `source:"uplink" \| {type:"server_file",path:str}` plus `file:{name:str, duration_s:float?, chapters:[{start_s:float, end_s:float?, title:str?}]?}`, `video:{codec:str, extradata_b64:str?, width:int, height:int, time_base:[num,den], avg_rate:[num,den]?, sample_aspect_ratio:[num,den]?, color:{primaries:int, transfer:int, matrix:int, range:"limited"\|"full"?}?, bit_depth:int?, hdr:{...}?, dolby_vision:{...}?, hdr10plus:bool?}`, `model:str`, `quality_tier:str`, `display:{w:int,h:int}`, `fit_mode:str?`, `resize_algorithm:str?`, `aux_tracks:"external"\|"muxed"?`, `aux_attachments:"embedded"\|"cached"?`, `high_bit_depth:"hdr"\|"all"?`, `display_target:{transfer:"pq"\|"sdr", peak_nits:float?, sdr_white_nits:float?}?`, `buffer_target_ms:int?` | `source` defaults to `"uplink"`; `video` is omitted for `server_file`; omitting `resize_algorithm` selects the server default. `file.chapters` carries the source container's chapter marks for uplink sessions (only the client can read them). `video.sample_aspect_ratio` is the source's pixel width over height, including any container override (e.g. Matroska display dimensions); send it for anamorphic sources. Absent, zero, non-integer or implausible (outside 1/10..10) values mean square pixels, as before this field existed. The server fits and crops by the displayed shape and delivers square pixels: a 720x576 16:15 source on a 1920x1080 display gives `downlink_width/height` 1440x1080. For `server_file` the server reads it from the file itself. When an uplink omits it, the server reads the aspect from the parameter sets in `extradata_b64` where it can (H.264 SPS VUI, HEVC), so a client need only send what its container declares; an explicit value always wins. Additive: no protocol version change. `aux_tracks` defaults to `"external"`; request `"muxed"` only for `server_file` after `capabilities.muxed_aux_tracks == true`. `aux_attachments` defaults to `"embedded"`; request `"cached"` only together with muxed tracks after `attachment_cache >= 1`. The server may still confirm a fallback mode. `high_bit_depth` (after `capabilities.high_bit_depth`) and the `video.color` / `bit_depth` / `hdr` / `dolby_vision` fields are §3.5's; `display_target` (after `capabilities.display_mapping`) and `video.hdr10plus` are §3.6's; `buffer_target_ms` (how much video the server keeps buffered at the client) is §5's; all additive |
+| `open_session` | `source:"uplink" \| {type:"server_file",path:str}` plus `file:{name:str, duration_s:float?, chapters:[{start_s:float, end_s:float?, title:str?}]?}`, `video:{codec:str, extradata_b64:str?, width:int, height:int, time_base:[num,den], avg_rate:[num,den]?, sample_aspect_ratio:[num,den]?, color:{primaries:int, transfer:int, matrix:int, range:"limited"\|"full"?}?, bit_depth:int?, hdr:{...}?, dolby_vision:{...}?, hdr10plus:bool?}`, `model:str`, `quality_tier:str`, `display:{w:int,h:int}`, `fit_mode:str?`, `resize_algorithm:str?`, `aux_tracks:"external"\|"muxed"?`, `aux_attachments:"embedded"\|"cached"?`, `high_bit_depth:"hdr"\|"all"?`, `display_target:{transfer:"pq"\|"sdr", peak_nits:float?, sdr_white_nits:float?}?`, `buffer_target_ms:int?`, `resume:bool?` | `source` defaults to `"uplink"`; `video` is omitted for `server_file`; omitting `resize_algorithm` selects the server default. `file.chapters` carries the source container's chapter marks for uplink sessions (only the client can read them). `video.sample_aspect_ratio` is the source's pixel width over height, including any container override (e.g. Matroska display dimensions); send it for anamorphic sources. Absent, zero, non-integer or implausible (outside 1/10..10) values mean square pixels, as before this field existed. The server fits and crops by the displayed shape and delivers square pixels: a 720x576 16:15 source on a 1920x1080 display gives `downlink_width/height` 1440x1080. For `server_file` the server reads it from the file itself. When an uplink omits it, the server reads the aspect from the parameter sets in `extradata_b64` where it can (H.264 SPS VUI, HEVC), so a client need only send what its container declares; an explicit value always wins. Additive: no protocol version change. `aux_tracks` defaults to `"external"`; request `"muxed"` only for `server_file` after `capabilities.muxed_aux_tracks == true`. `aux_attachments` defaults to `"embedded"`; request `"cached"` only together with muxed tracks after `attachment_cache >= 1`. The server may still confirm a fallback mode. `high_bit_depth` (after `capabilities.high_bit_depth`) and the `video.color` / `bit_depth` / `hdr` / `dolby_vision` fields are §3.5's; `display_target` (after `capabilities.display_mapping`) and `video.hdr10plus` are §3.6's; `buffer_target_ms` (how much video the server keeps buffered at the client) is §5's; `resume` (after `capabilities.session_resume`) asks the server to hold the session through a lost control connection (§1.2); all additive |
 | `play` | | |
 | `pause` | | |
 | `seek` | `target_pts:int`, `epoch:int`, `display_target:{...}?` | epoch = client's current epoch + 1; see §4. `display_target` (§3.6) applies from this epoch on; absent keeps the current one |
 | `buffer_report` | `buffered_ms:int`, `playing_pts:int?`, `buffer_target_ms:int?` | send ~every 500 ms while media attached. `buffer_target_ms` replaces the session's buffer target from this report on (§5); absent keeps it |
+| `resume_session` | `session_id:str`, `resume_token:str` | in place of `open_session` on a new connection after `hello`, for a session opened with `resume:true` (§1.2). Answered by `session_resumed`, or the non-fatal error `resume_failed` |
 | `teardown` | | graceful close; `closed` is sent only after pipeline workers and native encoder/mux/inference owners have released their resources |
 
 ### server → client
 
 | type | fields | notes |
 |---|---|---|
-| `capabilities` | `protocol_version:int`, `server_name:str`, `models:[{name, scale_factor}]`, `quality_tiers:[str]`, `quality_options:[{id,label,codec,lossless,android_supported,p95_mbps}]`, `resize_algorithms:[str]`, `default_resize_algorithm:str`, `library:bool`, `library_sort:[str]`, `muxed_aux_tracks:bool`, `attachment_cache:int`, `high_bit_depth:bool?`, `display_mapping:bool?`, `server_id:str?` | `quality_tiers` remains the authoritative ID list; `quality_options` supplies presentation metadata. `library` means the library HTTP API is available. `muxed_aux_tracks` permits the opt-in mode. `attachment_cache >= 1` permits authenticated content-addressed attachment manifests; absent/zero means embedded attachments only. `high_bit_depth` permits `open_session.high_bit_depth` (§3.5). `display_mapping` permits `display_target` (§3.6). `server_id` is an opaque, non-secret identity for this server install, for keying per-server client state (history, watched flags, recents): 1-64 characters from `[A-Za-z0-9_-]`, stable across restarts, settings changes, address or port changes and upgrades. Clients must treat a missing value, or one outside that format, as absent and fall back to their own host:port. The server generates it once and keeps it in a `server-id` file in its per-user state directory (beside the instance lock; `UPSCALE_RELAY_LOCK_DIR` overrides it); deleting the file makes a new id, and a copied state directory shares its id. Additive: no protocol version change |
-| `session_opened` | `session_id:str`, `media_port:int`, `uplink_token:str?`, `downlink_token:str`, `epoch:int(=0)`, `source:str`, `time_base:[num,den]`, `duration_s:float?`, `avg_rate:[num,den]?`, `chapters:[...]?`, `downlink_container:"matroska"`, `downlink_codec:str`, `downlink_extradata_b64:str?`, `downlink_width:int`, `downlink_height:int`, `fit_mode:str`, `resize_algorithm:str`, `aux_tracks:"external"\|"muxed"`, `aux_attachments:"embedded"\|"cached"`, `attachment_manifest:[{name,mimetype,size,sha256}]?`, `attachment_token:str?`, `source_has_audio:bool?`, `source_has_auxiliary:bool?`, `downlink_bit_depth:int?`, `downlink_color:{primaries,transfer,matrix,range}?`, `downlink_dolby_vision:bool?`, `source_bit_depth:int?`, `downlink_mapping:{...}?`, `buffer_target_ms:int?` | Effective choices are authoritative. The `downlink_*` colour fields and `source_bit_depth` are §3.5's, `downlink_mapping` §3.6's; absent means an 8-bit downlink from a server that predates them. `buffer_target_ms` is the client buffer the server keeps topped off (§5); absent means 10 000. A client omits its external original-media source after muxed confirmation or confirmed absence of source audio/subtitle tracks. `cached` means attachment bodies are omitted from every epoch and both manifest and token are required; `embedded` means any accepted attachments remain in each Matroska header. Absent auxiliary mode fields mean `external` and `embedded` |
+| `capabilities` | `protocol_version:int`, `server_name:str`, `models:[{name, scale_factor}]`, `quality_tiers:[str]`, `quality_options:[{id,label,codec,lossless,android_supported,p95_mbps}]`, `resize_algorithms:[str]`, `default_resize_algorithm:str`, `library:bool`, `library_sort:[str]`, `muxed_aux_tracks:bool`, `attachment_cache:int`, `high_bit_depth:bool?`, `display_mapping:bool?`, `session_resume:bool?`, `server_id:str?` | `quality_tiers` remains the authoritative ID list; `quality_options` supplies presentation metadata. `library` means the library HTTP API is available. `muxed_aux_tracks` permits the opt-in mode. `attachment_cache >= 1` permits authenticated content-addressed attachment manifests; absent/zero means embedded attachments only. `high_bit_depth` permits `open_session.high_bit_depth` (§3.5). `display_mapping` permits `display_target` (§3.6). `session_resume` permits `open_session.resume` and `resume_session` (§1.2). `server_id` is an opaque, non-secret identity for this server install, for keying per-server client state (history, watched flags, recents): 1-64 characters from `[A-Za-z0-9_-]`, stable across restarts, settings changes, address or port changes and upgrades. Clients must treat a missing value, or one outside that format, as absent and fall back to their own host:port. The server generates it once and keeps it in a `server-id` file in its per-user state directory (beside the instance lock; `UPSCALE_RELAY_LOCK_DIR` overrides it); deleting the file makes a new id, and a copied state directory shares its id. Additive: no protocol version change |
+| `session_opened` | `session_id:str`, `media_port:int`, `uplink_token:str?`, `downlink_token:str`, `epoch:int(=0)`, `source:str`, `time_base:[num,den]`, `duration_s:float?`, `avg_rate:[num,den]?`, `chapters:[...]?`, `downlink_container:"matroska"`, `downlink_codec:str`, `downlink_extradata_b64:str?`, `downlink_width:int`, `downlink_height:int`, `fit_mode:str`, `resize_algorithm:str`, `aux_tracks:"external"\|"muxed"`, `aux_attachments:"embedded"\|"cached"`, `attachment_manifest:[{name,mimetype,size,sha256}]?`, `attachment_token:str?`, `source_has_audio:bool?`, `source_has_auxiliary:bool?`, `downlink_bit_depth:int?`, `downlink_color:{primaries,transfer,matrix,range}?`, `downlink_dolby_vision:bool?`, `source_bit_depth:int?`, `downlink_mapping:{...}?`, `buffer_target_ms:int?`, `resume_token:str?`, `resume_grace_s:float?` | Effective choices are authoritative. The `downlink_*` colour fields and `source_bit_depth` are §3.5's, `downlink_mapping` §3.6's; absent means an 8-bit downlink from a server that predates them. `buffer_target_ms` is the client buffer the server keeps topped off (§5); absent means 10 000. `resume_token` and `resume_grace_s` come together, and only when `open_session` asked for `resume` (§1.2); absent, the session ends with its control connection. A client omits its external original-media source after muxed confirmation or confirmed absence of source audio/subtitle tracks. `cached` means attachment bodies are omitted from every epoch and both manifest and token are required; `embedded` means any accepted attachments remain in each Matroska header. Absent auxiliary mode fields mean `external` and `embedded` |
 | `state` | `state:"open"\|"playing"\|"paused"\|"closed"` | emitted on every transition |
 | `session_progress` | `stage:str`, `message:str`, `elapsed_s:float` | ticked ~every 2 s while a slow `open_session` is being processed (today: `stage:"pipeline_init"`, e.g. a first-use TensorRT engine build, which can run for minutes). Clients must treat it as a keepalive for the pending open — refresh the open_session timeout on every tick — and should surface `message` as a loading indicator. Quick opens send none |
 | `seek_ready` | `epoch:int`, `downlink_color:{...}?`, `downlink_mapping:{...}?` | server has flushed; an uplink client may start sending the new epoch. A server-file source is restarted by the server. **Not a readiness signal for media** — it is dispatched within milliseconds, before any frame of the new epoch exists (§4) |
 | `seek_progress` | `epoch:int`, `target_pts:int`, `keyframe_pts:int?`, `frames_discarded:int`, `elapsed_s:float` | ticked ~every 500 ms while a seek has produced no downlink bytes yet, starting ~750 ms after the `seek`. Purely informational: the client renders it as seek progress so a long discard window (§4 step 4) is distinguishable from a wedged pipeline. `keyframe_pts` is null until the server's demuxer reports where the seek landed. A seek that produces media promptly sends none, and the server stops ticking after 60 s without downlink bytes or advancing subtitle-index progress. Additive and safe to ignore — clients that do not know the type must skip it, so it carries no protocol-version change |
 | `stats` | `pipeline_fps:float`, `queue_depths:{...}`, `buffered_ahead_ms:int` | periodic, informational |
 | `error` | `code:str`, `message:str`, `fatal:bool` | non-fatal errors leave the session usable |
+| `session_resumed` | `session_id:str`, `state:str`, `epoch:int`, `uplink_attached:bool`, `downlink_attached:bool`, `buffer_target_ms:int?`, `downlink_color:{...}?`, `downlink_mapping:{...}?` | answers `resume_session`: the session is on this connection now, and this is what was missed while it was held (§1.2) |
 | `closed` | | resource-release barrier acknowledging successful teardown; no acknowledgement is sent if a native owner times out |
 
 For `server_file`, the optional `source_has_audio` and `source_has_auxiliary`
@@ -171,7 +231,8 @@ FFV1.
 
 Error codes (initial set): `bad_message`, `unsupported_version`,
 `unknown_model`, `unknown_tier`, `unknown_resize_algorithm`, `decode_error`,
-`pipeline_error`, `media_timeout`, `server_restart_required`, `internal`.
+`pipeline_error`, `media_timeout`, `server_restart_required`, `resume_failed`
+(§1.2), `internal`.
 
 ## 3. Media framing (uplink and downlink)
 
@@ -550,7 +611,8 @@ are allowed without a version bump (receivers ignore unknown fields).
 
 The random media tokens authenticate TCP attachments to an already-open
 session; the short-lived attachment bearer token authorizes only hashes in one
-active manifest. Neither is user authentication. Control-channel pairing,
+active manifest. The resume token lets a new control connection take one
+session over (§1.2). Neither is user authentication. Control-channel pairing,
 persistent client credentials, TLS, and authorization for `/library` and
 `/media` are planned but not implemented. The current server is intended for a
 trusted LAN.
