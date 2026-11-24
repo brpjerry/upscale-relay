@@ -5,7 +5,6 @@ value it had before loadfile whenever a file stops; neither is the user's.
 """
 import asyncio
 import os
-from types import SimpleNamespace
 
 import pytest
 
@@ -14,7 +13,7 @@ pytest.importorskip("PySide6")
 pytest.importorskip("qasync")
 pytest.importorskip("mpv")
 
-from PySide6.QtCore import QSettings, QSize, Qt
+from PySide6.QtCore import QSettings, Qt
 from PySide6.QtGui import QKeyEvent
 from PySide6.QtWidgets import QApplication
 
@@ -38,7 +37,8 @@ def test_input_conf_pause_survives_seek_restart_and_fallback(tmp_path, monkeypat
         headless=True, no_hwdec=True, settings_scope=scope, input_conf_path=input_conf,
         log_root=tmp_path / "logs", discovery=False,
     ))
-    monkeypatch.setattr(window, "screen", lambda: SimpleNamespace(size=lambda: QSize(64, 64), devicePixelRatio=lambda: 1))
+    # A 64x64 session on any host display, whatever its scale.
+    monkeypatch.setattr(window, "_display_pixels", lambda: (64, 64))
     errors = []
     monkeypatch.setattr(window, "_error", lambda *args: errors.append(args))
     window.settings.quality_tier = "lossless-ffv1"

@@ -7,7 +7,6 @@ to stop at "server teardown unconfirmed" until the user connected again.
 """
 import asyncio
 import os
-from types import SimpleNamespace
 
 import pytest
 
@@ -16,7 +15,7 @@ pytest.importorskip("PySide6")
 pytest.importorskip("qasync")
 pytest.importorskip("mpv")
 
-from PySide6.QtCore import QSettings, QSize
+from PySide6.QtCore import QSettings
 from PySide6.QtWidgets import QApplication
 
 from desktop_client.main_window import MainWindow
@@ -37,7 +36,8 @@ def test_control_loss_mid_playback_ends_connected_and_usable(tmp_path, monkeypat
         headless=True, no_hwdec=True, settings_scope=scope,
         log_root=tmp_path / "logs", discovery=False,
     ))
-    monkeypatch.setattr(window, "screen", lambda: SimpleNamespace(size=lambda: QSize(64, 64), devicePixelRatio=lambda: 1))
+    # A 64x64 session on any host display, whatever its scale.
+    monkeypatch.setattr(window, "_display_pixels", lambda: (64, 64))
     errors = []
     monkeypatch.setattr(window, "_error", lambda *args: errors.append(args))
     logged = []

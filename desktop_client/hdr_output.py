@@ -400,18 +400,23 @@ class _WaylandOutputs:
         elif interface == "wl_output":
             version = min(version, 4)
             proxy = self.bind(name, self.output_interface, version)
-            output = self.outputs[name] = {"proxy": proxy, "version": version, "name": None}
+            # The output keeps its own listeners: they go when it does.
+            output = self.outputs[name] = {"proxy": proxy, "version": version, "name": None, "callbacks": []}
             signatures = ["iiiiissi", "uiii", "", "i", "s", "s"][:6 if version >= 4 else 4 if version >= 2 else 2]
-            handlers = [ignore, ignore, ignore, ignore,
-                        lambda _d, _p, value: output.update(name=(value or b"").decode()), ignore]
-            self.listen(proxy, signatures, handlers[:len(signatures)], self.callbacks)
+            handlers = [
+                lambda _d, _p, *geometry: _output_geometry(output, geometry[-1]),
+                lambda _d, _p, flags, width, height, _refresh: _output_mode(output, flags, width, height),
+                ignore, ignore,
+                lambda _d, _p, value: output.update(name=(value or b"").decode()), ignore,
+            ]
+            self.listen(proxy, signatures, handlers[:len(signatures)], output["callbacks"])
             if self.manager is not None:
                 self.manage(output)
 
     def manage(self, output):
         """The output's wp_color_management_output_v1 (get_output, opcode 1)."""
         output["cm_output"] = self.request(self.manager, 1, self.protocol.output, ("n", 0), ("o", output["proxy"]))
-        self.listen(output["cm_output"], [""], [lambda *_: None], self.callbacks)
+        self.listen(output["cm_output"], [""], [lambda *_: None], output["callbacks"])
 
     def on_global_remove(self, _data, _registry, name):
         output = self.outputs.pop(name, None)
@@ -423,6 +428,8 @@ class _WaylandOutputs:
             self.request(output["proxy"], 0, destroy=True)  # wl_output.release
         else:
             self.lib.wl_proxy_destroy(output["proxy"])
+        # Both proxies are gone, so libwayland calls none of these again.
+        output["callbacks"].clear()
 
     def query(self) -> list[dict]:
         """Every output's image description, as the compositor reports it now."""
@@ -533,6 +540,19 @@ class _WaylandOutputs:
         self.lib.wl_display_flush(self.display)
 
 
+def _output_geometry(output: dict, transform: int) -> None:
+    """wl_output.geometry: 90 and 270 degrees, flipped or not, put the mode
+    on its side."""
+    output["swap_axes"] = transform in (1, 3, 5, 7)
+
+
+def _output_mode(output: dict, flags: int, width: int, height: int) -> None:
+    """wl_output.mode: only the current mode is the output's size (the
+    compositor also lists the preferred and other modes)."""
+    if flags & 1:  # WL_OUTPUT_MODE_CURRENT
+        output["mode"] = (width, height)
+
+
 _outputs: _WaylandOutputs | None = None
 
 
@@ -544,6 +564,40 @@ def _wayland_client(display: int | None = None) -> _WaylandOutputs:
     if _outputs is None or _outputs.display != display:
         _outputs = _WaylandOutputs(display)
     return _outputs
+
+
+def wayland_output_pixels(screen) -> tuple[int, int] | None:
+    """A Wayland screen's size in pixels, from its output's current mode.
+
+    Upright: a portrait output's mode is rotated to match the screen. A
+    wl_output older than version 4 has no name to match the screen by, and
+    is used only as the sole output. None off Wayland, or when the mode is
+    unknown.
+    """
+    if platform_kind() != "wayland":
+        return None
+    try:
+        name = screen.name()
+        client = _wayland_client()
+        client.roundtrip()  # mode changes, and outputs that came or went
+        if any(_awaiting_events(output) for output in list(client.outputs.values())):
+            # A monitor plugged in since the last lookup was bound by that
+            # roundtrip; its name and mode arrive on the next.
+            client.roundtrip()
+    except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
+        return None
+    outputs = list(client.outputs.values())
+    for output in outputs:
+        sole_unnamed = len(outputs) == 1 and output.get("version", 4) < 4
+        if (sole_unnamed or (name and output.get("name") == name)) and output.get("mode"):
+            width, height = output["mode"]
+            if width > 0 and height > 0:
+                return (height, width) if output.get("swap_axes") else (width, height)
+    return None
+
+
+def _awaiting_events(output: dict) -> bool:
+    return not output.get("mode") or (output.get("version", 4) >= 4 and not output.get("name"))
 
 
 def wayland_outputs(display: int | None = None) -> list[dict]:

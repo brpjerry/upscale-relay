@@ -7,7 +7,6 @@ import asyncio
 import logging
 import os
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
@@ -16,7 +15,7 @@ pytest.importorskip("PySide6")
 pytest.importorskip("qasync")
 pytest.importorskip("mpv")
 
-from PySide6.QtCore import QSettings, QSize
+from PySide6.QtCore import QSettings
 from PySide6.QtWidgets import QApplication
 
 from desktop_client.main_window import MainWindow
@@ -46,7 +45,8 @@ def test_passthrough_resume_restart_seek_reopen_and_autoplay(tmp_path, monkeypat
         # absolute PTS and pause/seek behavior must agree across demuxers.
         window.player.mpv["demuxer"] = "lavf"
         window.player.mpv["demuxer-lavf-format"] = "matroska"
-    monkeypatch.setattr(window, "screen", lambda: SimpleNamespace(size=lambda: QSize(64, 64), devicePixelRatio=lambda: 1))
+    # A 64x64 session on any host display, whatever its scale.
+    monkeypatch.setattr(window, "_display_pixels", lambda: (64, 64))
     errors = []
     # Preserve native decoder/demuxer warnings in pytest's captured log. A
     # numeric end-file error alone cannot diagnose differences in distro mpv.
