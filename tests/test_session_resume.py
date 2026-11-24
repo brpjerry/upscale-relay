@@ -713,7 +713,8 @@ def test_a_client_displaced_after_a_resume_gives_the_session_up(source, monkeypa
         server._take_over_session = recorded
         try:
             client, info = await _playing_client(server, source)
-            # This client's resume will hang on its hello until released.
+            # This client's resume attempt waits, before its replacement
+            # socket opens, until the gate is released.
             gate = asyncio.Event()
             resume_once = client._resume_once
 
@@ -858,3 +859,25 @@ def test_a_connection_lost_right_after_session_opened_is_resumed(source):
             await runner.cleanup()
 
     _run(scenario)
+
+
+# Bugs caught: 0, False positives: 0
+def test_a_reply_that_arrived_before_its_write_failed_is_used():
+    # session_opened can arrive, with the end of the connection, while the
+    # open_session write is still reporting its failure.
+    async def scenario():
+        client = RelayClient("127.0.0.1", 1)
+
+        async def send(type_, **fields):
+            client._pending["session_opened"].set_result({"type": "session_opened"})
+            raise ConnectionResetError("closing transport")
+
+        client._send = send
+        try:
+            reply = await asyncio.wait_for(client._request("session_opened", "open_session"), 2)
+            assert reply == {"type": "session_opened"}
+        finally:
+            await client.close()
+
+    _run(scenario)
+

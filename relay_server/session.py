@@ -96,8 +96,9 @@ def _sample_aspect_ratio(video: dict) -> Fraction:
 
 
 # How much longer a stalled downlink waits when buffer reports stopped too:
-# the server's control heartbeat notices a dead connection within 30 s.
-_DETACH_WAIT_S = 30.0
+# the server's control heartbeat notices a dead connection within 30 s, and
+# the margin covers an event loop that runs the heartbeat late.
+_DETACH_WAIT_S = 45.0
 
 
 class State(str, Enum):

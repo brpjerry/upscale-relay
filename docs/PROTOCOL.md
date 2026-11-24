@@ -57,8 +57,9 @@ control connection to that server, before any `open_session`, it polls
    arrives (the server ends it too, as after any teardown). Then poll as
    below: after `closed` the first poll no longer lists the session, and it
    still says whether the server needs a restart. A `resume_failed` error
-   means the session is gone or already closing (within the 15 s close
-   bound), and the polling says which. A connection lost before `closed` is
+   only means this takeover failed (the session may be gone, closing, or
+   held with another token); the polling gives the verdict, with its
+   usual bound. A connection lost before `closed` is
    no answer, as for a failed request below. Send the token only to the
    host and port that issued it, never to another name for the server, and
    not to a server whose `server_id` differs from the issuer's (another
