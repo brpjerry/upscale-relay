@@ -196,6 +196,8 @@ class Session:
         self._open_task: asyncio.Task | None = None
         self._close_task: asyncio.Task | None = None
         self._closing = asyncio.Event()
+        # No downlink stall closes the session before this (attach()).
+        self._stall_grace_until = 0.0
         # Held through a seek: a resume's snapshot waits for it (PROTOCOL §1.2).
         self.seek_lock = asyncio.Lock()
         self._seek_progress_task: asyncio.Task | None = None
@@ -285,6 +287,10 @@ class Session:
     def attach(self, ws) -> None:
         """A resumed control connection takes the session over."""
         self.ws = ws
+        # A downlink still blocked from the dropout gets a fresh stall
+        # window: TCP backs its retransmissions off, and may take a while to
+        # drain once the network is back.
+        self._stall_grace_until = time.monotonic() + 30.0
         if self.pipeline is not None:
             self.pipeline.client_detached = False
 
@@ -351,6 +357,7 @@ class Session:
                     return
                 except concurrent.futures.TimeoutError:
                     now = time.monotonic()
+                    deadline = max(deadline, self._stall_grace_until)
                     if self.ws is None:
                         # Held for a resume: the network may be down. The
                         # grace period bounds the hold, not this deadline.

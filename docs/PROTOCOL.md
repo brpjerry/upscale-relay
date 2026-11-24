@@ -121,7 +121,9 @@ its session through one instead. Additive: no protocol version change.
 5. The client retries with backoff, each attempt bounded (a blackholed path
    hangs rather than refuses), until the server refuses or the grace period
    has certainly ended: `resume_grace_s` plus the server's heartbeat window
-   (30 s) after the client noticed the loss. It sends the token only once
+   (30 s) after the client noticed the loss. An attempt that sent
+   `resume_session` and then failed may have restarted the server's hold, so
+   the client renews that window once per outage. It sends the token only once
    the reconnect's `capabilities` still advertise `session_resume` and name
    the issuing server's `server_id` (when it had one); anything else is a
    refusal. A control connection that a redirect took to another host or
