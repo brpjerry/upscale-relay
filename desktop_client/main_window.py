@@ -2408,17 +2408,13 @@ class MainWindow(DesktopFeatures, QMainWindow):
         if self.client is None:  # teardown lost the connection and couldn't reconnect
             self._error("Not connected", "Lost the connection to the upscale server.")
             return
-        # Physical pixels: QScreen.size() is logical (a 4K panel at 150%
-        # Windows scaling reports 2560x1440 and we'd negotiate a too-small
-        # output).
-        screen = self.screen()
-        dpr = screen.devicePixelRatio()
+        display_w, display_h = self._display_pixels()
         cfg = SessionConfig(
             path=path,
             model=self.model_combo.currentText(),
             quality_tier=self._quality_tier(),
-            display_w=round(screen.size().width() * dpr),
-            display_h=round(screen.size().height() * dpr),
+            display_w=display_w,
+            display_h=display_h,
             fit_mode=self._fit_mode(),
             source=source,
             resize_algorithm=self._resize_algorithm(),
@@ -2660,6 +2656,20 @@ class MainWindow(DesktopFeatures, QMainWindow):
         at = next((i + 1 for i, row in enumerate(rows) if row[0] == "Output"), len(rows))
         rows[at:at] = _mapping_rows(getattr(session, "downlink_mapping", None))
         self._show_now_playing(title, detail, rows)
+
+    def _display_pixels(self) -> tuple[int, int]:
+        """The window's screen in physical pixels.
+
+        QScreen.size() is logical (a 4K panel at 150% reports 2560x1440, and
+        we'd negotiate a too-small output). Scale it by the window's ratio,
+        not QScreen.devicePixelRatio(): on Wayland that is the output's
+        integer scale (2 at 150%), and a 4K panel was sent as 5120x2880. The
+        window's ratio is the fractional scale it is drawn at (1.5), and the
+        screen's own ratio everywhere else.
+        """
+        size = self.screen().size()
+        dpr = self.devicePixelRatioF()
+        return round(size.width() * dpr), round(size.height() * dpr)
 
     def _display_target(self):
         """The display a relay stream is shown on (player.display_target),
