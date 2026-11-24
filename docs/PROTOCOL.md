@@ -60,7 +60,9 @@ control connection to that server, before any `open_session`, it polls
    means the session is gone or already closing (within the 15 s close
    bound), and the polling says which. A connection lost before `closed` is
    no answer, as for a failed request below. Send the token only to the
-   host and port that issued it, never to another name for the server.
+   host and port that issued it, never to another name for the server, and
+   not to a server whose `server_id` differs from the issuer's (another
+   install now answering at that address).
    Without this step a held session stays listed for its whole grace period,
    past the 60 s.
 1. `restart_required: true`: stop; the server must be restarted (checked first).
@@ -119,8 +121,10 @@ its session through one instead. Additive: no protocol version change.
    hangs rather than refuses), until the server refuses or the grace period
    has certainly ended: `resume_grace_s` plus the server's heartbeat window
    (30 s) after the client noticed the loss. It sends the token only once
-   the reconnect's `capabilities` still advertise `session_resume`; a server
-   that does not is a refusal. It closes an attempt it gives
+   the reconnect's `capabilities` still advertise `session_resume` and name
+   the issuing server's `server_id` (when it had one); anything else is a
+   refusal. A control connection that a redirect took to another host or
+   port is refused before anything is sent on it. It closes an attempt it gives
    up on with a code other than 1000 (`relay_client_core` uses 4000): the server
    may already have handed the session to that connection, and a normal
    close would end it. A client torn down meanwhile releases the session
@@ -163,7 +167,8 @@ One WebSocket connection = at most one session.
 IDLE ──────open_session────► OPEN ──play──► PLAYING ◄──play/pause──► PAUSED
                               │                │                        │
                               └────────────────┴──────teardown─────────┴──► CLOSED
-                                          (or WS disconnect ⇒ CLOSED)
+                     (or WS disconnect ⇒ CLOSED, after the §1.2 hold for a session
+                      opened with resume:true that is not resumed in time)
 ```
 
 - `OPEN`: pipeline allocated, media connections may attach, pre-buffering may

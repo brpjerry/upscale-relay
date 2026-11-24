@@ -98,8 +98,6 @@ def _sample_aspect_ratio(video: dict) -> Fraction:
 # How much longer a stalled downlink waits when buffer reports stopped too:
 # the server's control heartbeat notices a dead connection within 30 s.
 _DETACH_WAIT_S = 30.0
-# Clients report every 500 ms: this long without one, reports have stopped.
-_REPORTS_STOPPED_S = 2.0
 
 
 class State(str, Enum):
@@ -357,11 +355,12 @@ class Session:
                         # grace period bounds the hold, not this deadline.
                         deadline = now + 30.0
                     elif (now >= deadline and self.resumable
-                          and now - self.last_buffer_report > _REPORTS_STOPPED_S
+                          and self.last_buffer_report < deadline
                           and now < deadline + _DETACH_WAIT_S):
-                        # Reports stopped as well: the control connection is
-                        # likely dead too, and its heartbeat detaches the
-                        # session within this window (it is then held).
+                        # No report since the deadline: the control connection
+                        # may be dead too, and its heartbeat detaches the
+                        # session within this window (it is then held). A
+                        # live client reports within 500 ms and is dropped.
                         continue
                     elif now >= deadline:
                         log.warning("session %s: downlink stalled >30s, dropping session", self.id)
@@ -688,14 +687,26 @@ class Session:
 
     async def handle_seek(self, msg: dict) -> None:
         async with self.seek_lock:
-            await self._handle_seek(msg)
+            epoch = self.epoch
+            try:
+                await self._handle_seek(msg)
+            except Exception:
+                if self.epoch != epoch:
+                    # It published an epoch the pipeline may never have
+                    # installed: a resume must not report it. The session
+                    # closes, as the handler's failure would have closed it.
+                    self.mark_closing()
+                raise
 
     async def _handle_seek(self, msg: dict) -> None:
-        # Both read before the epoch changes: a malformed seek must not leave
-        # an epoch published that the pipeline never installed.
-        new_epoch, target_pts = int(msg["epoch"]), int(msg["target_pts"])
+        new_epoch = int(msg["epoch"])
         if new_epoch <= self.epoch or self.pipeline is None:
             return  # stale or premature
+        # Read before the epoch changes: a malformed seek must not leave an
+        # epoch published that the pipeline never installed.
+        target_pts = int(msg["target_pts"])
+        # A malformed or absent display_target keeps the mapping (§3.6).
+        display_target = DisplayTarget.from_wire(msg.get("display_target"))
         self.epoch = new_epoch
         await self._stop_seek_progress()
         # Drop everything queued for the downlink writer.
@@ -706,8 +717,6 @@ class Session:
             pass
         self.pipeline.note_buffer_report(0)
         await self._stop_server_source()
-        # A malformed or absent display_target keeps the mapping (§3.6).
-        display_target = DisplayTarget.from_wire(msg.get("display_target"))
         trace = await asyncio.to_thread(
             self.pipeline.flush, new_epoch, target_pts, display_target)
         if self.downlink_attached:

@@ -347,6 +347,7 @@ class MainWindow(DesktopFeatures, QMainWindow):
         # Its resume token, when the session was resumable (PROTOCOL §1.2):
         # the next connection then takes it over and tears it down.
         self._unreleased_resume_token: str | None = None
+        self._unreleased_server_id: str | None = None  # the token's issuer
         self._server_caps: dict = {}
         # The connected server predates buffer targets (PROTOCOL §5): a
         # session it opened confirmed none. Kept through the reconnect that
@@ -2217,7 +2218,10 @@ class MainWindow(DesktopFeatures, QMainWindow):
                 return
             client = RelayClient(lost.host, lost.port)
             try:
-                caps = await client.connect()
+                # Bounded: a silent path would otherwise hold Stop or Play
+                # for the library's connection timeouts, three times over.
+                caps = await asyncio.wait_for(
+                    client.connect(), _UNCONFIRMED_RECONNECT_TIMEOUT_S)
             except asyncio.CancelledError:
                 await client.close()
                 raise
@@ -2330,6 +2334,7 @@ class MainWindow(DesktopFeatures, QMainWindow):
             return False
         self._unreleased_session = (session_id, host, port)
         self._unreleased_resume_token = getattr(err, "resume_token", None)
+        self._unreleased_server_id = getattr(err, "server_id", None)
         self.client_log.record("teardown_unconfirmed", session=session_id, host=host, port=port)
         return True
 
@@ -2372,7 +2377,8 @@ class MainWindow(DesktopFeatures, QMainWindow):
             same_endpoint = (client.host, client.port) == (host, port)
             await client.wait_session_released(
                 session_id,
-                resume_token=self._unreleased_resume_token if same_endpoint else None)
+                resume_token=self._unreleased_resume_token if same_endpoint else None,
+                resume_server_id=self._unreleased_server_id)
         except TeardownNotConfirmedError as err:
             # Still held, restart required, or /status cannot say. A manual
             # Connect clears this stop, not the question: the next open asks again.
@@ -2399,7 +2405,7 @@ class MainWindow(DesktopFeatures, QMainWindow):
             return False
         if (client.host, client.port) == (host, port) and self._unreleased_session is pending:
             self._unreleased_session = None
-            self._unreleased_resume_token = None
+            self._unreleased_resume_token = self._unreleased_server_id = None
         self.client_log.record("release_confirmed", session=session_id, host=client.host, port=client.port)
         if self.statusBar().currentMessage() == _RELEASE_WAIT_NOTE:
             self.statusBar().clearMessage()

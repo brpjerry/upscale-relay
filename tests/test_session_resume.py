@@ -657,34 +657,143 @@ def test_a_client_whose_session_another_connection_resumed_does_not_take_it_back
     _run(scenario)
 
 
-# Bugs caught: 0, False positives: 0
+# Bugs caught: 0, False positives: 1
 def test_a_server_that_no_longer_resumes_gets_no_token(source):
     async def scenario():
         server = RelayServer("models", free_port_pair())
         await server.start()
         client = None
+        requests = []
+        take_over = server._take_over_session
+
+        def recorded(msg, ws):
+            requests.append(msg)  # what reached the server, token and all
+            return take_over(msg, ws)
+
+        server._take_over_session = recorded
         try:
             client, info = await _playing_client(server, source)
             server.resume_grace_s = 0.0  # as if rolled back: no session_resume
-            sent = []
-            resume_once = client._resume_once
-
-            async def watched(session):
-                try:
-                    return await resume_once(session)
-                finally:
-                    sent.append(client.capabilities.get("session_resume"))
-
-            client._resume_once = watched
             events = []
             client.on_disconnected = lambda: events.append("disconnected")
             client._ws._conn.transport.abort()
             async with asyncio.timeout(5):
                 await _until(lambda: events)
-            assert sent == [False]  # one attempt, refused before the token went out
+            assert client.capabilities["session_resume"] is False
+            assert requests == []  # refused before the token went out
         finally:
             if client is not None:
                 await client.close()
+            await server.stop()
+
+    _run(scenario)
+
+
+# Bugs caught: 0, False positives: 0
+def test_a_client_displaced_after_a_resume_gives_the_session_up(source, monkeypatch):
+    # The session changes hands while this client resumes it, and once more
+    # after: displaced (4001), it must not try again, its consumer wakes, and
+    # its teardown does not hand the token on (that would end the new
+    # owner's playback).
+    monkeypatch.setattr(client_module, "RESUME_RETRY_DELAYS_S", (0.05,))
+    monkeypatch.setattr(client_module, "RESUME_RETRY_MAX_S", 0.05)
+
+    async def scenario():
+        server = RelayServer("models", free_port_pair())
+        await server.start()
+        client = None
+        http = aiohttp.ClientSession()
+        requests = []
+        take_over = server._take_over_session
+
+        def recorded(msg, ws):
+            requests.append(msg["session_id"])
+            return take_over(msg, ws)
+
+        server._take_over_session = recorded
+        try:
+            client, info = await _playing_client(server, source)
+            # This client's resume will hang on its hello until released.
+            gate = asyncio.Event()
+            resume_once = client._resume_once
+
+            async def gated(session):
+                await gate.wait()
+                return await resume_once(session)
+
+            client._resume_once = gated
+            client._ws._conn.transport.abort()
+            await _until(lambda: client.resuming)
+            other = await http.ws_connect(f"http://127.0.0.1:{server.port}/control")
+            await other.send_str(json.dumps({"type": "hello", "protocol_version": PROTOCOL_VERSION}))
+            await _receive(other, "capabilities")
+            await other.send_str(json.dumps({
+                "type": "resume_session", "session_id": info.session_id,
+                "resume_token": info.resume_token,
+            }))
+            await _receive(other, "session_resumed")
+            # This client's own attempt then takes it back from `other`...
+            gate.set()
+            await _until(lambda: len(requests) >= 2)
+            await other.close()
+            # ...and a third connection takes it from this client: 4001.
+            http2 = aiohttp.ClientSession()
+            try:
+                again = await http2.ws_connect(f"http://127.0.0.1:{server.port}/control")
+                await again.send_str(json.dumps({"type": "hello", "protocol_version": PROTOCOL_VERSION}))
+                await _receive(again, "capabilities")
+                await again.send_str(json.dumps({
+                    "type": "resume_session", "session_id": info.session_id,
+                    "resume_token": info.resume_token,
+                }))
+                await _receive(again, "session_resumed")
+                count = len(requests)
+                # The displaced client wakes its consumer and stops.
+                while await client.downlink_queue().get() is not None:
+                    pass
+                assert client.source_error == "The session was resumed on another connection"
+                await asyncio.sleep(0.5)
+                assert len(requests) == count  # no attempt to take it back
+                with pytest.raises(TeardownNotConfirmedError) as unconfirmed:
+                    await client.teardown()
+                assert unconfirmed.value.session_id == info.session_id
+                assert unconfirmed.value.resume_token is None
+                assert server.sessions[info.session_id].ws is not None
+                await again.send_str(json.dumps({"type": "teardown"}))
+                await _receive(again, "closed")
+            finally:
+                await http2.close()
+        finally:
+            await http.close()
+            if client is not None:
+                await client.close()
+            await server.stop()
+
+    _run(scenario)
+
+
+# Bugs caught: 0, False positives: 0
+def test_a_stale_seek_without_a_target_is_ignored(source, tmp_path):
+    async def scenario():
+        server = RelayServer("models", free_port_pair(), library_root=str(tmp_path))
+        await server.start()
+        sockets = []
+        try:
+            http, ws = await _control(server.port)
+            sockets.append(http)
+            await ws.send_str(json.dumps({
+                "type": "open_session", "source": {"type": "server_file", "path": "a.mkv"},
+                "model": "passthrough", "quality_tier": "lossless-ffv1",
+                "display": {"w": 64, "h": 64}, "resume": True,
+            }))
+            opened = await _receive(ws, "session_opened")
+            await ws.send_str(json.dumps({"type": "seek", "epoch": 0}))  # stale, no target
+            await ws.send_str(json.dumps({"type": "pause"}))
+            assert (await _receive(ws, "state"))["state"] == "paused"
+            assert server.sessions[opened["session_id"]].epoch == 0
+        finally:
+            for http in sockets:
+                await http.close()
             await server.stop()
 
     _run(scenario)

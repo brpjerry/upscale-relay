@@ -107,7 +107,7 @@ class WorldClient(FakeSessionClient):
     async def wait_session_released(self, session_id, **kwargs):
         # The core's bound and interval, not the window's; the resume token
         # the unacknowledged teardown named (PROTOCOL §1.2), or None.
-        assert set(kwargs) == {"resume_token"}, kwargs
+        assert set(kwargs) == {"resume_token", "resume_server_id"}, kwargs
         self.world.tokens.append((self.host, kwargs["resume_token"]))
         self.world.events.append(("wait", session_id, self.host))
         while True:

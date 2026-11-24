@@ -411,6 +411,13 @@ class RelayServer:
                         report = session.resume_report()
                     if session.ws is not ws:
                         break  # resumed again meanwhile: the newer one answers
+                    if session.closing.is_set():
+                        # The seek it waited for failed; the session is ending.
+                        await ws.send_str(json.dumps({
+                            "type": "error", "code": "resume_failed",
+                            "message": "the session is closing", "fatal": False,
+                        }))
+                        break
                     await session.send("session_resumed", **report)
                 elif session is None:
                     await ws.send_str(json.dumps({
@@ -443,6 +450,16 @@ class RelayServer:
             else:
                 connection_ended = True
         finally:
+            if session is not None and session.ws is not ws and not ws.closed:
+                # Taken over, and leaving before the background close: say
+                # so, or the displaced client reads a normal close and tries
+                # to take the session back.
+                try:
+                    await asyncio.wait_for(ws.close(
+                        code=CLOSE_SESSION_TAKEN_OVER,
+                        message=b"session resumed on another connection"), 2.0)
+                except Exception:
+                    pass
             # A session that a resume took over belongs to its new connection.
             if session is not None and session.ws is ws:
                 # Held only when the connection was lost: a client that closed
