@@ -239,12 +239,37 @@ def test_saved_provider_is_read_without_onnxruntime(settings, monkeypatch):
     assert settings.requested_ep == "auto"
 
 
-@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux default")
-def test_linux_tray_models_default_matches_the_service(monkeypatch, tmp_path):
-    from relay_server import gui_settings
+# Bugs caught: 0, False positives: 0
+def test_linux_sign_in_without_runtime_starts_passthrough_unasked(app, monkeypatch):
+    # An unattended sign-in waited on the download question, so passthrough
+    # stayed offline until someone answered it.
+    from relay_server import runtime_bootstrap, tray
 
-    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
-    assert gui_settings.default_models_dir() == str(tmp_path / "data/upscale-relay/models")
+    monkeypatch.setattr(tray, "_setup_is_explicit", lambda: True)
+    monkeypatch.delattr(sys, "frozen", raising=False)
+    monkeypatch.setattr(sys, "argv", ["relay-server-gui", autostart.AUTOSTART_ARG])
+    monkeypatch.setattr(runtime_bootstrap, "activate_runtime", lambda: False)
+    monkeypatch.setattr(runtime_bootstrap, "source_runtime_ready", lambda ep: False)
+    created = _record_setup_dialogs(monkeypatch)
+    assert asyncio.run(ensure_runtime_gui()) == (True, None)
+    assert created == []
+
+
+# Bugs caught: 0, False positives: 0
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="XDG autostart")
+def test_apply_keeps_an_entry_disabled_while_the_pane_was_open(app, settings, tmp_path):
+    autostart.set_enabled(True)
+    dialog = ConfigDialog(settings)
+    try:
+        assert dialog.autostart_check.isChecked()
+        entry = tmp_path / "config" / "autostart" / "upscale-relay-server.desktop"
+        entry.write_text(entry.read_text() + "Hidden=true\n")  # a startup-apps manager
+        dialog.port_spin.setValue(dialog.port_spin.value() + 1)  # an unrelated change
+        dialog._on_apply()
+        assert autostart.is_enabled() is False
+        assert "Hidden=true" in entry.read_text()
+    finally:
+        dialog.deleteLater()
 
 
 def test_runtime_setup_close_cancels_installer(app):

@@ -15,11 +15,15 @@ sha256sums=('@SHA256@')
 # installer writes into the build interpreter's versioned site-packages.
 # Require a rebuild when Arch changes Python's minor version.
 _python=('python>=@PYTHON_MIN@' 'python<@PYTHON_MAX@')
+# Arch's interpreter, never one from an active virtualenv: installer takes its
+# scheme and the commands' shebangs from it. The bounds also stop a recipe
+# staged for another Python minor version before it packages anything.
+makedepends+=("${_python[@]}")
 
 build() {
   local part
   for part in common client server; do
-    (cd "$srcdir/upscale-relay/$part" && python -m build --wheel --no-isolation)
+    (cd "$srcdir/upscale-relay/$part" && /usr/bin/python -m build --wheel --no-isolation)
   done
 }
 
@@ -28,7 +32,7 @@ package_upscale-relay-common() {
   arch=('any')
   depends=("${_python[@]}" 'python-av')
   cd "$srcdir/upscale-relay/common"
-  python -m installer --destdir="$pkgdir" dist/*.whl
+  /usr/bin/python -m installer --destdir="$pkgdir" dist/*.whl
 }
 
 package_upscale-relay-client() {
@@ -41,7 +45,7 @@ package_upscale-relay-client() {
     'python-dbus-next'
   )
   cd "$srcdir/upscale-relay/client"
-  python -m installer --destdir="$pkgdir" dist/*.whl
+  /usr/bin/python -m installer --destdir="$pkgdir" dist/*.whl
   install -Dm644 upscale-relay-client.desktop \
     "$pkgdir/usr/share/applications/upscale-relay-client.desktop"
 }
@@ -68,7 +72,7 @@ package_upscale-relay-server() {
   )
   install=upscale-relay-server.install
   cd "$srcdir/upscale-relay/server"
-  python -m installer --destdir="$pkgdir" dist/*.whl
+  /usr/bin/python -m installer --destdir="$pkgdir" dist/*.whl
   install -Dm644 upscale-relay-server.service \
     "$pkgdir/usr/lib/systemd/user/upscale-relay-server.service"
 }

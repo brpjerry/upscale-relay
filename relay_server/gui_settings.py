@@ -8,7 +8,6 @@ server and desktop client never share a settings tree.
 
 from __future__ import annotations
 
-import os
 import sys
 from pathlib import Path
 
@@ -46,15 +45,13 @@ def __getattr__(name: str):
 
 
 def default_models_dir() -> str:
-    """Linux: the folder the packaged systemd unit serves, so switching
-    between the unit and the tray keeps the same models.  Elsewhere the
-    historical ./models."""
+    """Linux: the folder the packaged systemd unit serves
+    (``%h/.local/share/upscale-relay/models``, which the unit cannot take
+    from XDG_DATA_HOME), so switching between the unit and the tray keeps
+    the same models.  Elsewhere the historical ./models."""
     if not sys.platform.startswith("linux"):
         return "models"
-    data_home = Path(os.environ.get("XDG_DATA_HOME") or "")
-    if not data_home.is_absolute():
-        data_home = Path.home() / ".local" / "share"
-    return str(data_home / "upscale-relay" / "models")
+    return str(Path.home() / ".local" / "share" / "upscale-relay" / "models")
 
 
 class ServerSettings:

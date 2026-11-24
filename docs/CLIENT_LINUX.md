@@ -38,7 +38,7 @@ To build from a checkout on Arch:
 
 ```bash
 yay -S --needed base-devel python-build python-installer python-setuptools python-wheel
-python packaging/arch/prepare.py dist/pacman
+/usr/bin/python packaging/arch/prepare.py dist/pacman
 cd dist/pacman
 makepkg --syncdeps
 ```

@@ -83,11 +83,11 @@ server down cleanly: sessions close and the mDNS advertisement is withdrawn. Fur
 `~/.config/upscale-relay/server.env`:
 
 ```bash
-RELAY_SERVER_ARGS=--library /srv/video --library /mnt/nas/films
+RELAY_SERVER_ARGS=--library /srv/video --library "/mnt/nas/My Films"
 ```
 
-The variable is split on whitespace; for paths with spaces, override
-`ExecStart=` with `systemctl --user edit upscale-relay-server` instead.
+The variable is split on whitespace; quote a path that contains spaces, and
+systemd passes it as one argument.
 
 A user unit starts at login. To run the server on a headless box without
 anyone logged in, enable lingering once: `loginctl enable-linger $USER`.
@@ -124,7 +124,7 @@ On Arch, from a checkout:
 
 ```bash
 yay -S --needed base-devel python-build python-installer python-setuptools python-wheel
-python packaging/arch/prepare.py dist/pacman
+/usr/bin/python packaging/arch/prepare.py dist/pacman
 cd dist/pacman
 makepkg --syncdeps
 ```

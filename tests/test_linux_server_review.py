@@ -193,3 +193,65 @@ def test_unwritable_models_folder_disables_the_engine_cache(tmp_path):
     assert options["trt_engine_cache_enable"] is False
     assert options["trt_timing_cache_enable"] is False
     assert "trt_engine_cache_path" not in options
+
+
+# Bugs caught: 0, False positives: 0
+def test_saved_provider_missing_from_this_build_probes_as_auto(monkeypatch):
+    # The tray hands the probe its saved preference. A saved "tensorrt" in a
+    # build without it used to fail the probe, and the tray then offered (on
+    # Windows, started) the multi-gigabyte runtime download although the
+    # server would simply run auto on what is installed.
+    pytest.importorskip("onnxruntime")
+    pytest.importorskip("onnx")
+    monkeypatch.setattr(runtime, "_LINUX", False)
+    runtime._validate_source_runtime("dml", saved_choice=True)
+    with pytest.raises(RuntimeError, match="unavailable"):
+        runtime._validate_source_runtime("dml")
+
+
+def test_a_marker_of_the_wrong_type_is_not_ready(monkeypatch, tmp_path):
+    monkeypatch.setenv("UPSCALE_RELAY_RUNTIME_DIR", str(tmp_path))
+    target = tmp_path / runtime.RUNTIME_STACK_ID
+    target.mkdir()
+    for text in ("null", "[]", '"ready"'):
+        (target / ".runtime-ready.json").write_text(text)
+        assert runtime.runtime_ready() is False
+
+
+def test_activation_moves_a_listed_runtime_first(monkeypatch, tmp_path):
+    monkeypatch.setattr(runtime, "_LINUX", True)
+    monkeypatch.setenv("UPSCALE_RELAY_RUNTIME_DIR", str(tmp_path))
+    target = tmp_path / runtime.RUNTIME_STACK_ID
+    target.mkdir()
+    (target / ".runtime-ready.json").write_text(json.dumps({"stack_id": runtime.RUNTIME_STACK_ID}))
+    monkeypatch.setattr(sys, "path", ["/usr/lib/site-packages", str(target)])
+    monkeypatch.delenv("LD_LIBRARY_PATH", raising=False)
+    assert runtime.activate_runtime()
+    assert sys.path == [str(target), "/usr/lib/site-packages"]
+
+
+def test_relative_xdg_state_home_is_ignored(monkeypatch, tmp_path):
+    from relay_server import instance_lock
+
+    if sys.platform == "win32":
+        pytest.skip("XDG on Linux")
+    monkeypatch.delenv("UPSCALE_RELAY_LOCK_DIR", raising=False)
+    monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))
+    monkeypatch.setenv("XDG_STATE_HOME", "relative")
+    assert instance_lock.lock_dir() == tmp_path / ".local/state/upscale-relay"
+
+
+# Bugs caught: 0, False positives: 0
+def test_tray_models_default_is_the_units_folder(monkeypatch, tmp_path):
+    # The unit cannot follow XDG_DATA_HOME, so neither may the tray's
+    # default, or switching from the service to the tray loses the models.
+    pytest.importorskip("PySide6")
+    if not sys.platform.startswith("linux"):
+        pytest.skip("Linux default")
+    from relay_server.gui_settings import default_models_dir
+
+    monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "elsewhere"))
+    unit = (ROOT / "packaging/arch/upscale-relay-server.service").read_text()
+    assert "--models-dir %h/.local/share/upscale-relay/models" in unit
+    assert default_models_dir() == str(tmp_path / ".local/share/upscale-relay/models")

@@ -64,6 +64,8 @@ def _exec_argument(argument: str) -> str:
     """
     quoted = "".join("\\" + c if c in '"`$\\' else c for c in argument)
     quoted = quoted.replace("\\", "\\\\").replace("%", "%%")
+    # The key's value is one line: control characters use string escapes.
+    quoted = quoted.replace("\n", "\\n").replace("\t", "\\t").replace("\r", "\\r")
     return f'"{quoted}"'
 
 

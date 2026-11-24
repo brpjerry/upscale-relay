@@ -139,7 +139,7 @@ def runtime_ready(path: Path | None = None) -> bool:
         data = json.loads(_marker(target).read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return False
-    return data.get("stack_id") == RUNTIME_STACK_ID
+    return isinstance(data, dict) and data.get("stack_id") == RUNTIME_STACK_ID
 
 
 def _native_dll_dirs(target: Path) -> list[Path]:
@@ -182,8 +182,10 @@ def activate_runtime(path: Path | None = None, *, require_ready: bool = True) ->
 
     target_text = str(target)
     if _LINUX:
-        if target_text not in sys.path:
-            sys.path.insert(0, target_text)
+        # First, even if a .pth file already listed it after a system build.
+        if target_text in sys.path:
+            sys.path.remove(target_text)
+        sys.path.insert(0, target_text)
         libs = str(target / "tensorrt_libs")
         existing = os.environ.get("LD_LIBRARY_PATH", "")
         if libs not in existing.split(os.pathsep):
@@ -418,13 +420,20 @@ def _run_validation_process(target: Path) -> int:
     return subprocess.run(_validation_command(target), check=False).returncode
 
 
-def _validate_source_runtime(ep: str) -> None:
-    """Exercise the source environment in a disposable process, including DLLs."""
+def _validate_source_runtime(ep: str, *, saved_choice: bool = False) -> None:
+    """Exercise the source environment in a disposable process, including DLLs.
+
+    ``saved_choice``: ``ep`` is the tray's saved preference, which the server
+    itself replaces with auto when this build lacks it; probe it the same way
+    rather than offering a multi-gigabyte download.
+    """
     import numpy as np
     import onnx
     from upscale_cli.infer import ort, _EP_ORDER
 
     available = set(ort.get_available_providers())
+    if saved_choice and ep not in {alias for alias, name in _EP_ORDER if name in available}:
+        ep = "auto"
     providers = [name for alias, name in _EP_ORDER
                  if name in available and (ep == "auto" or alias == ep)]
     if not providers:
@@ -528,7 +537,7 @@ def maybe_run_runtime_installer(argv: list[str] | None = None) -> int | None:
     args = sys.argv[1:] if argv is None else argv
     if len(args) == 2 and args[0] == SOURCE_VALIDATE_ARG:
         try:
-            _validate_source_runtime(args[1])
+            _validate_source_runtime(args[1], saved_choice=True)
         except Exception as err:
             print(f"Source runtime validation failed: {err}", file=sys.stderr, flush=True)
             return 1

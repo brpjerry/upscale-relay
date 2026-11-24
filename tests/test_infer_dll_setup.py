@@ -48,7 +48,7 @@ def test_tensorrt_wheel_dirs_are_registered_on_windows_only(tmp_path, monkeypatc
         assert added == []
 
 
-# Bugs caught: 0, False positives: 0
+# Bugs caught: 0, False positives: 1
 def test_active_runtime_goes_first_and_preloads_tensorrt(tmp_path, monkeypatch):
     # The worker inherits the runtime through the environment. ORT's TensorRT
     # provider has no RUNPATH, so without the preload a process that started
@@ -63,13 +63,19 @@ def test_active_runtime_goes_first_and_preloads_tensorrt(tmp_path, monkeypatch):
         (libs / name).write_bytes(b"")
     loaded = []
     monkeypatch.setattr(ctypes, "CDLL", lambda path, mode=0: loaded.append((path, mode)))
-    monkeypatch.setattr(sys, "path", ["/usr/lib/site-packages"])
+    # Already listed, but after a system site-packages (a .pth file).
+    monkeypatch.setattr(sys, "path", ["/usr/lib/site-packages", str(runtime)])
     monkeypatch.setattr(sys, "platform", "linux")
     monkeypatch.setenv("UPSCALE_RELAY_ACTIVE_RUNTIME", str(runtime))
 
     infer._use_active_runtime()
 
     assert sys.path == [str(runtime), "/usr/lib/site-packages"]
+    # TensorRT loads only for a TensorRT session, so a CPU or CUDA session
+    # never depends on it.
+    assert loaded == []
+    infer._trt_options(tmp_path / "cache")
+    infer._trt_options(tmp_path / "cache")  # once per runtime
     assert [Path(path).name for path, _ in loaded] == [
         "libnvinfer.so.10", "libnvinfer_plugin.so.10", "libnvonnxparser.so.10",
     ]

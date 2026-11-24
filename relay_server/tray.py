@@ -261,6 +261,15 @@ async def ensure_runtime_gui(ep: str = "auto") -> tuple[bool, RuntimeSetupDialog
     if activate_runtime():
         return True, None
 
+    if linux and autostart.AUTOSTART_ARG in sys.argv[1:]:
+        # Unattended sign-in: serve passthrough now rather than wait on a
+        # question nobody may be there to answer. A manual launch asks.
+        log.warning(
+            "NVIDIA runtime not installed: only passthrough sessions can run. Run "
+            "relay-server --install-nvidia-runtime and relaunch the tray for models."
+        )
+        return True, None
+
     dialog = RuntimeSetupDialog()
     dialog.show()
     if linux and not await dialog.ask():
@@ -658,7 +667,8 @@ class ConfigDialog(QDialog):
         self.models_edit.setText(s.models_dir)
         self.mdns_check.setChecked(s.mdns)
         self.logging_check.setChecked(s.file_logging)
-        self.autostart_check.setChecked(autostart.is_enabled())
+        self._autostart_loaded = autostart.is_enabled()
+        self.autostart_check.setChecked(self._autostart_loaded)
 
     def _add_library_folder(self) -> None:
         selected = self.library_list.currentItem()
@@ -692,9 +702,12 @@ class ConfigDialog(QDialog):
         s.models_dir = self.models_edit.text().strip()
         s.mdns = self.mdns_check.isChecked()
         s.file_logging = self.logging_check.isChecked()
-        if autostart.is_supported():
+        # Only a change made here: the desktop may have changed the entry
+        # since the pane opened, and an unrelated Apply must not undo that.
+        if autostart.is_supported() and self.autostart_check.isChecked() != self._autostart_loaded:
             try:
                 autostart.set_enabled(self.autostart_check.isChecked())
+                self._autostart_loaded = self.autostart_check.isChecked()
             except OSError as err:
                 log.warning("could not update autostart: %r", err)
         self.applied.emit()

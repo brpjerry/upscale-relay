@@ -52,8 +52,10 @@ def lock_dir() -> Path:
         base = os.environ.get("LOCALAPPDATA")
         root = Path(base) if base else Path.home() / "AppData" / "Local"
         return root / "upscale-relay"
-    base = os.environ.get("XDG_STATE_HOME")
-    root = Path(base) if base else Path.home() / ".local" / "state"
+    # XDG base directories must be absolute; a relative value is ignored.
+    root = Path(os.environ.get("XDG_STATE_HOME") or "")
+    if not root.is_absolute():
+        root = Path.home() / ".local" / "state"
     return root / "upscale-relay"
 
 

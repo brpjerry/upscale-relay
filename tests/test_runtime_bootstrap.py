@@ -27,9 +27,11 @@ def test_source_runtime_validation_runs_in_an_isolated_process(monkeypatch):
 
 def test_source_runtime_dispatch_does_not_run_installer(monkeypatch):
     checked = []
-    monkeypatch.setattr(runtime, "_validate_source_runtime", checked.append)
+    monkeypatch.setattr(runtime, "_validate_source_runtime",
+                        lambda ep, *, saved_choice: checked.append((ep, saved_choice)))
     assert runtime.maybe_run_runtime_installer([runtime.SOURCE_VALIDATE_ARG, "cpu"]) == 0
-    assert checked == ["cpu"]
+    # The tray probes its saved preference, which may name a missing provider.
+    assert checked == [("cpu", True)]
 
 
 def _use_temp_runtime(monkeypatch, tmp_path: Path) -> Path:
