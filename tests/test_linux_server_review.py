@@ -71,11 +71,12 @@ def test_linux_validation_exercises_tensorrt_and_cuda(monkeypatch, tmp_path):
     assert checked == ["tensorrt", "cuda"]
 
 
-# Bugs caught: 1, False positives: 0
+# Bugs caught: 1, False positives: 1
 def test_relative_xdg_data_home_is_ignored(monkeypatch, tmp_path):
     monkeypatch.setattr(runtime, "_LINUX", True)
     monkeypatch.delenv("UPSCALE_RELAY_RUNTIME_DIR", raising=False)
-    monkeypatch.setenv("HOME", str(tmp_path))
+    # Not HOME: Windows' Path.home() reads USERPROFILE.
+    monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))
     monkeypatch.setenv("XDG_DATA_HOME", "relative/data")
     assert runtime.runtime_base_dir() == tmp_path / ".local/share/upscale-relay/runtimes"
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
