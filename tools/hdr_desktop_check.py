@@ -36,6 +36,8 @@ from PySide6.QtCore import QEvent, QObject, QSettings  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 from qasync import QEventLoop  # noqa: E402
 
+from desktop_client.app import request_true_color  # noqa: E402
+
 
 class Clock(QObject):
     """Timestamps of the events a measurement compares."""
@@ -313,6 +315,7 @@ def main():
     args = parser.parse_args()
     if args.surface != "auto":
         os.environ["RELAY_HDR_SURFACE"] = args.surface
+    request_true_color()  # the player's window format (8 bits per channel)
     app = QApplication([])
     # --hold ends when the window closes: quitting then would stop the loop
     # under the run before it reports and cleans up.
