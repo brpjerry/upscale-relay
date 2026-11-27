@@ -3,10 +3,11 @@
 import pytest
 
 pytest.importorskip("PySide6")
-mpv = pytest.importorskip("mpv")
+# Through the player module: on Windows it puts mpv-dev's libmpv on the path
+# before python-mpv loads it.
+mpv_view = pytest.importorskip("desktop_client.mpv_view")
 
-from desktop_client import mpv_view
-from desktop_client.mpv_view import _open_render_context, _render_renderer
+from desktop_client.mpv_view import _open_render_context, _render_renderer, mpv
 
 
 # Bugs caught: 0, False positives: 0
@@ -61,6 +62,17 @@ def test_renderer_is_omitted_for_older_libmpv(monkeypatch):
 
 
 # Bugs caught: 0, False positives: 0
+@pytest.mark.parametrize("renderer", ["gpu", "gpu-next"])
+def test_renderer_that_starts_is_asked_for_once(monkeypatch, renderer):
+    contexts = _Contexts()
+    monkeypatch.setattr(mpv_view.mpv, "MpvRenderContext", contexts)
+    ctx, used = _open_render_context("handle", {"opengl_init_params": 1}, renderer, pytest.fail)
+    assert used == renderer
+    assert contexts.created == [renderer]
+    assert ctx[1] == {"opengl_init_params": 1, "renderer": renderer}
+
+
+# Bugs caught: 0, False positives: 0
 def test_gpu_next_that_does_not_start_falls_back_to_gpu(monkeypatch):
     contexts = _Contexts(failing={"gpu-next"})
     warnings = []
@@ -77,3 +89,22 @@ def test_gpu_that_does_not_start_is_an_error(monkeypatch):
     monkeypatch.setattr(mpv_view.mpv, "MpvRenderContext", _Contexts(failing={"gpu"}))
     with pytest.raises(SystemError):
         _open_render_context("handle", {}, "gpu", pytest.fail)
+
+
+# Bugs caught: 0, False positives: 0
+def test_turning_logging_on_records_the_renderer_chosen_before_it():
+    from types import SimpleNamespace
+
+    from desktop_client.features import DesktopFeatures
+
+    records = []
+    log = SimpleNamespace(enable=lambda value: None, record=lambda event, **fields: records.append(fields))
+    features = SimpleNamespace(settings=SimpleNamespace(), client_log=log,
+                               player=SimpleNamespace(renderer="gpu"))
+    DesktopFeatures._set_logging(features, False)
+    assert records == []
+    DesktopFeatures._set_logging(features, True)
+    assert [r["message"] for r in records] == ["mpv renders with its gpu renderer"]
+    features.player.renderer = None  # headless: no render context
+    DesktopFeatures._set_logging(features, True)
+    assert len(records) == 1
