@@ -36,3 +36,27 @@ def test_deeper_requests_are_kept(default_format):
     request_true_color()
     fmt = QSurfaceFormat.defaultFormat()
     assert (fmt.redBufferSize(), fmt.greenBufferSize(), fmt.blueBufferSize(), fmt.alphaBufferSize()) == (10, 10, 10, 2)
+
+
+class _Stop(Exception):
+    pass
+
+
+# Bugs caught: 0, False positives: 0
+def test_main_requests_the_format_before_the_application_exists(default_format, monkeypatch):
+    # The default format only reaches windows when set before QApplication.
+    from desktop_client import app as app_module
+
+    seen = []
+
+    def application(_argv):
+        fmt = QSurfaceFormat.defaultFormat()
+        seen.append((fmt.redBufferSize(), fmt.greenBufferSize(), fmt.blueBufferSize()))
+        raise _Stop
+
+    QSurfaceFormat.setDefaultFormat(QSurfaceFormat())
+    monkeypatch.setattr(app_module, "QApplication", application)
+    monkeypatch.setattr(app_module.sys, "argv", ["relay-desktop"])
+    with pytest.raises(_Stop):
+        app_module.main()
+    assert seen == [(8, 8, 8)]

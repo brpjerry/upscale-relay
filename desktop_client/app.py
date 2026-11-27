@@ -55,11 +55,9 @@ def request_true_color() -> None:
     was cut again to 5/6/5 bits when Qt composited it, so gradients showed
     coarse steps in shifting colours. Must run before the QApplication."""
     fmt = QSurfaceFormat.defaultFormat()
-    for get, set_ in ((fmt.redBufferSize, fmt.setRedBufferSize),
-                      (fmt.greenBufferSize, fmt.setGreenBufferSize),
-                      (fmt.blueBufferSize, fmt.setBlueBufferSize)):
-        if get() < 8:
-            set_(8)
+    fmt.setRedBufferSize(max(8, fmt.redBufferSize()))
+    fmt.setGreenBufferSize(max(8, fmt.greenBufferSize()))
+    fmt.setBlueBufferSize(max(8, fmt.blueBufferSize()))
     QSurfaceFormat.setDefaultFormat(fmt)
 
 

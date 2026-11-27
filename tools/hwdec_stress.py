@@ -38,6 +38,8 @@ from PySide6.QtCore import QSettings  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 from qasync import QEventLoop  # noqa: E402
 
+from desktop_client.app import request_true_color  # noqa: E402
+
 
 def say(**fields) -> None:
     print(json.dumps({"t": round(time.monotonic(), 2), **fields}), flush=True)
@@ -203,6 +205,7 @@ def main():
         parser.error("--server and --file, or --local")
     if args.eof and not args.local:
         parser.error("--eof needs --local")
+    request_true_color()  # the player's window format (8 bits per channel)
     app = QApplication([])
     locale.setlocale(locale.LC_NUMERIC, "C")
     from desktop_client.main_window import MainWindow  # noqa: PLC0415
