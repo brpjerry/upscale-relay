@@ -95,6 +95,10 @@ flags:
   testing: `auto-copy-safe` for copy-back on an Intel laptop, `vaapi` for
   zero-copy elsewhere (`tools/hwdec_stress.py` drives the window through
   seeks, restarts and fullscreen with it).
+- `RELAY_RENDERER=gpu-next` asks libmpv's render API for its gpu-next
+  renderer (mpv >= 0.43, falling back to gpu if it does not start). The
+  player otherwise pins `gpu`, which mpv 0.43 no longer defaults to: every
+  render-path measurement below was taken on it.
 
 `python -m desktop_client.hdr_output` prints each screen's HDR state.
 `tools/hdr_desktop_check.py` plays an `upscale-cli sample --hdr` clip and times

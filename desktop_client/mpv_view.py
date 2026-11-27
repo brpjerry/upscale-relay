@@ -159,6 +159,46 @@ def _zero_copy(mode: str) -> bool:
                for candidate in (part.strip() for part in mode.split(",")))
 
 
+# MPV_RENDER_PARAM_RENDERER, from libmpv's client API 2.7 (mpv 0.43). python-
+# mpv 1.0.8 predates it and refuses render parameters it has no entry for.
+_RENDERER_API = (2, 7)
+_RENDERERS = ("gpu", "gpu-next")
+mpv.MpvRenderParam.TYPES.setdefault("renderer", (23, str))
+
+
+def _render_renderer(environ=None, api_version: tuple[int, int] | None = None) -> str | None:
+    """The renderer to ask libmpv's render API for; None where libmpv has
+    only one (before client API 2.7, always gpu).
+
+    From mpv 0.43 the render API picks gpu-next unless told otherwise. Every
+    render-path measurement behind this player (frame pacing, resize paths,
+    the zero-copy freeze, the HDR surface, power) was taken on gpu, so gpu
+    stays pinned until gpu-next has been measured the same way.
+    RELAY_RENDERER=gpu-next selects it for testing.
+    """
+    if (mpv.MPV_VERSION if api_version is None else api_version) < _RENDERER_API:
+        return None
+    override = (os.environ if environ is None else environ).get("RELAY_RENDERER", "").strip()
+    return override if override in _RENDERERS else "gpu"
+
+
+def _open_render_context(handle, params: dict, renderer: str | None, warn) -> tuple[object, str]:
+    """mpv's OpenGL render context with `renderer`, and the renderer it runs.
+
+    An explicit renderer that fails to start is an error rather than libmpv's
+    own fallback, so a gpu-next that does not start here falls back to gpu.
+    """
+    if renderer is None:
+        return mpv.MpvRenderContext(handle, "opengl", **params), "gpu"
+    try:
+        return mpv.MpvRenderContext(handle, "opengl", renderer=renderer, **params), renderer
+    except Exception as error:  # noqa: BLE001 - python-mpv raises per error code
+        if renderer == "gpu":
+            raise
+        warn(f"mpv's {renderer} renderer did not start ({error!r}); using gpu")
+    return mpv.MpvRenderContext(handle, "opengl", renderer="gpu", **params), "gpu"
+
+
 def _mpv_config_dirs(environ=None, platform: str | None = None) -> list[Path]:
     """mpv's user configuration folders, highest priority first.
 
@@ -467,6 +507,7 @@ class MpvPlayerView(QOpenGLWidget):
         self.options = options or DesktopOptions()
         # Read by resizeEvent/paintGL, so set before anything can resize the view.
         self._ctx = None  # MpvRenderContext, created in initializeGL
+        self.renderer: str | None = None  # mpv's renderer behind it ("gpu", "gpu-next")
         self._resizing = False
         # While the view is being resized (slides, fullscreen, splitter drags)
         # the last rendered picture is drawn scaled instead; see _paint_scaled.
@@ -787,10 +828,13 @@ class MpvPlayerView(QOpenGLWidget):
             "opengl_init_params": {"get_proc_address": self._get_proc},
             **_native_display_params(),
         }
-        ctx = mpv.MpvRenderContext(
-            self.mpv, "opengl",
-            **render_params,
+        ctx, renderer = _open_render_context(
+            self.mpv, render_params, _render_renderer(),
+            lambda message: self.log_message.emit("warn", "relay", message),
         )
+        if renderer != self.renderer:
+            self.renderer = renderer
+            self.log_message.emit("info", "relay", f"mpv renders with its {renderer} renderer")
         ctx.update_cb = self._frame_ready.emit
         return ctx
 
