@@ -98,7 +98,13 @@ def test_turning_logging_on_records_the_renderer_chosen_before_it():
     from desktop_client.features import DesktopFeatures
 
     records = []
-    log = SimpleNamespace(enable=lambda value: None, record=lambda event, **fields: records.append(fields))
+    enabled = []
+
+    def record(event, **fields):
+        assert enabled and enabled[-1] is True  # ClientLog drops records while off
+        records.append(fields)
+
+    log = SimpleNamespace(enable=enabled.append, record=record)
     features = SimpleNamespace(settings=SimpleNamespace(), client_log=log,
                                player=SimpleNamespace(renderer="gpu"))
     DesktopFeatures._set_logging(features, False)
