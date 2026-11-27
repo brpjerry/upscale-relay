@@ -10,6 +10,7 @@ import argparse
 import sys
 from pathlib import Path
 
+from PySide6.QtGui import QSurfaceFormat
 from PySide6.QtWidgets import QApplication
 from qasync import QEventLoop
 
@@ -46,6 +47,22 @@ def parse_args(argv: list[str] | None = None) -> tuple[DesktopOptions, list[str]
     ), qt_args
 
 
+def request_true_color() -> None:
+    """Ask for at least 8 bits per colour channel in every window.
+
+    A format that names no depth let NVIDIA's EGL on Wayland (Qt 6.12, driver
+    620) give the window RGB565: every frame mpv drew at 8 bits and dithered
+    was cut again to 5/6/5 bits when Qt composited it, so gradients showed
+    coarse steps in shifting colours. Must run before the QApplication."""
+    fmt = QSurfaceFormat.defaultFormat()
+    for get, set_ in ((fmt.redBufferSize, fmt.setRedBufferSize),
+                      (fmt.greenBufferSize, fmt.setGreenBufferSize),
+                      (fmt.blueBufferSize, fmt.setBlueBufferSize)):
+        if get() < 8:
+            set_(8)
+    QSurfaceFormat.setDefaultFormat(fmt)
+
+
 def main() -> None:
     # Opt-in only: mpv's OSC runs on LuaJIT, whose internal (caught) SEH
     # exceptions make faulthandler dump all threads on every stream reload —
@@ -61,6 +78,7 @@ def main() -> None:
 
     # Preserve unknown arguments for Qt itself (e.g. -platform), while
     # consuming the relay-specific flags above.
+    request_true_color()
     app = QApplication([sys.argv[0], *qt_args])
     # QApplication sets the process locale from the environment; libmpv
     # aborts ("Non-C locale detected") unless LC_NUMERIC is "C".
