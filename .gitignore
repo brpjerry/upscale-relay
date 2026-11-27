@@ -20,3 +20,5 @@ models/
 # Test media and captures (regenerate via `upscale-cli sample ...`)
 *.mkv
 *.bin
+
+artifacts/

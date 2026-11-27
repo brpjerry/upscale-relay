@@ -288,6 +288,10 @@ class DesktopFeatures:
     def _set_logging(self, value):
         self.settings.file_logging = value
         self.client_log.enable(value)
+        if value and getattr(self.player, "renderer", None):
+            # Chosen at the first render context, likely before logging was on.
+            self.client_log.record("mpv", level="info", prefix="relay",
+                                   message=f"mpv renders with its {self.player.renderer} renderer")
 
     def _feature_tick(self):
         if time.monotonic() - self._last_history_save >= 5:

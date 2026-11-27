@@ -215,8 +215,9 @@ switched the panel to HDR in fullscreen.
 
 ### What mpv does with the metadata
 
-The render API runs mpv's `gpu` renderer. gpu-next is not available through
-it. `gpu` uses static HDR10 metadata only: it tone-maps content brighter than
+The player pins the render API to mpv's `gpu` renderer (gpu-next, which the
+render API offers from mpv 0.43, is `RELAY_RENDERER=gpu-next` for testing).
+`gpu` uses static HDR10 metadata only: it tone-maps content brighter than
 `target-peak` (the display's peak) and passes the rest through. The Dolby
 Vision RPU and HDR10+ are therefore applied on the server, for the display the
 player names (docs/PROTOCOL.md §3.6). `MpvPlayerView.display_target()` takes the
@@ -370,9 +371,9 @@ Open before Windows can leave the prototype:
    at start (it raises now, which falls back to the widget).
 
 The alternative is mpv's own HDR output (`--wid`, `vo=gpu-next`,
-`gpu-api=d3d11`, `target-colorspace-hint`). It gains gpu-next (Dolby Vision
-and HDR10+), but it loses the render API, so there would be no scaled resizes
-and no mirrored overlays. mpv's window is on mpv's thread, so it cannot pass
+`gpu-api=d3d11`, `target-colorspace-hint`). It gives mpv its own window and
+loses the render API, so there would be no scaled resizes and no mirrored
+overlays. mpv's window is on mpv's thread, so it cannot pass
 the pointer through to the widgets beneath. The overlays would have to be
 separate top-level windows, with the focus and activation problems described
 above.
